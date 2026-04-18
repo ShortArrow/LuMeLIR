@@ -1,0 +1,14 @@
+/target
+*.pdb
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# LuMeLIR build artifacts (future)
+*.ll
+*.spv
+*.o

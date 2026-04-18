@@ -1,0 +1,22 @@
+[package]
+name = "lumelir"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+authors = ["ShortArrow <bamboogeneral@shortarrow.jp>"]
+description = "Lua Multi-Level Intermediate Representation compiler toolchain"
+license = "Apache-2.0 OR MIT"
+readme = "README.md"
+keywords = ["lua", "mlir", "compiler", "gpu", "fpga"]
+categories = ["compilers", "command-line-utilities"]
+
+[[bin]]
+name = "lumelir"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
