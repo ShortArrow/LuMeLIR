@@ -57,7 +57,7 @@ cli  →  (lib crate root, Phase 1+)  →  codegen  →  mir  →  hir  →  par
 
 - Each layer may only `use` items from layers **strictly inside it**. Reverse dependencies are forbidden.
 - MLIR / Melior / LLVM-sys bindings are confined to the `codegen` layer. `hir` / `mir` use plain Rust types.
-- Phase 0 current reality: single bin crate, only `cli` module exists. Phase 1 will introduce `src/lib.rs` and shrink `src/main.rs` to <20 lines. **TBD: ADR 0002 (`lib.rs` layering).**
+- Phase 1 adopted layering: `src/lib.rs` as the library root, `src/main.rs` as a thin entry (<20 lines) calling `lumelir::cli::run()`. See [ADR 0002](docs/design/0002-lib-rs-layering.md).
 
 ### 4.3 Test-Driven Development
 
@@ -80,7 +80,7 @@ Test naming convention: `fn <subject>_<condition>_<expectation>()`. Example: `fn
 
 - Lint gate: `cargo clippy --all-targets -- -D warnings` must pass.
 - `unwrap` / `expect` are **forbidden in non-test code** unless justified with a comment explaining why the invariant holds.
-- Error types: **TBD: Phase 1, ADR 0003** (`thiserror` vs hand-rolled enum vs `anyhow` boundary).
+- Error types: library layers use `thiserror`-derived enums; the CLI layer may use `anyhow` to collapse them at the boundary. See [ADR 0003](docs/design/0003-error-handling.md).
 - `unsafe` requires a `// SAFETY:` comment and is confined to MLIR/LLVM FFI boundaries.
 - Avoid `Clone` unless there is a clear ownership reason; prefer borrowing.
 - No premature abstractions. Follow the "rule of three" before extracting a helper.
@@ -177,12 +177,15 @@ If the task is ambiguous, ask the user before writing code. Blindly guessing at 
 
 Replace each entry with an ADR link once the decision lands.
 
-- **Lexer implementation strategy**: hand-written vs `nom` vs `logos` → ADR 0001
-- **Library/binary split and layer boundaries**: when and how to introduce `src/lib.rs` → ADR 0002
-- **Error handling approach**: `thiserror` vs `anyhow` vs hand-rolled enums, and where each applies → ADR 0003
 - **CI configuration**: GitHub Actions workflow for fmt / clippy / test / (future) cross-compile
 - **`.gitattributes` / `rustfmt.toml`**: formal line-ending and formatting rules
 - **Windows vs WSL2/Linux for MLIR builds**: primary development environment for Phase 1
+- **MLIR / Melior integration strategy**: which layer owns FFI, dialect registration, and build-time LLVM dependency
+
+### Resolved
+- Lexer implementation → [ADR 0001](docs/design/0001-lexer-implementation.md) (hand-written)
+- Library/binary split → [ADR 0002](docs/design/0002-lib-rs-layering.md) (`lib.rs` + thin `main.rs`)
+- Error handling → [ADR 0003](docs/design/0003-error-handling.md) (`thiserror` / `anyhow` boundary)
 
 ## 12. References
 

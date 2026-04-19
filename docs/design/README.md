@@ -39,4 +39,6 @@ What becomes easier, harder, or locked-in as a result.
 
 ## Index
 
-_No ADRs yet. The first one lands when Phase 1 PoC work begins (likely `0001-parser-choice.md` or `0001-melior-vs-direct-ffi.md`)._
+- [0001 — Lexer implementation: hand-written](0001-lexer-implementation.md)
+- [0002 — Split into `lib.rs` + `main.rs` for Clean Architecture layering](0002-lib-rs-layering.md)
+- [0003 — Error handling: `thiserror` in library, `anyhow` at CLI boundary](0003-error-handling.md)
