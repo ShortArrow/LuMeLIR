@@ -33,6 +33,7 @@ See [`docs/PRD.md`](docs/PRD.md) for the full product requirements.
 - [`docs/PRD.jp.md`](docs/PRD.jp.md) — Product Requirements (Japanese, Source of Truth)
 - [`docs/README.jp.md`](docs/README.jp.md) — Japanese README
 - [`docs/design/`](docs/design/) — Architecture Decision Records (ADR)
+- [`docs/handover/`](docs/handover/) — Session handover notes (e.g. environment migrations)
 - [`AGENTS.md`](AGENTS.md) — Working conventions for LLM coding agents (also the detailed reference for human contributors)
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — Human contributor quick start
 
