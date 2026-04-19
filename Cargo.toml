@@ -10,12 +10,18 @@ readme = "README.md"
 keywords = ["lua", "mlir", "compiler", "gpu", "fpga"]
 categories = ["compilers", "command-line-utilities"]
 
+[lib]
+name = "lumelir"
+path = "src/lib.rs"
+
 [[bin]]
 name = "lumelir"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+thiserror = "2.0"
 
 [profile.release]
 lto = "thin"

@@ -1,0 +1,195 @@
+//! Lexer — turns a Lua source string into a flat stream of [`Token`]s.
+//!
+//! Public API is a single pure function [`lex`]. See
+//! `docs/design/0001-lexer-implementation.md` for the implementation
+//! strategy (hand-written, no combinator or derive-macro crate).
+
+mod error;
+mod token;
+
+pub use error::LexError;
+pub use token::{Span, Token, TokenKind};
+
+/// Tokenize a Lua source string.
+///
+/// Pure function: identical input always yields identical output.
+pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
+    let mut tokens = Vec::new();
+    let mut chars = src.char_indices().peekable();
+
+    while let Some(&(offset, ch)) = chars.peek() {
+        if ch.is_ascii_whitespace() {
+            chars.next();
+            continue;
+        }
+
+        if ch.is_ascii_digit() {
+            let (span, value) = scan_number(src, &mut chars);
+            tokens.push(Token::new(TokenKind::Number(value), span));
+            continue;
+        }
+
+        if is_ident_start(ch) {
+            let (span, name) = scan_ident(src, &mut chars);
+            tokens.push(Token::new(TokenKind::Ident(name), span));
+            continue;
+        }
+
+        let single = match ch {
+            '(' => Some(TokenKind::LParen),
+            ')' => Some(TokenKind::RParen),
+            '+' => Some(TokenKind::Plus),
+            _ => None,
+        };
+
+        if let Some(kind) = single {
+            let span = Span::new(offset, offset + ch.len_utf8());
+            tokens.push(Token::new(kind, span));
+            chars.next();
+            continue;
+        }
+
+        return Err(LexError::Unexpected { ch, offset });
+    }
+
+    let end = src.len();
+    tokens.push(Token::new(TokenKind::Eof, Span::new(end, end)));
+    Ok(tokens)
+}
+
+fn is_ident_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn is_ident_continue(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn scan_number<I>(src: &str, chars: &mut std::iter::Peekable<I>) -> (Span, f64)
+where
+    I: Iterator<Item = (usize, char)>,
+{
+    let &(start, _) = chars.peek().expect("scan_number requires a digit");
+    let mut end = start;
+    while let Some(&(offset, ch)) = chars.peek() {
+        if ch.is_ascii_digit() {
+            end = offset + ch.len_utf8();
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    let lexeme = &src[start..end];
+    let value = lexeme
+        .parse::<f64>()
+        .expect("ascii-digit run is always a valid f64");
+    (Span::new(start, end), value)
+}
+
+fn scan_ident<I>(src: &str, chars: &mut std::iter::Peekable<I>) -> (Span, String)
+where
+    I: Iterator<Item = (usize, char)>,
+{
+    let &(start, _) = chars.peek().expect("scan_ident requires an ident-start");
+    let mut end = start;
+    while let Some(&(offset, ch)) = chars.peek() {
+        if is_ident_continue(ch) {
+            end = offset + ch.len_utf8();
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    (Span::new(start, end), src[start..end].to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kinds(src: &str) -> Vec<TokenKind> {
+        lex(src)
+            .expect("source must lex cleanly")
+            .into_iter()
+            .map(|t| t.kind)
+            .collect()
+    }
+
+    #[test]
+    fn lex_empty_source_yields_single_eof_token() {
+        assert_eq!(kinds(""), vec![TokenKind::Eof]);
+    }
+
+    #[test]
+    fn lex_single_integer_literal_yields_number_token() {
+        assert_eq!(kinds("42"), vec![TokenKind::Number(42.0), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn lex_plus_between_integers_yields_three_tokens() {
+        assert_eq!(
+            kinds("1+2"),
+            vec![
+                TokenKind::Number(1.0),
+                TokenKind::Plus,
+                TokenKind::Number(2.0),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn lex_whitespace_is_skipped() {
+        assert_eq!(
+            kinds(" 1 +\t2\n"),
+            vec![
+                TokenKind::Number(1.0),
+                TokenKind::Plus,
+                TokenKind::Number(2.0),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn lex_identifier_yields_ident_token() {
+        assert_eq!(
+            kinds("print"),
+            vec![TokenKind::Ident("print".to_owned()), TokenKind::Eof],
+        );
+    }
+
+    #[test]
+    fn lex_print_call_with_addition_yields_expected_token_sequence() {
+        assert_eq!(
+            kinds("print(1 + 2)"),
+            vec![
+                TokenKind::Ident("print".to_owned()),
+                TokenKind::LParen,
+                TokenKind::Number(1.0),
+                TokenKind::Plus,
+                TokenKind::Number(2.0),
+                TokenKind::RParen,
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn lex_unknown_character_returns_unexpected_error() {
+        let err = lex("@").expect_err("`@` is not a valid Lua token in Phase 1");
+        assert_eq!(err, LexError::Unexpected { ch: '@', offset: 0 },);
+    }
+
+    #[test]
+    fn lex_assigns_byte_spans_pointing_into_the_source() {
+        let src = "print(1)";
+        let tokens = lex(src).expect("source must lex cleanly");
+        let lexemes: Vec<&str> = tokens
+            .iter()
+            .filter(|t| t.kind != TokenKind::Eof)
+            .map(|t| &src[t.span.start..t.span.end])
+            .collect();
+        assert_eq!(lexemes, vec!["print", "(", "1", ")"]);
+    }
+}

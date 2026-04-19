@@ -1,9 +1,9 @@
 mod compile;
 mod run;
 
-use std::error::Error;
 use std::path::PathBuf;
 
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -38,12 +38,14 @@ enum Commands {
     },
 }
 
-pub fn run() -> Result<(), Box<dyn Error>> {
+pub fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Compile { input, output, target } => {
-            compile::invoke(&input, output.as_deref(), &target)
-        }
+        Commands::Compile {
+            input,
+            output,
+            target,
+        } => compile::invoke(&input, output.as_deref(), &target),
         Commands::Run { input } => run::invoke(&input),
     }
 }
