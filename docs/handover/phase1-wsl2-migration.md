@@ -6,9 +6,10 @@
 
 ## 1. Where you are
 
-- `/mnt/v/LuMeLIR/` — the LuMeLIR git repo (same working tree as Windows `V:/LuMeLIR/`).
+- `~/LuMeLIR/` — **primary working tree**, cloned from <https://github.com/ShortArrow/LuMeLIR> (private). Native ext4, fast build IO.
+- `/mnt/v/LuMeLIR/` — the original Windows-side clone of the same repo. Kept around for Windows native checks of pure-Rust layers. **Do not run MLIR-linked builds here** (slow 9P IO, Windows link issues). Use it only for the occasional `cargo check` on lexer/parser.
 - `/mnt/v/melior-spike/` — out-of-tree Windows spike. **Do not touch from WSL2**; it records Windows-side patches for later upstream PRs. See `/mnt/v/melior-spike/FINDINGS.md`.
-- Git on `/mnt/v/` works correctly (shared `.git` dir). Expect slightly slower file I/O than native ext4.
+- Remote: `origin = https://github.com/ShortArrow/LuMeLIR.git` (private). `git pull` / `git push` go there; the two local clones (`~/LuMeLIR` and `/mnt/v/LuMeLIR`) stay in sync through GitHub, not through each other.
 
 ## 2. What is already done
 
@@ -73,7 +74,7 @@ These tell `mlir-sys`, `llvm-sys`, and `tblgen` where to find `llvm-config` and 
 ### 3.4 Sanity check
 
 ```bash
-cd /mnt/v/LuMeLIR
+cd ~/LuMeLIR
 cargo fmt --check                              # clean
 cargo clippy --all-targets -- -D warnings      # clean
 cargo test --lib                                # 19 tests, all green
@@ -131,14 +132,15 @@ This is tracked under AGENTS.md §11 TBD "Windows native MLIR support".
 
 ## 7. Known annoyances under WSL2
 
-- `/mnt/v/` reports file changes to inotify with delay; if an editor watcher (`cargo watch`) seems slow, expect it.
-- Windows Defender may scan `target/` and slow things. If build times hurt, consider `cargo install cargo-target-dir-redirect`-style tricks or a pure-WSL ext4 clone.
-- The Windows-side LIBCLANG_PATH env var leaking into WSL2 shells: usually harmless (WSL2 has its own env), but if `bindgen` ever complains about a weird libclang, `unset LIBCLANG_PATH` first.
+- Since the working tree is now on native ext4 (`~/LuMeLIR`), the previous `/mnt/v/` slowness no longer applies. Ignore older advice about 9P performance.
+- The Windows-side `LIBCLANG_PATH` env var is sometimes imported into WSL2 shells (pointing at the Xtensa ESP clang on the Windows host). Usually harmless (WSL2 Rust uses system libclang), but if `bindgen` ever complains about a weird libclang, `unset LIBCLANG_PATH` first.
+- If you ever need to share a not-yet-pushed change between `~/LuMeLIR` and `/mnt/v/LuMeLIR`, push a branch to `origin` and pull on the other side. Do **not** try to share working trees or `.git` dirs across the WSL2 / Windows boundary.
 
 ## 8. What to do at session start (quick checklist)
 
 ```bash
-cd /mnt/v/LuMeLIR
+cd ~/LuMeLIR
+git pull --ff-only                                 # catch up with origin
 cat docs/handover/phase1-wsl2-migration.md        # this file
 cat AGENTS.md                                      # current conventions
 cat docs/design/0005-mlir-environment.md           # why we're here
