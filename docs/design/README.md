@@ -43,3 +43,4 @@ What becomes easier, harder, or locked-in as a result.
 - [0002 — Split into `lib.rs` + `main.rs` for Clean Architecture layering](0002-lib-rs-layering.md)
 - [0003 — Error handling: `thiserror` in library, `anyhow` at CLI boundary](0003-error-handling.md)
 - [0004 — Parser implementation: hand-written recursive descent with Pratt](0004-parser-implementation.md)
+- [0005 — MLIR integration environment: WSL2 (Arch) primary, Windows native best-effort](0005-mlir-environment.md)

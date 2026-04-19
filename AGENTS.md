@@ -22,6 +22,9 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 |---|---|---|
 | Phase 0 — Scaffolding | **Done** | Cargo workspace, CLI skeleton (clap), docs, dual license, ADR conventions |
 | Phase 1 — PoC | **In progress** | `print(1 + 2)` AOT: lexer → parser → HIR → MLIR emit → native binary |
+| ‣ lexer | **Done** | Hand-written, 8 unit tests green (ADR 0001) |
+| ‣ parser | **Done** | Recursive descent + Pratt, 11 unit tests green (ADR 0004) |
+| ‣ HIR / codegen / MLIR emit | **Next** | First Melior work happens under WSL2 Arch (ADR 0005) |
 | Phase 2 — Core Semantics | Not started | Tables, metatables, GC strategy |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |
 
@@ -156,12 +159,21 @@ Do **not** run the following without the user explicitly asking:
 - `LICENSE-APACHE`, `LICENSE-MIT` — licensing text is fixed.
 - `Cargo.lock` — do not hand-edit. Let `cargo` regenerate it.
 
-### 10.3 Environment Gotchas (Windows 11 + bash)
+### 10.3 Environment Gotchas
 
+**Primary dev environment as of Phase 1 MLIR work: WSL2 Arch Linux (see [ADR 0005](docs/design/0005-mlir-environment.md)).** The Rust crate builds on both Windows and WSL2; anything that pulls `melior` / `mlir-sys` needs WSL2.
+
+Under Windows 11 + Git Bash (historical scaffolding env, still usable for pure-Rust layers):
 - Shell is Git Bash / MSYS2-style. Use Unix syntax: `/dev/null` not `NUL`, forward slashes where possible.
 - **cwd may reset between tool invocations.** Prefer absolute paths (`V:/LuMeLIR/...`).
 - Line endings: repository is LF. Watch for `^M` in diffs — your editor may be inserting CRLF. **TBD: `.gitattributes` in Phase 1.**
 - Cargo cold builds take minutes; set generous timeouts for release builds.
+- `/usr/bin/link.exe` (Git Bash) shadows MSVC `link.exe`; affects any native link step. WSL2 sidesteps this.
+
+Under WSL2 Arch Linux:
+- Source tree lives at `/mnt/v/LuMeLIR` (Windows `V:/LuMeLIR/` shared). File I/O is slower than an ext4 home directory — acceptable for now; if build times become a problem, clone a pure ext4 copy into `~/LuMeLIR`.
+- MLIR toolchain: `sudo pacman -S base-devel llvm rust cmake ninja pkgconf clang zlib zstd libxml2` plus `paru -S mlir` (AUR).
+- Env vars for `melior`: `MLIR_SYS_220_PREFIX=/usr` etc. See `docs/handover/phase1-wsl2-migration.md` for the full bootstrap script.
 
 ### 10.4 Commits & Pushes Require Explicit Instruction
 
@@ -179,13 +191,15 @@ Replace each entry with an ADR link once the decision lands.
 
 - **CI configuration**: GitHub Actions workflow for fmt / clippy / test / (future) cross-compile
 - **`.gitattributes` / `rustfmt.toml`**: formal line-ending and formatting rules
-- **Windows vs WSL2/Linux for MLIR builds**: primary development environment for Phase 1
-- **MLIR / Melior integration strategy**: which layer owns FFI, dialect registration, and build-time LLVM dependency
+- **MLIR dialect ownership**: which layer owns FFI, dialect registration, first op set for Phase 1 (ADR pending once the first real codegen lands under WSL2)
+- **Windows native MLIR support**: re-opening after ADR 0005 — tracked out-of-tree in `V:/melior-spike/FINDINGS.md`; returns as a future ADR once upstream tblgen accepts the patches
 
 ### Resolved
 - Lexer implementation → [ADR 0001](docs/design/0001-lexer-implementation.md) (hand-written)
 - Library/binary split → [ADR 0002](docs/design/0002-lib-rs-layering.md) (`lib.rs` + thin `main.rs`)
 - Error handling → [ADR 0003](docs/design/0003-error-handling.md) (`thiserror` / `anyhow` boundary)
+- Parser implementation → [ADR 0004](docs/design/0004-parser-implementation.md) (recursive descent + Pratt)
+- MLIR integration environment → [ADR 0005](docs/design/0005-mlir-environment.md) (WSL2 Arch primary, Windows native best-effort)
 
 ## 12. References
 
