@@ -29,23 +29,34 @@ impl Token {
 
 /// The discriminated category of a [`Token`].
 ///
-/// Kept intentionally small for Phase 1 PoC (`print(1 + 2)`). Extended in
-/// subsequent phases as more of the Lua 5.4 lexical grammar is covered.
+/// Grows as more of the Lua 5.4 lexical grammar is covered. See ADRs 0001
+/// (Phase 1 baseline) and 0007 (Phase 2.0 additions).
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
-    /// Numeric literal stored as `f64` for now. Integer / float distinction
-    /// will be re-introduced when Lua 5.4 number semantics are covered.
     Number(f64),
-    /// Identifier (including keyword-like names; keyword classification is
-    /// deferred to a later phase).
     Ident(String),
-    /// `(`
+    Keyword(Keyword),
     LParen,
-    /// `)`
     RParen,
-    /// `+`
     Plus,
+    Equals,
+    Semicolon,
     /// End-of-source sentinel. Always present as the last element of a
     /// successful [`super::lex`] result.
     Eof,
+}
+
+/// Reserved words. Phase 2.0 introduces `local`; more land as Phase 2 grows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Keyword {
+    Local,
+}
+
+impl Keyword {
+    pub fn from_lexeme(lex: &str) -> Option<Self> {
+        match lex {
+            "local" => Some(Keyword::Local),
+            _ => None,
+        }
+    }
 }

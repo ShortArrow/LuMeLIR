@@ -1,8 +1,8 @@
-//! Emit MLIR from a parsed AST expression.
+//! Emit MLIR from a resolved HIR chunk.
 //!
 //! Produces an MLIR `Module` using standard dialects (`arith`, `func`, `llvm`).
-//! The module wraps the expression in a `func.func @main` that calls `printf`
-//! to print the result.
+//! All statements run in `func.func @main`. Locals are stack slots created
+//! with `llvm.alloca` at function entry.
 
 use melior::{
     Context,
@@ -22,11 +22,11 @@ use melior::{
     utility::register_all_dialects,
 };
 
-use crate::parser::{BinOp, Expr, ExprKind};
+use crate::hir::{Builtin, HirChunk, HirExpr, HirExprKind, HirStmtKind, LocalId};
+use crate::parser::BinOp;
 
 use super::error::CodegenError;
 
-/// Cached MLIR types used throughout code generation.
 struct Types<'c> {
     i32: Type<'c>,
     i64: Type<'c>,
@@ -34,11 +34,8 @@ struct Types<'c> {
     ptr: Type<'c>,
 }
 
-/// Emit an MLIR module from an AST expression.
-///
-/// The emitted module wraps the expression in `func.func @main`, prints
-/// the result via `printf("%g\n", <result>)`, and returns 0.
-pub fn emit_module<'c>(context: &'c Context, expr: &Expr) -> Result<Module<'c>, CodegenError> {
+/// Emit an MLIR module from a resolved HIR chunk.
+pub fn emit_module<'c>(context: &'c Context, chunk: &HirChunk) -> Result<Module<'c>, CodegenError> {
     let loc = Location::unknown(context);
     let module = Module::new(loc);
 
@@ -52,7 +49,7 @@ pub fn emit_module<'c>(context: &'c Context, expr: &Expr) -> Result<Module<'c>, 
 
     emit_fmt_global(context, &module, i8_type, loc);
     emit_printf_decl(context, &module, &types, loc);
-    emit_main(context, &module, expr, &types, loc)?;
+    emit_main(context, &module, chunk, &types, loc)?;
 
     if !module.as_operation().verify() {
         return Err(CodegenError::VerificationFailed);
@@ -61,7 +58,6 @@ pub fn emit_module<'c>(context: &'c Context, expr: &Expr) -> Result<Module<'c>, 
     Ok(module)
 }
 
-/// Create a new MLIR context with all dialects registered.
 pub fn new_context() -> Context {
     let context = Context::new();
     let registry = DialectRegistry::new();
@@ -114,18 +110,31 @@ fn emit_printf_decl<'c>(
 fn emit_main<'c>(
     context: &'c Context,
     module: &Module<'c>,
-    expr: &Expr,
+    chunk: &HirChunk,
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     let main_region = Region::new();
     let main_block = Block::new(&[]);
 
-    let result = emit_expr(context, &main_block, expr, types, loc)?;
+    let slots: Vec<Value<'c, '_>> = chunk
+        .locals
+        .iter()
+        .map(|_| emit_alloca_slot(context, &main_block, types, loc))
+        .collect();
 
-    emit_printf_call(context, &main_block, result, types, loc);
+    for stmt in &chunk.stmts {
+        match &stmt.kind {
+            HirStmtKind::LocalInit { id, value } => {
+                let v = emit_expr(context, &main_block, value, &slots, types, loc)?;
+                emit_store(&main_block, v, slots[id.0], loc);
+            }
+            HirStmtKind::ExprStmt(expr) => {
+                emit_expr_stmt(context, &main_block, expr, &slots, types, loc)?;
+            }
+        }
+    }
 
-    // return 0 : i64
     let zero = arith::constant(context, IntegerAttribute::new(types.i64, 0).into(), loc);
     let zero_val = main_block.append_operation(zero).result(0).unwrap().into();
     main_block.append_operation(func::r#return(&[zero_val], loc));
@@ -145,15 +154,64 @@ fn emit_main<'c>(
     Ok(())
 }
 
+fn emit_alloca_slot<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let one = arith::constant(context, IntegerAttribute::new(types.i32, 1).into(), loc);
+    let one_val: Value<'c, 'a> = block.append_operation(one).result(0).unwrap().into();
+
+    let alloca = OperationBuilder::new("llvm.alloca", loc)
+        .add_operands(&[one_val])
+        .add_attributes(&[(
+            Identifier::new(context, "elem_type"),
+            TypeAttribute::new(types.f64).into(),
+        )])
+        .add_results(&[types.ptr])
+        .build()
+        .expect("llvm.alloca");
+    block.append_operation(alloca).result(0).unwrap().into()
+}
+
+fn emit_store<'a, 'c>(
+    block: &'a Block<'c>,
+    value: Value<'c, 'a>,
+    slot: Value<'c, 'a>,
+    loc: Location<'c>,
+) {
+    let store = OperationBuilder::new("llvm.store", loc)
+        .add_operands(&[value, slot])
+        .build()
+        .expect("llvm.store");
+    block.append_operation(store);
+}
+
+fn emit_load<'a, 'c>(
+    block: &'a Block<'c>,
+    slot: Value<'c, 'a>,
+    f64_type: Type<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let load = OperationBuilder::new("llvm.load", loc)
+        .add_operands(&[slot])
+        .add_results(&[f64_type])
+        .build()
+        .expect("llvm.load");
+    block.append_operation(load).result(0).unwrap().into()
+}
+
 fn emit_expr<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
-    expr: &Expr,
+    expr: &HirExpr,
+    slots: &[Value<'c, 'a>],
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Result<Value<'c, 'a>, CodegenError> {
     match &expr.kind {
-        ExprKind::Number(n) => {
+        HirExprKind::Number(n) => {
             let op = arith::constant(
                 context,
                 FloatAttribute::new(context, types.f64, *n).into(),
@@ -161,24 +219,32 @@ fn emit_expr<'a, 'c>(
             );
             Ok(block.append_operation(op).result(0).unwrap().into())
         }
-        ExprKind::BinOp { op, lhs, rhs } => {
-            let lhs_val = emit_expr(context, block, lhs, types, loc)?;
-            let rhs_val = emit_expr(context, block, rhs, types, loc)?;
+        HirExprKind::Local(LocalId(idx)) => Ok(emit_load(block, slots[*idx], types.f64, loc)),
+        HirExprKind::BinOp { op, lhs, rhs } => {
+            let lhs_val = emit_expr(context, block, lhs, slots, types, loc)?;
+            let rhs_val = emit_expr(context, block, rhs, slots, types, loc)?;
             emit_binop(block, *op, lhs_val, rhs_val, loc)
         }
-        ExprKind::Call { callee, args } => match &callee.kind {
-            ExprKind::Ident(name) if name == "print" && args.len() == 1 => {
-                emit_expr(context, block, &args[0], types, loc)
+        HirExprKind::Call { builtin, args } => match builtin {
+            Builtin::Print => {
+                let arg_val = emit_expr(context, block, &args[0], slots, types, loc)?;
+                emit_printf_call(context, block, arg_val, types, loc);
+                Ok(arg_val)
             }
-            _ => Err(CodegenError::UnsupportedExpr(format!(
-                "unsupported call: {:?}",
-                callee.kind
-            ))),
         },
-        ExprKind::Ident(name) => Err(CodegenError::UnsupportedExpr(format!(
-            "bare identifier '{name}' not supported in Phase 1"
-        ))),
     }
+}
+
+fn emit_expr_stmt<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    expr: &HirExpr,
+    slots: &[Value<'c, 'a>],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    emit_expr(context, block, expr, slots, types, loc)?;
+    Ok(())
 }
 
 fn emit_binop<'a, 'c>(
@@ -242,42 +308,18 @@ fn emit_printf_call<'a, 'c>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::Span;
-    use crate::parser::{BinOp, Expr, ExprKind};
+    use crate::hir;
+    use crate::parser;
 
-    fn span() -> Span {
-        Span { start: 0, end: 0 }
-    }
-
-    fn number(n: f64) -> Expr {
-        Expr::new(ExprKind::Number(n), span())
-    }
-
-    fn addition(lhs: Expr, rhs: Expr) -> Expr {
-        Expr::new(
-            ExprKind::BinOp {
-                op: BinOp::Add,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            },
-            span(),
-        )
-    }
-
-    fn print_call(arg: Expr) -> Expr {
-        Expr::new(
-            ExprKind::Call {
-                callee: Box::new(Expr::new(ExprKind::Ident("print".into()), span())),
-                args: vec![arg],
-            },
-            span(),
-        )
+    fn lower_src(src: &str) -> HirChunk {
+        let chunk = parser::parse(src).expect("parse");
+        hir::lower(&chunk).expect("lower")
     }
 
     #[test]
     fn emit_number_constant_produces_arith_constant() {
         let ctx = new_context();
-        let module = emit_module(&ctx, &print_call(number(42.0))).unwrap();
+        let module = emit_module(&ctx, &lower_src("print(42)")).unwrap();
         let mlir = module.as_operation().to_string();
         assert!(
             mlir.contains("arith.constant 4.200000e+01"),
@@ -288,7 +330,7 @@ mod tests {
     #[test]
     fn emit_addition_produces_arith_addf() {
         let ctx = new_context();
-        let module = emit_module(&ctx, &print_call(addition(number(1.0), number(2.0)))).unwrap();
+        let module = emit_module(&ctx, &lower_src("print(1 + 2)")).unwrap();
         let mlir = module.as_operation().to_string();
         assert!(
             mlir.contains("arith.addf"),
@@ -299,7 +341,7 @@ mod tests {
     #[test]
     fn emit_print_call_produces_printf_call() {
         let ctx = new_context();
-        let module = emit_module(&ctx, &print_call(number(7.0))).unwrap();
+        let module = emit_module(&ctx, &lower_src("print(7)")).unwrap();
         let mlir = module.as_operation().to_string();
         assert!(
             mlir.contains("llvm.call @printf"),
@@ -310,7 +352,7 @@ mod tests {
     #[test]
     fn emit_print_1_plus_2_verifies() {
         let ctx = new_context();
-        let module = emit_module(&ctx, &print_call(addition(number(1.0), number(2.0)))).unwrap();
+        let module = emit_module(&ctx, &lower_src("print(1 + 2)")).unwrap();
         assert!(
             module.as_operation().verify(),
             "module should verify for print(1 + 2)"
@@ -318,20 +360,27 @@ mod tests {
     }
 
     #[test]
-    fn emit_from_parsed_source_verifies() {
+    fn emit_local_then_print_verifies() {
         let ctx = new_context();
-        let expr = crate::parser::parse("print(1 + 2)").unwrap();
-        let module = emit_module(&ctx, &expr).unwrap();
+        let module = emit_module(&ctx, &lower_src("local x = 1\nprint(x + 2)")).unwrap();
         assert!(
             module.as_operation().verify(),
-            "module from parsed source should verify"
+            "Phase 2.0 target should verify"
         );
     }
 
     #[test]
-    fn emit_unsupported_bare_ident_errors() {
+    fn emit_local_emits_alloca() {
         let ctx = new_context();
-        let expr = Expr::new(ExprKind::Ident("x".into()), span());
-        assert!(emit_module(&ctx, &expr).is_err());
+        let module = emit_module(&ctx, &lower_src("local x = 1\nprint(x)")).unwrap();
+        let mlir = module.as_operation().to_string();
+        assert!(
+            mlir.contains("llvm.alloca"),
+            "expected llvm.alloca for local, got:\n{mlir}"
+        );
+        assert!(
+            mlir.contains("llvm.store") && mlir.contains("llvm.load"),
+            "expected llvm.store/load for local, got:\n{mlir}"
+        );
     }
 }

@@ -45,3 +45,4 @@ What becomes easier, harder, or locked-in as a result.
 - [0004 — Parser implementation: hand-written recursive descent with Pratt](0004-parser-implementation.md)
 - [0005 — MLIR integration environment: WSL2 (Arch) primary, Windows native best-effort](0005-mlir-environment.md)
 - [0006 — Phase 1 codegen: standard MLIR dialects, no HIR, melior 0.27](0006-phase1-codegen.md)
+- [0007 — Phase 2.0: `local` bindings, multi-statement, HIR introduction](0007-phase2-0-local-and-multistmt.md)

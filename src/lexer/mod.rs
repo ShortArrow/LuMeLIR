@@ -8,7 +8,7 @@ mod error;
 mod token;
 
 pub use error::LexError;
-pub use token::{Span, Token, TokenKind};
+pub use token::{Keyword, Span, Token, TokenKind};
 
 /// Tokenize a Lua source string.
 ///
@@ -31,7 +31,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
 
         if is_ident_start(ch) {
             let (span, name) = scan_ident(src, &mut chars);
-            tokens.push(Token::new(TokenKind::Ident(name), span));
+            let kind = match Keyword::from_lexeme(&name) {
+                Some(kw) => TokenKind::Keyword(kw),
+                None => TokenKind::Ident(name),
+            };
+            tokens.push(Token::new(kind, span));
             continue;
         }
 
@@ -39,6 +43,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
             '(' => Some(TokenKind::LParen),
             ')' => Some(TokenKind::RParen),
             '+' => Some(TokenKind::Plus),
+            '=' => Some(TokenKind::Equals),
+            ';' => Some(TokenKind::Semicolon),
             _ => None,
         };
 
@@ -172,6 +178,37 @@ mod tests {
                 TokenKind::RParen,
                 TokenKind::Eof,
             ],
+        );
+    }
+
+    #[test]
+    fn lex_local_keyword_yields_keyword_token() {
+        assert_eq!(
+            kinds("local"),
+            vec![TokenKind::Keyword(Keyword::Local), TokenKind::Eof],
+        );
+    }
+
+    #[test]
+    fn lex_equals_and_semicolon_yield_punctuation_tokens() {
+        assert_eq!(
+            kinds("local x = 1;"),
+            vec![
+                TokenKind::Keyword(Keyword::Local),
+                TokenKind::Ident("x".to_owned()),
+                TokenKind::Equals,
+                TokenKind::Number(1.0),
+                TokenKind::Semicolon,
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn lex_identifier_starting_with_keyword_prefix_is_still_ident() {
+        assert_eq!(
+            kinds("locale"),
+            vec![TokenKind::Ident("locale".to_owned()), TokenKind::Eof],
         );
     }
 

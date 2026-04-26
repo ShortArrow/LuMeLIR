@@ -64,13 +64,14 @@ mod tests {
     use super::*;
     use crate::codegen::emit::{emit_module, new_context};
     use crate::codegen::lower::to_llvm_ir;
-    use crate::parser;
+    use crate::{hir, parser};
 
     #[test]
     fn to_native_produces_executable() {
         let ctx = new_context();
-        let expr = parser::parse("print(1 + 2)").unwrap();
-        let module = emit_module(&ctx, &expr).unwrap();
+        let chunk = parser::parse("print(1 + 2)").unwrap();
+        let hir = hir::lower(&chunk).unwrap();
+        let module = emit_module(&ctx, &hir).unwrap();
         let llvm_ir = to_llvm_ir(&module).unwrap();
 
         let tmp = std::env::temp_dir().join("lumelir_test_link");

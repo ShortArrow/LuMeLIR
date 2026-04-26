@@ -6,11 +6,12 @@ pub fn invoke(input: &Path) -> Result<()> {
     let source =
         std::fs::read_to_string(input).with_context(|| format!("reading {}", input.display()))?;
 
-    let expr = crate::parser::parse(&source).map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
+    let chunk = crate::parser::parse(&source).map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
+    let hir = crate::hir::lower(&chunk).map_err(|e| anyhow::anyhow!("hir error: {e}"))?;
 
     let tmp = std::env::temp_dir().join("lumelir_run_tmp");
 
-    crate::codegen::compile(&expr, &tmp).map_err(|e| anyhow::anyhow!("codegen error: {e}"))?;
+    crate::codegen::compile(&hir, &tmp).map_err(|e| anyhow::anyhow!("codegen error: {e}"))?;
 
     let status = std::process::Command::new(&tmp)
         .status()

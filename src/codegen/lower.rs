@@ -73,13 +73,14 @@ fn run_mlir_translate(mlir: &str) -> Result<String, CodegenError> {
 mod tests {
     use super::*;
     use crate::codegen::emit::{emit_module, new_context};
-    use crate::parser;
+    use crate::{hir, parser};
 
     #[test]
     fn to_llvm_ir_produces_valid_llvm() {
         let ctx = new_context();
-        let expr = parser::parse("print(1 + 2)").unwrap();
-        let module = emit_module(&ctx, &expr).unwrap();
+        let chunk = parser::parse("print(1 + 2)").unwrap();
+        let hir = hir::lower(&chunk).unwrap();
+        let module = emit_module(&ctx, &hir).unwrap();
         let llvm_ir = to_llvm_ir(&module).unwrap();
         assert!(
             llvm_ir.contains("define"),

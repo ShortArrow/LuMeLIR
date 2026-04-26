@@ -7,8 +7,9 @@ fn compile_and_run_print_1_plus_2() {
     let tmp_dir = std::env::temp_dir();
     let output = tmp_dir.join("lumelir_phase1_test");
 
-    let expr = lumelir::parser::parse("print(1 + 2)").unwrap();
-    lumelir::codegen::compile(&expr, &output).unwrap();
+    let chunk = lumelir::parser::parse("print(1 + 2)").unwrap();
+    let hir = lumelir::hir::lower(&chunk).unwrap();
+    lumelir::codegen::compile(&hir, &output).unwrap();
 
     assert!(output.exists(), "compiled binary should exist");
 

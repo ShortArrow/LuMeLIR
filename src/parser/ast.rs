@@ -14,8 +14,6 @@ impl Expr {
 }
 
 /// The discriminated shape of an [`Expr`].
-///
-/// Kept intentionally small for Phase 1 PoC. Extended as Lua 5.4 grammar lands.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
     Number(f64),
@@ -37,3 +35,26 @@ pub enum ExprKind {
 pub enum BinOp {
     Add,
 }
+
+/// A statement. Phase 2.0 introduces `local` declarations and bare
+/// expression statements; richer statement forms join in 2.1+.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stmt {
+    pub kind: StmtKind,
+    pub span: Span,
+}
+
+impl Stmt {
+    pub fn new(kind: StmtKind, span: Span) -> Self {
+        Self { kind, span }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StmtKind {
+    Local { name: String, value: Expr },
+    ExprStmt(Expr),
+}
+
+/// A Lua chunk — the top-level unit produced by [`super::parse`].
+pub type Chunk = Vec<Stmt>;
