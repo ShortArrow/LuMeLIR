@@ -44,3 +44,4 @@ What becomes easier, harder, or locked-in as a result.
 - [0003 — Error handling: `thiserror` in library, `anyhow` at CLI boundary](0003-error-handling.md)
 - [0004 — Parser implementation: hand-written recursive descent with Pratt](0004-parser-implementation.md)
 - [0005 — MLIR integration environment: WSL2 (Arch) primary, Windows native best-effort](0005-mlir-environment.md)
+- [0006 — Phase 1 codegen: standard MLIR dialects, no HIR, melior 0.27](0006-phase1-codegen.md)

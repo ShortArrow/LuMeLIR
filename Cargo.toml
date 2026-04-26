@@ -21,6 +21,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+melior = { version = "0.27", features = ["ods-dialects"] }
 thiserror = "2.0"
 
 [profile.release]

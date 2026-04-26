@@ -1,16 +1,21 @@
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
-pub fn invoke(input: &Path, output: Option<&Path>, target: &str) -> Result<()> {
-    eprintln!(
-        "lumelir compile: input={} output={} target={}",
-        input.display(),
-        output
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<auto>".into()),
-        target,
-    );
-    eprintln!("not yet implemented: Phase 1 PoC");
+pub fn invoke(input: &Path, output: Option<&Path>, _target: &str) -> Result<()> {
+    let source =
+        std::fs::read_to_string(input).with_context(|| format!("reading {}", input.display()))?;
+
+    let expr = crate::parser::parse(&source).map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
+
+    let output_path = match output {
+        Some(p) => p.to_path_buf(),
+        None => input.with_extension(""),
+    };
+
+    crate::codegen::compile(&expr, &output_path)
+        .map_err(|e| anyhow::anyhow!("codegen error: {e}"))?;
+
+    eprintln!("compiled → {}", output_path.display());
     Ok(())
 }

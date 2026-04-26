@@ -12,5 +12,6 @@
 //! See `docs/design/0002-lib-rs-layering.md` for the full layering rationale.
 
 pub mod cli;
+pub mod codegen;
 pub mod lexer;
 pub mod parser;

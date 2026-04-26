@@ -8,6 +8,9 @@ Thumbs.db
 .vscode/
 *.swp
 
+# Other agent harnesses
+.codex
+
 # LuMeLIR build artifacts (future)
 *.ll
 *.spv
