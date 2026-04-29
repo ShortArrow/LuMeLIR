@@ -76,9 +76,28 @@ impl Stmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StmtKind {
-    Local { name: String, value: Expr },
-    Assign { name: String, value: Expr },
+    Local {
+        name: String,
+        value: Expr,
+    },
+    Assign {
+        name: String,
+        value: Expr,
+    },
     Block(Chunk),
+    /// `if cond then ... [elseif cond then ...]* [else ...]? end`.
+    /// `elifs` keeps the chain explicit (one entry per `elseif` arm).
+    If {
+        cond: Expr,
+        then_body: Chunk,
+        elifs: Vec<(Expr, Chunk)>,
+        else_body: Option<Chunk>,
+    },
+    /// `while cond do ... end`.
+    While {
+        cond: Expr,
+        body: Chunk,
+    },
     ExprStmt(Expr),
 }
 

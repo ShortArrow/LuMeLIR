@@ -29,9 +29,30 @@ pub struct HirStmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HirStmtKind {
-    LocalInit { id: LocalId, value: HirExpr },
-    Assign { id: LocalId, value: HirExpr },
-    Block { stmts: Vec<HirStmt> },
+    LocalInit {
+        id: LocalId,
+        value: HirExpr,
+    },
+    Assign {
+        id: LocalId,
+        value: HirExpr,
+    },
+    Block {
+        stmts: Vec<HirStmt>,
+    },
+    /// `if cond then ... [elseif cond then ...]* [else ...]? end`.
+    /// Body, elif arms, and else body are independent lexical scopes.
+    If {
+        cond: HirExpr,
+        then_body: Vec<HirStmt>,
+        elifs: Vec<(HirExpr, Vec<HirStmt>)>,
+        else_body: Option<Vec<HirStmt>>,
+    },
+    /// `while cond do body end`.
+    While {
+        cond: HirExpr,
+        body: Vec<HirStmt>,
+    },
     ExprStmt(HirExpr),
 }
 

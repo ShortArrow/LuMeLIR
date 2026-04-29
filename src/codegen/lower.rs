@@ -24,6 +24,9 @@ pub fn to_llvm_ir(module: &Module<'_>) -> Result<String, CodegenError> {
 fn run_mlir_opt(mlir: &str) -> Result<String, CodegenError> {
     let mut child = Command::new("mlir-opt")
         .args([
+            // Phase 2.3b: lower scf (if/while) → cf (cond_br/br) → LLVM.
+            "--convert-scf-to-cf",
+            "--convert-cf-to-llvm",
             "--convert-arith-to-llvm",
             "--convert-func-to-llvm",
             "--reconcile-unrealized-casts",

@@ -108,6 +108,15 @@ impl LowerCtx {
         Ok(out)
     }
 
+    /// Lower a body with a fresh lexical scope pushed/popped around it.
+    /// Used for `do/end`, `if`/`elseif`/`else` bodies, and `while` bodies.
+    fn lower_scoped_body(&mut self, stmts: &[Stmt]) -> Result<Vec<HirStmt>, HirError> {
+        self.scopes.push(HashMap::new());
+        let result = self.lower_stmts(stmts);
+        self.scopes.pop();
+        result
+    }
+
     fn resolve(&self, name: &str) -> Option<LocalId> {
         for frame in self.scopes.iter().rev() {
             if let Some(id) = frame.get(name) {
@@ -169,6 +178,47 @@ impl LowerCtx {
                 let stmts = result?;
                 Ok(HirStmt {
                     kind: HirStmtKind::Block { stmts },
+                    span: stmt.span,
+                })
+            }
+            StmtKind::If {
+                cond,
+                then_body,
+                elifs,
+                else_body,
+            } => {
+                let cond_hir = self.lower_expr(cond)?;
+                let then_hir = self.lower_scoped_body(then_body)?;
+                let elifs_hir = elifs
+                    .iter()
+                    .map(|(c, b)| {
+                        let c_hir = self.lower_expr(c)?;
+                        let b_hir = self.lower_scoped_body(b)?;
+                        Ok((c_hir, b_hir))
+                    })
+                    .collect::<Result<Vec<_>, HirError>>()?;
+                let else_hir = match else_body {
+                    Some(body) => Some(self.lower_scoped_body(body)?),
+                    None => None,
+                };
+                Ok(HirStmt {
+                    kind: HirStmtKind::If {
+                        cond: cond_hir,
+                        then_body: then_hir,
+                        elifs: elifs_hir,
+                        else_body: else_hir,
+                    },
+                    span: stmt.span,
+                })
+            }
+            StmtKind::While { cond, body } => {
+                let cond_hir = self.lower_expr(cond)?;
+                let body_hir = self.lower_scoped_body(body)?;
+                Ok(HirStmt {
+                    kind: HirStmtKind::While {
+                        cond: cond_hir,
+                        body: body_hir,
+                    },
                     span: stmt.span,
                 })
             }
@@ -611,6 +661,60 @@ mod tests {
     fn lower_nil_lt_number_returns_type_mismatch() {
         let err = lower_src("print(nil < 1)").expect_err("nil < number must reject");
         assert!(matches!(err, HirError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn lower_simple_if_resolves_body() {
+        let hir = lower_src("if 1 then print(1) end").expect("must lower");
+        assert_eq!(hir.stmts.len(), 1);
+        let HirStmtKind::If {
+            then_body,
+            elifs,
+            else_body,
+            ..
+        } = &hir.stmts[0].kind
+        else {
+            panic!("expected If, got {:?}", hir.stmts[0].kind);
+        };
+        assert_eq!(then_body.len(), 1);
+        assert!(elifs.is_empty());
+        assert!(else_body.is_none());
+    }
+
+    #[test]
+    fn lower_if_elseif_else_chain() {
+        let src = "if 1 then print(1) elseif 2 then print(2) else print(3) end";
+        let hir = lower_src(src).expect("must lower");
+        let HirStmtKind::If {
+            then_body,
+            elifs,
+            else_body,
+            ..
+        } = &hir.stmts[0].kind
+        else {
+            panic!("expected If");
+        };
+        assert_eq!(then_body.len(), 1);
+        assert_eq!(elifs.len(), 1);
+        assert!(else_body.as_ref().unwrap().len() == 1);
+    }
+
+    #[test]
+    fn lower_while_resolves_body() {
+        let hir = lower_src("local i = 0\nwhile i < 3 do i = i + 1 end").expect("must lower");
+        assert_eq!(hir.stmts.len(), 2);
+        let HirStmtKind::While { body, .. } = &hir.stmts[1].kind else {
+            panic!("expected While");
+        };
+        assert_eq!(body.len(), 1);
+    }
+
+    #[test]
+    fn lower_local_inside_if_uses_inner_scope() {
+        // The inner `x` does not leak.
+        let err = lower_src("if 1 then local x = 1 end\nprint(x)")
+            .expect_err("inner local must not leak past `end`");
+        assert!(matches!(err, HirError::UndefinedName { .. }));
     }
 
     #[test]

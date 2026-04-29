@@ -11,6 +11,7 @@ use melior::{
         arith::CmpfPredicate,
         func, llvm,
         ods::llvm::{AddressOfOperationBuilder, GlobalOperationBuilder, LLVMFuncOperationBuilder},
+        scf,
     },
     ir::{
         Block, BlockLike, Identifier, Location, Module, Region, RegionLike, Type, Value,
@@ -252,6 +253,19 @@ fn emit_stmt<'a, 'c>(
         }
         HirStmtKind::Block { stmts } => {
             emit_stmts(context, block, stmts, slots, locals, types, loc)?;
+        }
+        HirStmtKind::If {
+            cond,
+            then_body,
+            elifs,
+            else_body,
+        } => {
+            emit_if(
+                context, block, cond, then_body, elifs, else_body, slots, locals, types, loc,
+            )?;
+        }
+        HirStmtKind::While { cond, body } => {
+            emit_while(context, block, cond, body, slots, locals, types, loc)?;
         }
         HirStmtKind::ExprStmt(expr) => {
             emit_expr_stmt(context, block, expr, slots, locals, types, loc)?;
@@ -650,6 +664,172 @@ fn emit_printf<'a, 'c>(
     block.append_operation(call_op);
 }
 
+/// Convert a Lua value to its truthiness `i1`.
+///
+/// Lua 5.4: only `nil` and `false` are falsy; everything else (including
+/// `0` and the empty string) is truthy. Because slot kinds are static
+/// in Phase 2.3b, the conversion is a compile-time three-way switch and
+/// emits at most one `arith.constant`.
+fn emit_truthiness<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    value: Value<'c, 'a>,
+    kind: ValueKind,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    match kind {
+        ValueKind::Number => {
+            let attr = IntegerAttribute::new(types.i1, 1);
+            block
+                .append_operation(arith::constant(context, attr.into(), loc))
+                .result(0)
+                .unwrap()
+                .into()
+        }
+        ValueKind::Bool => value,
+        ValueKind::Nil => {
+            let attr = IntegerAttribute::new(types.i1, 0);
+            block
+                .append_operation(arith::constant(context, attr.into(), loc))
+                .result(0)
+                .unwrap()
+                .into()
+        }
+    }
+}
+
+/// Lower an `if/elseif*/else?/end` to a (possibly nested) `scf.if`.
+///
+/// The chain `if c1 then b1 elseif c2 then b2 else b3 end` becomes
+/// `scf.if c1 { b1 } else { scf.if c2 { b2 } else { b3 } }`.
+#[allow(clippy::too_many_arguments)]
+fn emit_if<'a, 'c>(
+    context: &'c Context,
+    parent: &'a Block<'c>,
+    cond: &HirExpr,
+    then_body: &[HirStmt],
+    elifs: &[(HirExpr, Vec<HirStmt>)],
+    else_body: &Option<Vec<HirStmt>>,
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    let cond_kind = infer_kind(cond, locals);
+    let cond_val = emit_expr(context, parent, cond, slots, locals, types, loc)?;
+    let cond_i1 = emit_truthiness(context, parent, cond_val, cond_kind, types, loc);
+
+    let then_region = build_body_region(context, then_body, slots, locals, types, loc)?;
+    let else_region = build_else_region(context, elifs, else_body, slots, locals, types, loc)?;
+
+    let if_op = scf::r#if(cond_i1, &[], then_region, else_region, loc);
+    parent.append_operation(if_op);
+    Ok(())
+}
+
+/// Build the `else` region for an If, recursing on the elseif chain.
+#[allow(clippy::too_many_arguments)]
+fn build_else_region<'c>(
+    context: &'c Context,
+    elifs: &[(HirExpr, Vec<HirStmt>)],
+    else_body: &Option<Vec<HirStmt>>,
+    slots: &[Value<'c, '_>],
+    locals: &[LocalInfo],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Result<Region<'c>, CodegenError> {
+    if let Some(((cond, body), rest)) = elifs.split_first() {
+        // Nested scf.if for the next elseif/else arm.
+        let region = Region::new();
+        let blk = Block::new(&[]);
+        let cond_kind = infer_kind(cond, locals);
+        // Re-bind slots and emit into the new block.
+        let blk_slots = transmute_slots(slots);
+        let cond_val = emit_expr(context, &blk, cond, blk_slots, locals, types, loc)?;
+        let cond_i1 = emit_truthiness(context, &blk, cond_val, cond_kind, types, loc);
+        let nested_then = build_body_region(context, body, blk_slots, locals, types, loc)?;
+        let nested_else =
+            build_else_region(context, rest, else_body, blk_slots, locals, types, loc)?;
+        blk.append_operation(scf::r#if(cond_i1, &[], nested_then, nested_else, loc));
+        blk.append_operation(scf::r#yield(&[], loc));
+        region.append_block(blk);
+        Ok(region)
+    } else {
+        // Leaf: either else_body or empty `scf.yield` for absent else.
+        match else_body {
+            Some(body) => build_body_region(context, body, slots, locals, types, loc),
+            None => {
+                let region = Region::new();
+                let blk = Block::new(&[]);
+                blk.append_operation(scf::r#yield(&[], loc));
+                region.append_block(blk);
+                Ok(region)
+            }
+        }
+    }
+}
+
+/// Build a Region containing one Block: the body, terminated by `scf.yield`.
+fn build_body_region<'c>(
+    context: &'c Context,
+    body: &[HirStmt],
+    slots: &[Value<'c, '_>],
+    locals: &[LocalInfo],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Result<Region<'c>, CodegenError> {
+    let region = Region::new();
+    let blk = Block::new(&[]);
+    let blk_slots = transmute_slots(slots);
+    emit_stmts(context, &blk, body, blk_slots, locals, types, loc)?;
+    blk.append_operation(scf::r#yield(&[], loc));
+    region.append_block(blk);
+    Ok(region)
+}
+
+/// Re-borrow the slot table at the inner block's lifetime. The slot
+/// pointers are produced by allocas in the function entry block, which
+/// dominates every inner region — so the values themselves are valid
+/// inside the new block. The lifetime parameter `'a` on `Value` is just
+/// the borrow lifetime of the caller's block, not the value's actual
+/// scope, so a transmute is sound here.
+fn transmute_slots<'a, 'c>(slots: &[Value<'c, '_>]) -> &'a [Value<'c, 'a>] {
+    // SAFETY: Value<'c, '_> is covariant in the second lifetime; the
+    // alloca'd pointers dominate every inner region, so referencing them
+    // from inner blocks is well-typed at the MLIR level. Rust's type
+    // system can't see this dominance relation, so we cast.
+    unsafe { std::mem::transmute(slots) }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_while<'a, 'c>(
+    context: &'c Context,
+    parent: &'a Block<'c>,
+    cond: &HirExpr,
+    body: &[HirStmt],
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    // before region: evaluate cond, scf.condition.
+    let before = Region::new();
+    let before_blk = Block::new(&[]);
+    let blk_slots = transmute_slots(slots);
+    let cond_kind = infer_kind(cond, locals);
+    let cond_val = emit_expr(context, &before_blk, cond, blk_slots, locals, types, loc)?;
+    let cond_i1 = emit_truthiness(context, &before_blk, cond_val, cond_kind, types, loc);
+    before_blk.append_operation(scf::condition(cond_i1, &[], loc));
+    before.append_block(before_blk);
+
+    // after region: body, scf.yield.
+    let after = build_body_region(context, body, slots, locals, types, loc)?;
+
+    parent.append_operation(scf::r#while(&[], &[], before, after, loc));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -806,6 +986,65 @@ mod tests {
         let ctx = new_context();
         let module = emit_module(&ctx, &lower_src("print(2 >= 2)"))
             .expect("print(comparison) module must verify after Step 5");
+        assert!(module.as_operation().verify());
+    }
+
+    #[test]
+    fn emit_if_uses_scf_if() {
+        let ctx = new_context();
+        let module =
+            emit_module(&ctx, &lower_src("if 1 then print(1) end")).expect("if module must verify");
+        let mlir = module.as_operation().to_string();
+        assert!(mlir.contains("scf.if"), "expected scf.if op, got:\n{mlir}");
+    }
+
+    #[test]
+    fn emit_if_with_else_emits_both_arms() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("if 1 then print(1) else print(2) end")).unwrap();
+        let mlir = module.as_operation().to_string();
+        // scf.if with both arms is pretty-printed as `scf.if ... { ... } else { ... }`.
+        // (Empty-yield-only regions don't print `scf.yield` explicitly.)
+        assert!(
+            mlir.contains("scf.if") && mlir.contains("} else {"),
+            "expected scf.if with else arm, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_while_uses_scf_while() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src("local i = 0\nwhile i < 3 do i = i + 1 end"),
+        )
+        .expect("while module must verify");
+        let mlir = module.as_operation().to_string();
+        assert!(
+            mlir.contains("scf.while") && mlir.contains("scf.condition"),
+            "expected scf.while + scf.condition, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_truthiness_for_number_emits_constant_true() {
+        // `if 1 then ... end`: number-typed cond becomes a static `true`
+        // constant before scf.if (Lua: every number is truthy).
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("if 1 then print(1) end")).unwrap();
+        let mlir = module.as_operation().to_string();
+        // Pretty-printer: `%true = arith.constant true` (no `value =` prefix).
+        assert!(
+            mlir.contains("arith.constant true"),
+            "expected i1 `true` from number-truthiness, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_module_with_if_verifies() {
+        let ctx = new_context();
+        let module =
+            emit_module(&ctx, &lower_src("if nil then print(1) else print(2) end")).unwrap();
         assert!(module.as_operation().verify());
     }
 

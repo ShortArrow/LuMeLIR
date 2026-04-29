@@ -80,6 +80,8 @@ impl<'t> Parser<'t> {
         match self.peek().kind {
             TokenKind::Keyword(Keyword::Local) => self.parse_local(),
             TokenKind::Keyword(Keyword::Do) => self.parse_block(),
+            TokenKind::Keyword(Keyword::If) => self.parse_if(),
+            TokenKind::Keyword(Keyword::While) => self.parse_while(),
             TokenKind::Ident(_) if matches!(self.peek_kind_at(1), Some(TokenKind::Equals)) => {
                 self.parse_assign()
             }
@@ -89,6 +91,76 @@ impl<'t> Parser<'t> {
                 Ok(Stmt::new(StmtKind::ExprStmt(expr), span))
             }
         }
+    }
+
+    fn expect_keyword(&mut self, kw: Keyword) -> Result<Token, ParseError> {
+        let tok = self.peek().clone();
+        match tok.kind {
+            TokenKind::Keyword(k) if k == kw => {
+                self.bump();
+                Ok(tok)
+            }
+            TokenKind::Eof => Err(ParseError::UnexpectedEof {
+                offset: tok.span.start,
+            }),
+            other => Err(ParseError::UnexpectedToken {
+                actual: other,
+                offset: tok.span.start,
+            }),
+        }
+    }
+
+    fn parse_if(&mut self) -> Result<Stmt, ParseError> {
+        let if_tok = self.bump().clone(); // 'if'
+        let cond = self.parse_expr(0)?;
+        self.expect_keyword(Keyword::Then)?;
+        let terminators = [
+            TokenKind::Keyword(Keyword::Elseif),
+            TokenKind::Keyword(Keyword::Else),
+            TokenKind::Keyword(Keyword::End),
+            TokenKind::Eof,
+        ];
+        let then_body = self.parse_chunk_until(&terminators)?;
+
+        let mut elifs: Vec<(Expr, Chunk)> = Vec::new();
+        while matches!(self.peek().kind, TokenKind::Keyword(Keyword::Elseif)) {
+            self.bump();
+            let elif_cond = self.parse_expr(0)?;
+            self.expect_keyword(Keyword::Then)?;
+            let elif_body = self.parse_chunk_until(&terminators)?;
+            elifs.push((elif_cond, elif_body));
+        }
+
+        let else_body = if matches!(self.peek().kind, TokenKind::Keyword(Keyword::Else)) {
+            self.bump();
+            let body =
+                self.parse_chunk_until(&[TokenKind::Keyword(Keyword::End), TokenKind::Eof])?;
+            Some(body)
+        } else {
+            None
+        };
+
+        let end_tok = self.expect_keyword(Keyword::End)?;
+        let span = Span::new(if_tok.span.start, end_tok.span.end);
+        Ok(Stmt::new(
+            StmtKind::If {
+                cond,
+                then_body,
+                elifs,
+                else_body,
+            },
+            span,
+        ))
+    }
+
+    fn parse_while(&mut self) -> Result<Stmt, ParseError> {
+        let while_tok = self.bump().clone();
+        let cond = self.parse_expr(0)?;
+        self.expect_keyword(Keyword::Do)?;
+        let body = self.parse_chunk_until(&[TokenKind::Keyword(Keyword::End), TokenKind::Eof])?;
+        let end_tok = self.expect_keyword(Keyword::End)?;
+        let span = Span::new(while_tok.span.start, end_tok.span.end);
+        Ok(Stmt::new(StmtKind::While { cond, body }, span))
     }
 
     fn peek_kind_at(&self, offset: usize) -> Option<&TokenKind> {
@@ -426,6 +498,29 @@ mod tests {
             StmtKind::Block(body) => {
                 StmtKind::Block(body.into_iter().map(strip_span_stmt).collect())
             }
+            StmtKind::If {
+                cond,
+                then_body,
+                elifs,
+                else_body,
+            } => StmtKind::If {
+                cond: strip_span_expr(cond),
+                then_body: then_body.into_iter().map(strip_span_stmt).collect(),
+                elifs: elifs
+                    .into_iter()
+                    .map(|(c, b)| {
+                        (
+                            strip_span_expr(c),
+                            b.into_iter().map(strip_span_stmt).collect(),
+                        )
+                    })
+                    .collect(),
+                else_body: else_body.map(|b| b.into_iter().map(strip_span_stmt).collect()),
+            },
+            StmtKind::While { cond, body } => StmtKind::While {
+                cond: strip_span_expr(cond),
+                body: body.into_iter().map(strip_span_stmt).collect(),
+            },
             StmtKind::ExprStmt(e) => StmtKind::ExprStmt(strip_span_expr(e)),
         };
         Stmt::new(kind, Span::new(0, 0))
@@ -855,6 +950,81 @@ mod tests {
                 args: vec![Expr::new(ExprKind::Nil, Span::new(0, 0))],
             },
         );
+    }
+
+    #[test]
+    fn parse_simple_if_yields_if_stmt() {
+        let stmt = parse_single_stmt("if 1 then end").expect("must parse");
+        match stmt.kind {
+            StmtKind::If {
+                then_body,
+                elifs,
+                else_body,
+                ..
+            } => {
+                assert!(then_body.is_empty());
+                assert!(elifs.is_empty());
+                assert!(else_body.is_none());
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_if_with_else_yields_else_body() {
+        let stmt = parse_single_stmt("if 1 then print(1) else print(2) end").expect("must parse");
+        match stmt.kind {
+            StmtKind::If {
+                then_body,
+                elifs,
+                else_body,
+                ..
+            } => {
+                assert_eq!(then_body.len(), 1);
+                assert!(elifs.is_empty());
+                let body = else_body.expect("else body must exist");
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_if_with_elseif_chain() {
+        let stmt = parse_single_stmt(
+            "if 1 then print(1) elseif 2 then print(2) elseif 3 then print(3) else print(0) end",
+        )
+        .expect("must parse");
+        match stmt.kind {
+            StmtKind::If {
+                then_body,
+                elifs,
+                else_body,
+                ..
+            } => {
+                assert_eq!(then_body.len(), 1);
+                assert_eq!(elifs.len(), 2, "two elseif arms expected");
+                assert!(else_body.is_some());
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_while_yields_while_stmt() {
+        let stmt = parse_single_stmt("while 1 do print(1) end").expect("must parse");
+        match stmt.kind {
+            StmtKind::While { body, .. } => {
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("expected While, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unterminated_if_is_rejected() {
+        let err = parse("if 1 then print(1)").expect_err("missing `end` must fail");
+        assert!(matches!(err, ParseError::UnexpectedEof { .. }));
     }
 
     #[test]
