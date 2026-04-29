@@ -58,7 +58,7 @@ pub enum TokenKind {
 }
 
 /// Reserved words. Grows phase by phase: 2.0 `local`, 2.1 `do`/`end`,
-/// 2.2b `true`/`false`.
+/// 2.2b `true`/`false`, 2.3a `nil`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keyword {
     Local,
@@ -66,6 +66,7 @@ pub enum Keyword {
     End,
     True,
     False,
+    Nil,
 }
 
 impl Keyword {
@@ -76,6 +77,7 @@ impl Keyword {
             "end" => Some(Keyword::End),
             "true" => Some(Keyword::True),
             "false" => Some(Keyword::False),
+            "nil" => Some(Keyword::Nil),
             _ => None,
         }
     }

@@ -256,6 +256,14 @@ mod tests {
     }
 
     #[test]
+    fn lex_nil_keyword_yields_keyword_token() {
+        assert_eq!(
+            kinds("nil"),
+            vec![TokenKind::Keyword(Keyword::Nil), TokenKind::Eof],
+        );
+    }
+
+    #[test]
     fn lex_double_equals_yields_eqeq_token() {
         assert_eq!(
             kinds("=="),
