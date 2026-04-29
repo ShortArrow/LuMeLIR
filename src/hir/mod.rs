@@ -13,7 +13,63 @@ pub use ir::{Builtin, HirChunk, HirExpr, HirExprKind, HirStmt, HirStmtKind, Loca
 
 use std::collections::HashMap;
 
-use crate::parser::{Chunk, Expr, ExprKind, Stmt, StmtKind};
+use crate::parser::{BinOp, Chunk, Expr, ExprKind, Stmt, StmtKind};
+
+/// Static value-kind used for the minimal type guard added in Phase
+/// 2.2b. Computed by [`infer_kind`] over a fully lowered HIR expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueKind {
+    Number,
+    Bool,
+}
+
+impl ValueKind {
+    fn name(self) -> &'static str {
+        match self {
+            ValueKind::Number => "number",
+            ValueKind::Bool => "bool",
+        }
+    }
+}
+
+fn infer_kind(expr: &HirExpr) -> ValueKind {
+    match &expr.kind {
+        HirExprKind::Number(_) => ValueKind::Number,
+        HirExprKind::Bool(_) => ValueKind::Bool,
+        // Slots are f64 in 2.2b — `local b = true` lands in 2.3.
+        HirExprKind::Local(_) => ValueKind::Number,
+        HirExprKind::UnaryOp { .. } => ValueKind::Number,
+        HirExprKind::BinOp { op, .. } => match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow => {
+                ValueKind::Number
+            }
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => {
+                ValueKind::Bool
+            }
+        },
+        // print() returns no value in Lua, but our HIR treats it as
+        // an expression. It can never appear as an operand to a
+        // comparison anyway (we'd have already errored on parse).
+        HirExprKind::Call { .. } => ValueKind::Number,
+    }
+}
+
+fn binop_symbol(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Mod => "%",
+        BinOp::Pow => "^",
+        BinOp::Lt => "<",
+        BinOp::Le => "<=",
+        BinOp::Gt => ">",
+        BinOp::Ge => ">=",
+        BinOp::Eq => "==",
+        BinOp::Ne => "~=",
+    }
+}
 
 /// Lower a parsed [`Chunk`] into a [`HirChunk`] with resolved names.
 pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
@@ -121,17 +177,38 @@ impl LowerCtx {
                     });
                 }
             },
-            ExprKind::Bool(_) => {
-                // Step 2 stub — proper Bool support and type guards land
-                // in Step 3 (HIR) and Step 4 (codegen). Tests that
-                // exercise this path are added in those steps.
-                unimplemented!("HirExprKind::Bool — Step 3");
+            ExprKind::Bool(b) => HirExprKind::Bool(*b),
+            ExprKind::BinOp { op, lhs, rhs } => {
+                let lhs_hir = self.lower_expr(lhs)?;
+                let rhs_hir = self.lower_expr(rhs)?;
+                let lk = infer_kind(&lhs_hir);
+                let rk = infer_kind(&rhs_hir);
+                let allowed = match op {
+                    // Arithmetic: both sides must be Number.
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow => {
+                        lk == ValueKind::Number && rk == ValueKind::Number
+                    }
+                    // Ordering: both sides must be Number.
+                    BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                        lk == ValueKind::Number && rk == ValueKind::Number
+                    }
+                    // Equality: both sides must share a kind.
+                    BinOp::Eq | BinOp::Ne => lk == rk,
+                };
+                if !allowed {
+                    return Err(HirError::TypeMismatch {
+                        op: binop_symbol(*op).to_owned(),
+                        lhs_kind: lk.name().to_owned(),
+                        rhs_kind: rk.name().to_owned(),
+                        offset: expr.span.start,
+                    });
+                }
+                HirExprKind::BinOp {
+                    op: *op,
+                    lhs: Box::new(lhs_hir),
+                    rhs: Box::new(rhs_hir),
+                }
             }
-            ExprKind::BinOp { op, lhs, rhs } => HirExprKind::BinOp {
-                op: *op,
-                lhs: Box::new(self.lower_expr(lhs)?),
-                rhs: Box::new(self.lower_expr(rhs)?),
-            },
             ExprKind::UnaryOp { op, operand } => HirExprKind::UnaryOp {
                 op: *op,
                 operand: Box::new(self.lower_expr(operand)?),
@@ -359,6 +436,50 @@ mod tests {
         ] {
             assert!(lower_src(src).is_ok(), "{src} must lower");
         }
+    }
+
+    #[test]
+    fn lower_true_yields_hir_bool() {
+        let hir = lower_src("print(true)").expect("must lower");
+        let HirStmtKind::ExprStmt(call) = &hir.stmts[0].kind else {
+            panic!("expected ExprStmt");
+        };
+        let HirExprKind::Call { args, .. } = &call.kind else {
+            panic!("expected Call");
+        };
+        assert!(matches!(args[0].kind, HirExprKind::Bool(true)));
+    }
+
+    #[test]
+    fn lower_lt_passes_through_to_hir() {
+        let hir = lower_src("print(1 < 2)").expect("must lower");
+        let HirStmtKind::ExprStmt(call) = &hir.stmts[0].kind else {
+            panic!("expected ExprStmt");
+        };
+        let HirExprKind::Call { args, .. } = &call.kind else {
+            panic!("expected Call");
+        };
+        assert!(matches!(
+            args[0].kind,
+            HirExprKind::BinOp {
+                op: crate::parser::BinOp::Lt,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn lower_number_eq_bool_returns_type_mismatch() {
+        // Heterogeneous == is rejected (Phase 2.2b defers Lua's runtime
+        // dispatch). `1 == true` must surface as HirError::TypeMismatch.
+        let err = lower_src("print(1 == true)").expect_err("heterogeneous == must error");
+        assert!(matches!(err, HirError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn lower_lt_with_bool_lhs_returns_type_mismatch() {
+        let err = lower_src("print(true < 1)").expect_err("bool < number must error");
+        assert!(matches!(err, HirError::TypeMismatch { .. }));
     }
 
     #[test]

@@ -280,6 +280,10 @@ fn emit_expr<'a, 'c>(
             );
             Ok(block.append_operation(op).result(0).unwrap().into())
         }
+        HirExprKind::Bool(_) => {
+            // Step 3 stub — i1 emit lands in Step 4.
+            unimplemented!("HirExprKind::Bool codegen — Step 4");
+        }
         HirExprKind::Local(LocalId(idx)) => Ok(emit_load(block, slots[*idx], types.f64, loc)),
         HirExprKind::BinOp { op, lhs, rhs } => {
             let lhs_val = emit_expr(context, block, lhs, slots, types, loc)?;

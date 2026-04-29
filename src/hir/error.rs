@@ -19,4 +19,14 @@ pub enum HirError {
 
     #[error("unsupported call form at byte offset {offset}")]
     UnsupportedCall { offset: usize },
+
+    #[error(
+        "operator '{op}' has incompatible operand types: lhs={lhs_kind}, rhs={rhs_kind} (offset {offset})"
+    )]
+    TypeMismatch {
+        op: String,
+        lhs_kind: String,
+        rhs_kind: String,
+        offset: usize,
+    },
 }

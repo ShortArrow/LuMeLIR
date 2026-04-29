@@ -41,6 +41,7 @@ pub struct HirExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HirExprKind {
     Number(f64),
+    Bool(bool),
     Local(LocalId),
     BinOp {
         op: BinOp,
