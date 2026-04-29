@@ -27,7 +27,9 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.1 reassignment / scopes | **Done** | `x = 2`, `do ... end` blocks, scope stack, shadowing (ADR 0008) |
 | ‣ 2.2a arithmetic operators | **Done** | `-` `*` `/` `%` `^` + unary `-`; libm pow/floor (ADR 0009) |
 | ‣ 2.2b comparisons + bool literals | **Done** | `<` `<=` `==` `~=` `>` `>=`, `true`/`false`; ordered cmpf, print(bool) (ADR 0010) |
-| ‣ 2.3 control flow + truthiness | Next | `if`/`while`, `nil`, `and`/`or`/`not`, per-slot type tracking |
+| ‣ 2.3a nil + per-slot types + heterogeneous == | **Done** | `nil`, `local b = true`, `1 == nil` → false (ADR 0011) |
+| ‣ 2.3b control flow | Next | `if`/`while` via scf, truthiness helper |
+| ‣ 2.3c short-circuit | Not started | `and`/`or`/`not` |
 | ‣ 2.4+ tables / bitwise | Not started | tables, metatables, GC, bitwise ops |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |
 

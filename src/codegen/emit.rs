@@ -557,9 +557,9 @@ fn emit_print_value<'a, 'c>(
     }
 }
 
-fn emit_print_nil<'a, 'c>(
+fn emit_print_nil<'c>(
     context: &'c Context,
-    block: &'a Block<'c>,
+    block: &Block<'c>,
     types: &Types<'c>,
     loc: Location<'c>,
 ) {
