@@ -26,8 +26,9 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.0 `local` + multi-stmt | **Done** | HIR layer introduced; `local x = 1; print(x + 2)` (ADR 0007) |
 | ‣ 2.1 reassignment / scopes | **Done** | `x = 2`, `do ... end` blocks, scope stack, shadowing (ADR 0008) |
 | ‣ 2.2a arithmetic operators | **Done** | `-` `*` `/` `%` `^` + unary `-`; libm pow/floor (ADR 0009) |
-| ‣ 2.2b comparisons / truthiness | Next | `<` `<=` `==` `~=` `>` `>=` and Lua truthiness model |
-| ‣ 2.3+ control flow / tables | Not started | `if` / `while` then tables/metatables/GC |
+| ‣ 2.2b comparisons + bool literals | **Done** | `<` `<=` `==` `~=` `>` `>=`, `true`/`false`; ordered cmpf, print(bool) (ADR 0010) |
+| ‣ 2.3 control flow + truthiness | Next | `if`/`while`, `nil`, `and`/`or`/`not`, per-slot type tracking |
+| ‣ 2.4+ tables / bitwise | Not started | tables, metatables, GC, bitwise ops |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |
 
 **How to read TBD markers:** sections marked `TBD: Phase N, ADR XXXX` indicate the rule is undecided until that ADR lands. Do not invent answers — surface the question instead.
