@@ -15,13 +15,14 @@ use std::collections::HashMap;
 
 use crate::parser::{BinOp, Chunk, Expr, ExprKind, Stmt, StmtKind};
 
-/// Static value-kind for a fully lowered HIR expression. Used both by
-/// the in-HIR type guard and by codegen to dispatch the `print` path
-/// between number and bool.
+/// Static value-kind for a fully lowered HIR expression. Used by the
+/// in-HIR type guard, the heterogeneous-`==` fold, and by codegen to
+/// dispatch the `print` path and the per-slot alloca type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueKind {
     Number,
     Bool,
+    Nil,
 }
 
 impl ValueKind {
@@ -29,16 +30,17 @@ impl ValueKind {
         match self {
             ValueKind::Number => "number",
             ValueKind::Bool => "bool",
+            ValueKind::Nil => "nil",
         }
     }
 }
 
-pub fn infer_kind(expr: &HirExpr) -> ValueKind {
+pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo]) -> ValueKind {
     match &expr.kind {
         HirExprKind::Number(_) => ValueKind::Number,
         HirExprKind::Bool(_) => ValueKind::Bool,
-        // Slots are f64 in 2.2b — `local b = true` lands in 2.3.
-        HirExprKind::Local(_) => ValueKind::Number,
+        HirExprKind::Nil => ValueKind::Nil,
+        HirExprKind::Local(LocalId(idx)) => locals[*idx].kind,
         HirExprKind::UnaryOp { .. } => ValueKind::Number,
         HirExprKind::BinOp { op, .. } => match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow => {
@@ -115,9 +117,12 @@ impl LowerCtx {
         None
     }
 
-    fn declare_local(&mut self, name: String) -> LocalId {
+    fn declare_local(&mut self, name: String, kind: ValueKind) -> LocalId {
         let id = LocalId(self.locals.len());
-        self.locals.push(LocalInfo { name: name.clone() });
+        self.locals.push(LocalInfo {
+            name: name.clone(),
+            kind,
+        });
         self.scopes
             .last_mut()
             .expect("scope stack is never empty")
@@ -129,7 +134,8 @@ impl LowerCtx {
         match &stmt.kind {
             StmtKind::Local { name, value } => {
                 let value = self.lower_expr(value)?;
-                let id = self.declare_local(name.clone());
+                let kind = infer_kind(&value, &self.locals);
+                let id = self.declare_local(name.clone(), kind);
                 Ok(HirStmt {
                     kind: HirStmtKind::LocalInit { id, value },
                     span: stmt.span,
@@ -141,6 +147,16 @@ impl LowerCtx {
                     offset: stmt.span.start,
                 })?;
                 let value = self.lower_expr(value)?;
+                let slot_kind = self.locals[id.0].kind;
+                let value_kind = infer_kind(&value, &self.locals);
+                if slot_kind != value_kind {
+                    return Err(HirError::TypeMismatch {
+                        op: "=".to_owned(),
+                        lhs_kind: slot_kind.name().to_owned(),
+                        rhs_kind: value_kind.name().to_owned(),
+                        offset: stmt.span.start,
+                    });
+                }
                 Ok(HirStmt {
                     kind: HirStmtKind::Assign { id, value },
                     span: stmt.span,
@@ -179,40 +195,66 @@ impl LowerCtx {
                 }
             },
             ExprKind::Bool(b) => HirExprKind::Bool(*b),
-            ExprKind::Nil => {
-                // Step 2 stub — HIR support, per-slot kind tracking, and
-                // the heterogeneous-`==` fold land in Step 3.
-                unimplemented!("ExprKind::Nil — Phase 2.3a Step 3");
-            }
+            ExprKind::Nil => HirExprKind::Nil,
             ExprKind::BinOp { op, lhs, rhs } => {
                 let lhs_hir = self.lower_expr(lhs)?;
                 let rhs_hir = self.lower_expr(rhs)?;
-                let lk = infer_kind(&lhs_hir);
-                let rk = infer_kind(&rhs_hir);
-                let allowed = match op {
+                let lk = infer_kind(&lhs_hir, &self.locals);
+                let rk = infer_kind(&rhs_hir, &self.locals);
+                match op {
                     // Arithmetic: both sides must be Number.
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow => {
-                        lk == ValueKind::Number && rk == ValueKind::Number
+                        if !(lk == ValueKind::Number && rk == ValueKind::Number) {
+                            return Err(HirError::TypeMismatch {
+                                op: binop_symbol(*op).to_owned(),
+                                lhs_kind: lk.name().to_owned(),
+                                rhs_kind: rk.name().to_owned(),
+                                offset: expr.span.start,
+                            });
+                        }
+                        HirExprKind::BinOp {
+                            op: *op,
+                            lhs: Box::new(lhs_hir),
+                            rhs: Box::new(rhs_hir),
+                        }
                     }
-                    // Ordering: both sides must be Number.
+                    // Ordering: both sides must be Number (nil/bool reject).
                     BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                        lk == ValueKind::Number && rk == ValueKind::Number
+                        if !(lk == ValueKind::Number && rk == ValueKind::Number) {
+                            return Err(HirError::TypeMismatch {
+                                op: binop_symbol(*op).to_owned(),
+                                lhs_kind: lk.name().to_owned(),
+                                rhs_kind: rk.name().to_owned(),
+                                offset: expr.span.start,
+                            });
+                        }
+                        HirExprKind::BinOp {
+                            op: *op,
+                            lhs: Box::new(lhs_hir),
+                            rhs: Box::new(rhs_hir),
+                        }
                     }
-                    // Equality: both sides must share a kind.
-                    BinOp::Eq | BinOp::Ne => lk == rk,
-                };
-                if !allowed {
-                    return Err(HirError::TypeMismatch {
-                        op: binop_symbol(*op).to_owned(),
-                        lhs_kind: lk.name().to_owned(),
-                        rhs_kind: rk.name().to_owned(),
-                        offset: expr.span.start,
-                    });
-                }
-                HirExprKind::BinOp {
-                    op: *op,
-                    lhs: Box::new(lhs_hir),
-                    rhs: Box::new(rhs_hir),
+                    // Equality: heterogeneous kinds and both-Nil fold to a
+                    // constant (Lua semantics: `1 == nil` ≡ false). Same-
+                    // kind non-Nil drops through to runtime cmpf in codegen.
+                    BinOp::Eq | BinOp::Ne => {
+                        let fold = lk != rk || (lk == ValueKind::Nil && rk == ValueKind::Nil);
+                        if fold {
+                            let equal = lk == rk; // both-Nil → true; heterogeneous → false
+                            let folded = match op {
+                                BinOp::Eq => equal,
+                                BinOp::Ne => !equal,
+                                _ => unreachable!(),
+                            };
+                            HirExprKind::Bool(folded)
+                        } else {
+                            HirExprKind::BinOp {
+                                op: *op,
+                                lhs: Box::new(lhs_hir),
+                                rhs: Box::new(rhs_hir),
+                            }
+                        }
+                    }
                 }
             }
             ExprKind::UnaryOp { op, operand } => HirExprKind::UnaryOp {
@@ -474,17 +516,100 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn lower_number_eq_bool_returns_type_mismatch() {
-        // Heterogeneous == is rejected (Phase 2.2b defers Lua's runtime
-        // dispatch). `1 == true` must surface as HirError::TypeMismatch.
-        let err = lower_src("print(1 == true)").expect_err("heterogeneous == must error");
-        assert!(matches!(err, HirError::TypeMismatch { .. }));
-    }
+    // (Phase 2.2b's `lower_number_eq_bool_returns_type_mismatch` was
+    // removed in 2.3a — heterogeneous `==` now folds to a constant
+    // per ADR 0011. The replacement assertion lives in
+    // `lower_number_eq_bool_now_folds_instead_of_erroring` below.)
 
     #[test]
     fn lower_lt_with_bool_lhs_returns_type_mismatch() {
         let err = lower_src("print(true < 1)").expect_err("bool < number must error");
+        assert!(matches!(err, HirError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn lower_nil_yields_hir_nil() {
+        let hir = lower_src("print(nil == nil)").expect("must lower");
+        // The (nil == nil) is statically folded to Bool(true); we
+        // observe it via the print arg shape.
+        let HirStmtKind::ExprStmt(call) = &hir.stmts[0].kind else {
+            panic!("expected ExprStmt");
+        };
+        let HirExprKind::Call { args, .. } = &call.kind else {
+            panic!("expected Call");
+        };
+        assert!(matches!(args[0].kind, HirExprKind::Bool(true)));
+    }
+
+    #[test]
+    fn lower_local_with_bool_value_records_bool_kind() {
+        let hir = lower_src("local b = true").expect("must lower");
+        assert_eq!(hir.locals.len(), 1);
+        assert_eq!(hir.locals[0].name, "b");
+        assert_eq!(hir.locals[0].kind, ValueKind::Bool);
+    }
+
+    #[test]
+    fn lower_local_with_nil_value_records_nil_kind() {
+        let hir = lower_src("local n = nil").expect("must lower");
+        assert_eq!(hir.locals.len(), 1);
+        assert_eq!(hir.locals[0].kind, ValueKind::Nil);
+    }
+
+    #[test]
+    fn lower_assign_changing_kind_returns_type_mismatch() {
+        let err = lower_src("local x = 1\nx = nil").expect_err("kind change must reject");
+        match err {
+            HirError::TypeMismatch {
+                lhs_kind, rhs_kind, ..
+            } => {
+                assert_eq!(lhs_kind, "number");
+                assert_eq!(rhs_kind, "nil");
+            }
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_nil_eq_nil_folds_to_bool_true() {
+        let hir = lower_src("print(nil == nil)").expect("must lower");
+        let HirStmtKind::ExprStmt(call) = &hir.stmts[0].kind else {
+            panic!("expected ExprStmt");
+        };
+        let HirExprKind::Call { args, .. } = &call.kind else {
+            panic!("expected Call");
+        };
+        assert!(matches!(args[0].kind, HirExprKind::Bool(true)));
+    }
+
+    #[test]
+    fn lower_number_eq_nil_folds_to_bool_false() {
+        let hir = lower_src("print(1 == nil)").expect("must lower");
+        let HirStmtKind::ExprStmt(call) = &hir.stmts[0].kind else {
+            panic!("expected ExprStmt");
+        };
+        let HirExprKind::Call { args, .. } = &call.kind else {
+            panic!("expected Call");
+        };
+        assert!(matches!(args[0].kind, HirExprKind::Bool(false)));
+    }
+
+    #[test]
+    fn lower_number_eq_bool_now_folds_instead_of_erroring() {
+        // ADR 0010 rejected this with TypeMismatch; ADR 0011 folds it.
+        let hir = lower_src("print(1 == true)").expect("must lower (heterogeneous fold)");
+        let HirStmtKind::ExprStmt(call) = &hir.stmts[0].kind else {
+            panic!("expected ExprStmt");
+        };
+        let HirExprKind::Call { args, .. } = &call.kind else {
+            panic!("expected Call");
+        };
+        assert!(matches!(args[0].kind, HirExprKind::Bool(false)));
+    }
+
+    #[test]
+    fn lower_nil_lt_number_returns_type_mismatch() {
+        let err = lower_src("print(nil < 1)").expect_err("nil < number must reject");
         assert!(matches!(err, HirError::TypeMismatch { .. }));
     }
 

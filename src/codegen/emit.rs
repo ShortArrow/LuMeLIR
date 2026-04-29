@@ -25,7 +25,8 @@ use melior::{
 };
 
 use crate::hir::{
-    Builtin, HirChunk, HirExpr, HirExprKind, HirStmt, HirStmtKind, LocalId, ValueKind, infer_kind,
+    Builtin, HirChunk, HirExpr, HirExprKind, HirStmt, HirStmtKind, LocalId, LocalInfo, ValueKind,
+    infer_kind,
 };
 use crate::parser::{BinOp, UnaryOp};
 
@@ -189,7 +190,15 @@ fn emit_main<'c>(
         .map(|_| emit_alloca_slot(context, &main_block, types, loc))
         .collect();
 
-    emit_stmts(context, &main_block, &chunk.stmts, &slots, types, loc)?;
+    emit_stmts(
+        context,
+        &main_block,
+        &chunk.stmts,
+        &slots,
+        &chunk.locals,
+        types,
+        loc,
+    )?;
 
     let zero = arith::constant(context, IntegerAttribute::new(types.i64, 0).into(), loc);
     let zero_val = main_block.append_operation(zero).result(0).unwrap().into();
@@ -215,11 +224,12 @@ fn emit_stmts<'a, 'c>(
     block: &'a Block<'c>,
     stmts: &[HirStmt],
     slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     for stmt in stmts {
-        emit_stmt(context, block, stmt, slots, types, loc)?;
+        emit_stmt(context, block, stmt, slots, locals, types, loc)?;
     }
     Ok(())
 }
@@ -229,19 +239,20 @@ fn emit_stmt<'a, 'c>(
     block: &'a Block<'c>,
     stmt: &HirStmt,
     slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     match &stmt.kind {
         HirStmtKind::LocalInit { id, value } | HirStmtKind::Assign { id, value } => {
-            let v = emit_expr(context, block, value, slots, types, loc)?;
+            let v = emit_expr(context, block, value, slots, locals, types, loc)?;
             emit_store(block, v, slots[id.0], loc);
         }
         HirStmtKind::Block { stmts } => {
-            emit_stmts(context, block, stmts, slots, types, loc)?;
+            emit_stmts(context, block, stmts, slots, locals, types, loc)?;
         }
         HirStmtKind::ExprStmt(expr) => {
-            emit_expr_stmt(context, block, expr, slots, types, loc)?;
+            emit_expr_stmt(context, block, expr, slots, locals, types, loc)?;
         }
     }
     Ok(())
@@ -300,6 +311,7 @@ fn emit_expr<'a, 'c>(
     block: &'a Block<'c>,
     expr: &HirExpr,
     slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Result<Value<'c, 'a>, CodegenError> {
@@ -317,20 +329,28 @@ fn emit_expr<'a, 'c>(
             let op = arith::constant(context, attr.into(), loc);
             Ok(block.append_operation(op).result(0).unwrap().into())
         }
+        HirExprKind::Nil => {
+            // Step 3 stub — per-kind slot allocation lands in Step 4.
+            // Bool(0) stand-in keeps the IR shape valid so we can
+            // exercise the HIR fold logic in tests.
+            let attr = IntegerAttribute::new(types.i1, 0);
+            let op = arith::constant(context, attr.into(), loc);
+            Ok(block.append_operation(op).result(0).unwrap().into())
+        }
         HirExprKind::Local(LocalId(idx)) => Ok(emit_load(block, slots[*idx], types.f64, loc)),
         HirExprKind::BinOp { op, lhs, rhs } => {
-            let lhs_val = emit_expr(context, block, lhs, slots, types, loc)?;
-            let rhs_val = emit_expr(context, block, rhs, slots, types, loc)?;
+            let lhs_val = emit_expr(context, block, lhs, slots, locals, types, loc)?;
+            let rhs_val = emit_expr(context, block, rhs, slots, locals, types, loc)?;
             emit_binop(context, block, *op, lhs_val, rhs_val, types, loc)
         }
         HirExprKind::UnaryOp { op, operand } => {
-            let v = emit_expr(context, block, operand, slots, types, loc)?;
+            let v = emit_expr(context, block, operand, slots, locals, types, loc)?;
             emit_unary(block, *op, v, loc)
         }
         HirExprKind::Call { builtin, args } => match builtin {
             Builtin::Print => {
-                let kind = infer_kind(&args[0]);
-                let arg_val = emit_expr(context, block, &args[0], slots, types, loc)?;
+                let kind = infer_kind(&args[0], locals);
+                let arg_val = emit_expr(context, block, &args[0], slots, locals, types, loc)?;
                 emit_print_value(context, block, arg_val, kind, types, loc);
                 Ok(arg_val)
             }
@@ -343,10 +363,11 @@ fn emit_expr_stmt<'a, 'c>(
     block: &'a Block<'c>,
     expr: &HirExpr,
     slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
-    emit_expr(context, block, expr, slots, types, loc)?;
+    emit_expr(context, block, expr, slots, locals, types, loc)?;
     Ok(())
 }
 
@@ -515,6 +536,13 @@ fn emit_print_value<'a, 'c>(
     match kind {
         ValueKind::Number => emit_printf_g(context, block, value, types, loc),
         ValueKind::Bool => emit_print_bool(context, block, value, types, loc),
+        ValueKind::Nil => {
+            // Step 3 stub — Step 4 adds the @s_nil global and a
+            // dedicated print path. For now, route through the bool
+            // path so the IR shape is well-formed (the value is
+            // always 0 ≡ "false" temporarily).
+            emit_print_bool(context, block, value, types, loc);
+        }
     }
 }
 

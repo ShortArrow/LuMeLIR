@@ -1,3 +1,4 @@
+use crate::hir::ValueKind;
 use crate::lexer::Span;
 use crate::parser::{BinOp, UnaryOp};
 
@@ -5,10 +6,12 @@ use crate::parser::{BinOp, UnaryOp};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LocalId(pub usize);
 
-/// Per-local metadata. Phase 2.0 carries only the source name.
+/// Per-local metadata. Phase 2.3a adds the static value kind that
+/// determines the stack slot type at codegen time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalInfo {
     pub name: String,
+    pub kind: ValueKind,
 }
 
 /// A name-resolved program — the input to codegen.
@@ -42,6 +45,7 @@ pub struct HirExpr {
 pub enum HirExprKind {
     Number(f64),
     Bool(bool),
+    Nil,
     Local(LocalId),
     BinOp {
         op: BinOp,
