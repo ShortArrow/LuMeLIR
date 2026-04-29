@@ -28,9 +28,10 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.2a arithmetic operators | **Done** | `-` `*` `/` `%` `^` + unary `-`; libm pow/floor (ADR 0009) |
 | ‣ 2.2b comparisons + bool literals | **Done** | `<` `<=` `==` `~=` `>` `>=`, `true`/`false`; ordered cmpf, print(bool) (ADR 0010) |
 | ‣ 2.3a nil + per-slot types + heterogeneous == | **Done** | `nil`, `local b = true`, `1 == nil` → false (ADR 0011) |
-| ‣ 2.3b control flow | Next | `if`/`while` via scf, truthiness helper |
-| ‣ 2.3c short-circuit | Not started | `and`/`or`/`not` |
-| ‣ 2.4+ tables / bitwise | Not started | tables, metatables, GC, bitwise ops |
+| ‣ 2.3b control flow | **Done** | `if`/`elseif`/`else`/`while` via `scf`, truthiness helper (ADR 0012) |
+| ‣ 2.3c short-circuit | Next | `and`/`or`/`not` |
+| ‣ 2.3d for loops | Not started | numeric / generic `for` |
+| ‣ 2.4+ tables / functions | Not started | tables, metatables, functions, `return`, `break` |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |
 
 **How to read TBD markers:** sections marked `TBD: Phase N, ADR XXXX` indicate the rule is undecided until that ADR lands. Do not invent answers — surface the question instead.
