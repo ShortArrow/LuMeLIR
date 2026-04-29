@@ -57,12 +57,18 @@ impl<'t> Parser<'t> {
     }
 
     fn parse_chunk(&mut self) -> Result<Chunk, ParseError> {
+        self.parse_chunk_until(&[TokenKind::Eof])
+    }
+
+    /// Parse statements until the next significant token matches one of
+    /// `terminators`. The terminator itself is **not** consumed.
+    fn parse_chunk_until(&mut self, terminators: &[TokenKind]) -> Result<Chunk, ParseError> {
         let mut stmts = Vec::new();
         loop {
             while matches!(self.peek().kind, TokenKind::Semicolon) {
                 self.bump();
             }
-            if matches!(self.peek().kind, TokenKind::Eof) {
+            if terminators.iter().any(|t| t == &self.peek().kind) {
                 break;
             }
             stmts.push(self.parse_stmt()?);
@@ -71,12 +77,53 @@ impl<'t> Parser<'t> {
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
-        if matches!(self.peek().kind, TokenKind::Keyword(Keyword::Local)) {
-            self.parse_local()
-        } else {
-            let expr = self.parse_expr(0)?;
-            let span = expr.span;
-            Ok(Stmt::new(StmtKind::ExprStmt(expr), span))
+        match self.peek().kind {
+            TokenKind::Keyword(Keyword::Local) => self.parse_local(),
+            TokenKind::Keyword(Keyword::Do) => self.parse_block(),
+            TokenKind::Ident(_) if matches!(self.peek_kind_at(1), Some(TokenKind::Equals)) => {
+                self.parse_assign()
+            }
+            _ => {
+                let expr = self.parse_expr(0)?;
+                let span = expr.span;
+                Ok(Stmt::new(StmtKind::ExprStmt(expr), span))
+            }
+        }
+    }
+
+    fn peek_kind_at(&self, offset: usize) -> Option<&TokenKind> {
+        self.tokens.get(self.pos + offset).map(|t| &t.kind)
+    }
+
+    fn parse_assign(&mut self) -> Result<Stmt, ParseError> {
+        let name_tok = self.peek().clone();
+        let TokenKind::Ident(name) = name_tok.kind else {
+            unreachable!("parse_assign requires an Ident at peek()");
+        };
+        self.bump(); // ident
+        self.bump(); // '=' (already verified by lookahead)
+        let value = self.parse_expr(0)?;
+        let span = Span::new(name_tok.span.start, value.span.end);
+        Ok(Stmt::new(StmtKind::Assign { name, value }, span))
+    }
+
+    fn parse_block(&mut self) -> Result<Stmt, ParseError> {
+        let do_tok = self.bump().clone();
+        let body = self.parse_chunk_until(&[TokenKind::Keyword(Keyword::End), TokenKind::Eof])?;
+        let end_tok = self.peek().clone();
+        match end_tok.kind {
+            TokenKind::Keyword(Keyword::End) => {
+                self.bump();
+                let span = Span::new(do_tok.span.start, end_tok.span.end);
+                Ok(Stmt::new(StmtKind::Block(body), span))
+            }
+            TokenKind::Eof => Err(ParseError::UnexpectedEof {
+                offset: end_tok.span.start,
+            }),
+            other => Err(ParseError::UnexpectedToken {
+                actual: other,
+                offset: end_tok.span.start,
+            }),
         }
     }
 
@@ -288,6 +335,13 @@ mod tests {
                 name,
                 value: strip_span_expr(value),
             },
+            StmtKind::Assign { name, value } => StmtKind::Assign {
+                name,
+                value: strip_span_expr(value),
+            },
+            StmtKind::Block(body) => {
+                StmtKind::Block(body.into_iter().map(strip_span_stmt).collect())
+            }
             StmtKind::ExprStmt(e) => StmtKind::ExprStmt(strip_span_expr(e)),
         };
         Stmt::new(kind, Span::new(0, 0))
@@ -469,5 +523,61 @@ mod tests {
     fn parse_empty_source_yields_empty_chunk() {
         let chunk = parse("").expect("empty source must parse to empty chunk");
         assert!(chunk.is_empty());
+    }
+
+    #[test]
+    fn parse_assignment_yields_assign_stmt() {
+        let stmt = parse_single_stmt("x = 2").expect("assignment must parse");
+        let stripped = strip_span_stmt(stmt);
+        assert_eq!(
+            stripped.kind,
+            StmtKind::Assign {
+                name: "x".to_owned(),
+                value: number(2.0),
+            },
+        );
+    }
+
+    #[test]
+    fn parse_empty_do_end_yields_block_with_no_body() {
+        let stmt = parse_single_stmt("do end").expect("empty block must parse");
+        match stmt.kind {
+            StmtKind::Block(body) => assert!(body.is_empty()),
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_do_end_with_inner_local_yields_block() {
+        let stmt = parse_single_stmt("do local x = 1 end").expect("block with local must parse");
+        let stripped = strip_span_stmt(stmt);
+        match stripped.kind {
+            StmtKind::Block(body) => {
+                assert_eq!(body.len(), 1);
+                assert!(matches!(body[0].kind, StmtKind::Local { .. }));
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_nested_do_end_blocks() {
+        let chunk = parse("do do print(1) end end").expect("nested blocks must parse");
+        assert_eq!(chunk.len(), 1);
+        let StmtKind::Block(outer) = &chunk[0].kind else {
+            panic!("expected outer Block");
+        };
+        assert_eq!(outer.len(), 1);
+        let StmtKind::Block(inner) = &outer[0].kind else {
+            panic!("expected inner Block");
+        };
+        assert_eq!(inner.len(), 1);
+        assert!(matches!(inner[0].kind, StmtKind::ExprStmt(_)));
+    }
+
+    #[test]
+    fn parse_unterminated_do_block_is_rejected() {
+        let err = parse("do local x = 1").expect_err("missing `end` must fail");
+        assert!(matches!(err, ParseError::UnexpectedEof { .. }));
     }
 }

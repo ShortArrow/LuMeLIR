@@ -46,16 +46,20 @@ pub enum TokenKind {
     Eof,
 }
 
-/// Reserved words. Phase 2.0 introduces `local`; more land as Phase 2 grows.
+/// Reserved words. Phase 2.0 introduced `local`; Phase 2.1 adds `do`/`end`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keyword {
     Local,
+    Do,
+    End,
 }
 
 impl Keyword {
     pub fn from_lexeme(lex: &str) -> Option<Self> {
         match lex {
             "local" => Some(Keyword::Local),
+            "do" => Some(Keyword::Do),
+            "end" => Some(Keyword::End),
             _ => None,
         }
     }

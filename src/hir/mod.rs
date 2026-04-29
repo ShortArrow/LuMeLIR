@@ -3,7 +3,7 @@
 //! Lowers a [`crate::parser::Chunk`] (syntactic AST) into a representation
 //! where names are resolved to [`LocalId`] indices and the only call form
 //! is a known [`Builtin`]. Codegen consumes the HIR; the AST stays pure
-//! syntax. See ADR 0007.
+//! syntax. See ADRs 0007 (Phase 2.0) and 0008 (Phase 2.1 scope stack).
 
 mod error;
 mod ir;
@@ -17,39 +17,85 @@ use crate::parser::{Chunk, Expr, ExprKind, Stmt, StmtKind};
 
 /// Lower a parsed [`Chunk`] into a [`HirChunk`] with resolved names.
 pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
-    let mut ctx = LowerCtx::default();
-    let mut stmts = Vec::with_capacity(chunk.len());
-    for stmt in chunk {
-        stmts.push(ctx.lower_stmt(stmt)?);
-    }
+    let mut ctx = LowerCtx::new();
+    let stmts = ctx.lower_stmts(chunk)?;
     Ok(HirChunk {
         locals: ctx.locals,
         stmts,
     })
 }
 
-#[derive(Default)]
 struct LowerCtx {
     locals: Vec<LocalInfo>,
-    scope: HashMap<String, LocalId>,
+    /// Scope stack: innermost scope is the last element. `local` always
+    /// pushes into the top frame, allowing same-scope shadowing per Lua
+    /// 5.4 semantics. See ADR 0008.
+    scopes: Vec<HashMap<String, LocalId>>,
 }
 
 impl LowerCtx {
+    fn new() -> Self {
+        Self {
+            locals: Vec::new(),
+            scopes: vec![HashMap::new()],
+        }
+    }
+
+    fn lower_stmts(&mut self, stmts: &[Stmt]) -> Result<Vec<HirStmt>, HirError> {
+        let mut out = Vec::with_capacity(stmts.len());
+        for s in stmts {
+            out.push(self.lower_stmt(s)?);
+        }
+        Ok(out)
+    }
+
+    fn resolve(&self, name: &str) -> Option<LocalId> {
+        for frame in self.scopes.iter().rev() {
+            if let Some(id) = frame.get(name) {
+                return Some(*id);
+            }
+        }
+        None
+    }
+
+    fn declare_local(&mut self, name: String) -> LocalId {
+        let id = LocalId(self.locals.len());
+        self.locals.push(LocalInfo { name: name.clone() });
+        self.scopes
+            .last_mut()
+            .expect("scope stack is never empty")
+            .insert(name, id);
+        id
+    }
+
     fn lower_stmt(&mut self, stmt: &Stmt) -> Result<HirStmt, HirError> {
         match &stmt.kind {
             StmtKind::Local { name, value } => {
-                if self.scope.contains_key(name) {
-                    return Err(HirError::RedefinedLocal {
-                        name: name.clone(),
-                        offset: stmt.span.start,
-                    });
-                }
                 let value = self.lower_expr(value)?;
-                let id = LocalId(self.locals.len());
-                self.locals.push(LocalInfo { name: name.clone() });
-                self.scope.insert(name.clone(), id);
+                let id = self.declare_local(name.clone());
                 Ok(HirStmt {
                     kind: HirStmtKind::LocalInit { id, value },
+                    span: stmt.span,
+                })
+            }
+            StmtKind::Assign { name, value } => {
+                let id = self.resolve(name).ok_or_else(|| HirError::UndefinedName {
+                    name: name.clone(),
+                    offset: stmt.span.start,
+                })?;
+                let value = self.lower_expr(value)?;
+                Ok(HirStmt {
+                    kind: HirStmtKind::Assign { id, value },
+                    span: stmt.span,
+                })
+            }
+            StmtKind::Block(body) => {
+                self.scopes.push(HashMap::new());
+                let result = self.lower_stmts(body);
+                self.scopes.pop();
+                let stmts = result?;
+                Ok(HirStmt {
+                    kind: HirStmtKind::Block { stmts },
                     span: stmt.span,
                 })
             }
@@ -66,8 +112,8 @@ impl LowerCtx {
     fn lower_expr(&self, expr: &Expr) -> Result<HirExpr, HirError> {
         let kind = match &expr.kind {
             ExprKind::Number(n) => HirExprKind::Number(*n),
-            ExprKind::Ident(name) => match self.scope.get(name) {
-                Some(&id) => HirExprKind::Local(id),
+            ExprKind::Ident(name) => match self.resolve(name) {
+                Some(id) => HirExprKind::Local(id),
                 None => {
                     return Err(HirError::UndefinedName {
                         name: name.clone(),
@@ -191,9 +237,74 @@ mod tests {
     }
 
     #[test]
-    fn lower_redefining_local_errors() {
-        let err = lower_src("local x = 1\nlocal x = 2").expect_err("redef must fail");
-        assert!(matches!(err, HirError::RedefinedLocal { .. }));
+    fn lower_same_scope_shadowing_is_allowed() {
+        // Lua 5.4 allows re-declaring a local in the same scope; the
+        // newer binding shadows the old one.
+        let hir = lower_src("local x = 1\nlocal x = 2\nprint(x)")
+            .expect("same-scope shadowing must lower");
+        assert_eq!(hir.locals.len(), 2, "two distinct slots");
+        let HirStmtKind::ExprStmt(call) = &hir.stmts[2].kind else {
+            panic!("expected ExprStmt");
+        };
+        let HirExprKind::Call { args, .. } = &call.kind else {
+            panic!("expected Call");
+        };
+        // The print(x) reference resolves to the *second* x (LocalId(1)).
+        assert!(matches!(args[0].kind, HirExprKind::Local(LocalId(1))));
+    }
+
+    #[test]
+    fn lower_assign_to_existing_local_resolves() {
+        let hir = lower_src("local x = 1\nx = 2").expect("assign must lower");
+        assert_eq!(hir.locals.len(), 1);
+        let HirStmtKind::Assign { id, value } = &hir.stmts[1].kind else {
+            panic!("expected Assign, got {:?}", hir.stmts[1].kind);
+        };
+        assert_eq!(*id, LocalId(0));
+        assert!(matches!(value.kind, HirExprKind::Number(2.0)));
+    }
+
+    #[test]
+    fn lower_assign_to_undefined_name_errors() {
+        let err = lower_src("y = 1").expect_err("assign-to-undef must fail");
+        match err {
+            HirError::UndefinedName { name, .. } => assert_eq!(name, "y"),
+            other => panic!("expected UndefinedName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_block_creates_inner_scope_and_pops_on_exit() {
+        // Inner `local x` shadows outer `x` only within the block.
+        let hir = lower_src("local x = 1\ndo local x = 99\nprint(x) end\nprint(x)")
+            .expect("nested scope must lower");
+        assert_eq!(hir.locals.len(), 2);
+        let HirStmtKind::Block { stmts } = &hir.stmts[1].kind else {
+            panic!("expected Block at stmts[1]");
+        };
+        let HirStmtKind::ExprStmt(inner_call) = &stmts[1].kind else {
+            panic!("expected inner ExprStmt");
+        };
+        let HirExprKind::Call { args, .. } = &inner_call.kind else {
+            panic!("expected inner Call");
+        };
+        // Inside the block, x → LocalId(1) (the inner shadow).
+        assert!(matches!(args[0].kind, HirExprKind::Local(LocalId(1))));
+
+        let HirStmtKind::ExprStmt(outer_call) = &hir.stmts[2].kind else {
+            panic!("expected outer ExprStmt");
+        };
+        let HirExprKind::Call { args, .. } = &outer_call.kind else {
+            panic!("expected outer Call");
+        };
+        // After the block, x → LocalId(0) (the outer binding).
+        assert!(matches!(args[0].kind, HirExprKind::Local(LocalId(0))));
+    }
+
+    #[test]
+    fn lower_local_inside_block_is_invisible_outside() {
+        let err = lower_src("do local x = 1 end\nprint(x)").expect_err("inner local must not leak");
+        assert!(matches!(err, HirError::UndefinedName { .. }));
     }
 
     #[test]

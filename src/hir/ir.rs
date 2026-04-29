@@ -27,6 +27,8 @@ pub struct HirStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HirStmtKind {
     LocalInit { id: LocalId, value: HirExpr },
+    Assign { id: LocalId, value: HirExpr },
+    Block { stmts: Vec<HirStmt> },
     ExprStmt(HirExpr),
 }
 

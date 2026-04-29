@@ -36,8 +36,8 @@ pub enum BinOp {
     Add,
 }
 
-/// A statement. Phase 2.0 introduces `local` declarations and bare
-/// expression statements; richer statement forms join in 2.1+.
+/// A statement. Phase 2.0 introduced `local` declarations and bare
+/// expression statements; Phase 2.1 adds `Assign` and `Block` (do/end).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stmt {
     pub kind: StmtKind,
@@ -53,6 +53,8 @@ impl Stmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StmtKind {
     Local { name: String, value: Expr },
+    Assign { name: String, value: Expr },
+    Block(Chunk),
     ExprStmt(Expr),
 }
 

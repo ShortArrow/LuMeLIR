@@ -213,6 +213,26 @@ mod tests {
     }
 
     #[test]
+    fn lex_do_and_end_keywords_yield_keyword_tokens() {
+        assert_eq!(
+            kinds("do end"),
+            vec![
+                TokenKind::Keyword(Keyword::Do),
+                TokenKind::Keyword(Keyword::End),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn lex_identifier_ending_with_keyword_suffix_is_still_ident() {
+        assert_eq!(
+            kinds("ended"),
+            vec![TokenKind::Ident("ended".to_owned()), TokenKind::Eof],
+        );
+    }
+
+    #[test]
     fn lex_unknown_character_returns_unexpected_error() {
         let err = lex("@").expect_err("`@` is not a valid Lua token in Phase 1");
         assert_eq!(err, LexError::Unexpected { ch: '@', offset: 0 },);

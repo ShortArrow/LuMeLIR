@@ -6,9 +6,6 @@ pub enum HirError {
     #[error("undefined name '{name}' at byte offset {offset}")]
     UndefinedName { name: String, offset: usize },
 
-    #[error("local '{name}' already defined in this scope (offset {offset})")]
-    RedefinedLocal { name: String, offset: usize },
-
     #[error("unknown builtin '{name}' at byte offset {offset}")]
     UnknownBuiltin { name: String, offset: usize },
 

@@ -24,8 +24,9 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | Phase 1 — PoC | **Done** | `print(1 + 2)` AOT: lexer → parser → MLIR emit → native binary (ADR 0006) |
 | Phase 2 — Core Semantics | **In progress** | `local`, scopes, control flow, tables, metatables, GC |
 | ‣ 2.0 `local` + multi-stmt | **Done** | HIR layer introduced; `local x = 1; print(x + 2)` (ADR 0007) |
-| ‣ 2.1 reassignment / scopes | Next | `x = 2`, `do ... end` blocks |
-| ‣ 2.2+ ops / control flow / tables | Not started | `-` `*` `/` `<` `if` `while` then tables/metatables/GC |
+| ‣ 2.1 reassignment / scopes | **Done** | `x = 2`, `do ... end` blocks, scope stack, shadowing (ADR 0008) |
+| ‣ 2.2 more operators | Next | `-` `*` `/`, comparisons |
+| ‣ 2.3+ control flow / tables | Not started | `if` / `while` then tables/metatables/GC |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |
 
 **How to read TBD markers:** sections marked `TBD: Phase N, ADR XXXX` indicate the rule is undecided until that ADR lands. Do not invent answers — surface the question instead.

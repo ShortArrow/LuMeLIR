@@ -22,7 +22,7 @@ use melior::{
     utility::register_all_dialects,
 };
 
-use crate::hir::{Builtin, HirChunk, HirExpr, HirExprKind, HirStmtKind, LocalId};
+use crate::hir::{Builtin, HirChunk, HirExpr, HirExprKind, HirStmt, HirStmtKind, LocalId};
 use crate::parser::BinOp;
 
 use super::error::CodegenError;
@@ -123,17 +123,7 @@ fn emit_main<'c>(
         .map(|_| emit_alloca_slot(context, &main_block, types, loc))
         .collect();
 
-    for stmt in &chunk.stmts {
-        match &stmt.kind {
-            HirStmtKind::LocalInit { id, value } => {
-                let v = emit_expr(context, &main_block, value, &slots, types, loc)?;
-                emit_store(&main_block, v, slots[id.0], loc);
-            }
-            HirStmtKind::ExprStmt(expr) => {
-                emit_expr_stmt(context, &main_block, expr, &slots, types, loc)?;
-            }
-        }
-    }
+    emit_stmts(context, &main_block, &chunk.stmts, &slots, types, loc)?;
 
     let zero = arith::constant(context, IntegerAttribute::new(types.i64, 0).into(), loc);
     let zero_val = main_block.append_operation(zero).result(0).unwrap().into();
@@ -151,6 +141,43 @@ fn emit_main<'c>(
         loc,
     );
     module.body().append_operation(main_op);
+    Ok(())
+}
+
+fn emit_stmts<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    stmts: &[HirStmt],
+    slots: &[Value<'c, 'a>],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    for stmt in stmts {
+        emit_stmt(context, block, stmt, slots, types, loc)?;
+    }
+    Ok(())
+}
+
+fn emit_stmt<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    stmt: &HirStmt,
+    slots: &[Value<'c, 'a>],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    match &stmt.kind {
+        HirStmtKind::LocalInit { id, value } | HirStmtKind::Assign { id, value } => {
+            let v = emit_expr(context, block, value, slots, types, loc)?;
+            emit_store(block, v, slots[id.0], loc);
+        }
+        HirStmtKind::Block { stmts } => {
+            emit_stmts(context, block, stmts, slots, types, loc)?;
+        }
+        HirStmtKind::ExprStmt(expr) => {
+            emit_expr_stmt(context, block, expr, slots, types, loc)?;
+        }
+    }
     Ok(())
 }
 
@@ -366,6 +393,37 @@ mod tests {
         assert!(
             module.as_operation().verify(),
             "Phase 2.0 target should verify"
+        );
+    }
+
+    #[test]
+    fn emit_assignment_verifies_and_emits_store() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("local x = 1\nx = 2\nprint(x)")).unwrap();
+        assert!(
+            module.as_operation().verify(),
+            "assign module should verify"
+        );
+        let mlir = module.as_operation().to_string();
+        // Two stores expected: one for the init, one for the reassignment.
+        let stores = mlir.matches("llvm.store").count();
+        assert!(
+            stores >= 2,
+            "expected ≥2 llvm.store ops for init+assign, got {stores} in:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_block_with_inner_local_verifies() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src("local x = 1\ndo local x = 99\nprint(x) end\nprint(x)"),
+        )
+        .unwrap();
+        assert!(
+            module.as_operation().verify(),
+            "block-shadowing module should verify"
         );
     }
 
