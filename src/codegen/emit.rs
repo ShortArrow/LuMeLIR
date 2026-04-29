@@ -7,7 +7,9 @@
 use melior::{
     Context,
     dialect::{
-        DialectRegistry, arith, func, llvm,
+        DialectRegistry, arith,
+        arith::CmpfPredicate,
+        func, llvm,
         ods::llvm::{AddressOfOperationBuilder, GlobalOperationBuilder, LLVMFuncOperationBuilder},
     },
     ir::{
@@ -28,19 +30,36 @@ use crate::parser::{BinOp, UnaryOp};
 use super::error::CodegenError;
 
 struct Types<'c> {
+    i1: Type<'c>,
     i32: Type<'c>,
     i64: Type<'c>,
     f64: Type<'c>,
     ptr: Type<'c>,
 }
 
-/// Emit an MLIR module from a resolved HIR chunk.
+/// Emit a verified MLIR module from a resolved HIR chunk.
 pub fn emit_module<'c>(context: &'c Context, chunk: &HirChunk) -> Result<Module<'c>, CodegenError> {
+    let module = emit_module_unverified(context, chunk)?;
+    if !module.as_operation().verify() {
+        return Err(CodegenError::VerificationFailed);
+    }
+    Ok(module)
+}
+
+/// Emit an MLIR module **without** the final `verify()` gate — used by
+/// codegen unit tests that want to inspect the IR for ops that depend on
+/// later-Phase-2.2b machinery (e.g. comparing ops emitted before
+/// `print(bool)` is wired up).
+pub(crate) fn emit_module_unverified<'c>(
+    context: &'c Context,
+    chunk: &HirChunk,
+) -> Result<Module<'c>, CodegenError> {
     let loc = Location::unknown(context);
     let module = Module::new(loc);
 
     let i8_type = IntegerType::new(context, 8).into();
     let types = Types {
+        i1: IntegerType::new(context, 1).into(),
         i32: IntegerType::new(context, 32).into(),
         i64: IntegerType::new(context, 64).into(),
         f64: Type::float64(context),
@@ -51,10 +70,6 @@ pub fn emit_module<'c>(context: &'c Context, chunk: &HirChunk) -> Result<Module<
     emit_printf_decl(context, &module, &types, loc);
     emit_libm_decls(context, &module, &types, loc);
     emit_main(context, &module, chunk, &types, loc)?;
-
-    if !module.as_operation().verify() {
-        return Err(CodegenError::VerificationFailed);
-    }
 
     Ok(module)
 }
@@ -280,9 +295,10 @@ fn emit_expr<'a, 'c>(
             );
             Ok(block.append_operation(op).result(0).unwrap().into())
         }
-        HirExprKind::Bool(_) => {
-            // Step 3 stub — i1 emit lands in Step 4.
-            unimplemented!("HirExprKind::Bool codegen — Step 4");
+        HirExprKind::Bool(b) => {
+            let attr = IntegerAttribute::new(types.i1, i64::from(*b));
+            let op = arith::constant(context, attr.into(), loc);
+            Ok(block.append_operation(op).result(0).unwrap().into())
         }
         HirExprKind::Local(LocalId(idx)) => Ok(emit_load(block, slots[*idx], types.f64, loc)),
         HirExprKind::BinOp { op, lhs, rhs } => {
@@ -349,11 +365,30 @@ fn emit_binop<'a, 'c>(
         BinOp::Mod => emit_lua_mod(context, block, lhs, rhs, types, loc),
         BinOp::Pow => emit_libm_pow(context, block, lhs, rhs, types, loc),
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => {
-            // Step 2 stub — comparison codegen lands in Step 4.
-            unimplemented!("comparison operators — Step 4");
+            let predicate = cmpf_predicate(op);
+            block
+                .append_operation(arith::cmpf(context, predicate, lhs, rhs, loc))
+                .result(0)
+                .unwrap()
+                .into()
         }
     };
     Ok(result)
+}
+
+/// Map a comparison [`BinOp`] to its `arith.cmpf` predicate. Always
+/// **ordered** — `NaN <op> x` is `false`, including `NaN == NaN`,
+/// matching IEEE 754 and Lua 5.4 semantics.
+fn cmpf_predicate(op: BinOp) -> CmpfPredicate {
+    match op {
+        BinOp::Lt => CmpfPredicate::Olt,
+        BinOp::Le => CmpfPredicate::Ole,
+        BinOp::Gt => CmpfPredicate::Ogt,
+        BinOp::Ge => CmpfPredicate::Oge,
+        BinOp::Eq => CmpfPredicate::Oeq,
+        BinOp::Ne => CmpfPredicate::One,
+        _ => unreachable!("cmpf_predicate called with non-comparison BinOp"),
+    }
 }
 
 fn emit_unary<'a, 'c>(
@@ -582,6 +617,42 @@ mod tests {
         assert!(
             module.as_operation().verify(),
             "block-shadowing module should verify"
+        );
+    }
+
+    #[test]
+    fn emit_lt_uses_arith_cmpf_olt() {
+        let ctx = new_context();
+        // Use the unverified variant: print(bool) lands in Step 5,
+        // so the module would fail verify until then. We're only
+        // checking the comparison op shape here.
+        let module = emit_module_unverified(&ctx, &lower_src("print(1 < 2)")).unwrap();
+        let mlir = module.as_operation().to_string();
+        assert!(
+            mlir.contains("arith.cmpf olt"),
+            "expected arith.cmpf olt, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_eq_uses_arith_cmpf_oeq() {
+        let ctx = new_context();
+        let module = emit_module_unverified(&ctx, &lower_src("print(1 == 2)")).unwrap();
+        let mlir = module.as_operation().to_string();
+        assert!(
+            mlir.contains("arith.cmpf oeq"),
+            "expected arith.cmpf oeq, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_true_literal_produces_i1_constant() {
+        let ctx = new_context();
+        let module = emit_module_unverified(&ctx, &lower_src("print(true == true)")).unwrap();
+        let mlir = module.as_operation().to_string();
+        assert!(
+            mlir.contains("value = true") && mlir.contains("-> i1"),
+            "expected an i1 `value = true` constant, got:\n{mlir}"
         );
     }
 
