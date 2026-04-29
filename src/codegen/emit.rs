@@ -24,7 +24,9 @@ use melior::{
     utility::register_all_dialects,
 };
 
-use crate::hir::{Builtin, HirChunk, HirExpr, HirExprKind, HirStmt, HirStmtKind, LocalId};
+use crate::hir::{
+    Builtin, HirChunk, HirExpr, HirExprKind, HirStmt, HirStmtKind, LocalId, ValueKind, infer_kind,
+};
 use crate::parser::{BinOp, UnaryOp};
 
 use super::error::CodegenError;
@@ -89,17 +91,32 @@ fn emit_fmt_global<'c>(
     i8_type: Type<'c>,
     loc: Location<'c>,
 ) {
-    let array_type = llvm::r#type::array(i8_type, 4);
+    emit_string_global(context, module, i8_type, "fmt", "%g\n\0", loc);
+    // Phase 2.2b: format and string pool for `print(bool)`.
+    emit_string_global(context, module, i8_type, "fmt_str", "%s\n\0", loc);
+    emit_string_global(context, module, i8_type, "s_true", "true\0", loc);
+    emit_string_global(context, module, i8_type, "s_false", "false\0", loc);
+}
+
+fn emit_string_global<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    i8_type: Type<'c>,
+    name: &str,
+    value: &str,
+    loc: Location<'c>,
+) {
+    let array_type = llvm::r#type::array(i8_type, value.len() as u32);
     let global_op = GlobalOperationBuilder::new(context, loc)
         .initializer(Region::new())
         .global_type(TypeAttribute::new(array_type))
-        .sym_name(StringAttribute::new(context, "fmt"))
+        .sym_name(StringAttribute::new(context, name))
         .linkage(llvm::attributes::linkage(
             context,
             llvm::attributes::Linkage::Internal,
         ))
         .constant(melior::ir::attribute::Attribute::unit(context))
-        .value(StringAttribute::new(context, "%g\n\0").into())
+        .value(StringAttribute::new(context, value).into())
         .build();
     module.body().append_operation(global_op.into());
 }
@@ -312,8 +329,9 @@ fn emit_expr<'a, 'c>(
         }
         HirExprKind::Call { builtin, args } => match builtin {
             Builtin::Print => {
+                let kind = infer_kind(&args[0]);
                 let arg_val = emit_expr(context, block, &args[0], slots, types, loc)?;
-                emit_printf_call(context, block, arg_val, types, loc);
+                emit_print_value(context, block, arg_val, kind, types, loc);
                 Ok(arg_val)
             }
         },
@@ -482,23 +500,80 @@ fn emit_libm_call<'a, 'c>(
     block.append_operation(call_op).result(0).unwrap().into()
 }
 
-fn emit_printf_call<'a, 'c>(
+/// Dispatch print to the right libc path based on the static value
+/// kind of the argument. Numbers go through `printf("%g\n", v)`;
+/// booleans select between `s_true`/`s_false` via `llvm.select` and
+/// print through `printf("%s\n", ptr)`.
+fn emit_print_value<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    value: Value<'c, 'a>,
+    kind: ValueKind,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    match kind {
+        ValueKind::Number => emit_printf_g(context, block, value, types, loc),
+        ValueKind::Bool => emit_print_bool(context, block, value, types, loc),
+    }
+}
+
+fn emit_printf_g<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     value: Value<'c, 'a>,
     types: &Types<'c>,
     loc: Location<'c>,
 ) {
+    let fmt_ptr = emit_addressof(context, block, "fmt", types, loc);
+    emit_printf(context, block, fmt_ptr, value, types, loc);
+}
+
+fn emit_print_bool<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    cond_i1: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let true_ptr = emit_addressof(context, block, "s_true", types, loc);
+    let false_ptr = emit_addressof(context, block, "s_false", types, loc);
+    let select_op = OperationBuilder::new("llvm.select", loc)
+        .add_operands(&[cond_i1, true_ptr, false_ptr])
+        .add_results(&[types.ptr])
+        .build()
+        .expect("llvm.select i1, ptr, ptr");
+    let selected = block.append_operation(select_op).result(0).unwrap().into();
+    let fmt_ptr = emit_addressof(context, block, "fmt_str", types, loc);
+    emit_printf(context, block, fmt_ptr, selected, types, loc);
+}
+
+fn emit_addressof<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    global_name: &str,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
     let addr_op = AddressOfOperationBuilder::new(context, loc)
         .res(types.ptr)
-        .global_name(FlatSymbolRefAttribute::new(context, "fmt"))
+        .global_name(FlatSymbolRefAttribute::new(context, global_name))
         .build();
-    let fmt_ptr = block
+    block
         .append_operation(addr_op.into())
         .result(0)
         .unwrap()
-        .into();
+        .into()
+}
 
+fn emit_printf<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    fmt_ptr: Value<'c, 'a>,
+    value: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
     let call_op = OperationBuilder::new("llvm.call", loc)
         .add_operands(&[fmt_ptr, value])
         .add_attributes(&[
@@ -654,6 +729,34 @@ mod tests {
             mlir.contains("value = true") && mlir.contains("-> i1"),
             "expected an i1 `value = true` constant, got:\n{mlir}"
         );
+    }
+
+    #[test]
+    fn emit_print_true_uses_string_format() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("print(true)"))
+            .expect("print(true) module must verify after Step 5");
+        let mlir = module.as_operation().to_string();
+        assert!(
+            mlir.contains("@s_true") && mlir.contains("@s_false"),
+            "expected string globals @s_true/@s_false, got:\n{mlir}"
+        );
+        assert!(
+            mlir.contains("@fmt_str"),
+            "expected `%s\\n` format global @fmt_str, got:\n{mlir}"
+        );
+        assert!(
+            mlir.contains("llvm.select"),
+            "expected llvm.select to choose between true/false ptrs, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_print_comparison_module_verifies() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("print(2 >= 2)"))
+            .expect("print(comparison) module must verify after Step 5");
+        assert!(module.as_operation().verify());
     }
 
     #[test]

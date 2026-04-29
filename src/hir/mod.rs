@@ -15,10 +15,11 @@ use std::collections::HashMap;
 
 use crate::parser::{BinOp, Chunk, Expr, ExprKind, Stmt, StmtKind};
 
-/// Static value-kind used for the minimal type guard added in Phase
-/// 2.2b. Computed by [`infer_kind`] over a fully lowered HIR expression.
+/// Static value-kind for a fully lowered HIR expression. Used both by
+/// the in-HIR type guard and by codegen to dispatch the `print` path
+/// between number and bool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ValueKind {
+pub enum ValueKind {
     Number,
     Bool,
 }
@@ -32,7 +33,7 @@ impl ValueKind {
     }
 }
 
-fn infer_kind(expr: &HirExpr) -> ValueKind {
+pub fn infer_kind(expr: &HirExpr) -> ValueKind {
     match &expr.kind {
         HirExprKind::Number(_) => ValueKind::Number,
         HirExprKind::Bool(_) => ValueKind::Bool,
