@@ -179,6 +179,11 @@ impl LowerCtx {
                 }
             },
             ExprKind::Bool(b) => HirExprKind::Bool(*b),
+            ExprKind::Nil => {
+                // Step 2 stub — HIR support, per-slot kind tracking, and
+                // the heterogeneous-`==` fold land in Step 3.
+                unimplemented!("ExprKind::Nil — Phase 2.3a Step 3");
+            }
             ExprKind::BinOp { op, lhs, rhs } => {
                 let lhs_hir = self.lower_expr(lhs)?;
                 let rhs_hir = self.lower_expr(rhs)?;

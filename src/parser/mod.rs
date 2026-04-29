@@ -237,6 +237,10 @@ impl<'t> Parser<'t> {
                 self.bump();
                 Ok(Expr::new(ExprKind::Bool(false), tok.span))
             }
+            TokenKind::Keyword(Keyword::Nil) => {
+                self.bump();
+                Ok(Expr::new(ExprKind::Nil, tok.span))
+            }
             TokenKind::LParen => {
                 self.bump();
                 let inner = self.parse_expr(0)?;
@@ -390,6 +394,7 @@ mod tests {
         let kind = match expr.kind {
             ExprKind::Number(v) => ExprKind::Number(v),
             ExprKind::Bool(b) => ExprKind::Bool(b),
+            ExprKind::Nil => ExprKind::Nil,
             ExprKind::Ident(n) => ExprKind::Ident(n),
             ExprKind::Call { callee, args } => ExprKind::Call {
                 callee: Box::new(strip_span_expr(*callee)),
@@ -831,6 +836,23 @@ mod tests {
             ExprKind::Call {
                 callee: Box::new(ident("print")),
                 args: vec![bool_lit(true)],
+            },
+        );
+    }
+
+    #[test]
+    fn parse_nil_literal_yields_nil_expr() {
+        assert_eq!(parse_single_expr("nil").unwrap(), ExprKind::Nil);
+    }
+
+    #[test]
+    fn parse_nil_in_print_call() {
+        let kind = parse_single_expr("print(nil)").expect("must parse");
+        assert_eq!(
+            kind,
+            ExprKind::Call {
+                callee: Box::new(ident("print")),
+                args: vec![Expr::new(ExprKind::Nil, Span::new(0, 0))],
             },
         );
     }

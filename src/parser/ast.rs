@@ -18,6 +18,7 @@ impl Expr {
 pub enum ExprKind {
     Number(f64),
     Bool(bool),
+    Nil,
     Ident(String),
     Call {
         callee: Box<Expr>,
