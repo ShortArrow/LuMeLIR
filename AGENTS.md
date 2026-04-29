@@ -29,8 +29,8 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.2b comparisons + bool literals | **Done** | `<` `<=` `==` `~=` `>` `>=`, `true`/`false`; ordered cmpf, print(bool) (ADR 0010) |
 | ‣ 2.3a nil + per-slot types + heterogeneous == | **Done** | `nil`, `local b = true`, `1 == nil` → false (ADR 0011) |
 | ‣ 2.3b control flow | **Done** | `if`/`elseif`/`else`/`while` via `scf`, truthiness helper (ADR 0012) |
-| ‣ 2.3c short-circuit | Next | `and`/`or`/`not` |
-| ‣ 2.3d for loops | Not started | numeric / generic `for` |
+| ‣ 2.3c short-circuit | **Done** | `and`/`or`/`not` via `scf.if` expression form + `arith.xori` (ADR 0013) |
+| ‣ 2.3d for loops | Next | numeric / generic `for` |
 | ‣ 2.4+ tables / functions | Not started | tables, metatables, functions, `return`, `break` |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |
 
