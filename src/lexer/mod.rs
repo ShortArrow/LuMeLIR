@@ -39,6 +39,33 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
             continue;
         }
 
+        // Two-character punctuation with `=` as the second char.
+        // `=`/`<`/`>`/`~` may form `==`/`<=`/`>=`/`~=`. `~` alone is
+        // reserved for Phase 2.4 bitwise NOT and rejected here.
+        if matches!(ch, '=' | '<' | '>' | '~') {
+            chars.next();
+            let next_eq = matches!(chars.peek(), Some(&(_, '=')));
+            let kind = match (ch, next_eq) {
+                ('=', true) => TokenKind::EqEq,
+                ('=', false) => TokenKind::Equals,
+                ('<', true) => TokenKind::LtEq,
+                ('<', false) => TokenKind::Lt,
+                ('>', true) => TokenKind::GtEq,
+                ('>', false) => TokenKind::Gt,
+                ('~', true) => TokenKind::TildeEq,
+                ('~', false) => return Err(LexError::Unexpected { ch, offset }),
+                _ => unreachable!(),
+            };
+            let end = if next_eq {
+                chars.next();
+                offset + ch.len_utf8() + '='.len_utf8()
+            } else {
+                offset + ch.len_utf8()
+            };
+            tokens.push(Token::new(kind, Span::new(offset, end)));
+            continue;
+        }
+
         let single = match ch {
             '(' => Some(TokenKind::LParen),
             ')' => Some(TokenKind::RParen),
@@ -48,7 +75,6 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
             '/' => Some(TokenKind::Slash),
             '%' => Some(TokenKind::Percent),
             '^' => Some(TokenKind::Caret),
-            '=' => Some(TokenKind::Equals),
             ';' => Some(TokenKind::Semicolon),
             _ => None,
         };
@@ -227,6 +253,42 @@ mod tests {
                 TokenKind::Eof,
             ],
         );
+    }
+
+    #[test]
+    fn lex_double_equals_yields_eqeq_token() {
+        assert_eq!(
+            kinds("=="),
+            vec![TokenKind::EqEq, TokenKind::Eof],
+            "`==` must lex as a single EqEq token, not two `=`",
+        );
+    }
+
+    #[test]
+    fn lex_lt_eq_yields_lteq_and_gt_eq_yields_gteq() {
+        assert_eq!(
+            kinds("<= >="),
+            vec![TokenKind::LtEq, TokenKind::GtEq, TokenKind::Eof],
+        );
+    }
+
+    #[test]
+    fn lex_tilde_eq_yields_tildeeq() {
+        assert_eq!(kinds("~="), vec![TokenKind::TildeEq, TokenKind::Eof],);
+    }
+
+    #[test]
+    fn lex_lt_and_gt_alone_yield_single_tokens() {
+        assert_eq!(
+            kinds("< >"),
+            vec![TokenKind::Lt, TokenKind::Gt, TokenKind::Eof],
+        );
+    }
+
+    #[test]
+    fn lex_tilde_alone_returns_unexpected_error() {
+        let err = lex("~").expect_err("standalone `~` is reserved (bitwise NOT — Phase 2.4)");
+        assert_eq!(err, LexError::Unexpected { ch: '~', offset: 0 });
     }
 
     #[test]

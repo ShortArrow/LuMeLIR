@@ -45,6 +45,12 @@ pub enum TokenKind {
     Percent,
     Caret,
     Equals,
+    EqEq,
+    TildeEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
     Semicolon,
     /// End-of-source sentinel. Always present as the last element of a
     /// successful [`super::lex`] result.
