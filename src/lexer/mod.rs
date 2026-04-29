@@ -256,6 +256,21 @@ mod tests {
     }
 
     #[test]
+    fn lex_control_flow_keywords_yield_keyword_tokens() {
+        assert_eq!(
+            kinds("if then else elseif while"),
+            vec![
+                TokenKind::Keyword(Keyword::If),
+                TokenKind::Keyword(Keyword::Then),
+                TokenKind::Keyword(Keyword::Else),
+                TokenKind::Keyword(Keyword::Elseif),
+                TokenKind::Keyword(Keyword::While),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
     fn lex_nil_keyword_yields_keyword_token() {
         assert_eq!(
             kinds("nil"),
