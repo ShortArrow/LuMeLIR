@@ -41,14 +41,20 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo]) -> ValueKind {
         HirExprKind::Bool(_) => ValueKind::Bool,
         HirExprKind::Nil => ValueKind::Nil,
         HirExprKind::Local(LocalId(idx)) => locals[*idx].kind,
-        HirExprKind::UnaryOp { .. } => ValueKind::Number,
-        HirExprKind::BinOp { op, .. } => match op {
+        HirExprKind::UnaryOp { op, .. } => match op {
+            crate::parser::UnaryOp::Neg => ValueKind::Number,
+            crate::parser::UnaryOp::Not => ValueKind::Bool,
+        },
+        HirExprKind::BinOp { op, lhs, .. } => match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow => {
                 ValueKind::Number
             }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => {
                 ValueKind::Bool
             }
+            // `and`/`or` preserve the operand kind (lower-time guard
+            // ensures both sides share a kind).
+            BinOp::And | BinOp::Or => infer_kind(lhs, locals),
         },
         // print() returns no value in Lua, but our HIR treats it as
         // an expression. It can never appear as an operand to a
@@ -71,6 +77,8 @@ fn binop_symbol(op: BinOp) -> &'static str {
         BinOp::Ge => ">=",
         BinOp::Eq => "==",
         BinOp::Ne => "~=",
+        BinOp::And => "and",
+        BinOp::Or => "or",
     }
 }
 
@@ -303,6 +311,24 @@ impl LowerCtx {
                                 lhs: Box::new(lhs_hir),
                                 rhs: Box::new(rhs_hir),
                             }
+                        }
+                    }
+                    // Logical and/or: both sides must share a kind. Result
+                    // kind matches both. (Heterogeneous defers to dynamic
+                    // typing in a later phase — ADR 0013.)
+                    BinOp::And | BinOp::Or => {
+                        if lk != rk {
+                            return Err(HirError::TypeMismatch {
+                                op: binop_symbol(*op).to_owned(),
+                                lhs_kind: lk.name().to_owned(),
+                                rhs_kind: rk.name().to_owned(),
+                                offset: expr.span.start,
+                            });
+                        }
+                        HirExprKind::BinOp {
+                            op: *op,
+                            lhs: Box::new(lhs_hir),
+                            rhs: Box::new(rhs_hir),
                         }
                     }
                 }
@@ -715,6 +741,50 @@ mod tests {
         let err = lower_src("if 1 then local x = 1 end\nprint(x)")
             .expect_err("inner local must not leak past `end`");
         assert!(matches!(err, HirError::UndefinedName { .. }));
+    }
+
+    #[test]
+    fn lower_not_returns_bool_kind() {
+        // `not 1` → UnaryOp::Not(Number) — kind must be Bool.
+        let hir = lower_src("print(not 1)").expect("must lower");
+        let HirStmtKind::ExprStmt(call) = &hir.stmts[0].kind else {
+            panic!("expected ExprStmt");
+        };
+        let HirExprKind::Call { args, .. } = &call.kind else {
+            panic!("expected Call");
+        };
+        let arg = &args[0];
+        assert_eq!(infer_kind(arg, &hir.locals), ValueKind::Bool);
+    }
+
+    #[test]
+    fn lower_and_with_same_kind_passes() {
+        let hir = lower_src("print(true and false)").expect("must lower");
+        let HirStmtKind::ExprStmt(call) = &hir.stmts[0].kind else {
+            panic!("expected ExprStmt");
+        };
+        let HirExprKind::Call { args, .. } = &call.kind else {
+            panic!("expected Call");
+        };
+        assert!(matches!(
+            args[0].kind,
+            HirExprKind::BinOp {
+                op: crate::parser::BinOp::And,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn lower_and_with_different_kinds_returns_type_mismatch() {
+        let err = lower_src("print(1 and true)").expect_err("heterogeneous and must reject");
+        assert!(matches!(err, HirError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn lower_or_with_different_kinds_returns_type_mismatch() {
+        let err = lower_src("print(nil or 1)").expect_err("heterogeneous or must reject");
+        assert!(matches!(err, HirError::TypeMismatch { .. }));
     }
 
     #[test]

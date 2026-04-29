@@ -370,11 +370,32 @@ fn emit_expr<'a, 'c>(
             Ok(emit_load(block, slots[*idx], slot_ty, loc))
         }
         HirExprKind::BinOp { op, lhs, rhs } => {
+            // `and`/`or` short-circuit — must NOT eagerly evaluate rhs.
+            if matches!(op, BinOp::And | BinOp::Or) {
+                return emit_short_circuit(
+                    context, block, *op, lhs, rhs, slots, locals, types, loc,
+                );
+            }
             let lhs_val = emit_expr(context, block, lhs, slots, locals, types, loc)?;
             let rhs_val = emit_expr(context, block, rhs, slots, locals, types, loc)?;
             emit_binop(context, block, *op, lhs_val, rhs_val, types, loc)
         }
         HirExprKind::UnaryOp { op, operand } => {
+            // `not` accepts any kind: convert operand to truthiness i1
+            // first, then flip with xori. Other unaries (currently `-`)
+            // pass through emit_unary unchanged.
+            if matches!(op, UnaryOp::Not) {
+                let kind = infer_kind(operand, locals);
+                let v = emit_expr(context, block, operand, slots, locals, types, loc)?;
+                let truth = emit_truthiness(context, block, v, kind, types, loc);
+                let one = arith::constant(context, IntegerAttribute::new(types.i1, 1).into(), loc);
+                let one_val: Value<'c, 'a> = block.append_operation(one).result(0).unwrap().into();
+                return Ok(block
+                    .append_operation(arith::xori(truth, one_val, loc))
+                    .result(0)
+                    .unwrap()
+                    .into());
+            }
             let v = emit_expr(context, block, operand, slots, locals, types, loc)?;
             emit_unary(block, *op, v, loc)
         }
@@ -442,6 +463,12 @@ fn emit_binop<'a, 'c>(
                 .unwrap()
                 .into()
         }
+        BinOp::And | BinOp::Or => {
+            // Step 2 stub — short-circuit codegen lands in Step 4.
+            // emit_expr should bypass emit_binop for these via the
+            // emit_short_circuit special case once that exists.
+            unimplemented!("BinOp::And/Or — Phase 2.3c Step 4");
+        }
     };
     Ok(result)
 }
@@ -473,6 +500,15 @@ fn emit_unary<'a, 'c>(
             .result(0)
             .unwrap()
             .into()),
+        UnaryOp::Not => {
+            // Caller (emit_expr) is responsible for converting `operand`
+            // to its truthiness `i1` before reaching here, since `not`
+            // accepts any kind. We then flip the bit with xori.
+            unreachable!(
+                "UnaryOp::Not should be handled in emit_expr where the \
+                 operand kind is available for truthiness conversion"
+            );
+        }
     }
 }
 
@@ -697,6 +733,109 @@ fn emit_truthiness<'a, 'c>(
                 .into()
         }
     }
+}
+
+/// Map a static [`ValueKind`] to the MLIR type used for slots / yields
+/// of values of that kind. Phase 2.3a fixes the layout: Number → f64,
+/// Bool/Nil → i1.
+fn kind_to_mlir_type<'c>(kind: ValueKind, types: &Types<'c>) -> Type<'c> {
+    match kind {
+        ValueKind::Number => types.f64,
+        ValueKind::Bool | ValueKind::Nil => types.i1,
+    }
+}
+
+/// Lower `a and b` / `a or b` as an expression-form `scf.if`.
+///
+/// `a and b`: if `truthy(a)` yield `b`, else yield `a` (Lua: value-
+/// preserving). `a or b` is the dual. The two-arm `scf.if` joins both
+/// values via its result, so RHS is only evaluated when needed.
+///
+/// Same-kind enforcement happens at HIR-time, so `kind_to_mlir_type`
+/// works for both arms.
+#[allow(clippy::too_many_arguments)]
+fn emit_short_circuit<'a, 'c>(
+    context: &'c Context,
+    parent: &'a Block<'c>,
+    op: BinOp,
+    lhs: &HirExpr,
+    rhs: &HirExpr,
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Result<Value<'c, 'a>, CodegenError> {
+    let kind = infer_kind(lhs, locals);
+    let result_ty = kind_to_mlir_type(kind, types);
+
+    let lhs_val = emit_expr(context, parent, lhs, slots, locals, types, loc)?;
+    let cond = emit_truthiness(context, parent, lhs_val, kind, types, loc);
+
+    // For `and`: then = rhs, else = lhs. For `or`: then = lhs, else = rhs.
+    let (then_yield_lhs, else_yield_lhs) = match op {
+        BinOp::And => (false, true),
+        BinOp::Or => (true, false),
+        _ => unreachable!("emit_short_circuit called with non-and/or BinOp"),
+    };
+
+    let then_region = build_yield_region(
+        context,
+        parent,
+        rhs,
+        lhs_val,
+        then_yield_lhs,
+        slots,
+        locals,
+        types,
+        loc,
+    )?;
+    let else_region = build_yield_region(
+        context,
+        parent,
+        rhs,
+        lhs_val,
+        else_yield_lhs,
+        slots,
+        locals,
+        types,
+        loc,
+    )?;
+
+    let if_op = scf::r#if(cond, &[result_ty], then_region, else_region, loc);
+    let result = parent.append_operation(if_op).result(0).unwrap().into();
+    Ok(result)
+}
+
+/// Build a Region with one Block that either yields `lhs_val` directly
+/// (when `yield_lhs == true`) or evaluates `rhs` inside the block and
+/// yields the result.
+#[allow(clippy::too_many_arguments)]
+fn build_yield_region<'a, 'c>(
+    context: &'c Context,
+    _parent: &'a Block<'c>,
+    rhs: &HirExpr,
+    lhs_val: Value<'c, 'a>,
+    yield_lhs: bool,
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Result<Region<'c>, CodegenError> {
+    let region = Region::new();
+    let blk = Block::new(&[]);
+    let blk_slots = transmute_slots(slots);
+    let yielded: Value<'c, '_> = if yield_lhs {
+        // `lhs_val` was produced in the parent block; its lifetime is
+        // tied to the caller's block. Re-borrow at the inner block's
+        // lifetime — sound because the parent block dominates the
+        // scf.if's regions.
+        unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(lhs_val) }
+    } else {
+        emit_expr(context, &blk, rhs, blk_slots, locals, types, loc)?
+    };
+    blk.append_operation(scf::r#yield(&[yielded], loc));
+    region.append_block(blk);
+    Ok(region)
 }
 
 /// Lower an `if/elseif*/else?/end` to a (possibly nested) `scf.if`.
@@ -986,6 +1125,64 @@ mod tests {
         let ctx = new_context();
         let module = emit_module(&ctx, &lower_src("print(2 >= 2)"))
             .expect("print(comparison) module must verify after Step 5");
+        assert!(module.as_operation().verify());
+    }
+
+    #[test]
+    fn emit_not_uses_arith_xori() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("print(not true)")).unwrap();
+        let mlir = module.as_operation().to_string();
+        assert!(
+            mlir.contains("arith.xori"),
+            "expected arith.xori for `not`, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_not_with_number_emits_truthiness_then_xor() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("print(not 1)")).unwrap();
+        let mlir = module.as_operation().to_string();
+        // Number truthiness folds to constant true at compile time;
+        // xori turns that into false.
+        assert!(
+            mlir.contains("arith.xori") && mlir.contains("arith.constant true"),
+            "expected truthiness + xori for `not 1`, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_and_uses_scf_if_with_yield() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("print(true and false)")).unwrap();
+        let mlir = module.as_operation().to_string();
+        // Expression-form scf.if: pretty-prints `-> (i1)` and yields i1.
+        assert!(
+            mlir.contains("scf.if") && mlir.contains("-> (i1)") && mlir.contains("scf.yield"),
+            "expected expression-form scf.if for `and`, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_or_uses_scf_if_with_yield() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("print(false or true)")).unwrap();
+        let mlir = module.as_operation().to_string();
+        assert!(
+            mlir.contains("scf.if") && mlir.contains("-> (i1)") && mlir.contains("scf.yield"),
+            "expected expression-form scf.if for `or`, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_module_with_short_circuit_verifies() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src("if (1 < 2) and (2 < 3) then print(true) end"),
+        )
+        .expect("short-circuit module must verify");
         assert!(module.as_operation().verify());
     }
 

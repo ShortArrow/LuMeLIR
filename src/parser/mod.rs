@@ -272,16 +272,20 @@ impl<'t> Parser<'t> {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
-        if matches!(self.peek().kind, TokenKind::Minus) {
-            let minus_tok = self.bump().clone();
-            // Unary `-` binds tighter than `*`/`/`/`%` but looser than `^`
-            // (Lua 5.4 §3.4.8). Recurse at PREC_UNARY so that `-x ^ 2`
-            // parses as `-(x^2)`.
+        let unary_op = match self.peek().kind {
+            TokenKind::Minus => Some(UnaryOp::Neg),
+            TokenKind::Keyword(Keyword::Not) => Some(UnaryOp::Not),
+            _ => None,
+        };
+        if let Some(op) = unary_op {
+            let op_tok = self.bump().clone();
+            // Unary operators bind at PREC_UNARY (12) — tighter than
+            // `*`/`/`/`%` and `<`/`==`/etc., looser than `^`.
             let operand = self.parse_expr(PREC_UNARY)?;
-            let span = Span::new(minus_tok.span.start, operand.span.end);
+            let span = Span::new(op_tok.span.start, operand.span.end);
             return Ok(Expr::new(
                 ExprKind::UnaryOp {
-                    op: UnaryOp::Neg,
+                    op,
                     operand: Box::new(operand),
                 },
                 span,
@@ -378,7 +382,9 @@ impl<'t> Parser<'t> {
     }
 }
 
-/// Precedence ladder per ADRs 0009 and 0010 (Lua 5.4 §3.4.8 subset).
+/// Precedence ladder per ADRs 0009, 0010, and 0013 (Lua 5.4 §3.4.8 subset).
+const PREC_OR: u8 = 5;
+const PREC_AND: u8 = 6;
 const PREC_CMP: u8 = 8;
 const PREC_ADD: u8 = 10;
 const PREC_MUL: u8 = 11;
@@ -392,6 +398,14 @@ struct InfixInfo {
 
 fn infix_op(kind: &TokenKind) -> Option<InfixInfo> {
     match kind {
+        TokenKind::Keyword(Keyword::Or) => Some(InfixInfo {
+            prec: PREC_OR,
+            right_assoc: false,
+        }),
+        TokenKind::Keyword(Keyword::And) => Some(InfixInfo {
+            prec: PREC_AND,
+            right_assoc: false,
+        }),
         TokenKind::Lt
         | TokenKind::Gt
         | TokenKind::LtEq
@@ -431,6 +445,8 @@ fn binop_from_token(kind: &TokenKind) -> Option<BinOp> {
         TokenKind::GtEq => Some(BinOp::Ge),
         TokenKind::EqEq => Some(BinOp::Eq),
         TokenKind::TildeEq => Some(BinOp::Ne),
+        TokenKind::Keyword(Keyword::And) => Some(BinOp::And),
+        TokenKind::Keyword(Keyword::Or) => Some(BinOp::Or),
         _ => None,
     }
 }
@@ -1025,6 +1041,76 @@ mod tests {
     fn parse_unterminated_if_is_rejected() {
         let err = parse("if 1 then print(1)").expect_err("missing `end` must fail");
         assert!(matches!(err, ParseError::UnexpectedEof { .. }));
+    }
+
+    #[test]
+    fn parse_not_yields_unary_not() {
+        let kind = parse_single_expr("not true").expect("must parse");
+        assert_eq!(
+            kind,
+            ExprKind::UnaryOp {
+                op: UnaryOp::Not,
+                operand: Box::new(bool_lit(true)),
+            },
+        );
+    }
+
+    #[test]
+    fn parse_and_binds_tighter_than_or() {
+        // a or b and c == a or (b and c)
+        let kind = parse_single_expr("true or false and true").expect("must parse");
+        assert_eq!(
+            kind,
+            ExprKind::BinOp {
+                op: BinOp::Or,
+                lhs: Box::new(bool_lit(true)),
+                rhs: Box::new(binop(BinOp::And, bool_lit(false), bool_lit(true))),
+            },
+        );
+    }
+
+    #[test]
+    fn parse_or_lower_prec_than_and() {
+        // a and b or c == (a and b) or c
+        let kind = parse_single_expr("true and false or true").expect("must parse");
+        assert_eq!(
+            kind,
+            ExprKind::BinOp {
+                op: BinOp::Or,
+                lhs: Box::new(binop(BinOp::And, bool_lit(true), bool_lit(false))),
+                rhs: Box::new(bool_lit(true)),
+            },
+        );
+    }
+
+    #[test]
+    fn parse_and_lower_prec_than_comparison() {
+        // 1 < 2 and 3 < 4 == (1<2) and (3<4)
+        let kind = parse_single_expr("1 < 2 and 3 < 4").expect("must parse");
+        assert_eq!(
+            kind,
+            ExprKind::BinOp {
+                op: BinOp::And,
+                lhs: Box::new(binop(BinOp::Lt, number(1.0), number(2.0))),
+                rhs: Box::new(binop(BinOp::Lt, number(3.0), number(4.0))),
+            },
+        );
+    }
+
+    #[test]
+    fn parse_not_with_truthy_subject() {
+        // `not 1 < 2` == `(not 1) < 2`? Actually Lua: `not` is unary at
+        // PREC_UNARY (12), `<` at PREC_CMP (8). So `not 1 < 2` parses
+        // as `(not 1) < 2` (not binds tighter).
+        let kind = parse_single_expr("not 1 < 2").expect("must parse");
+        assert_eq!(
+            kind,
+            ExprKind::BinOp {
+                op: BinOp::Lt,
+                lhs: Box::new(unary(UnaryOp::Not, number(1.0))),
+                rhs: Box::new(number(2.0)),
+            },
+        );
     }
 
     #[test]

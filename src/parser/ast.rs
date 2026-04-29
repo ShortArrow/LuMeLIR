@@ -37,7 +37,8 @@ pub enum ExprKind {
 
 /// Binary operators. Phase 2.2a covers all arithmetic operators
 /// except `//` (floor div, deferred). Phase 2.2b adds the six relational
-/// operators. See ADRs 0009 and 0010.
+/// operators. Phase 2.3c adds the short-circuit logical operators.
+/// See ADRs 0009, 0010, 0013.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add,
@@ -52,12 +53,16 @@ pub enum BinOp {
     Ge,
     Eq,
     Ne,
+    And,
+    Or,
 }
 
 /// Unary prefix operators. Phase 2.2a introduces arithmetic negation.
+/// Phase 2.3c adds logical `not`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
     Neg,
+    Not,
 }
 
 /// A statement. Phase 2.0 introduced `local` declarations and bare
