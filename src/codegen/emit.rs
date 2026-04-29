@@ -97,6 +97,8 @@ fn emit_fmt_global<'c>(
     emit_string_global(context, module, i8_type, "fmt_str", "%s\n\0", loc);
     emit_string_global(context, module, i8_type, "s_true", "true\0", loc);
     emit_string_global(context, module, i8_type, "s_false", "false\0", loc);
+    // Phase 2.3a: nil string for `print(nil)`.
+    emit_string_global(context, module, i8_type, "s_nil", "nil\0", loc);
 }
 
 fn emit_string_global<'c>(
@@ -187,7 +189,7 @@ fn emit_main<'c>(
     let slots: Vec<Value<'c, '_>> = chunk
         .locals
         .iter()
-        .map(|_| emit_alloca_slot(context, &main_block, types, loc))
+        .map(|info| emit_alloca_slot_for_kind(context, &main_block, info.kind, types, loc))
         .collect();
 
     emit_stmts(
@@ -258,12 +260,21 @@ fn emit_stmt<'a, 'c>(
     Ok(())
 }
 
-fn emit_alloca_slot<'a, 'c>(
+fn emit_alloca_slot_for_kind<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
+    kind: ValueKind,
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
+    let elem = match kind {
+        ValueKind::Number => types.f64,
+        // Bool: 1-bit. Nil: nominally 1-bit too — the value is never
+        // observed (heterogeneous `==` and print(nil) both bypass
+        // the slot via static dispatch), but storage is uniform.
+        ValueKind::Bool | ValueKind::Nil => types.i1,
+    };
+
     let one = arith::constant(context, IntegerAttribute::new(types.i32, 1).into(), loc);
     let one_val: Value<'c, 'a> = block.append_operation(one).result(0).unwrap().into();
 
@@ -271,7 +282,7 @@ fn emit_alloca_slot<'a, 'c>(
         .add_operands(&[one_val])
         .add_attributes(&[(
             Identifier::new(context, "elem_type"),
-            TypeAttribute::new(types.f64).into(),
+            TypeAttribute::new(elem).into(),
         )])
         .add_results(&[types.ptr])
         .build()
@@ -337,7 +348,13 @@ fn emit_expr<'a, 'c>(
             let op = arith::constant(context, attr.into(), loc);
             Ok(block.append_operation(op).result(0).unwrap().into())
         }
-        HirExprKind::Local(LocalId(idx)) => Ok(emit_load(block, slots[*idx], types.f64, loc)),
+        HirExprKind::Local(LocalId(idx)) => {
+            let slot_ty = match locals[*idx].kind {
+                ValueKind::Number => types.f64,
+                ValueKind::Bool | ValueKind::Nil => types.i1,
+            };
+            Ok(emit_load(block, slots[*idx], slot_ty, loc))
+        }
         HirExprKind::BinOp { op, lhs, rhs } => {
             let lhs_val = emit_expr(context, block, lhs, slots, locals, types, loc)?;
             let rhs_val = emit_expr(context, block, rhs, slots, locals, types, loc)?;
@@ -536,14 +553,19 @@ fn emit_print_value<'a, 'c>(
     match kind {
         ValueKind::Number => emit_printf_g(context, block, value, types, loc),
         ValueKind::Bool => emit_print_bool(context, block, value, types, loc),
-        ValueKind::Nil => {
-            // Step 3 stub — Step 4 adds the @s_nil global and a
-            // dedicated print path. For now, route through the bool
-            // path so the IR shape is well-formed (the value is
-            // always 0 ≡ "false" temporarily).
-            emit_print_bool(context, block, value, types, loc);
-        }
+        ValueKind::Nil => emit_print_nil(context, block, types, loc),
     }
+}
+
+fn emit_print_nil<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let nil_ptr = emit_addressof(context, block, "s_nil", types, loc);
+    let fmt_ptr = emit_addressof(context, block, "fmt_str", types, loc);
+    emit_printf(context, block, fmt_ptr, nil_ptr, types, loc);
 }
 
 fn emit_printf_g<'a, 'c>(
@@ -785,6 +807,40 @@ mod tests {
         let module = emit_module(&ctx, &lower_src("print(2 >= 2)"))
             .expect("print(comparison) module must verify after Step 5");
         assert!(module.as_operation().verify());
+    }
+
+    #[test]
+    fn emit_local_bool_uses_i1_slot() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("local b = true\nprint(b)"))
+            .expect("local-bool module must verify");
+        let mlir = module.as_operation().to_string();
+        // Expect an i1 alloca, not f64. Pretty-printed shape is
+        // `llvm.alloca %c1 x i1 : (i32) -> !llvm.ptr`.
+        assert!(
+            mlir.contains("llvm.alloca") && mlir.contains("x i1"),
+            "expected i1 alloca slot for bool local, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_local_nil_module_verifies() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("local n = nil\nprint(n)"))
+            .expect("local-nil module must verify");
+        assert!(module.as_operation().verify());
+    }
+
+    #[test]
+    fn emit_print_nil_uses_s_nil_global() {
+        let ctx = new_context();
+        let module =
+            emit_module(&ctx, &lower_src("print(nil)")).expect("print(nil) module must verify");
+        let mlir = module.as_operation().to_string();
+        assert!(
+            mlir.contains("@s_nil"),
+            "expected @s_nil string global, got:\n{mlir}"
+        );
     }
 
     #[test]
