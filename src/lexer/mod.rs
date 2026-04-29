@@ -256,6 +256,19 @@ mod tests {
     }
 
     #[test]
+    fn lex_logical_keywords_yield_keyword_tokens() {
+        assert_eq!(
+            kinds("and or not"),
+            vec![
+                TokenKind::Keyword(Keyword::And),
+                TokenKind::Keyword(Keyword::Or),
+                TokenKind::Keyword(Keyword::Not),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
     fn lex_control_flow_keywords_yield_keyword_tokens() {
         assert_eq!(
             kinds("if then else elseif while"),
