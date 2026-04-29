@@ -9,7 +9,7 @@
 mod ast;
 mod error;
 
-pub use ast::{BinOp, Chunk, Expr, ExprKind, Stmt, StmtKind};
+pub use ast::{BinOp, Chunk, Expr, ExprKind, Stmt, StmtKind, UnaryOp};
 pub use error::ParseError;
 
 use crate::lexer::{self, Keyword, Span, Token, TokenKind};
@@ -170,17 +170,21 @@ impl<'t> Parser<'t> {
     }
 
     fn parse_expr(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_primary()?;
+        let mut lhs = self.parse_unary()?;
         lhs = self.parse_call_suffix(lhs)?;
 
-        while let Some(prec) = infix_precedence(&self.peek().kind) {
-            if prec < min_prec {
+        while let Some(info) = infix_op(&self.peek().kind) {
+            if info.prec < min_prec {
                 break;
             }
             let op_tok = self.bump();
-            let op = binop_from_token(&op_tok.kind)
-                .expect("infix_precedence guarantees a known operator");
-            let rhs = self.parse_expr(prec + 1)?;
+            let op = binop_from_token(&op_tok.kind).expect("infix_op guarantees a known operator");
+            let next_min = if info.right_assoc {
+                info.prec
+            } else {
+                info.prec + 1
+            };
+            let rhs = self.parse_expr(next_min)?;
             let span = Span::new(lhs.span.start, rhs.span.end);
             lhs = Expr::new(
                 ExprKind::BinOp {
@@ -193,6 +197,25 @@ impl<'t> Parser<'t> {
         }
 
         Ok(lhs)
+    }
+
+    fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        if matches!(self.peek().kind, TokenKind::Minus) {
+            let minus_tok = self.bump().clone();
+            // Unary `-` binds tighter than `*`/`/`/`%` but looser than `^`
+            // (Lua 5.4 §3.4.8). Recurse at PREC_UNARY so that `-x ^ 2`
+            // parses as `-(x^2)`.
+            let operand = self.parse_expr(PREC_UNARY)?;
+            let span = Span::new(minus_tok.span.start, operand.span.end);
+            return Ok(Expr::new(
+                ExprKind::UnaryOp {
+                    op: UnaryOp::Neg,
+                    operand: Box::new(operand),
+                },
+                span,
+            ));
+        }
+        self.parse_primary()
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
@@ -271,9 +294,31 @@ impl<'t> Parser<'t> {
     }
 }
 
-fn infix_precedence(kind: &TokenKind) -> Option<u8> {
+/// Precedence ladder per ADR 0009 §2 (Lua 5.4 §3.4.8 subset).
+const PREC_ADD: u8 = 10;
+const PREC_MUL: u8 = 11;
+const PREC_UNARY: u8 = 12;
+const PREC_POW: u8 = 13;
+
+struct InfixInfo {
+    prec: u8,
+    right_assoc: bool,
+}
+
+fn infix_op(kind: &TokenKind) -> Option<InfixInfo> {
     match kind {
-        TokenKind::Plus => Some(10),
+        TokenKind::Plus | TokenKind::Minus => Some(InfixInfo {
+            prec: PREC_ADD,
+            right_assoc: false,
+        }),
+        TokenKind::Star | TokenKind::Slash | TokenKind::Percent => Some(InfixInfo {
+            prec: PREC_MUL,
+            right_assoc: false,
+        }),
+        TokenKind::Caret => Some(InfixInfo {
+            prec: PREC_POW,
+            right_assoc: true,
+        }),
         _ => None,
     }
 }
@@ -281,6 +326,11 @@ fn infix_precedence(kind: &TokenKind) -> Option<u8> {
 fn binop_from_token(kind: &TokenKind) -> Option<BinOp> {
     match kind {
         TokenKind::Plus => Some(BinOp::Add),
+        TokenKind::Minus => Some(BinOp::Sub),
+        TokenKind::Star => Some(BinOp::Mul),
+        TokenKind::Slash => Some(BinOp::Div),
+        TokenKind::Percent => Some(BinOp::Mod),
+        TokenKind::Caret => Some(BinOp::Pow),
         _ => None,
     }
 }
@@ -324,6 +374,10 @@ mod tests {
                 op,
                 lhs: Box::new(strip_span_expr(*lhs)),
                 rhs: Box::new(strip_span_expr(*rhs)),
+            },
+            ExprKind::UnaryOp { op, operand } => ExprKind::UnaryOp {
+                op,
+                operand: Box::new(strip_span_expr(*operand)),
             },
         };
         Expr::new(kind, Span::new(0, 0))
@@ -573,6 +627,121 @@ mod tests {
         };
         assert_eq!(inner.len(), 1);
         assert!(matches!(inner[0].kind, StmtKind::ExprStmt(_)));
+    }
+
+    fn binop(op: BinOp, lhs: Expr, rhs: Expr) -> Expr {
+        Expr::new(
+            ExprKind::BinOp {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            },
+            Span::new(0, 0),
+        )
+    }
+
+    fn unary(op: UnaryOp, operand: Expr) -> Expr {
+        Expr::new(
+            ExprKind::UnaryOp {
+                op,
+                operand: Box::new(operand),
+            },
+            Span::new(0, 0),
+        )
+    }
+
+    #[test]
+    fn parse_subtraction_yields_sub_binop() {
+        let kind = parse_single_expr("3 - 1").expect("subtraction must parse");
+        assert_eq!(
+            kind,
+            ExprKind::BinOp {
+                op: BinOp::Sub,
+                lhs: Box::new(number(3.0)),
+                rhs: Box::new(number(1.0)),
+            },
+        );
+    }
+
+    #[test]
+    fn parse_multiplication_binds_tighter_than_addition() {
+        // 1 + 2 * 3 == 1 + (2 * 3)
+        let kind = parse_single_expr("1 + 2 * 3").expect("must parse");
+        assert_eq!(
+            kind,
+            ExprKind::BinOp {
+                op: BinOp::Add,
+                lhs: Box::new(number(1.0)),
+                rhs: Box::new(binop(BinOp::Mul, number(2.0), number(3.0))),
+            },
+        );
+    }
+
+    #[test]
+    fn parse_division_and_modulo_share_mul_precedence() {
+        // 6 / 2 % 3 == (6 / 2) % 3 (left-assoc within the same level)
+        let kind = parse_single_expr("6 / 2 % 3").expect("must parse");
+        assert_eq!(
+            kind,
+            ExprKind::BinOp {
+                op: BinOp::Mod,
+                lhs: Box::new(binop(BinOp::Div, number(6.0), number(2.0))),
+                rhs: Box::new(number(3.0)),
+            },
+        );
+    }
+
+    #[test]
+    fn parse_caret_is_right_associative() {
+        // 2 ^ 3 ^ 2 == 2 ^ (3 ^ 2)
+        let kind = parse_single_expr("2 ^ 3 ^ 2").expect("must parse");
+        assert_eq!(
+            kind,
+            ExprKind::BinOp {
+                op: BinOp::Pow,
+                lhs: Box::new(number(2.0)),
+                rhs: Box::new(binop(BinOp::Pow, number(3.0), number(2.0))),
+            },
+        );
+    }
+
+    #[test]
+    fn parse_unary_minus_yields_unary_neg() {
+        let kind = parse_single_expr("-5").expect("must parse");
+        assert_eq!(
+            kind,
+            ExprKind::UnaryOp {
+                op: UnaryOp::Neg,
+                operand: Box::new(number(5.0)),
+            },
+        );
+    }
+
+    #[test]
+    fn parse_unary_minus_binds_looser_than_caret() {
+        // -x^2 == -(x^2)
+        let kind = parse_single_expr("-2 ^ 3").expect("must parse");
+        assert_eq!(
+            kind,
+            ExprKind::UnaryOp {
+                op: UnaryOp::Neg,
+                operand: Box::new(binop(BinOp::Pow, number(2.0), number(3.0))),
+            },
+        );
+    }
+
+    #[test]
+    fn parse_unary_minus_binds_tighter_than_mul() {
+        // -2 * 3 == (-2) * 3
+        let kind = parse_single_expr("-2 * 3").expect("must parse");
+        assert_eq!(
+            kind,
+            ExprKind::BinOp {
+                op: BinOp::Mul,
+                lhs: Box::new(unary(UnaryOp::Neg, number(2.0))),
+                rhs: Box::new(number(3.0)),
+            },
+        );
     }
 
     #[test]

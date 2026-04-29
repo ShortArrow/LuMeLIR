@@ -39,6 +39,11 @@ pub enum TokenKind {
     LParen,
     RParen,
     Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    Caret,
     Equals,
     Semicolon,
     /// End-of-source sentinel. Always present as the last element of a

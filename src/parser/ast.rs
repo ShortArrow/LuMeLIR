@@ -27,13 +27,28 @@ pub enum ExprKind {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
+    UnaryOp {
+        op: UnaryOp,
+        operand: Box<Expr>,
+    },
 }
 
-/// Binary operators. Phase 1 has addition only; more will join it as the
-/// grammar grows (see ADR 0004).
+/// Binary operators. Phase 2.2a covers all arithmetic operators
+/// except `//` (floor div, deferred). See ADR 0009.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Pow,
+}
+
+/// Unary prefix operators. Phase 2.2a introduces arithmetic negation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Neg,
 }
 
 /// A statement. Phase 2.0 introduced `local` declarations and bare

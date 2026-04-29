@@ -43,6 +43,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
             '(' => Some(TokenKind::LParen),
             ')' => Some(TokenKind::RParen),
             '+' => Some(TokenKind::Plus),
+            '-' => Some(TokenKind::Minus),
+            '*' => Some(TokenKind::Star),
+            '/' => Some(TokenKind::Slash),
+            '%' => Some(TokenKind::Percent),
+            '^' => Some(TokenKind::Caret),
             '=' => Some(TokenKind::Equals),
             ';' => Some(TokenKind::Semicolon),
             _ => None,
@@ -219,6 +224,21 @@ mod tests {
             vec![
                 TokenKind::Keyword(Keyword::Do),
                 TokenKind::Keyword(Keyword::End),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn lex_arithmetic_punctuation_yields_individual_tokens() {
+        assert_eq!(
+            kinds("- * / % ^"),
+            vec![
+                TokenKind::Minus,
+                TokenKind::Star,
+                TokenKind::Slash,
+                TokenKind::Percent,
+                TokenKind::Caret,
                 TokenKind::Eof,
             ],
         );

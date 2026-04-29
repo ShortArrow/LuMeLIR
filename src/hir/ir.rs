@@ -1,5 +1,5 @@
 use crate::lexer::Span;
-use crate::parser::BinOp;
+use crate::parser::{BinOp, UnaryOp};
 
 /// Index into [`HirChunk::locals`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -46,6 +46,10 @@ pub enum HirExprKind {
         op: BinOp,
         lhs: Box<HirExpr>,
         rhs: Box<HirExpr>,
+    },
+    UnaryOp {
+        op: UnaryOp,
+        operand: Box<HirExpr>,
     },
     Call {
         builtin: Builtin,

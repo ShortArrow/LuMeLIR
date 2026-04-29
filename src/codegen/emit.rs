@@ -23,7 +23,7 @@ use melior::{
 };
 
 use crate::hir::{Builtin, HirChunk, HirExpr, HirExprKind, HirStmt, HirStmtKind, LocalId};
-use crate::parser::BinOp;
+use crate::parser::{BinOp, UnaryOp};
 
 use super::error::CodegenError;
 
@@ -49,6 +49,7 @@ pub fn emit_module<'c>(context: &'c Context, chunk: &HirChunk) -> Result<Module<
 
     emit_fmt_global(context, &module, i8_type, loc);
     emit_printf_decl(context, &module, &types, loc);
+    emit_libm_decls(context, &module, &types, loc);
     emit_main(context, &module, chunk, &types, loc)?;
 
     if !module.as_operation().verify() {
@@ -105,6 +106,39 @@ fn emit_printf_decl<'c>(
         ))
         .build();
     module.body().append_operation(printf_op.into());
+}
+
+fn emit_libm_decls<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    // pow(f64, f64) -> f64
+    let pow_ty = llvm::r#type::function(types.f64, &[types.f64, types.f64], false);
+    let pow_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "pow"))
+        .function_type(TypeAttribute::new(pow_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(pow_op.into());
+
+    // floor(f64) -> f64
+    let floor_ty = llvm::r#type::function(types.f64, &[types.f64], false);
+    let floor_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "floor"))
+        .function_type(TypeAttribute::new(floor_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(floor_op.into());
 }
 
 fn emit_main<'c>(
@@ -250,7 +284,11 @@ fn emit_expr<'a, 'c>(
         HirExprKind::BinOp { op, lhs, rhs } => {
             let lhs_val = emit_expr(context, block, lhs, slots, types, loc)?;
             let rhs_val = emit_expr(context, block, rhs, slots, types, loc)?;
-            emit_binop(block, *op, lhs_val, rhs_val, loc)
+            emit_binop(context, block, *op, lhs_val, rhs_val, types, loc)
+        }
+        HirExprKind::UnaryOp { op, operand } => {
+            let v = emit_expr(context, block, operand, slots, types, loc)?;
+            emit_unary(block, *op, v, loc)
         }
         HirExprKind::Call { builtin, args } => match builtin {
             Builtin::Print => {
@@ -275,18 +313,130 @@ fn emit_expr_stmt<'a, 'c>(
 }
 
 fn emit_binop<'a, 'c>(
+    context: &'c Context,
     block: &'a Block<'c>,
     op: BinOp,
     lhs: Value<'c, 'a>,
     rhs: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Result<Value<'c, 'a>, CodegenError> {
+    let result = match op {
+        BinOp::Add => block
+            .append_operation(arith::addf(lhs, rhs, loc))
+            .result(0)
+            .unwrap()
+            .into(),
+        BinOp::Sub => block
+            .append_operation(arith::subf(lhs, rhs, loc))
+            .result(0)
+            .unwrap()
+            .into(),
+        BinOp::Mul => block
+            .append_operation(arith::mulf(lhs, rhs, loc))
+            .result(0)
+            .unwrap()
+            .into(),
+        BinOp::Div => block
+            .append_operation(arith::divf(lhs, rhs, loc))
+            .result(0)
+            .unwrap()
+            .into(),
+        BinOp::Mod => emit_lua_mod(context, block, lhs, rhs, types, loc),
+        BinOp::Pow => emit_libm_pow(context, block, lhs, rhs, types, loc),
+    };
+    Ok(result)
+}
+
+fn emit_unary<'a, 'c>(
+    block: &'a Block<'c>,
+    op: UnaryOp,
+    operand: Value<'c, 'a>,
     loc: Location<'c>,
 ) -> Result<Value<'c, 'a>, CodegenError> {
     match op {
-        BinOp::Add => {
-            let add_op = arith::addf(lhs, rhs, loc);
-            Ok(block.append_operation(add_op).result(0).unwrap().into())
-        }
+        UnaryOp::Neg => Ok(block
+            .append_operation(arith::negf(operand, loc))
+            .result(0)
+            .unwrap()
+            .into()),
     }
+}
+
+/// `a % b` per Lua 5.4: floor modulo, sign follows divisor.
+/// `a - floor(a/b) * b`
+fn emit_lua_mod<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    lhs: Value<'c, 'a>,
+    rhs: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let div = block
+        .append_operation(arith::divf(lhs, rhs, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let floored = emit_libm_call(context, block, "floor", &[div], types, loc);
+    let scaled = block
+        .append_operation(arith::mulf(floored, rhs, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    block
+        .append_operation(arith::subf(lhs, scaled, loc))
+        .result(0)
+        .unwrap()
+        .into()
+}
+
+fn emit_libm_pow<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    base: Value<'c, 'a>,
+    exp: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    emit_libm_call(context, block, "pow", &[base, exp], types, loc)
+}
+
+/// Emit `llvm.call @<name>(args) : (f64, ...) -> f64`. The extern decl
+/// must already exist in the module (see [`emit_libm_decls`]).
+///
+/// `var_callee_type` is omitted for non-variadic callees — the call-site
+/// type is recovered from the symbol declaration. (printf needs it
+/// because it *is* variadic.)
+fn emit_libm_call<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    name: &str,
+    args: &[Value<'c, 'a>],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let n = i32::try_from(args.len()).expect("libm arity fits in i32");
+    let call_op = OperationBuilder::new("llvm.call", loc)
+        .add_operands(args)
+        .add_attributes(&[
+            (
+                Identifier::new(context, "callee"),
+                FlatSymbolRefAttribute::new(context, name).into(),
+            ),
+            (
+                Identifier::new(context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(context, &[n, 0]).into(),
+            ),
+            (
+                Identifier::new(context, "op_bundle_sizes"),
+                DenseI32ArrayAttribute::new(context, &[]).into(),
+            ),
+        ])
+        .add_results(&[types.f64])
+        .build()
+        .unwrap_or_else(|_| panic!("llvm.call @{name}"));
+    block.append_operation(call_op).result(0).unwrap().into()
 }
 
 fn emit_printf_call<'a, 'c>(
@@ -425,6 +575,55 @@ mod tests {
             module.as_operation().verify(),
             "block-shadowing module should verify"
         );
+    }
+
+    #[test]
+    fn emit_subtraction_uses_arith_subf() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("print(3 - 1)")).unwrap();
+        assert!(module.as_operation().verify());
+        assert!(module.as_operation().to_string().contains("arith.subf"));
+    }
+
+    #[test]
+    fn emit_multiplication_uses_arith_mulf() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("print(2 * 3)")).unwrap();
+        assert!(module.as_operation().verify());
+        assert!(module.as_operation().to_string().contains("arith.mulf"));
+    }
+
+    #[test]
+    fn emit_division_uses_arith_divf() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("print(8 / 2)")).unwrap();
+        assert!(module.as_operation().verify());
+        assert!(module.as_operation().to_string().contains("arith.divf"));
+    }
+
+    #[test]
+    fn emit_pow_calls_libm_pow() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("print(2 ^ 10)")).unwrap();
+        assert!(module.as_operation().verify());
+        assert!(module.as_operation().to_string().contains("llvm.call @pow"));
+    }
+
+    #[test]
+    fn emit_modulo_uses_floor_for_lua_semantics() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("print(5 % 3)")).unwrap();
+        assert!(module.as_operation().verify());
+        let mlir = module.as_operation().to_string();
+        assert!(mlir.contains("llvm.call @floor"), "got:\n{mlir}");
+    }
+
+    #[test]
+    fn emit_unary_minus_uses_arith_negf() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("print(-5)")).unwrap();
+        assert!(module.as_operation().verify());
+        assert!(module.as_operation().to_string().contains("arith.negf"));
     }
 
     #[test]

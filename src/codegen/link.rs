@@ -49,7 +49,7 @@ fn link_object(obj_path: &Path, output: &Path) -> Result<(), CodegenError> {
         .arg(obj_path)
         .args(["-o"])
         .arg(output)
-        .arg("-lc")
+        .args(["-lc", "-lm"])
         .status()
         .map_err(|e| CodegenError::LinkFailed(format!("failed to spawn cc: {e}")))?;
 

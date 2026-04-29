@@ -126,6 +126,10 @@ impl LowerCtx {
                 lhs: Box::new(self.lower_expr(lhs)?),
                 rhs: Box::new(self.lower_expr(rhs)?),
             },
+            ExprKind::UnaryOp { op, operand } => HirExprKind::UnaryOp {
+                op: *op,
+                operand: Box::new(self.lower_expr(operand)?),
+            },
             ExprKind::Call { callee, args } => self.lower_call(callee, args, expr)?,
         };
         Ok(HirExpr {
@@ -317,6 +321,38 @@ mod tests {
     fn lower_print_arity_mismatch_errors() {
         let err = lower_src("print()").expect_err("print arity must match");
         assert!(matches!(err, HirError::ArityMismatch { .. }));
+    }
+
+    #[test]
+    fn lower_unary_minus_preserves_op() {
+        let hir = lower_src("print(-1)").expect("must lower");
+        let HirStmtKind::ExprStmt(call) = &hir.stmts[0].kind else {
+            panic!("expected ExprStmt");
+        };
+        let HirExprKind::Call { args, .. } = &call.kind else {
+            panic!("expected Call");
+        };
+        assert!(matches!(
+            args[0].kind,
+            HirExprKind::UnaryOp {
+                op: crate::parser::UnaryOp::Neg,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn lower_all_arith_ops_pass_through() {
+        // Smoke test: each new op survives lowering with its identity.
+        for src in [
+            "print(1 - 2)",
+            "print(1 * 2)",
+            "print(1 / 2)",
+            "print(1 % 2)",
+            "print(1 ^ 2)",
+        ] {
+            assert!(lower_src(src).is_ok(), "{src} must lower");
+        }
     }
 
     #[test]
