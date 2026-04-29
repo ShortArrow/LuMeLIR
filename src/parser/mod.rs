@@ -229,6 +229,14 @@ impl<'t> Parser<'t> {
                 self.bump();
                 Ok(Expr::new(ExprKind::Ident(name.clone()), tok.span))
             }
+            TokenKind::Keyword(Keyword::True) => {
+                self.bump();
+                Ok(Expr::new(ExprKind::Bool(true), tok.span))
+            }
+            TokenKind::Keyword(Keyword::False) => {
+                self.bump();
+                Ok(Expr::new(ExprKind::Bool(false), tok.span))
+            }
             TokenKind::LParen => {
                 self.bump();
                 let inner = self.parse_expr(0)?;
@@ -294,7 +302,8 @@ impl<'t> Parser<'t> {
     }
 }
 
-/// Precedence ladder per ADR 0009 §2 (Lua 5.4 §3.4.8 subset).
+/// Precedence ladder per ADRs 0009 and 0010 (Lua 5.4 §3.4.8 subset).
+const PREC_CMP: u8 = 8;
 const PREC_ADD: u8 = 10;
 const PREC_MUL: u8 = 11;
 const PREC_UNARY: u8 = 12;
@@ -307,6 +316,15 @@ struct InfixInfo {
 
 fn infix_op(kind: &TokenKind) -> Option<InfixInfo> {
     match kind {
+        TokenKind::Lt
+        | TokenKind::Gt
+        | TokenKind::LtEq
+        | TokenKind::GtEq
+        | TokenKind::EqEq
+        | TokenKind::TildeEq => Some(InfixInfo {
+            prec: PREC_CMP,
+            right_assoc: false,
+        }),
         TokenKind::Plus | TokenKind::Minus => Some(InfixInfo {
             prec: PREC_ADD,
             right_assoc: false,
@@ -331,6 +349,12 @@ fn binop_from_token(kind: &TokenKind) -> Option<BinOp> {
         TokenKind::Slash => Some(BinOp::Div),
         TokenKind::Percent => Some(BinOp::Mod),
         TokenKind::Caret => Some(BinOp::Pow),
+        TokenKind::Lt => Some(BinOp::Lt),
+        TokenKind::LtEq => Some(BinOp::Le),
+        TokenKind::Gt => Some(BinOp::Gt),
+        TokenKind::GtEq => Some(BinOp::Ge),
+        TokenKind::EqEq => Some(BinOp::Eq),
+        TokenKind::TildeEq => Some(BinOp::Ne),
         _ => None,
     }
 }
@@ -365,6 +389,7 @@ mod tests {
     fn strip_span_expr(expr: Expr) -> Expr {
         let kind = match expr.kind {
             ExprKind::Number(v) => ExprKind::Number(v),
+            ExprKind::Bool(b) => ExprKind::Bool(b),
             ExprKind::Ident(n) => ExprKind::Ident(n),
             ExprKind::Call { callee, args } => ExprKind::Call {
                 callee: Box::new(strip_span_expr(*callee)),
@@ -740,6 +765,72 @@ mod tests {
                 op: BinOp::Mul,
                 lhs: Box::new(unary(UnaryOp::Neg, number(2.0))),
                 rhs: Box::new(number(3.0)),
+            },
+        );
+    }
+
+    fn bool_lit(b: bool) -> Expr {
+        Expr::new(ExprKind::Bool(b), Span::new(0, 0))
+    }
+
+    #[test]
+    fn parse_true_literal_yields_bool_expr() {
+        assert_eq!(parse_single_expr("true").unwrap(), ExprKind::Bool(true));
+    }
+
+    #[test]
+    fn parse_false_literal_yields_bool_expr() {
+        assert_eq!(parse_single_expr("false").unwrap(), ExprKind::Bool(false));
+    }
+
+    #[test]
+    fn parse_lt_yields_lt_binop() {
+        let kind = parse_single_expr("1 < 2").expect("must parse");
+        assert_eq!(
+            kind,
+            ExprKind::BinOp {
+                op: BinOp::Lt,
+                lhs: Box::new(number(1.0)),
+                rhs: Box::new(number(2.0)),
+            },
+        );
+    }
+
+    #[test]
+    fn parse_eq_eq_yields_eq_binop() {
+        let kind = parse_single_expr("1 == 1").expect("must parse");
+        assert_eq!(
+            kind,
+            ExprKind::BinOp {
+                op: BinOp::Eq,
+                lhs: Box::new(number(1.0)),
+                rhs: Box::new(number(1.0)),
+            },
+        );
+    }
+
+    #[test]
+    fn parse_comparison_lower_prec_than_addition() {
+        // 1 + 2 < 3 * 4  ==  (1 + 2) < (3 * 4)
+        let kind = parse_single_expr("1 + 2 < 3 * 4").expect("must parse");
+        assert_eq!(
+            kind,
+            ExprKind::BinOp {
+                op: BinOp::Lt,
+                lhs: Box::new(binop(BinOp::Add, number(1.0), number(2.0))),
+                rhs: Box::new(binop(BinOp::Mul, number(3.0), number(4.0))),
+            },
+        );
+    }
+
+    #[test]
+    fn parse_bool_expr_in_print_call() {
+        let kind = parse_single_expr("print(true)").expect("must parse");
+        assert_eq!(
+            kind,
+            ExprKind::Call {
+                callee: Box::new(ident("print")),
+                args: vec![bool_lit(true)],
             },
         );
     }

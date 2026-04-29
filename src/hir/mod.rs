@@ -121,6 +121,12 @@ impl LowerCtx {
                     });
                 }
             },
+            ExprKind::Bool(_) => {
+                // Step 2 stub — proper Bool support and type guards land
+                // in Step 3 (HIR) and Step 4 (codegen). Tests that
+                // exercise this path are added in those steps.
+                unimplemented!("HirExprKind::Bool — Step 3");
+            }
             ExprKind::BinOp { op, lhs, rhs } => HirExprKind::BinOp {
                 op: *op,
                 lhs: Box::new(self.lower_expr(lhs)?),

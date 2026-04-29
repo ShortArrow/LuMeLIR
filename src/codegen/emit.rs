@@ -344,6 +344,10 @@ fn emit_binop<'a, 'c>(
             .into(),
         BinOp::Mod => emit_lua_mod(context, block, lhs, rhs, types, loc),
         BinOp::Pow => emit_libm_pow(context, block, lhs, rhs, types, loc),
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => {
+            // Step 2 stub — comparison codegen lands in Step 4.
+            unimplemented!("comparison operators — Step 4");
+        }
     };
     Ok(result)
 }

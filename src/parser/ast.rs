@@ -17,6 +17,7 @@ impl Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
     Number(f64),
+    Bool(bool),
     Ident(String),
     Call {
         callee: Box<Expr>,
@@ -34,7 +35,8 @@ pub enum ExprKind {
 }
 
 /// Binary operators. Phase 2.2a covers all arithmetic operators
-/// except `//` (floor div, deferred). See ADR 0009.
+/// except `//` (floor div, deferred). Phase 2.2b adds the six relational
+/// operators. See ADRs 0009 and 0010.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add,
@@ -43,6 +45,12 @@ pub enum BinOp {
     Div,
     Mod,
     Pow,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
 }
 
 /// Unary prefix operators. Phase 2.2a introduces arithmetic negation.
