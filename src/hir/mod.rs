@@ -14,7 +14,7 @@ pub use ir::{Builtin, HirChunk, HirExpr, HirExprKind, HirStmt, HirStmtKind, Loca
 use std::collections::{HashMap, HashSet};
 
 use crate::lexer::Span;
-use crate::parser::{BinOp, Chunk, Expr, ExprKind, Stmt, StmtKind};
+use crate::parser::{BinOp, Chunk, Expr, ExprKind, Stmt, StmtKind, UnaryOp};
 
 /// Static value-kind for a fully lowered HIR expression. Used by the
 /// in-HIR type guard, the heterogeneous-`==` fold, and by codegen to
@@ -64,6 +64,58 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo]) -> ValueKind {
     }
 }
 
+/// True iff `stmts` contains a `break` reachable from this loop's body —
+/// i.e. without crossing a nested loop boundary. Used by
+/// `lower_stmt(While|ForNumeric)` to decide whether to allocate a
+/// `_broken` flag (ADR 0015).
+fn body_contains_break(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_contains_break)
+}
+
+fn stmt_contains_break(s: &Stmt) -> bool {
+    match &s.kind {
+        StmtKind::Break => true,
+        StmtKind::If {
+            then_body,
+            elifs,
+            else_body,
+            ..
+        } => {
+            body_contains_break(then_body)
+                || elifs.iter().any(|(_, b)| body_contains_break(b))
+                || else_body.as_ref().is_some_and(|b| body_contains_break(b))
+        }
+        StmtKind::Block(b) => body_contains_break(b),
+        // Nested loops have their own break scope — their breaks do
+        // not escape to this loop.
+        StmtKind::While { .. } | StmtKind::ForNumeric { .. } => false,
+        _ => false,
+    }
+}
+
+fn wrap_with_broken_guard(stmt: HirStmt, broken_id: LocalId) -> HirStmt {
+    let span = stmt.span;
+    let cond = HirExpr {
+        kind: HirExprKind::UnaryOp {
+            op: UnaryOp::Not,
+            operand: Box::new(HirExpr {
+                kind: HirExprKind::Local(broken_id),
+                span,
+            }),
+        },
+        span,
+    };
+    HirStmt {
+        kind: HirStmtKind::If {
+            cond,
+            then_body: vec![stmt],
+            elifs: vec![],
+            else_body: None,
+        },
+        span,
+    }
+}
+
 fn binop_symbol(op: BinOp) -> &'static str {
     match op {
         BinOp::Add => "+",
@@ -102,6 +154,13 @@ struct LowerCtx {
     /// Locals that cannot be reassigned with `=` — currently only
     /// numeric `for` loop variables (Lua 5.4 §3.3.5). See ADR 0014.
     readonly_locals: HashSet<LocalId>,
+    /// Stack of optional `_broken` flag locals, one entry per active
+    /// loop. Top is the innermost loop. A loop without `break` in its
+    /// body pushes `None` — body statements then lower without the
+    /// guard wrap, but `break` inside such a body would error
+    /// (impossible because we only push `None` when there is no
+    /// `break` to target it). See ADR 0015.
+    loop_break_targets: Vec<Option<LocalId>>,
 }
 
 impl LowerCtx {
@@ -110,6 +169,7 @@ impl LowerCtx {
             locals: Vec::new(),
             scopes: vec![HashMap::new()],
             readonly_locals: HashSet::new(),
+            loop_break_targets: Vec::new(),
         }
     }
 
@@ -123,11 +183,37 @@ impl LowerCtx {
 
     /// Lower a body with a fresh lexical scope pushed/popped around it.
     /// Used for `do/end`, `if`/`elseif`/`else` bodies, and `while` bodies.
+    /// When the innermost active loop has a break flag, every body
+    /// statement is wrapped in `if not load(_broken) then ... end` so
+    /// post-`break` code is skipped at runtime (ADR 0015).
     fn lower_scoped_body(&mut self, stmts: &[Stmt]) -> Result<Vec<HirStmt>, HirError> {
         self.scopes.push(HashMap::new());
-        let result = self.lower_stmts(stmts);
+        let result = self.lower_stmts_maybe_guarded(stmts);
         self.scopes.pop();
         result
+    }
+
+    /// Same as `lower_scoped_body` but the caller is responsible for the
+    /// scope push/pop. Used by `for`-loop lowering, which needs to
+    /// declare the read-only loop variable inside the body's own scope.
+    fn lower_scoped_body_no_push(&mut self, stmts: &[Stmt]) -> Result<Vec<HirStmt>, HirError> {
+        self.lower_stmts_maybe_guarded(stmts)
+    }
+
+    fn lower_stmts_maybe_guarded(&mut self, stmts: &[Stmt]) -> Result<Vec<HirStmt>, HirError> {
+        // The innermost loop's break flag (if any) — `None` for either
+        // top-level lowering or a loop whose body has no `break`.
+        let broken_id = self.loop_break_targets.last().copied().flatten();
+        let mut out = Vec::with_capacity(stmts.len());
+        for stmt in stmts {
+            let lowered = self.lower_stmt(stmt)?;
+            let final_stmt = match broken_id {
+                Some(id) => wrap_with_broken_guard(lowered, id),
+                None => lowered,
+            };
+            out.push(final_stmt);
+        }
+        Ok(out)
     }
 
     fn resolve(&self, name: &str) -> Option<LocalId> {
@@ -231,12 +317,71 @@ impl LowerCtx {
                 })
             }
             StmtKind::While { cond, body } => {
+                let needs_break = body_contains_break(body);
+                let break_id =
+                    if needs_break {
+                        Some(self.declare_local(
+                            format!("_broken_{}", self.locals.len()),
+                            ValueKind::Bool,
+                        ))
+                    } else {
+                        None
+                    };
+                self.loop_break_targets.push(break_id);
                 let cond_hir = self.lower_expr(cond)?;
                 let body_hir = self.lower_scoped_body(body)?;
-                Ok(HirStmt {
+                self.loop_break_targets.pop();
+                let while_stmt = HirStmt {
                     kind: HirStmtKind::While {
                         cond: cond_hir,
                         body: body_hir,
+                        break_id,
+                    },
+                    span: stmt.span,
+                };
+                if let Some(id) = break_id {
+                    let init = HirStmt {
+                        kind: HirStmtKind::LocalInit {
+                            id,
+                            value: HirExpr {
+                                kind: HirExprKind::Bool(false),
+                                span: stmt.span,
+                            },
+                        },
+                        span: stmt.span,
+                    };
+                    Ok(HirStmt {
+                        kind: HirStmtKind::Block {
+                            stmts: vec![init, while_stmt],
+                        },
+                        span: stmt.span,
+                    })
+                } else {
+                    Ok(while_stmt)
+                }
+            }
+            StmtKind::Break => {
+                // `break` lowers to `Assign { _broken_<n>, true }` —
+                // the AND-extension of the loop cond and the per-stmt
+                // guard wrap take care of skipping the rest. ADR 0015.
+                //
+                // Innermost loop's break target is on top of the stack.
+                // It must be `Some` because `body_contains_break` runs
+                // before the loop pushes, ensuring `break_id` is set
+                // for any loop whose body holds a `break` reachable
+                // from this point.
+                let broken_id = self.loop_break_targets.last().copied().flatten().ok_or(
+                    HirError::BreakOutsideLoop {
+                        offset: stmt.span.start,
+                    },
+                )?;
+                Ok(HirStmt {
+                    kind: HirStmtKind::Assign {
+                        id: broken_id,
+                        value: HirExpr {
+                            kind: HirExprKind::Bool(true),
+                            span: stmt.span,
+                        },
                     },
                     span: stmt.span,
                 })
@@ -276,24 +421,57 @@ impl LowerCtx {
                         });
                     }
                 }
-                // Body scope + read-only loop variable.
+                // Body scope + read-only loop variable + optional break flag.
+                let needs_break = body_contains_break(body);
+                let break_id =
+                    if needs_break {
+                        Some(self.declare_local(
+                            format!("_broken_{}", self.locals.len()),
+                            ValueKind::Bool,
+                        ))
+                    } else {
+                        None
+                    };
+                self.loop_break_targets.push(break_id);
                 self.scopes.push(HashMap::new());
                 let var_id = self.declare_local(var.clone(), ValueKind::Number);
                 self.readonly_locals.insert(var_id);
-                let body_result = self.lower_stmts(body);
+                let body_result = self.lower_scoped_body_no_push(body);
                 self.readonly_locals.remove(&var_id);
                 self.scopes.pop();
+                self.loop_break_targets.pop();
                 let body_hir = body_result?;
-                Ok(HirStmt {
+                let for_stmt = HirStmt {
                     kind: HirStmtKind::ForNumeric {
                         var_id,
                         start: start_hir,
                         stop: stop_hir,
                         step: step_hir,
                         body: body_hir,
+                        break_id,
                     },
                     span: stmt.span,
-                })
+                };
+                if let Some(id) = break_id {
+                    let init = HirStmt {
+                        kind: HirStmtKind::LocalInit {
+                            id,
+                            value: HirExpr {
+                                kind: HirExprKind::Bool(false),
+                                span: stmt.span,
+                            },
+                        },
+                        span: stmt.span,
+                    };
+                    Ok(HirStmt {
+                        kind: HirStmtKind::Block {
+                            stmts: vec![init, for_stmt],
+                        },
+                        span: stmt.span,
+                    })
+                } else {
+                    Ok(for_stmt)
+                }
             }
             StmtKind::ExprStmt(expr) => {
                 let hir_expr = self.lower_expr(expr)?;
@@ -909,6 +1087,80 @@ mod tests {
     fn lower_for_loop_var_invisible_outside() {
         let err = lower_src("for i = 1, 3 do end\nprint(i)").expect_err("loop var must not leak");
         assert!(matches!(err, HirError::UndefinedName { .. }));
+    }
+
+    #[test]
+    fn lower_break_outside_loop_returns_error() {
+        let err = lower_src("break").expect_err("break outside loop must reject");
+        assert!(matches!(err, HirError::BreakOutsideLoop { .. }));
+    }
+
+    #[test]
+    fn lower_break_inside_while_lowers_without_error() {
+        // The hidden flag is wrapped inside an enclosing Block so the
+        // public HirChunk has a single top-level Block stmt that
+        // contains a LocalInit + While.
+        let hir = lower_src("while true do break end").expect("must lower");
+        assert_eq!(hir.stmts.len(), 1);
+        let HirStmtKind::Block { stmts } = &hir.stmts[0].kind else {
+            panic!("expected enclosing Block for while+break");
+        };
+        // First stmt: LocalInit of the hidden _broken local (Bool).
+        assert!(matches!(stmts[0].kind, HirStmtKind::LocalInit { .. }));
+        // Second stmt: the actual While.
+        assert!(matches!(stmts[1].kind, HirStmtKind::While { .. }));
+    }
+
+    #[test]
+    fn lower_break_inside_for_sets_break_id() {
+        let hir = lower_src("for i = 1, 5 do if i == 3 then break end end").expect("must lower");
+        let HirStmtKind::Block { stmts } = &hir.stmts[0].kind else {
+            panic!("expected enclosing Block for for+break");
+        };
+        assert!(matches!(stmts[0].kind, HirStmtKind::LocalInit { .. }));
+        let HirStmtKind::ForNumeric { break_id, .. } = &stmts[1].kind else {
+            panic!("expected ForNumeric");
+        };
+        assert!(
+            break_id.is_some(),
+            "for-loop with break must carry break_id"
+        );
+    }
+
+    #[test]
+    fn lower_break_inside_if_in_while_targets_outer_while() {
+        let hir = lower_src("while true do if true then break end end").expect("must lower");
+        // Should lower without BreakOutsideLoop.
+        let HirStmtKind::Block { stmts } = &hir.stmts[0].kind else {
+            panic!("expected Block");
+        };
+        assert!(matches!(stmts[1].kind, HirStmtKind::While { .. }));
+    }
+
+    #[test]
+    fn lower_nested_loops_break_targets_innermost() {
+        // Inner break should reference the inner loop's flag — the
+        // outer body has no `break` of its own, so the outer While
+        // stays unwrapped while the inner becomes a Block { LocalInit
+        // _broken, While { break_id: Some(_) } }.
+        let hir = lower_src("while true do while true do break end end").expect("must lower");
+        let HirStmtKind::While { body, break_id, .. } = &hir.stmts[0].kind else {
+            panic!("expected outer While at top level");
+        };
+        assert!(break_id.is_none(), "outer body has no break");
+        // Outer body's only stmt is the inner block.
+        assert_eq!(body.len(), 1);
+        let HirStmtKind::Block { stmts } = &body[0].kind else {
+            panic!("expected inner to be wrapped in Block");
+        };
+        assert_eq!(stmts.len(), 2);
+    }
+
+    #[test]
+    fn lower_break_in_do_block_outside_loop_errors() {
+        let err =
+            lower_src("do break end").expect_err("break in do-block outside loop must reject");
+        assert!(matches!(err, HirError::BreakOutsideLoop { .. }));
     }
 
     #[test]

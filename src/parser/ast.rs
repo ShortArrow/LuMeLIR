@@ -112,6 +112,9 @@ pub enum StmtKind {
         step: Option<Expr>,
         body: Chunk,
     },
+    /// `break` — exits the innermost enclosing loop. HIR rejects
+    /// `break` outside of any loop with `BreakOutsideLoop`.
+    Break,
     ExprStmt(Expr),
 }
 

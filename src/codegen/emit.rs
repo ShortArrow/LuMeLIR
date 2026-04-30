@@ -264,8 +264,14 @@ fn emit_stmt<'a, 'c>(
                 context, block, cond, then_body, elifs, else_body, slots, locals, types, loc,
             )?;
         }
-        HirStmtKind::While { cond, body } => {
-            emit_while(context, block, cond, body, slots, locals, types, loc)?;
+        HirStmtKind::While {
+            cond,
+            body,
+            break_id,
+        } => {
+            emit_while(
+                context, block, cond, body, *break_id, slots, locals, types, loc,
+            )?;
         }
         HirStmtKind::ForNumeric {
             var_id,
@@ -273,9 +279,11 @@ fn emit_stmt<'a, 'c>(
             stop,
             step,
             body,
+            break_id,
         } => {
             emit_for_numeric(
-                context, block, *var_id, start, stop, step, body, slots, locals, types, loc,
+                context, block, *var_id, start, stop, step, body, *break_id, slots, locals, types,
+                loc,
             )?;
         }
         HirStmtKind::ExprStmt(expr) => {
@@ -958,18 +966,22 @@ fn emit_while<'a, 'c>(
     parent: &'a Block<'c>,
     cond: &HirExpr,
     body: &[HirStmt],
+    break_id: Option<LocalId>,
     slots: &[Value<'c, 'a>],
     locals: &[LocalInfo],
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
-    // before region: evaluate cond, scf.condition.
+    // before region: evaluate cond, optionally AND with `not _broken`.
     let before = Region::new();
     let before_blk = Block::new(&[]);
     let blk_slots = transmute_slots(slots);
     let cond_kind = infer_kind(cond, locals);
     let cond_val = emit_expr(context, &before_blk, cond, blk_slots, locals, types, loc)?;
-    let cond_i1 = emit_truthiness(context, &before_blk, cond_val, cond_kind, types, loc);
+    let mut cond_i1 = emit_truthiness(context, &before_blk, cond_val, cond_kind, types, loc);
+    if let Some(id) = break_id {
+        cond_i1 = and_not_broken(context, &before_blk, cond_i1, blk_slots, id, types, loc);
+    }
     before_blk.append_operation(scf::condition(cond_i1, &[], loc));
     before.append_block(before_blk);
 
@@ -978,6 +990,32 @@ fn emit_while<'a, 'c>(
 
     parent.append_operation(scf::r#while(&[], &[], before, after, loc));
     Ok(())
+}
+
+/// `cond AND (NOT load(slots[broken_id]))` as a single i1 in `block`.
+/// Used by emit_while/emit_for_numeric to honour `break` flags.
+fn and_not_broken<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    cond_i1: Value<'c, 'a>,
+    slots: &[Value<'c, 'a>],
+    broken_id: LocalId,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let broken = emit_load(block, slots[broken_id.0], types.i1, loc);
+    let one = arith::constant(context, IntegerAttribute::new(types.i1, 1).into(), loc);
+    let one_val: Value<'c, 'a> = block.append_operation(one).result(0).unwrap().into();
+    let not_broken: Value<'c, 'a> = block
+        .append_operation(arith::xori(broken, one_val, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    block
+        .append_operation(arith::andi(cond_i1, not_broken, loc))
+        .result(0)
+        .unwrap()
+        .into()
 }
 
 /// Lower a numeric `for var = start, stop, step do body end` to a
@@ -998,6 +1036,7 @@ fn emit_for_numeric<'a, 'c>(
     stop: &HirExpr,
     step: &HirExpr,
     body: &[HirStmt],
+    break_id: Option<LocalId>,
     slots: &[Value<'c, 'a>],
     locals: &[LocalInfo],
     types: &Types<'c>,
@@ -1061,7 +1100,12 @@ fn emit_for_numeric<'a, 'c>(
         .result(0)
         .unwrap()
         .into();
-    before_blk.append_operation(scf::condition(cond, &[], loc));
+    let final_cond = if let Some(id) = break_id {
+        and_not_broken(context, &before_blk, cond, blk_slots, id, types, loc)
+    } else {
+        cond
+    };
+    before_blk.append_operation(scf::condition(final_cond, &[], loc));
     before.append_block(before_blk);
 
     // After region: body, then i = i + step, scf.yield.
@@ -1327,6 +1371,29 @@ mod tests {
             &lower_src("if (1 < 2) and (2 < 3) then print(true) end"),
         )
         .expect("short-circuit module must verify");
+        assert!(module.as_operation().verify());
+    }
+
+    #[test]
+    fn emit_while_with_break_extends_cond_with_andi() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("while true do break end")).unwrap();
+        let mlir = module.as_operation().to_string();
+        // `and_not_broken` emits xori + andi against the broken flag.
+        assert!(
+            mlir.contains("arith.andi") && mlir.contains("arith.xori"),
+            "expected andi+xori for break-aware cond, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_module_with_break_in_for_verifies() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src("for i = 1, 5 do if i == 3 then break end end"),
+        )
+        .expect("for+break module must verify");
         assert!(module.as_operation().verify());
     }
 

@@ -83,6 +83,10 @@ impl<'t> Parser<'t> {
             TokenKind::Keyword(Keyword::If) => self.parse_if(),
             TokenKind::Keyword(Keyword::While) => self.parse_while(),
             TokenKind::Keyword(Keyword::For) => self.parse_for(),
+            TokenKind::Keyword(Keyword::Break) => {
+                let tok = self.bump().clone();
+                Ok(Stmt::new(StmtKind::Break, tok.span))
+            }
             TokenKind::Ident(_) if matches!(self.peek_kind_at(1), Some(TokenKind::Equals)) => {
                 self.parse_assign()
             }
@@ -615,6 +619,7 @@ mod tests {
                 step: step.map(strip_span_expr),
                 body: body.into_iter().map(strip_span_stmt).collect(),
             },
+            StmtKind::Break => StmtKind::Break,
             StmtKind::ExprStmt(e) => StmtKind::ExprStmt(strip_span_expr(e)),
         };
         Stmt::new(kind, Span::new(0, 0))
@@ -1233,6 +1238,24 @@ mod tests {
     fn parse_for_unterminated_is_rejected() {
         let err = parse("for i = 1, 3 do print(i)").expect_err("missing `end` must fail");
         assert!(matches!(err, ParseError::UnexpectedEof { .. }));
+    }
+
+    #[test]
+    fn parse_break_yields_break_stmt() {
+        let stmt = parse_single_stmt("break").expect("must parse");
+        assert!(matches!(stmt.kind, StmtKind::Break));
+    }
+
+    #[test]
+    fn parse_break_inside_while_body() {
+        let stmt = parse_single_stmt("while true do break end").expect("must parse");
+        match stmt.kind {
+            StmtKind::While { body, .. } => {
+                assert_eq!(body.len(), 1);
+                assert!(matches!(body[0].kind, StmtKind::Break));
+            }
+            other => panic!("expected While, got {other:?}"),
+        }
     }
 
     #[test]

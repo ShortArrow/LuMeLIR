@@ -32,4 +32,7 @@ pub enum HirError {
 
     #[error("loop variable '{name}' is read-only inside its `for` body (offset {offset})")]
     ReadOnlyAssign { name: String, offset: usize },
+
+    #[error("`break` is not inside any loop (offset {offset})")]
+    BreakOutsideLoop { offset: usize },
 }
