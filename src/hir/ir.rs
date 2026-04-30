@@ -37,9 +37,11 @@ pub struct HirChunk {
 pub struct FuncId(pub usize);
 
 /// A user-defined function. The body is a fully-lowered statement
-/// sequence with its own private `locals` table. Phase 2.5a allows
-/// only `Number` parameters and an optional `Number` return type;
-/// later sub-phases (2.5b/c/d) widen this. See ADR 0016.
+/// sequence with its own private `locals` table. Phase 2.5d (ADR
+/// 0021) generalises the return type from `Option<ValueKind>` to a
+/// `Vec<ValueKind>` — empty for void, length 1 for the historical
+/// single-return case, length ≥2 for multi-return. See ADRs 0016,
+/// 0019, 0020, 0021.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirFunction {
     /// Source-level Lua name.
@@ -51,11 +53,11 @@ pub struct HirFunction {
     /// the i-th parameter slot.
     pub params: Vec<LocalInfo>,
     /// All locals (params first, then body-introduced locals + the
-    /// synthetic `_returned` / `_ret_value` slots).
+    /// synthetic `_returned` / `_ret_value_*` slots).
     pub locals: Vec<LocalInfo>,
     pub body: Vec<HirStmt>,
-    /// `None` ⇒ `void` return; `Some(k)` ⇒ a value of kind `k`.
-    pub ret_kind: Option<ValueKind>,
+    /// Empty ⇒ void; length N ⇒ N return values, in source order.
+    pub ret_kinds: Vec<ValueKind>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +110,17 @@ pub enum HirStmtKind {
         step: HirExpr,
         body: Vec<HirStmt>,
         break_id: Option<LocalId>,
+    },
+    /// `local a, b, ... = f(args)` (Phase 2.5d, ADR 0021): a single
+    /// multi-result call whose results are bound 1-1 to the listed
+    /// destination locals. Equivalent in observable behaviour to
+    /// "evaluate the call, then store each result into the matching
+    /// `dst_ids[i]` slot", but represented atomically because codegen
+    /// must emit the call once and read multiple `result(i)` values.
+    MultiAssignFromCall {
+        dst_ids: Vec<LocalId>,
+        callee: Callee,
+        args: Vec<HirExpr>,
     },
     ExprStmt(HirExpr),
 }

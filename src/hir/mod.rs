@@ -75,7 +75,13 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.
-            Callee::User(FuncId(id)) => functions[*id].ret_kind.unwrap_or(ValueKind::Number),
+            // For multi-return callees in expression position, Lua
+            // truncates to the first result. Phase 2.5d (ADR 0021).
+            Callee::User(FuncId(id)) => functions[*id]
+                .ret_kinds
+                .first()
+                .copied()
+                .unwrap_or(ValueKind::Number),
             // Indirect call (function-kind local): Phase 2.5b.2 fixes
             // returns to Number, so that's the answer.
             Callee::Indirect(_) => ValueKind::Number,
@@ -137,6 +143,59 @@ fn wrap_with_broken_guard(stmt: HirStmt, broken_id: LocalId) -> HirStmt {
         },
         span,
     }
+}
+
+/// Phase 2.5d (ADR 0021): scan a function body for the largest
+/// number of return values produced by any `return` in the body
+/// (recursing through nested control flow but not into nested
+/// `FunctionDef` bodies, which have their own return scope). Used by
+/// [`LowerCtx::lower_function_body`] to allocate one `_ret_value_N`
+/// slot per return position.
+fn ast_max_return_arity(stmts: &[Stmt]) -> usize {
+    fn visit(s: &Stmt, max: &mut usize) {
+        match &s.kind {
+            StmtKind::Return { value: Some(_) } => *max = (*max).max(1),
+            StmtKind::Return { value: None } => {}
+            StmtKind::ReturnMulti { values } => *max = (*max).max(values.len()),
+            StmtKind::Block(b) => {
+                for st in b {
+                    visit(st, max);
+                }
+            }
+            StmtKind::If {
+                then_body,
+                elifs,
+                else_body,
+                ..
+            } => {
+                for st in then_body {
+                    visit(st, max);
+                }
+                for (_, b) in elifs {
+                    for st in b {
+                        visit(st, max);
+                    }
+                }
+                if let Some(b) = else_body {
+                    for st in b {
+                        visit(st, max);
+                    }
+                }
+            }
+            StmtKind::While { body, .. } | StmtKind::ForNumeric { body, .. } => {
+                for st in body {
+                    visit(st, max);
+                }
+            }
+            // Nested FunctionDef bodies have their own return scope.
+            _ => {}
+        }
+    }
+    let mut max = 0;
+    for s in stmts {
+        visit(s, &mut max);
+    }
+    max
 }
 
 /// Phase 2.5e (ADR 0020): static value-kind of an AST expression used
@@ -244,6 +303,16 @@ fn infer_user_function_param_kinds(
             StmtKind::FunctionDef { body, .. } => {
                 for st in body {
                     visit_stmt(st, names, kinds, seen);
+                }
+            }
+            StmtKind::LocalMulti { values, .. } => {
+                for v in values {
+                    visit_expr(v, names, kinds, seen);
+                }
+            }
+            StmtKind::ReturnMulti { values } => {
+                for v in values {
+                    visit_expr(v, names, kinds, seen);
                 }
             }
             StmtKind::Break => {}
@@ -369,6 +438,16 @@ fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
             }
             StmtKind::Break => {}
             StmtKind::FunctionDef { .. } => {} // nested fn defs not in 2.5b.2
+            StmtKind::LocalMulti { values, .. } => {
+                for v in values {
+                    visit_expr(v, name_to_idx, kinds);
+                }
+            }
+            StmtKind::ReturnMulti { values } => {
+                for v in values {
+                    visit_expr(v, name_to_idx, kinds);
+                }
+            }
         }
     }
 
@@ -447,9 +526,9 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
                         func_id: None,
                     })
                     .collect(),
-                locals: Vec::new(), // filled in pass 2
-                body: Vec::new(),   // filled in pass 2
-                ret_kind: None,     // resolved in pass 2
+                locals: Vec::new(),    // filled in pass 2
+                body: Vec::new(),      // filled in pass 2
+                ret_kinds: Vec::new(), // resolved in pass 2
             });
             function_names.insert(name.clone(), id);
         }
@@ -482,7 +561,7 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
             let mut fn_ctx =
                 LowerCtx::for_function(&function_names, &functions, params, body, &external_kinds);
             let body_hir = fn_ctx.lower_function_body(body)?;
-            let ret_kind = fn_ctx.in_function_ret_kind;
+            let ret_kinds = fn_ctx.in_function_ret_kinds.unwrap_or_default();
             // Phase 2.5b.2: copy the inferred param kinds (the first
             // `params.len()` locals carry them) into the public
             // `HirFunction.params` slice so callers see the right
@@ -490,7 +569,7 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
             functions[id.0].params = fn_ctx.locals[..params.len()].to_vec();
             functions[id.0].locals = fn_ctx.locals;
             functions[id.0].body = body_hir;
-            functions[id.0].ret_kind = ret_kind;
+            functions[id.0].ret_kinds = ret_kinds;
             // Phase 2.5b.3: anonymous functions registered while lowering
             // this body live only in `fn_ctx.functions`; hoist the new
             // ones (indices ≥ pre_count) into the outer table so codegen
@@ -554,15 +633,18 @@ struct LowerCtx {
     /// user-call return-type lookup. Phase 2.5a clones it into each
     /// `LowerCtx`; the cost is negligible at this scale.
     functions: Vec<HirFunction>,
-    /// `Some((returned_id, ret_value_id))` while lowering inside a
-    /// function body; `None` at top level. `ret_value_id` is `None`
-    /// for void functions (no value ever stored).
-    in_function: Option<(LocalId, Option<LocalId>)>,
-    /// The return kind discovered while lowering the current function
-    /// body: `None` (uninitialised) → `Some(Number)` once a value-
-    /// returning `return` is seen. Phase 2.5a fixes value returns to
-    /// Number so this never widens.
-    in_function_ret_kind: Option<ValueKind>,
+    /// `Some((returned_id, ret_value_ids))` while lowering inside a
+    /// function body; `None` at top level. Phase 2.5d (ADR 0021):
+    /// `ret_value_ids` is a `Vec` of `_ret_value_N` slot ids — one
+    /// per return position. Empty for void functions, length 1 for
+    /// the historical single-return case, length ≥2 for multi-return.
+    in_function: Option<(LocalId, Vec<LocalId>)>,
+    /// Return kinds discovered while lowering the current function
+    /// body. `None` until the first return is seen; `Some(vec![])`
+    /// for a void return; `Some(vec![k])` for single; `Some(vec![k1,
+    /// k2, ...])` for multi-return. Subsequent returns must agree on
+    /// arity and per-position kind.
+    in_function_ret_kinds: Option<Vec<ValueKind>>,
 }
 
 impl LowerCtx {
@@ -575,7 +657,7 @@ impl LowerCtx {
             function_names,
             functions,
             in_function: None,
-            in_function_ret_kind: None,
+            in_function_ret_kinds: None,
         }
     }
 
@@ -610,21 +692,21 @@ impl LowerCtx {
     }
 
     /// Lower a function body. Allocates the synthetic `_returned` and
-    /// `_ret_value` slots, sets `in_function`, and applies the same
+    /// `_ret_value_N` slots, sets `in_function`, and applies the same
     /// body-guard wrap pattern used by `break` (ADR 0015) so that
-    /// post-`return` statements are skipped at runtime.
+    /// post-`return` statements are skipped at runtime. Phase 2.5d
+    /// (ADR 0021): N comes from a pre-scan of the body's max return
+    /// arity, so multi-return bodies allocate one slot per position.
     fn lower_function_body(&mut self, stmts: &[Stmt]) -> Result<Vec<HirStmt>, HirError> {
-        // Synthetic flag + value slot, declared at the top of the
-        // body's outermost scope (after parameters). The `_ret_value`
-        // slot's kind starts as Number; the first value-returning
-        // `return` upgrades it to whatever kind the value carries
-        // (Phase 2.5b.3 / ADR 0019).
         let returned_id = self.declare_local("_returned".to_owned(), ValueKind::Bool);
-        let ret_value_id = self.declare_local("_ret_value".to_owned(), ValueKind::Number);
-        self.in_function = Some((returned_id, Some(ret_value_id)));
+        let ret_arity = ast_max_return_arity(stmts);
+        let mut ret_value_ids: Vec<LocalId> = Vec::with_capacity(ret_arity);
+        for i in 0..ret_arity {
+            let id = self.declare_local(format!("_ret_value_{i}"), ValueKind::Number);
+            ret_value_ids.push(id);
+        }
+        self.in_function = Some((returned_id, ret_value_ids.clone()));
 
-        // Lower the body first so that the slot's final kind is known
-        // before we emit the synthetic prelude.
         let span = stmts.first().map(|s| s.span).unwrap_or(Span::new(0, 0));
         self.loop_break_targets.push(Some(returned_id));
         let lowered = self.lower_stmts(stmts)?;
@@ -641,24 +723,25 @@ impl LowerCtx {
             },
             span,
         });
-        // Phase 2.5b.3 + 2.5e: emit a kind-appropriate default init
-        // for `_ret_value` so an early-exit path still loads a sane
-        // value. Function-kind slots have no sensible default — the
+        // Kind-appropriate default for each `_ret_value_N` slot —
+        // Function-kind has no sensible default and is skipped, the
         // body-guard pattern guarantees a real value before load.
-        let init_value = match self.locals[ret_value_id.0].kind {
-            ValueKind::Number => Some(HirExprKind::Number(0.0)),
-            ValueKind::Bool => Some(HirExprKind::Bool(false)),
-            ValueKind::Nil => Some(HirExprKind::Nil),
-            ValueKind::Function(_) => None,
-        };
-        if let Some(kind) = init_value {
-            out.push(HirStmt {
-                kind: HirStmtKind::LocalInit {
-                    id: ret_value_id,
-                    value: HirExpr { kind, span },
-                },
-                span,
-            });
+        for &slot_id in &ret_value_ids {
+            let init_value = match self.locals[slot_id.0].kind {
+                ValueKind::Number => Some(HirExprKind::Number(0.0)),
+                ValueKind::Bool => Some(HirExprKind::Bool(false)),
+                ValueKind::Nil => Some(HirExprKind::Nil),
+                ValueKind::Function(_) => None,
+            };
+            if let Some(kind) = init_value {
+                out.push(HirStmt {
+                    kind: HirStmtKind::LocalInit {
+                        id: slot_id,
+                        value: HirExpr { kind, span },
+                    },
+                    span,
+                });
+            }
         }
 
         for stmt in lowered {
@@ -883,59 +966,18 @@ impl LowerCtx {
                 );
             }
             StmtKind::Return { value } => {
-                let (returned_id, ret_value_id) =
-                    self.in_function.ok_or(HirError::ReturnOutsideFunction {
-                        offset: stmt.span.start,
-                    })?;
-                let mut block_stmts = Vec::new();
-                if let Some(expr) = value {
-                    let v = self.lower_expr(expr)?;
-                    let v_kind = infer_kind(&v, &self.locals, &self.functions);
-                    // Phase 2.5e (ADR 0020): all four kinds may be
-                    // returned. Cross-check below ensures every
-                    // return in a body agrees on the kind.
-                    let _ = v_kind;
-                    // All returns in a function body must share a kind.
-                    if let Some(prev) = self.in_function_ret_kind
-                        && prev != v_kind
-                    {
-                        return Err(HirError::TypeMismatch {
-                            op: "return".to_owned(),
-                            lhs_kind: prev.name().to_owned(),
-                            rhs_kind: v_kind.name().to_owned(),
-                            offset: stmt.span.start,
-                        });
-                    }
-                    self.in_function_ret_kind = Some(v_kind);
-                    let ret_value_id = ret_value_id
-                        .expect("_ret_value slot allocated whenever any return has a value");
-                    // Upgrade the `_ret_value` slot's kind from its
-                    // default (Number) to whatever the return value
-                    // actually carries — codegen uses this to pick the
-                    // slot's MLIR type and the function's result type.
-                    self.locals[ret_value_id.0].kind = v_kind;
-                    block_stmts.push(HirStmt {
-                        kind: HirStmtKind::Assign {
-                            id: ret_value_id,
-                            value: v,
-                        },
-                        span: stmt.span,
-                    });
-                }
-                block_stmts.push(HirStmt {
-                    kind: HirStmtKind::Assign {
-                        id: returned_id,
-                        value: HirExpr {
-                            kind: HirExprKind::Bool(true),
-                            span: stmt.span,
-                        },
-                    },
-                    span: stmt.span,
-                });
-                Ok(HirStmt {
-                    kind: HirStmtKind::Block { stmts: block_stmts },
-                    span: stmt.span,
-                })
+                let values: Vec<HirExpr> = match value {
+                    Some(e) => vec![self.lower_expr(e)?],
+                    None => Vec::new(),
+                };
+                self.lower_return_with_values(values, stmt.span)
+            }
+            StmtKind::ReturnMulti { values } => {
+                let lowered: Vec<HirExpr> = values
+                    .iter()
+                    .map(|e| self.lower_expr(e))
+                    .collect::<Result<_, _>>()?;
+                self.lower_return_with_values(lowered, stmt.span)
             }
             StmtKind::Break => {
                 // `break` lowers to `Assign { _broken_<n>, true }` —
@@ -1057,7 +1099,178 @@ impl LowerCtx {
                     span: stmt.span,
                 })
             }
+            StmtKind::LocalMulti { names, values } => {
+                self.lower_local_multi(names, values, stmt.span)
+            }
         }
+    }
+
+    /// Phase 2.5d (ADR 0021): shared implementation for both
+    /// single-result `Return { value }` and multi-result
+    /// `ReturnMulti { values }`. Cross-checks arity and per-position
+    /// kind against any prior return in the same body, upgrades
+    /// `_ret_value_N` slot kinds, and emits the body-guard pattern's
+    /// `_ret_value_N := ...; _returned := true` block.
+    fn lower_return_with_values(
+        &mut self,
+        lowered: Vec<HirExpr>,
+        span: Span,
+    ) -> Result<HirStmt, HirError> {
+        let (returned_id, ret_value_ids) = self
+            .in_function
+            .as_ref()
+            .map(|(r, ids)| (*r, ids.clone()))
+            .ok_or(HirError::ReturnOutsideFunction { offset: span.start })?;
+        let kinds: Vec<ValueKind> = lowered
+            .iter()
+            .map(|e| infer_kind(e, &self.locals, &self.functions))
+            .collect();
+        if let Some(prev) = &self.in_function_ret_kinds {
+            if prev.len() != kinds.len() {
+                return Err(HirError::ArityMismatch {
+                    builtin: "return".to_owned(),
+                    expected: prev.len(),
+                    actual: kinds.len(),
+                    offset: span.start,
+                });
+            }
+            for (i, (p, k)) in prev.iter().zip(kinds.iter()).enumerate() {
+                if p != k {
+                    return Err(HirError::TypeMismatch {
+                        op: format!("return position {i}"),
+                        lhs_kind: p.name().to_owned(),
+                        rhs_kind: k.name().to_owned(),
+                        offset: span.start,
+                    });
+                }
+            }
+        } else {
+            // First return seen — upgrade each `_ret_value_N` slot kind.
+            for (slot_id, k) in ret_value_ids.iter().zip(kinds.iter()) {
+                self.locals[slot_id.0].kind = *k;
+            }
+            self.in_function_ret_kinds = Some(kinds.clone());
+        }
+        let mut block_stmts: Vec<HirStmt> = Vec::with_capacity(lowered.len() + 1);
+        for (slot_id, v) in ret_value_ids.iter().zip(lowered.into_iter()) {
+            block_stmts.push(HirStmt {
+                kind: HirStmtKind::Assign {
+                    id: *slot_id,
+                    value: v,
+                },
+                span,
+            });
+        }
+        block_stmts.push(HirStmt {
+            kind: HirStmtKind::Assign {
+                id: returned_id,
+                value: HirExpr {
+                    kind: HirExprKind::Bool(true),
+                    span,
+                },
+            },
+            span,
+        });
+        Ok(HirStmt {
+            kind: HirStmtKind::Block { stmts: block_stmts },
+            span,
+        })
+    }
+
+    /// Phase 2.5d (ADR 0021): lower `local NAMES = VALUES`. Two
+    /// shapes are supported:
+    ///
+    /// - `len(values) == len(names)` — parallel binding, lowers to a
+    ///   `Block` of independent `LocalInit` statements.
+    /// - `len(values) == 1` and that value is a multi-result Call
+    ///   whose ret arity matches `len(names)` — emits a single
+    ///   `MultiAssignFromCall` so codegen evaluates the call once.
+    ///
+    /// Any other shape is rejected as `ArityMismatch`.
+    fn lower_local_multi(
+        &mut self,
+        names: &[String],
+        values: &[Expr],
+        span: Span,
+    ) -> Result<HirStmt, HirError> {
+        if values.len() == names.len() {
+            // Parallel: lower each value, declare locals 1-1.
+            // Lower all RHS first under the original scope so name
+            // shadowing matches single-binding semantics.
+            let lowered: Vec<HirExpr> = values
+                .iter()
+                .map(|e| self.lower_expr(e))
+                .collect::<Result<_, _>>()?;
+            let mut stmts: Vec<HirStmt> = Vec::with_capacity(names.len());
+            for (n, v) in names.iter().zip(lowered.into_iter()) {
+                let kind = infer_kind(&v, &self.locals, &self.functions);
+                let func_id = match &v.kind {
+                    HirExprKind::FunctionRef(fid) => Some(*fid),
+                    HirExprKind::Local(LocalId(idx)) => self.locals[*idx].func_id,
+                    _ => None,
+                };
+                let id = self.declare_local_with_func_id(n.clone(), kind, func_id);
+                stmts.push(HirStmt {
+                    kind: HirStmtKind::LocalInit { id, value: v },
+                    span,
+                });
+            }
+            return Ok(HirStmt {
+                kind: HirStmtKind::Block { stmts },
+                span,
+            });
+        }
+        if values.len() == 1 {
+            // Multi-bind from a single Call. The Call must be a User-
+            // dispatch (Builtin/Indirect ret arities aren't tracked
+            // statically), and its ret arity must equal `names.len()`.
+            let lowered = self.lower_expr(&values[0])?;
+            let HirExprKind::Call { callee, args } = lowered.kind else {
+                return Err(HirError::ArityMismatch {
+                    builtin: "local =".to_owned(),
+                    expected: names.len(),
+                    actual: 1,
+                    offset: span.start,
+                });
+            };
+            let ret_kinds: Vec<ValueKind> = match callee {
+                Callee::User(FuncId(fid)) => self.functions[fid].ret_kinds.clone(),
+                _ => {
+                    return Err(HirError::ArityMismatch {
+                        builtin: "local =".to_owned(),
+                        expected: names.len(),
+                        actual: 1,
+                        offset: span.start,
+                    });
+                }
+            };
+            if ret_kinds.len() != names.len() {
+                return Err(HirError::ArityMismatch {
+                    builtin: "local =".to_owned(),
+                    expected: ret_kinds.len(),
+                    actual: names.len(),
+                    offset: span.start,
+                });
+            }
+            let mut dst_ids: Vec<LocalId> = Vec::with_capacity(names.len());
+            for (n, k) in names.iter().zip(ret_kinds.iter()) {
+                dst_ids.push(self.declare_local(n.clone(), *k));
+            }
+            return Ok(HirStmt {
+                kind: HirStmtKind::MultiAssignFromCall {
+                    dst_ids,
+                    callee,
+                    args,
+                },
+                span,
+            });
+        }
+        Err(HirError::ArityMismatch {
+            builtin: "local =".to_owned(),
+            expected: names.len(),
+            actual: values.len(),
+            offset: span.start,
+        })
     }
 
     fn lower_expr(&mut self, expr: &Expr) -> Result<HirExpr, HirError> {
@@ -1186,7 +1399,7 @@ impl LowerCtx {
                         .collect(),
                     locals: Vec::new(),
                     body: Vec::new(),
-                    ret_kind: None,
+                    ret_kinds: Vec::new(),
                 });
                 // Anonymous functions have no caller-name to scan
                 // for call-site arg kinds; default to Number for all
@@ -1201,11 +1414,11 @@ impl LowerCtx {
                     &external_kinds,
                 );
                 let body_hir = fn_ctx.lower_function_body(body)?;
-                let ret_kind = fn_ctx.in_function_ret_kind;
+                let ret_kinds = fn_ctx.in_function_ret_kinds.unwrap_or_default();
                 self.functions[id.0].params = fn_ctx.locals[..params.len()].to_vec();
                 self.functions[id.0].locals = fn_ctx.locals;
                 self.functions[id.0].body = body_hir;
-                self.functions[id.0].ret_kind = ret_kind;
+                self.functions[id.0].ret_kinds = ret_kinds;
                 HirExprKind::FunctionRef(id)
             }
             ExprKind::Call { callee, args } => self.lower_call(callee, args, expr)?,
@@ -1913,7 +2126,7 @@ mod tests {
         assert_eq!(hir.functions[0].name, "f");
         assert_eq!(hir.functions[0].mangled_name, "user_f_0");
         assert!(hir.functions[0].params.is_empty());
-        assert_eq!(hir.functions[0].ret_kind, None);
+        assert!(hir.functions[0].ret_kinds.is_empty());
     }
 
     #[test]
@@ -1965,8 +2178,8 @@ mod tests {
         let body = &hir.functions[0].body;
         // The body's first user statement is the return; the lowering
         // wraps it in the same body-guard pattern as break, so we just
-        // inspect the function's ret_kind here.
-        assert_eq!(hir.functions[0].ret_kind, Some(ValueKind::Number));
+        // inspect the function's ret_kinds here.
+        assert_eq!(hir.functions[0].ret_kinds, vec![ValueKind::Number]);
         assert!(!body.is_empty());
     }
 
@@ -2125,7 +2338,7 @@ mod tests {
             .iter()
             .find(|fn_| fn_.name == "get_f")
             .expect("get_f present");
-        assert_eq!(get_f.ret_kind, Some(ValueKind::Function(1)));
+        assert_eq!(get_f.ret_kinds, vec![ValueKind::Function(1)]);
     }
 
     #[test]
@@ -2154,7 +2367,7 @@ mod tests {
             .iter()
             .find(|fn_| fn_.name == "make")
             .expect("make present");
-        assert_eq!(make_fn.ret_kind, Some(ValueKind::Function(1)));
+        assert_eq!(make_fn.ret_kinds, vec![ValueKind::Function(1)]);
         // The anon function must also have been hoisted into the
         // chunk's function table so codegen can emit it.
         assert!(
@@ -2189,7 +2402,7 @@ mod tests {
         let src = "local function pos(x) return x > 0 end";
         let hir = lower_src(src).expect("Phase 2.5e: Bool return must lower");
         let pos = &hir.functions[0];
-        assert_eq!(pos.ret_kind, Some(ValueKind::Bool));
+        assert_eq!(pos.ret_kinds, vec![ValueKind::Bool]);
     }
 
     #[test]
@@ -2197,7 +2410,7 @@ mod tests {
         let src = "local function n() return nil end";
         let hir = lower_src(src).expect("Phase 2.5e: Nil return must lower");
         let n = &hir.functions[0];
-        assert_eq!(n.ret_kind, Some(ValueKind::Nil));
+        assert_eq!(n.ret_kinds, vec![ValueKind::Nil]);
     }
 
     #[test]
@@ -2223,7 +2436,7 @@ mod tests {
         let hir = lower_src(src).expect("Phase 2.5e: Bool param inference must lower");
         let neg = &hir.functions[0];
         assert_eq!(neg.params[0].kind, ValueKind::Bool);
-        assert_eq!(neg.ret_kind, Some(ValueKind::Bool));
+        assert_eq!(neg.ret_kinds, vec![ValueKind::Bool]);
     }
 
     #[test]
@@ -2234,5 +2447,69 @@ mod tests {
         let hir = lower_src(src).expect("Phase 2.5e: Nil param inference must lower");
         let f = &hir.functions[0];
         assert_eq!(f.params[0].kind, ValueKind::Nil);
+    }
+
+    // -----------------------------------------------------------
+    // Phase 2.5d — multi-return / multi-binding (ADR 0021).
+    // -----------------------------------------------------------
+
+    #[test]
+    fn lower_multi_return_collects_all_kinds() {
+        let src = "local function pair() return 1, 2 end";
+        let hir = lower_src(src).expect("Phase 2.5d: multi-return must lower");
+        let pair = &hir.functions[0];
+        assert_eq!(pair.ret_kinds, vec![ValueKind::Number, ValueKind::Number]);
+    }
+
+    #[test]
+    fn lower_local_multi_from_call_emits_multi_assign() {
+        let src = "local function pair() return 1, 2 end\nlocal a, b = pair()";
+        let hir = lower_src(src).expect("Phase 2.5d: local a,b = pair() must lower");
+        // The multi-assign statement is the second top-level stmt.
+        match &hir.stmts[0].kind {
+            HirStmtKind::MultiAssignFromCall { dst_ids, .. } => {
+                assert_eq!(dst_ids.len(), 2);
+            }
+            other => panic!("expected MultiAssignFromCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_local_multi_from_values_emits_block_of_inits() {
+        let src = "local a, b = 1, 2";
+        let hir = lower_src(src).expect("Phase 2.5d: parallel binding must lower");
+        match &hir.stmts[0].kind {
+            HirStmtKind::Block { stmts } => {
+                assert_eq!(stmts.len(), 2);
+                assert!(matches!(stmts[0].kind, HirStmtKind::LocalInit { .. }));
+                assert!(matches!(stmts[1].kind, HirStmtKind::LocalInit { .. }));
+            }
+            other => panic!("expected Block of LocalInits, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_arity_mismatch_in_multi_call_errors() {
+        // 1 LHS, 2-result call.
+        let src = "local function pair() return 1, 2 end\nlocal a = pair()";
+        // This actually parses as `Local { name: "a", value: Call }` —
+        // single name, single value, the call's first result is taken.
+        // To exercise the multi-call arity check, we need ≥2 LHS.
+        let _ok = lower_src(src).expect("1-binding from multi-call truncates per Lua");
+
+        // 3 LHS, 2-result call → arity mismatch.
+        let bad = "local function pair() return 1, 2 end\nlocal a, b, c = pair()";
+        assert!(lower_src(bad).is_err());
+    }
+
+    #[test]
+    fn lower_inconsistent_return_arity_errors() {
+        let src = concat!(
+            "local function bad(x)\n",
+            "  if x > 0 then return 1, 2 end\n",
+            "  return 3\n",
+            "end\n",
+        );
+        assert!(lower_src(src).is_err());
     }
 }
