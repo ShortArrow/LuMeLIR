@@ -36,8 +36,9 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.5b anonymous + first-class (HIR-time) | **Done** | `local f = function() end`, alias `local g = f`, static dispatch (ADR 0017) |
 | ‣ 2.5b.2 functions as args | **Done** | `apply(f, x)`, `func.call_indirect`, param-kind back-inference (ADR 0018) |
 | ‣ 2.5b.3 functions as return values | **Done** | `return f`, ret_kind→Function, ptr-slot+ucast bridging (ADR 0019) |
+| ‣ 2.5e Bool/Nil params/return | **Done** | predicates (`return x > 0`), `not b`, `nil`-returning helpers; call-site param inference (ADR 0020) |
 | ‣ 2.5c closures | Next | upvalue capture, heap-allocated environments |
-| ‣ 2.5d+ multi-return / Bool-Nil params | Not started | `return a, b`, varargs, Bool/Nil signatures |
+| ‣ 2.5d multi-return | Not started | `return a, b`, `local x, y = call()`, `select` |
 | ‣ 2.6+ tables / strings | Not started | tables, metatables, generic for, strings, GC |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |
 
