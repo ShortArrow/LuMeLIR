@@ -38,4 +38,7 @@ pub enum HirError {
 
     #[error("unknown function '{name}' at byte offset {offset}")]
     UnknownFunction { name: String, offset: usize },
+
+    #[error("function value '{name}' can only be called, not used as a value (offset {offset})")]
+    FunctionUsedAsValue { name: String, offset: usize },
 }

@@ -22,11 +22,17 @@ use crate::parser::{BinOp, Chunk, Expr, ExprKind, Stmt, StmtKind, UnaryOp};
 /// Static value-kind for a fully lowered HIR expression. Used by the
 /// in-HIR type guard, the heterogeneous-`==` fold, and by codegen to
 /// dispatch the `print` path and the per-slot alloca type.
+///
+/// Phase 2.5b adds `Function(FuncId)` for HIR-time-resolvable function
+/// values (ADR 0017). Function-kind locals can only appear as a
+/// `Call`'s callee; using them anywhere else surfaces
+/// `HirError::FunctionUsedAsValue`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueKind {
     Number,
     Bool,
     Nil,
+    Function(FuncId),
 }
 
 impl ValueKind {
@@ -35,6 +41,7 @@ impl ValueKind {
             ValueKind::Number => "number",
             ValueKind::Bool => "bool",
             ValueKind::Nil => "nil",
+            ValueKind::Function(_) => "function",
         }
     }
 }
@@ -70,6 +77,7 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // never appear in expression position legally.
             Callee::User(FuncId(id)) => functions[*id].ret_kind.unwrap_or(ValueKind::Number),
         },
+        HirExprKind::FunctionRef(fid) => ValueKind::Function(*fid),
     }
 }
 
@@ -191,7 +199,7 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
         }
     }
 
-    let mut ctx = LowerCtx::new(function_names.clone(), functions.clone());
+    let mut ctx = LowerCtx::new(function_names.clone(), functions);
     // Lower top-level stmts, skipping FunctionDef (already lifted).
     let mut stmts = Vec::new();
     for s in chunk {
@@ -200,10 +208,12 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
         }
         stmts.push(ctx.lower_stmt(s)?);
     }
+    // ctx.functions accumulates anonymous functions registered during
+    // lowering of `local f = function() ... end` (Phase 2.5b, ADR 0017).
     Ok(HirChunk {
         locals: ctx.locals,
         stmts,
-        functions,
+        functions: ctx.functions,
     })
 }
 
@@ -699,16 +709,25 @@ impl LowerCtx {
         }
     }
 
-    fn lower_expr(&self, expr: &Expr) -> Result<HirExpr, HirError> {
+    fn lower_expr(&mut self, expr: &Expr) -> Result<HirExpr, HirError> {
         let kind = match &expr.kind {
             ExprKind::Number(n) => HirExprKind::Number(*n),
             ExprKind::Ident(name) => match self.resolve(name) {
                 Some(id) => HirExprKind::Local(id),
                 None => {
-                    return Err(HirError::UndefinedName {
-                        name: name.clone(),
-                        offset: expr.span.start,
-                    });
+                    // Phase 2.5b: a top-level `local function f` registers
+                    // `f` in `function_names` but does *not* (in 2.5a)
+                    // create a local. Resolve identifiers that hit this
+                    // map as a `FunctionRef` so they can be aliased via
+                    // `local g = f` and called via `f(args)`.
+                    if let Some(&fid) = self.function_names.get(name) {
+                        HirExprKind::FunctionRef(fid)
+                    } else {
+                        return Err(HirError::UndefinedName {
+                            name: name.clone(),
+                            offset: expr.span.start,
+                        });
+                    }
                 }
             },
             ExprKind::Bool(b) => HirExprKind::Bool(*b),
@@ -796,6 +815,36 @@ impl LowerCtx {
                 op: *op,
                 operand: Box::new(self.lower_expr(operand)?),
             },
+            ExprKind::FunctionExpr { params, body } => {
+                // Register a fresh HirFunction with `name = ""` and
+                // mangled `user_anon_<idx>` (ADR 0017). The body is
+                // lowered in a separate LowerCtx so it has its own
+                // scope/locals/break-stack.
+                let id = FuncId(self.functions.len());
+                let mangled = format!("user_anon_{}", id.0);
+                self.functions.push(HirFunction {
+                    name: String::new(),
+                    mangled_name: mangled,
+                    params: params
+                        .iter()
+                        .map(|p| LocalInfo {
+                            name: p.clone(),
+                            kind: ValueKind::Number,
+                        })
+                        .collect(),
+                    locals: Vec::new(),
+                    body: Vec::new(),
+                    ret_kind: None,
+                });
+                let mut fn_ctx =
+                    LowerCtx::for_function(&self.function_names, &self.functions, params);
+                let body_hir = fn_ctx.lower_function_body(body)?;
+                let ret_kind = fn_ctx.in_function_ret_kind;
+                self.functions[id.0].locals = fn_ctx.locals;
+                self.functions[id.0].body = body_hir;
+                self.functions[id.0].ret_kind = ret_kind;
+                HirExprKind::FunctionRef(id)
+            }
             ExprKind::Call { callee, args } => self.lower_call(callee, args, expr)?,
         };
         Ok(HirExpr {
@@ -805,7 +854,7 @@ impl LowerCtx {
     }
 
     fn lower_call(
-        &self,
+        &mut self,
         callee: &Expr,
         args: &[Expr],
         whole: &Expr,
@@ -818,6 +867,42 @@ impl LowerCtx {
                 });
             }
         };
+        // Phase 2.5b: a Function-kind local takes precedence over the
+        // function-name table. This handles `local f = function() end;
+        // f()` and the alias case `local g = f; g()`.
+        if let Some(local_id) = self.resolve(name) {
+            if let ValueKind::Function(fid) = self.locals[local_id.0].kind {
+                let user_fn = &self.functions[fid.0];
+                let expected = user_fn.params.len();
+                if args.len() != expected {
+                    return Err(HirError::ArityMismatch {
+                        builtin: name.clone(),
+                        expected,
+                        actual: args.len(),
+                        offset: whole.span.start,
+                    });
+                }
+                let lowered_args = args
+                    .iter()
+                    .map(|a| self.lower_expr(a))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for arg in &lowered_args {
+                    let k = infer_kind(arg, &self.locals, &self.functions);
+                    if k != ValueKind::Number {
+                        return Err(HirError::TypeMismatch {
+                            op: format!("call-{name}"),
+                            lhs_kind: "number".to_owned(),
+                            rhs_kind: k.name().to_owned(),
+                            offset: arg.span.start,
+                        });
+                    }
+                }
+                return Ok(HirExprKind::Call {
+                    callee: Callee::User(fid),
+                    args: lowered_args,
+                });
+            }
+        }
         // User functions take precedence over builtins. (Phase 2.5a
         // doesn't allow shadowing `print` since users can't define a
         // function called `print` without explicit conflict — but we
@@ -877,6 +962,22 @@ impl LowerCtx {
             .iter()
             .map(|a| self.lower_expr(a))
             .collect::<Result<Vec<_>, _>>()?;
+        // Phase 2.5b: builtin args may be Number/Bool/Nil but never a
+        // Function value (function values cannot be printed or otherwise
+        // observed as values yet). Reject explicitly.
+        for arg in &lowered_args {
+            if let ValueKind::Function(_) = infer_kind(arg, &self.locals, &self.functions) {
+                let arg_name = match &arg.kind {
+                    HirExprKind::Local(LocalId(idx)) => self.locals[*idx].name.clone(),
+                    HirExprKind::FunctionRef(_) => "<anonymous>".to_owned(),
+                    _ => "<unknown>".to_owned(),
+                };
+                return Err(HirError::FunctionUsedAsValue {
+                    name: arg_name,
+                    offset: arg.span.start,
+                });
+            }
+        }
         Ok(HirExprKind::Call {
             callee: Callee::Builtin(builtin),
             args: lowered_args,
@@ -1497,6 +1598,72 @@ mod tests {
         assert_eq!(hir.locals[0].name, "x");
         // Function f has its own params and locals (independent).
         assert_eq!(hir.functions[0].params.len(), 1);
+    }
+
+    #[test]
+    fn lower_anonymous_function_registers_in_table_with_anon_name() {
+        let hir = lower_src("local f = function() return 1 end").expect("must lower");
+        assert_eq!(hir.functions.len(), 1);
+        assert_eq!(hir.functions[0].mangled_name, "user_anon_0");
+        // Source-level name is intentionally empty for anonymous fns.
+        assert!(hir.functions[0].name.is_empty());
+    }
+
+    #[test]
+    fn lower_local_init_with_function_expr_records_function_kind() {
+        let hir = lower_src("local f = function(x) return x end").expect("must lower");
+        assert_eq!(hir.locals.len(), 1);
+        assert_eq!(hir.locals[0].name, "f");
+        assert!(matches!(hir.locals[0].kind, ValueKind::Function(FuncId(0))));
+    }
+
+    #[test]
+    fn lower_alias_local_propagates_function_kind() {
+        let hir =
+            lower_src("local f = function() return 1 end\nlocal g = f").expect("alias must lower");
+        assert_eq!(hir.locals.len(), 2);
+        // Both locals share the same Function(FuncId(0)) kind.
+        assert!(matches!(hir.locals[0].kind, ValueKind::Function(FuncId(0))));
+        assert!(matches!(hir.locals[1].kind, ValueKind::Function(FuncId(0))));
+    }
+
+    #[test]
+    fn lower_call_via_function_typed_local_resolves_to_func_id() {
+        let hir = lower_src("local f = function(x) return x end\nprint(f(7))").expect("must lower");
+        // The print's arg is a Call into the Function-typed local.
+        let HirStmtKind::ExprStmt(call) = &hir.stmts[1].kind else {
+            panic!("expected print(f(7)) ExprStmt at stmts[1]");
+        };
+        let HirExprKind::Call { args, .. } = &call.kind else {
+            panic!("expected print Call");
+        };
+        let HirExprKind::Call { callee: inner, .. } = &args[0].kind else {
+            panic!("expected nested Call");
+        };
+        assert!(matches!(inner, Callee::User(FuncId(0))));
+    }
+
+    #[test]
+    fn lower_function_used_as_value_errors() {
+        let err = lower_src("local f = function() end\nprint(f)")
+            .expect_err("function passed as plain value must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("function") || msg.contains("FunctionUsedAsValue"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn lower_function_passed_as_arg_errors() {
+        // Note: `apply` is not defined here — so the message could be
+        // either UnknownFunction (apply) or FunctionUsedAsValue (f).
+        // Both are acceptable; just make sure it does NOT silently
+        // succeed with f passed as a value.
+        let result = lower_src(
+            "local f = function() return 1 end\nlocal function apply(g) return g() end\napply(f)",
+        );
+        assert!(result.is_err(), "expected an error for f-as-arg");
     }
 
     #[test]

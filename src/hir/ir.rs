@@ -131,6 +131,12 @@ pub enum HirExprKind {
         callee: Callee,
         args: Vec<HirExpr>,
     },
+    /// Reference to a user function by id (Phase 2.5b, ADR 0017).
+    /// Produced by lowering an anonymous function expression
+    /// `function() ... end` and stored into the matching Function-kind
+    /// local; codegen treats it as an `i1 0` placeholder because the
+    /// actual function is resolved by name at every call site.
+    FunctionRef(FuncId),
 }
 
 /// Discriminates whether a [`HirExprKind::Call`] hits a built-in

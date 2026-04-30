@@ -388,7 +388,7 @@ fn emit_alloca_slot_for_kind<'a, 'c>(
         // Bool: 1-bit. Nil: nominally 1-bit too — the value is never
         // observed (heterogeneous `==` and print(nil) both bypass
         // the slot via static dispatch), but storage is uniform.
-        ValueKind::Bool | ValueKind::Nil => types.i1,
+        ValueKind::Bool | ValueKind::Nil | ValueKind::Function(_) => types.i1,
     };
 
     let one = arith::constant(context, IntegerAttribute::new(types.i32, 1).into(), loc);
@@ -469,7 +469,7 @@ fn emit_expr<'a, 'c>(
         HirExprKind::Local(LocalId(idx)) => {
             let slot_ty = match locals[*idx].kind {
                 ValueKind::Number => types.f64,
-                ValueKind::Bool | ValueKind::Nil => types.i1,
+                ValueKind::Bool | ValueKind::Nil | ValueKind::Function(_) => types.i1,
             };
             Ok(emit_load(block, slots[*idx], slot_ty, loc))
         }
@@ -552,6 +552,14 @@ fn emit_expr<'a, 'c>(
                 }
             }
         },
+        HirExprKind::FunctionRef(_) => {
+            // Phase 2.5b: a function reference is HIR-only metadata.
+            // Codegen never reads the slot value; emitting an i1 0
+            // gives the LocalInit a benign placeholder. ADR 0017.
+            let attr = IntegerAttribute::new(types.i1, 0);
+            let op = arith::constant(context, attr.into(), loc);
+            Ok(block.append_operation(op).result(0).unwrap().into())
+        }
     }
 }
 
@@ -751,6 +759,10 @@ fn emit_print_value<'a, 'c>(
         ValueKind::Number => emit_printf_g(context, block, value, types, loc),
         ValueKind::Bool => emit_print_bool(context, block, value, types, loc),
         ValueKind::Nil => emit_print_nil(context, block, types, loc),
+        ValueKind::Function(_) => unreachable!(
+            "Function-kind args are rejected at HIR-time \
+             (HirError::FunctionUsedAsValue) — should not reach codegen"
+        ),
     }
 }
 
@@ -879,6 +891,10 @@ fn emit_truthiness<'a, 'c>(
                 .unwrap()
                 .into()
         }
+        ValueKind::Function(_) => unreachable!(
+            "Function-kind values do not flow through truthiness \
+             (HIR rejects them at use sites) — ADR 0017"
+        ),
     }
 }
 
@@ -888,7 +904,7 @@ fn emit_truthiness<'a, 'c>(
 fn kind_to_mlir_type<'c>(kind: ValueKind, types: &Types<'c>) -> Type<'c> {
     match kind {
         ValueKind::Number => types.f64,
-        ValueKind::Bool | ValueKind::Nil => types.i1,
+        ValueKind::Bool | ValueKind::Nil | ValueKind::Function(_) => types.i1,
     }
 }
 
@@ -1535,6 +1551,49 @@ mod tests {
         )
         .expect("short-circuit module must verify");
         assert!(module.as_operation().verify());
+    }
+
+    #[test]
+    fn emit_anonymous_function_creates_user_anon_symbol() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src("local f = function() return 1 end\nprint(f())"),
+        )
+        .unwrap();
+        let mlir = module.as_operation().to_string();
+        assert!(
+            mlir.contains("func.func @user_anon_0"),
+            "expected mangled `@user_anon_0` symbol, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_local_function_value_module_verifies() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src("local f = function(x) return x * 2 end\nprint(f(7))"),
+        )
+        .expect("function-value module must verify");
+        assert!(module.as_operation().verify());
+    }
+
+    #[test]
+    fn emit_alias_call_resolves_to_anon_symbol() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src("local f = function() return 42 end\nlocal g = f\nprint(g())"),
+        )
+        .expect("alias module must verify");
+        let mlir = module.as_operation().to_string();
+        // The call site for g() should still resolve to @user_anon_0
+        // — alias is a HIR-only kind copy.
+        assert!(
+            mlir.contains("call @user_anon_0"),
+            "expected alias call to @user_anon_0, got:\n{mlir}"
+        );
     }
 
     #[test]
