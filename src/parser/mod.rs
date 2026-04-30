@@ -276,24 +276,33 @@ impl<'t> Parser<'t> {
         if matches!(self.peek().kind, TokenKind::Keyword(Keyword::Function)) {
             return self.parse_function_def(local_tok);
         }
-        let name_tok = self.peek().clone();
-        let name = match name_tok.kind {
-            TokenKind::Ident(ref n) => {
+        // Parse one or more names separated by commas.
+        let mut names: Vec<String> = Vec::new();
+        loop {
+            let name_tok = self.peek().clone();
+            match name_tok.kind {
+                TokenKind::Ident(ref n) => {
+                    self.bump();
+                    names.push(n.clone());
+                }
+                TokenKind::Eof => {
+                    return Err(ParseError::UnexpectedEof {
+                        offset: name_tok.span.start,
+                    });
+                }
+                other => {
+                    return Err(ParseError::UnexpectedToken {
+                        actual: other,
+                        offset: name_tok.span.start,
+                    });
+                }
+            }
+            if matches!(self.peek().kind, TokenKind::Comma) {
                 self.bump();
-                n.clone()
+            } else {
+                break;
             }
-            TokenKind::Eof => {
-                return Err(ParseError::UnexpectedEof {
-                    offset: name_tok.span.start,
-                });
-            }
-            other => {
-                return Err(ParseError::UnexpectedToken {
-                    actual: other,
-                    offset: name_tok.span.start,
-                });
-            }
-        };
+        }
         let eq_tok = self.peek().clone();
         match eq_tok.kind {
             TokenKind::Equals => {
@@ -311,9 +320,25 @@ impl<'t> Parser<'t> {
                 });
             }
         }
-        let value = self.parse_expr(0)?;
-        let span = Span::new(local_tok.span.start, value.span.end);
-        Ok(Stmt::new(StmtKind::Local { name, value }, span))
+        // Parse one or more values separated by commas.
+        let mut values: Vec<Expr> = vec![self.parse_expr(0)?];
+        while matches!(self.peek().kind, TokenKind::Comma) {
+            self.bump();
+            values.push(self.parse_expr(0)?);
+        }
+        let span_end = values.last().expect("at least one value").span.end;
+        let span = Span::new(local_tok.span.start, span_end);
+        // Single name + single value → existing `Local` shape; any
+        // multi shape (multi-name and/or multi-value) → `LocalMulti`,
+        // which HIR validates against the Phase 2.5d rules.
+        let kind = if names.len() == 1 && values.len() == 1 {
+            let value = values.pop().unwrap();
+            let name = names.pop().unwrap();
+            StmtKind::Local { name, value }
+        } else {
+            StmtKind::LocalMulti { names, values }
+        };
+        Ok(Stmt::new(kind, span))
     }
 
     fn parse_function_def(&mut self, local_tok: Token) -> Result<Stmt, ParseError> {
@@ -391,15 +416,26 @@ impl<'t> Parser<'t> {
                 | TokenKind::Keyword(Keyword::Else)
                 | TokenKind::Keyword(Keyword::Elseif)
         );
-        let (value, span_end) = if has_value {
-            let v = self.parse_expr(0)?;
-            let end = v.span.end;
-            (Some(v), end)
-        } else {
-            (None, return_tok.span.end)
-        };
+        if !has_value {
+            let span = Span::new(return_tok.span.start, return_tok.span.end);
+            return Ok(Stmt::new(StmtKind::Return { value: None }, span));
+        }
+        // One or more comma-separated return expressions (Phase 2.5d).
+        let mut values: Vec<Expr> = vec![self.parse_expr(0)?];
+        while matches!(self.peek().kind, TokenKind::Comma) {
+            self.bump();
+            values.push(self.parse_expr(0)?);
+        }
+        let span_end = values.last().expect("at least one value").span.end;
         let span = Span::new(return_tok.span.start, span_end);
-        Ok(Stmt::new(StmtKind::Return { value }, span))
+        let kind = if values.len() == 1 {
+            StmtKind::Return {
+                value: Some(values.pop().unwrap()),
+            }
+        } else {
+            StmtKind::ReturnMulti { values }
+        };
+        Ok(Stmt::new(kind, span))
     }
 
     fn parse_expr(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
@@ -733,6 +769,13 @@ mod tests {
             },
             StmtKind::Return { value } => StmtKind::Return {
                 value: value.map(strip_span_expr),
+            },
+            StmtKind::LocalMulti { names, values } => StmtKind::LocalMulti {
+                names,
+                values: values.into_iter().map(strip_span_expr).collect(),
+            },
+            StmtKind::ReturnMulti { values } => StmtKind::ReturnMulti {
+                values: values.into_iter().map(strip_span_expr).collect(),
             },
             StmtKind::ExprStmt(e) => StmtKind::ExprStmt(strip_span_expr(e)),
         };
@@ -1474,5 +1517,66 @@ mod tests {
     fn parse_unterminated_do_block_is_rejected() {
         let err = parse("do local x = 1").expect_err("missing `end` must fail");
         assert!(matches!(err, ParseError::UnexpectedEof { .. }));
+    }
+
+    // -----------------------------------------------------------
+    // Phase 2.5d — multi-return / multi-binding (ADR 0021).
+    // -----------------------------------------------------------
+
+    #[test]
+    fn parse_local_multi_value_yields_local_multi() {
+        let stmt = parse_single_stmt("local a, b = 1, 2").expect("must parse");
+        match stmt.kind {
+            StmtKind::LocalMulti { names, values } => {
+                assert_eq!(names, vec!["a".to_owned(), "b".to_owned()]);
+                assert_eq!(values.len(), 2);
+            }
+            other => panic!("expected LocalMulti, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_local_multi_name_single_call_yields_local_multi() {
+        let stmt = parse_single_stmt("local a, b = f()").expect("must parse");
+        match stmt.kind {
+            StmtKind::LocalMulti { names, values } => {
+                assert_eq!(names.len(), 2);
+                assert_eq!(values.len(), 1);
+                assert!(matches!(values[0].kind, ExprKind::Call { .. }));
+            }
+            other => panic!("expected LocalMulti, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_return_multi_values() {
+        // `return 1, 2` parses as ReturnMulti { values: [1, 2] }.
+        let stmt = parse("local function f() return 1, 2 end")
+            .expect("must parse")
+            .into_iter()
+            .next()
+            .unwrap();
+        let StmtKind::FunctionDef { body, .. } = stmt.kind else {
+            panic!("expected FunctionDef");
+        };
+        match &body[0].kind {
+            StmtKind::ReturnMulti { values } => {
+                assert_eq!(values.len(), 2);
+            }
+            other => panic!("expected ReturnMulti, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_single_return_unchanged_after_2_5d() {
+        // Regression: single-return uses the existing Return shape.
+        let stmt = parse_single_stmt("local function f() return 42 end").expect("must parse");
+        let StmtKind::FunctionDef { body, .. } = stmt.kind else {
+            panic!("expected FunctionDef");
+        };
+        match &body[0].kind {
+            StmtKind::Return { value: Some(_) } => {}
+            other => panic!("expected Return (single), got {other:?}"),
+        }
     }
 }

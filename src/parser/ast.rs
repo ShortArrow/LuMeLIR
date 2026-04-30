@@ -92,6 +92,14 @@ pub enum StmtKind {
         name: String,
         value: Expr,
     },
+    /// `local NAME (, NAME)+ = EXPR (, EXPR)*` (Phase 2.5d, ADR 0021).
+    /// `values.len() == 1` means a single Call expanded across all
+    /// names; `values.len() == names.len()` means parallel binding;
+    /// any other shape is a parse-time error.
+    LocalMulti {
+        names: Vec<String>,
+        values: Vec<Expr>,
+    },
     Assign {
         name: String,
         value: Expr,
@@ -133,6 +141,11 @@ pub enum StmtKind {
     /// `ReturnOutsideFunction`.
     Return {
         value: Option<Expr>,
+    },
+    /// `return EXPR, EXPR (, EXPR)*` — two or more return values
+    /// (Phase 2.5d, ADR 0021).
+    ReturnMulti {
+        values: Vec<Expr>,
     },
     ExprStmt(Expr),
 }
