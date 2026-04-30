@@ -305,6 +305,7 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
     for (idx, stmt) in chunk.iter().enumerate() {
         if let StmtKind::FunctionDef { params, body, .. } = &stmt.kind {
             let id = FuncId(idx_of_funcdef(chunk, idx));
+            let pre_count = functions.len();
             let mut fn_ctx = LowerCtx::for_function(&function_names, &functions, params, body);
             let body_hir = fn_ctx.lower_function_body(body)?;
             let ret_kind = fn_ctx.in_function_ret_kind;
@@ -316,6 +317,14 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
             functions[id.0].locals = fn_ctx.locals;
             functions[id.0].body = body_hir;
             functions[id.0].ret_kind = ret_kind;
+            // Phase 2.5b.3: anonymous functions registered while lowering
+            // this body live only in `fn_ctx.functions`; hoist the new
+            // ones (indices ≥ pre_count) into the outer table so codegen
+            // can emit them. FuncIds remain stable because the inner
+            // table was a clone and indices only grew.
+            for new_fn in fn_ctx.functions.into_iter().skip(pre_count) {
+                functions.push(new_fn);
+            }
         }
     }
 
@@ -423,14 +432,21 @@ impl LowerCtx {
     /// post-`return` statements are skipped at runtime.
     fn lower_function_body(&mut self, stmts: &[Stmt]) -> Result<Vec<HirStmt>, HirError> {
         // Synthetic flag + value slot, declared at the top of the
-        // body's outermost scope (after parameters).
+        // body's outermost scope (after parameters). The `_ret_value`
+        // slot's kind starts as Number; the first value-returning
+        // `return` upgrades it to whatever kind the value carries
+        // (Phase 2.5b.3 / ADR 0019).
         let returned_id = self.declare_local("_returned".to_owned(), ValueKind::Bool);
         let ret_value_id = self.declare_local("_ret_value".to_owned(), ValueKind::Number);
         self.in_function = Some((returned_id, Some(ret_value_id)));
 
-        // The implicit Span for synthetic locals — pick the chunk's
-        // first stmt's span if available, else a zero-width sentinel.
+        // Lower the body first so that the slot's final kind is known
+        // before we emit the synthetic prelude.
         let span = stmts.first().map(|s| s.span).unwrap_or(Span::new(0, 0));
+        self.loop_break_targets.push(Some(returned_id));
+        let lowered = self.lower_stmts(stmts)?;
+        self.loop_break_targets.pop();
+
         let mut out = Vec::with_capacity(stmts.len() + 2);
         out.push(HirStmt {
             kind: HirStmtKind::LocalInit {
@@ -442,29 +458,24 @@ impl LowerCtx {
             },
             span,
         });
-        out.push(HirStmt {
-            kind: HirStmtKind::LocalInit {
-                id: ret_value_id,
-                value: HirExpr {
-                    kind: HirExprKind::Number(0.0),
-                    span,
+        // Phase 2.5b.3: only initialise `_ret_value` when its slot kind
+        // is Number — there is no sensible default for a Function-kind
+        // slot, and the body-guard pattern guarantees that any path
+        // reading the trailing return load has already assigned to the
+        // slot first.
+        if matches!(self.locals[ret_value_id.0].kind, ValueKind::Number) {
+            out.push(HirStmt {
+                kind: HirStmtKind::LocalInit {
+                    id: ret_value_id,
+                    value: HirExpr {
+                        kind: HirExprKind::Number(0.0),
+                        span,
+                    },
                 },
-            },
-            span,
-        });
+                span,
+            });
+        }
 
-        // Lower body statements with the `_returned` guard wrap (same
-        // pattern as `break`). Reuse `loop_break_targets` machinery by
-        // pushing the returned flag — every body stmt becomes
-        // `if not _returned then stmt`.
-        self.loop_break_targets.push(Some(returned_id));
-        let lowered = self.lower_stmts(stmts)?;
-        self.loop_break_targets.pop();
-
-        // Apply the guard wrap manually (lower_stmts doesn't wrap on
-        // its own — only `lower_stmts_maybe_guarded` does, and that
-        // helper is loop-specific). Reuse `wrap_with_broken_guard`
-        // since the shape is identical.
         for stmt in lowered {
             out.push(wrap_with_broken_guard(stmt, returned_id));
         }
@@ -695,17 +706,35 @@ impl LowerCtx {
                 if let Some(expr) = value {
                     let v = self.lower_expr(expr)?;
                     let v_kind = infer_kind(&v, &self.locals, &self.functions);
-                    if v_kind != ValueKind::Number {
+                    // Phase 2.5b.3 (ADR 0019): allow Number or
+                    // Function(arity) returns; reject Bool/Nil for now.
+                    if !matches!(v_kind, ValueKind::Number | ValueKind::Function(_)) {
                         return Err(HirError::TypeMismatch {
                             op: "return".to_owned(),
-                            lhs_kind: "number".to_owned(),
+                            lhs_kind: "number or function".to_owned(),
                             rhs_kind: v_kind.name().to_owned(),
                             offset: stmt.span.start,
                         });
                     }
-                    self.in_function_ret_kind = Some(ValueKind::Number);
+                    // All returns in a function body must share a kind.
+                    if let Some(prev) = self.in_function_ret_kind
+                        && prev != v_kind
+                    {
+                        return Err(HirError::TypeMismatch {
+                            op: "return".to_owned(),
+                            lhs_kind: prev.name().to_owned(),
+                            rhs_kind: v_kind.name().to_owned(),
+                            offset: stmt.span.start,
+                        });
+                    }
+                    self.in_function_ret_kind = Some(v_kind);
                     let ret_value_id = ret_value_id
                         .expect("_ret_value slot allocated whenever any return has a value");
+                    // Upgrade the `_ret_value` slot's kind from its
+                    // default (Number) to whatever the return value
+                    // actually carries — codegen uses this to pick the
+                    // slot's MLIR type and the function's result type.
+                    self.locals[ret_value_id.0].kind = v_kind;
                     block_stmts.push(HirStmt {
                         kind: HirStmtKind::Assign {
                             id: ret_value_id,
@@ -1890,5 +1919,73 @@ mod tests {
         let hir = lower_src("local x = 1\nprint(x + 2)").expect("Phase 2.0 target lowers");
         assert_eq!(hir.locals.len(), 1);
         assert_eq!(hir.stmts.len(), 2);
+    }
+
+    // -----------------------------------------------------------
+    // Phase 2.5b.3 — functions as return values (ADR 0019).
+    // -----------------------------------------------------------
+
+    #[test]
+    fn lower_function_returning_function_has_function_ret_kind() {
+        let src = "local function f(x) return x end\nlocal function get_f() return f end";
+        let hir = lower_src(src).expect("Phase 2.5b.3: returning a function must lower");
+        let get_f = hir
+            .functions
+            .iter()
+            .find(|fn_| fn_.name == "get_f")
+            .expect("get_f present");
+        assert_eq!(get_f.ret_kind, Some(ValueKind::Function(1)));
+    }
+
+    #[test]
+    fn lower_local_bound_to_call_returning_function_has_function_kind() {
+        let src = concat!(
+            "local function f(x) return x * 2 end\n",
+            "local function get_f() return f end\n",
+            "local g = get_f()\n",
+        );
+        let hir = lower_src(src).expect("Phase 2.5b.3: local from function-returning call");
+        let g_local = hir
+            .locals
+            .iter()
+            .find(|l| l.name == "g")
+            .expect("g local present");
+        assert_eq!(g_local.kind, ValueKind::Function(1));
+        assert_eq!(g_local.func_id, None, "call result has no static FuncId");
+    }
+
+    #[test]
+    fn lower_anon_function_directly_returned() {
+        let src = "local function make() return function(x) return x + 1 end end";
+        let hir = lower_src(src).expect("Phase 2.5b.3: returning anon fn must lower");
+        let make_fn = hir
+            .functions
+            .iter()
+            .find(|fn_| fn_.name == "make")
+            .expect("make present");
+        assert_eq!(make_fn.ret_kind, Some(ValueKind::Function(1)));
+        // The anon function must also have been hoisted into the
+        // chunk's function table so codegen can emit it.
+        assert!(
+            hir.functions.iter().any(|fn_| fn_.name.is_empty()),
+            "anon function must be hoisted into chunk.functions, got names: {:?}",
+            hir.functions.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn lower_arity_mismatch_on_returned_function_errors() {
+        // get_f returns a 1-arg function; calling g with 2 args must reject.
+        let src = concat!(
+            "local function f(x) return x end\n",
+            "local function get_f() return f end\n",
+            "local g = get_f()\n",
+            "print(g(1, 2))\n",
+        );
+        let result = lower_src(src);
+        assert!(
+            result.is_err(),
+            "arity mismatch on returned function must reject"
+        );
     }
 }
