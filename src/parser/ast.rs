@@ -103,6 +103,15 @@ pub enum StmtKind {
         cond: Expr,
         body: Chunk,
     },
+    /// `for var = start, stop[, step] do body end` (Lua 5.4 §3.3.5).
+    /// `step` is `None` when the implicit `1` is used.
+    ForNumeric {
+        var: String,
+        start: Expr,
+        stop: Expr,
+        step: Option<Expr>,
+        body: Chunk,
+    },
     ExprStmt(Expr),
 }
 

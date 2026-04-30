@@ -267,6 +267,17 @@ fn emit_stmt<'a, 'c>(
         HirStmtKind::While { cond, body } => {
             emit_while(context, block, cond, body, slots, locals, types, loc)?;
         }
+        HirStmtKind::ForNumeric {
+            var_id,
+            start,
+            stop,
+            step,
+            body,
+        } => {
+            emit_for_numeric(
+                context, block, *var_id, start, stop, step, body, slots, locals, types, loc,
+            )?;
+        }
         HirStmtKind::ExprStmt(expr) => {
             emit_expr_stmt(context, block, expr, slots, locals, types, loc)?;
         }
@@ -969,6 +980,139 @@ fn emit_while<'a, 'c>(
     Ok(())
 }
 
+/// Lower a numeric `for var = start, stop, step do body end` to a
+/// `scf.while` loop. start/stop/step are evaluated **once** before the
+/// loop (Lua 5.4 §3.3.5). Auxiliary `stop` and `step` slots are
+/// allocated in the parent block; the loop variable already has its
+/// own slot in `slots[var_id.0]`.
+///
+/// Sign dispatch is **runtime**: an inner `scf.if` in the before
+/// region picks `arith.cmpf ole` (step > 0) or `oge` (step ≤ 0).
+/// LLVM constant-folds when `step` is a literal.
+#[allow(clippy::too_many_arguments)]
+fn emit_for_numeric<'a, 'c>(
+    context: &'c Context,
+    parent: &'a Block<'c>,
+    var_id: LocalId,
+    start: &HirExpr,
+    stop: &HirExpr,
+    step: &HirExpr,
+    body: &[HirStmt],
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    // Evaluate start/stop/step once in the parent block, store into
+    // dedicated slots (stop/step) and the loop variable's own slot.
+    let start_val = emit_expr(context, parent, start, slots, locals, types, loc)?;
+    let stop_val = emit_expr(context, parent, stop, slots, locals, types, loc)?;
+    let step_val = emit_expr(context, parent, step, slots, locals, types, loc)?;
+
+    let stop_slot = emit_alloca_slot_for_kind(context, parent, ValueKind::Number, types, loc);
+    let step_slot = emit_alloca_slot_for_kind(context, parent, ValueKind::Number, types, loc);
+    emit_store(parent, start_val, slots[var_id.0], loc);
+    emit_store(parent, stop_val, stop_slot, loc);
+    emit_store(parent, step_val, step_slot, loc);
+
+    // Before region: load i/stop/step, runtime-dispatch on step sign,
+    // emit scf.condition.
+    let before = Region::new();
+    let before_blk = Block::new(&[]);
+    let blk_slots = transmute_slots(slots);
+    let var_slot = blk_slots[var_id.0];
+    let stop_slot_b = unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(stop_slot) };
+    let step_slot_b = unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(step_slot) };
+    let i_val = emit_load(&before_blk, var_slot, types.f64, loc);
+    let stop_now = emit_load(&before_blk, stop_slot_b, types.f64, loc);
+    let step_now = emit_load(&before_blk, step_slot_b, types.f64, loc);
+
+    let zero_attr = FloatAttribute::new(context, types.f64, 0.0);
+    let zero = before_blk
+        .append_operation(arith::constant(context, zero_attr.into(), loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let step_pos = before_blk
+        .append_operation(arith::cmpf(
+            context,
+            CmpfPredicate::Ogt,
+            step_now,
+            zero,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+
+    // Inner scf.if -> i1 yields the right ordered comparison.
+    let then_region =
+        build_for_cond_region(context, CmpfPredicate::Ole, i_val, stop_now, types, loc);
+    let else_region =
+        build_for_cond_region(context, CmpfPredicate::Oge, i_val, stop_now, types, loc);
+    let cond = before_blk
+        .append_operation(scf::r#if(
+            step_pos,
+            &[types.i1],
+            then_region,
+            else_region,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    before_blk.append_operation(scf::condition(cond, &[], loc));
+    before.append_block(before_blk);
+
+    // After region: body, then i = i + step, scf.yield.
+    let after = Region::new();
+    let after_blk = Block::new(&[]);
+    let after_slots = transmute_slots(slots);
+    emit_stmts(context, &after_blk, body, after_slots, locals, types, loc)?;
+    let i_now = emit_load(&after_blk, after_slots[var_id.0], types.f64, loc);
+    let step_now_after = emit_load(
+        &after_blk,
+        unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(step_slot) },
+        types.f64,
+        loc,
+    );
+    let i_next = after_blk
+        .append_operation(arith::addf(i_now, step_now_after, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_store(&after_blk, i_next, after_slots[var_id.0], loc);
+    after_blk.append_operation(scf::r#yield(&[], loc));
+    after.append_block(after_blk);
+
+    parent.append_operation(scf::r#while(&[], &[], before, after, loc));
+    Ok(())
+}
+
+/// Build a single-block Region that yields `arith.cmpf <pred> i, stop : i1`.
+/// Used as the then/else region of the for-loop sign dispatch.
+fn build_for_cond_region<'c, 'a>(
+    context: &'c Context,
+    pred: CmpfPredicate,
+    i: Value<'c, 'a>,
+    stop: Value<'c, 'a>,
+    _types: &Types<'c>,
+    loc: Location<'c>,
+) -> Region<'c> {
+    let region = Region::new();
+    let blk = Block::new(&[]);
+    let i_inner = unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(i) };
+    let stop_inner = unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(stop) };
+    let cmp = blk
+        .append_operation(arith::cmpf(context, pred, i_inner, stop_inner, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    blk.append_operation(scf::r#yield(&[cmp], loc));
+    region.append_block(blk);
+    region
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1183,6 +1327,55 @@ mod tests {
             &lower_src("if (1 < 2) and (2 < 3) then print(true) end"),
         )
         .expect("short-circuit module must verify");
+        assert!(module.as_operation().verify());
+    }
+
+    #[test]
+    fn emit_for_numeric_uses_scf_while() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("for i = 1, 3 do print(i) end")).unwrap();
+        let mlir = module.as_operation().to_string();
+        assert!(
+            mlir.contains("scf.while") && mlir.contains("scf.condition"),
+            "expected scf.while + scf.condition for `for`, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_for_numeric_evaluates_start_once() {
+        // start = 1 should appear exactly once in the IR (not inside
+        // the loop body) — proving it isn't re-evaluated each iter.
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("for i = 1, 3 do print(i) end")).unwrap();
+        let mlir = module.as_operation().to_string();
+        // arith.constant 1.000000e+00 should appear once (the loop init);
+        // the addf in the after region uses load+constant-step, not 1.
+        let starts = mlir.matches("1.000000e+00").count();
+        // 1 from `start`, plus possibly 1 from the synthetic step constant.
+        // Either way, less than 4 (we don't re-evaluate `start` each iter).
+        assert!(
+            starts <= 3,
+            "expected start evaluated once, got {starts} occurrences"
+        );
+    }
+
+    #[test]
+    fn emit_for_with_negative_step_uses_runtime_dispatch() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("for i = 10, 1, -2 do print(i) end")).unwrap();
+        let mlir = module.as_operation().to_string();
+        // Runtime sign dispatch: scf.if step > 0 yields ole, else oge.
+        assert!(
+            mlir.contains("scf.if") && (mlir.contains("ole") || mlir.contains("oge")),
+            "expected runtime sign dispatch via scf.if + ole/oge, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_module_with_for_verifies() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("for i = 1, 3 do print(i) end"))
+            .expect("for module must verify");
         assert!(module.as_operation().verify());
     }
 

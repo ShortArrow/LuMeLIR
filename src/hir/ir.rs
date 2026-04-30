@@ -53,6 +53,18 @@ pub enum HirStmtKind {
         cond: HirExpr,
         body: Vec<HirStmt>,
     },
+    /// `for var = start, stop[, step] do body end` (Lua 5.4 §3.3.5).
+    /// `step` is always present in the HIR — the parser's `Option`
+    /// is materialised into a `HirExpr::Number(1.0)` at lowering time.
+    /// `var_id` is the loop variable's slot, scoped to `body` only and
+    /// recorded in `LowerCtx::readonly_locals` while the body lowers.
+    ForNumeric {
+        var_id: LocalId,
+        start: HirExpr,
+        stop: HirExpr,
+        step: HirExpr,
+        body: Vec<HirStmt>,
+    },
     ExprStmt(HirExpr),
 }
 

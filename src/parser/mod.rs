@@ -82,6 +82,7 @@ impl<'t> Parser<'t> {
             TokenKind::Keyword(Keyword::Do) => self.parse_block(),
             TokenKind::Keyword(Keyword::If) => self.parse_if(),
             TokenKind::Keyword(Keyword::While) => self.parse_while(),
+            TokenKind::Keyword(Keyword::For) => self.parse_for(),
             TokenKind::Ident(_) if matches!(self.peek_kind_at(1), Some(TokenKind::Equals)) => {
                 self.parse_assign()
             }
@@ -90,6 +91,70 @@ impl<'t> Parser<'t> {
                 let span = expr.span;
                 Ok(Stmt::new(StmtKind::ExprStmt(expr), span))
             }
+        }
+    }
+
+    fn parse_for(&mut self) -> Result<Stmt, ParseError> {
+        let for_tok = self.bump().clone(); // 'for'
+        // Loop variable name.
+        let name_tok = self.peek().clone();
+        let var = match name_tok.kind {
+            TokenKind::Ident(n) => {
+                self.bump();
+                n
+            }
+            TokenKind::Eof => {
+                return Err(ParseError::UnexpectedEof {
+                    offset: name_tok.span.start,
+                });
+            }
+            other => {
+                return Err(ParseError::UnexpectedToken {
+                    actual: other,
+                    offset: name_tok.span.start,
+                });
+            }
+        };
+        self.expect_token(TokenKind::Equals)?;
+        let start = self.parse_expr(0)?;
+        self.expect_token(TokenKind::Comma)?;
+        let stop = self.parse_expr(0)?;
+        let step = if matches!(self.peek().kind, TokenKind::Comma) {
+            self.bump();
+            Some(self.parse_expr(0)?)
+        } else {
+            None
+        };
+        self.expect_keyword(Keyword::Do)?;
+        let body = self.parse_chunk_until(&[TokenKind::Keyword(Keyword::End), TokenKind::Eof])?;
+        let end_tok = self.expect_keyword(Keyword::End)?;
+        let span = Span::new(for_tok.span.start, end_tok.span.end);
+        Ok(Stmt::new(
+            StmtKind::ForNumeric {
+                var,
+                start,
+                stop,
+                step,
+                body,
+            },
+            span,
+        ))
+    }
+
+    fn expect_token(&mut self, expected: TokenKind) -> Result<Token, ParseError> {
+        let tok = self.peek().clone();
+        if tok.kind == expected {
+            self.bump();
+            Ok(tok)
+        } else if matches!(tok.kind, TokenKind::Eof) {
+            Err(ParseError::UnexpectedEof {
+                offset: tok.span.start,
+            })
+        } else {
+            Err(ParseError::UnexpectedToken {
+                actual: tok.kind,
+                offset: tok.span.start,
+            })
         }
     }
 
@@ -535,6 +600,19 @@ mod tests {
             },
             StmtKind::While { cond, body } => StmtKind::While {
                 cond: strip_span_expr(cond),
+                body: body.into_iter().map(strip_span_stmt).collect(),
+            },
+            StmtKind::ForNumeric {
+                var,
+                start,
+                stop,
+                step,
+                body,
+            } => StmtKind::ForNumeric {
+                var,
+                start: strip_span_expr(start),
+                stop: strip_span_expr(stop),
+                step: step.map(strip_span_expr),
                 body: body.into_iter().map(strip_span_stmt).collect(),
             },
             StmtKind::ExprStmt(e) => StmtKind::ExprStmt(strip_span_expr(e)),
@@ -1111,6 +1189,50 @@ mod tests {
                 rhs: Box::new(number(2.0)),
             },
         );
+    }
+
+    #[test]
+    fn parse_for_with_implicit_step() {
+        let stmt = parse_single_stmt("for i = 1, 3 do print(i) end").expect("must parse");
+        match stmt.kind {
+            StmtKind::ForNumeric {
+                var, step, body, ..
+            } => {
+                assert_eq!(var, "i");
+                assert!(step.is_none());
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("expected ForNumeric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_for_with_explicit_step() {
+        let stmt = parse_single_stmt("for i = 10, 1, -2 do print(i) end").expect("must parse");
+        match stmt.kind {
+            StmtKind::ForNumeric { step, .. } => {
+                assert!(step.is_some());
+            }
+            other => panic!("expected ForNumeric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_for_missing_do_is_rejected() {
+        let err = parse("for i = 1, 3 print(i) end").expect_err("missing `do` must fail");
+        assert!(matches!(err, ParseError::UnexpectedToken { .. }));
+    }
+
+    #[test]
+    fn parse_for_missing_comma_is_rejected() {
+        let err = parse("for i = 1 do print(i) end").expect_err("missing comma must fail");
+        assert!(matches!(err, ParseError::UnexpectedToken { .. }));
+    }
+
+    #[test]
+    fn parse_for_unterminated_is_rejected() {
+        let err = parse("for i = 1, 3 do print(i)").expect_err("missing `end` must fail");
+        assert!(matches!(err, ParseError::UnexpectedEof { .. }));
     }
 
     #[test]

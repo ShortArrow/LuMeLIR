@@ -11,8 +11,9 @@ mod ir;
 pub use error::HirError;
 pub use ir::{Builtin, HirChunk, HirExpr, HirExprKind, HirStmt, HirStmtKind, LocalId, LocalInfo};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::lexer::Span;
 use crate::parser::{BinOp, Chunk, Expr, ExprKind, Stmt, StmtKind};
 
 /// Static value-kind for a fully lowered HIR expression. Used by the
@@ -98,6 +99,9 @@ struct LowerCtx {
     /// pushes into the top frame, allowing same-scope shadowing per Lua
     /// 5.4 semantics. See ADR 0008.
     scopes: Vec<HashMap<String, LocalId>>,
+    /// Locals that cannot be reassigned with `=` — currently only
+    /// numeric `for` loop variables (Lua 5.4 §3.3.5). See ADR 0014.
+    readonly_locals: HashSet<LocalId>,
 }
 
 impl LowerCtx {
@@ -105,6 +109,7 @@ impl LowerCtx {
         Self {
             locals: Vec::new(),
             scopes: vec![HashMap::new()],
+            readonly_locals: HashSet::new(),
         }
     }
 
@@ -163,6 +168,12 @@ impl LowerCtx {
                     name: name.clone(),
                     offset: stmt.span.start,
                 })?;
+                if self.readonly_locals.contains(&id) {
+                    return Err(HirError::ReadOnlyAssign {
+                        name: name.clone(),
+                        offset: stmt.span.start,
+                    });
+                }
                 let value = self.lower_expr(value)?;
                 let slot_kind = self.locals[id.0].kind;
                 let value_kind = infer_kind(&value, &self.locals);
@@ -225,6 +236,60 @@ impl LowerCtx {
                 Ok(HirStmt {
                     kind: HirStmtKind::While {
                         cond: cond_hir,
+                        body: body_hir,
+                    },
+                    span: stmt.span,
+                })
+            }
+            StmtKind::ForNumeric {
+                var,
+                start,
+                stop,
+                step,
+                body,
+            } => {
+                // start/stop/step lower in the *outer* scope (they are
+                // evaluated once before the loop variable comes into
+                // existence — Lua 5.4 §3.3.5).
+                let start_hir = self.lower_expr(start)?;
+                let stop_hir = self.lower_expr(stop)?;
+                let step_hir = match step {
+                    Some(e) => self.lower_expr(e)?,
+                    None => HirExpr {
+                        kind: HirExprKind::Number(1.0),
+                        span: Span::new(stmt.span.end, stmt.span.end),
+                    },
+                };
+                // All three must be Number.
+                for (label, ex) in [
+                    ("start", &start_hir),
+                    ("stop", &stop_hir),
+                    ("step", &step_hir),
+                ] {
+                    let k = infer_kind(ex, &self.locals);
+                    if k != ValueKind::Number {
+                        return Err(HirError::TypeMismatch {
+                            op: format!("for-{label}"),
+                            lhs_kind: "number".to_owned(),
+                            rhs_kind: k.name().to_owned(),
+                            offset: ex.span.start,
+                        });
+                    }
+                }
+                // Body scope + read-only loop variable.
+                self.scopes.push(HashMap::new());
+                let var_id = self.declare_local(var.clone(), ValueKind::Number);
+                self.readonly_locals.insert(var_id);
+                let body_result = self.lower_stmts(body);
+                self.readonly_locals.remove(&var_id);
+                self.scopes.pop();
+                let body_hir = body_result?;
+                Ok(HirStmt {
+                    kind: HirStmtKind::ForNumeric {
+                        var_id,
+                        start: start_hir,
+                        stop: stop_hir,
+                        step: step_hir,
                         body: body_hir,
                     },
                     span: stmt.span,
@@ -785,6 +850,65 @@ mod tests {
     fn lower_or_with_different_kinds_returns_type_mismatch() {
         let err = lower_src("print(nil or 1)").expect_err("heterogeneous or must reject");
         assert!(matches!(err, HirError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn lower_for_numeric_default_step_inserts_constant_one() {
+        let hir = lower_src("for i = 1, 3 do print(i) end").expect("must lower");
+        let HirStmtKind::ForNumeric {
+            start,
+            stop,
+            step,
+            body,
+            ..
+        } = &hir.stmts[0].kind
+        else {
+            panic!("expected ForNumeric, got {:?}", hir.stmts[0].kind);
+        };
+        assert!(matches!(start.kind, HirExprKind::Number(1.0)));
+        assert!(matches!(stop.kind, HirExprKind::Number(3.0)));
+        // Implicit step → synthesised Number(1.0).
+        assert!(matches!(step.kind, HirExprKind::Number(1.0)));
+        assert_eq!(body.len(), 1);
+    }
+
+    #[test]
+    fn lower_for_numeric_with_explicit_step() {
+        let hir = lower_src("for i = 10, 1, -2 do print(i) end").expect("must lower");
+        let HirStmtKind::ForNumeric { step, .. } = &hir.stmts[0].kind else {
+            panic!("expected ForNumeric");
+        };
+        // -2 lowers to UnaryOp::Neg over Number(2.0).
+        assert!(matches!(
+            step.kind,
+            HirExprKind::UnaryOp {
+                op: crate::parser::UnaryOp::Neg,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn lower_for_with_non_number_start_returns_type_mismatch() {
+        let err =
+            lower_src("for i = true, 3 do print(i) end").expect_err("non-Number start must reject");
+        assert!(matches!(err, HirError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn lower_for_with_assign_to_loop_var_returns_readonly() {
+        let err =
+            lower_src("for i = 1, 3 do i = 99 end").expect_err("assigning to loop var must reject");
+        match err {
+            HirError::ReadOnlyAssign { name, .. } => assert_eq!(name, "i"),
+            other => panic!("expected ReadOnlyAssign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_for_loop_var_invisible_outside() {
+        let err = lower_src("for i = 1, 3 do end\nprint(i)").expect_err("loop var must not leak");
+        assert!(matches!(err, HirError::UndefinedName { .. }));
     }
 
     #[test]

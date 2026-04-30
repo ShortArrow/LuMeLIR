@@ -29,4 +29,7 @@ pub enum HirError {
         rhs_kind: String,
         offset: usize,
     },
+
+    #[error("loop variable '{name}' is read-only inside its `for` body (offset {offset})")]
+    ReadOnlyAssign { name: String, offset: usize },
 }
