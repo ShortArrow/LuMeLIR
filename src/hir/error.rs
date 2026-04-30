@@ -6,9 +6,6 @@ pub enum HirError {
     #[error("undefined name '{name}' at byte offset {offset}")]
     UndefinedName { name: String, offset: usize },
 
-    #[error("unknown builtin '{name}' at byte offset {offset}")]
-    UnknownBuiltin { name: String, offset: usize },
-
     #[error("builtin '{builtin}' expects {expected} argument(s), got {actual} (offset {offset})")]
     ArityMismatch {
         builtin: String,
@@ -35,4 +32,10 @@ pub enum HirError {
 
     #[error("`break` is not inside any loop (offset {offset})")]
     BreakOutsideLoop { offset: usize },
+
+    #[error("`return` is not inside a function (offset {offset})")]
+    ReturnOutsideFunction { offset: usize },
+
+    #[error("unknown function '{name}' at byte offset {offset}")]
+    UnknownFunction { name: String, offset: usize },
 }

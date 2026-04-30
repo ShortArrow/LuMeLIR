@@ -115,6 +115,18 @@ pub enum StmtKind {
     /// `break` — exits the innermost enclosing loop. HIR rejects
     /// `break` outside of any loop with `BreakOutsideLoop`.
     Break,
+    /// `local function NAME(PARAMS) BODY end` (Phase 2.5a, ADR 0016).
+    /// First-class anonymous functions arrive in 2.5b.
+    FunctionDef {
+        name: String,
+        params: Vec<String>,
+        body: Chunk,
+    },
+    /// `return [expr]`. HIR rejects `return` outside any function with
+    /// `ReturnOutsideFunction`.
+    Return {
+        value: Option<Expr>,
+    },
     ExprStmt(Expr),
 }
 

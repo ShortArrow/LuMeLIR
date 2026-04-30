@@ -26,8 +26,8 @@ use melior::{
 };
 
 use crate::hir::{
-    Builtin, HirChunk, HirExpr, HirExprKind, HirStmt, HirStmtKind, LocalId, LocalInfo, ValueKind,
-    infer_kind,
+    Builtin, Callee, FuncId, HirChunk, HirExpr, HirExprKind, HirFunction, HirStmt, HirStmtKind,
+    LocalId, LocalInfo, ValueKind, infer_kind,
 };
 use crate::parser::{BinOp, UnaryOp};
 
@@ -73,6 +73,9 @@ pub(crate) fn emit_module_unverified<'c>(
     emit_fmt_global(context, &module, i8_type, loc);
     emit_printf_decl(context, &module, &types, loc);
     emit_libm_decls(context, &module, &types, loc);
+    for hir_fn in &chunk.functions {
+        emit_function(context, &module, hir_fn, &chunk.functions, &types, loc)?;
+    }
     emit_main(context, &module, chunk, &types, loc)?;
 
     Ok(module)
@@ -177,6 +180,80 @@ fn emit_libm_decls<'c>(
     module.body().append_operation(floor_op.into());
 }
 
+/// Emit a `func.func @<mangled_name>(...) -> (...)` for a user-defined
+/// function. Phase 2.5a constrains every parameter and the optional
+/// return value to `Number` (f64). The `_returned` / `_ret_value`
+/// slots that the HIR's return-desugar relies on live as ordinary
+/// locals at the head of `hir_fn.locals` (declared by `lower_function_body`).
+fn emit_function<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    hir_fn: &HirFunction,
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    let region = Region::new();
+    // Phase 2.5a: every parameter is f64.
+    let param_types: Vec<Type<'c>> = hir_fn.params.iter().map(|_| types.f64).collect();
+    // Block argument list = parameter types, each tagged with `loc`.
+    let block_args: Vec<(Type<'c>, Location<'c>)> = param_types.iter().map(|t| (*t, loc)).collect();
+    let block = Block::new(&block_args);
+
+    // Allocate every local's slot at function entry (params first).
+    let slots: Vec<Value<'c, '_>> = hir_fn
+        .locals
+        .iter()
+        .map(|info| emit_alloca_slot_for_kind(context, &block, info.kind, types, loc))
+        .collect();
+
+    // Store each parameter (block argument) into its alloca slot.
+    for (i, _) in hir_fn.params.iter().enumerate() {
+        let arg: Value<'c, '_> = block.argument(i).unwrap().into();
+        emit_store(&block, arg, slots[i], loc);
+    }
+
+    emit_stmts(
+        context,
+        &block,
+        &hir_fn.body,
+        &slots,
+        &hir_fn.locals,
+        functions,
+        types,
+        loc,
+    )?;
+
+    // Trailing return: load `_ret_value` (Phase 2.5a places it at
+    // `params.len() + 1` — params, then `_returned`, then `_ret_value`).
+    let ret_values: Vec<Value<'c, '_>> = match hir_fn.ret_kind {
+        Some(ValueKind::Number) => {
+            let ret_value_idx = hir_fn.params.len() + 1;
+            vec![emit_load(&block, slots[ret_value_idx], types.f64, loc)]
+        }
+        Some(other) => unreachable!("Phase 2.5a returns Number only, got {other:?}"),
+        None => vec![],
+    };
+    block.append_operation(func::r#return(&ret_values, loc));
+    region.append_block(block);
+
+    let ret_types: Vec<Type<'c>> = match hir_fn.ret_kind {
+        Some(_) => vec![types.f64],
+        None => vec![],
+    };
+    let fn_type = FunctionType::new(context, &param_types, &ret_types);
+    let func_op = func::func(
+        context,
+        StringAttribute::new(context, &hir_fn.mangled_name),
+        TypeAttribute::new(fn_type.into()),
+        region,
+        &[],
+        loc,
+    );
+    module.body().append_operation(func_op);
+    Ok(())
+}
+
 fn emit_main<'c>(
     context: &'c Context,
     module: &Module<'c>,
@@ -199,6 +276,7 @@ fn emit_main<'c>(
         &chunk.stmts,
         &slots,
         &chunk.locals,
+        &chunk.functions,
         types,
         loc,
     )?;
@@ -222,37 +300,41 @@ fn emit_main<'c>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_stmts<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     stmts: &[HirStmt],
     slots: &[Value<'c, 'a>],
     locals: &[LocalInfo],
+    functions: &[HirFunction],
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     for stmt in stmts {
-        emit_stmt(context, block, stmt, slots, locals, types, loc)?;
+        emit_stmt(context, block, stmt, slots, locals, functions, types, loc)?;
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_stmt<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     stmt: &HirStmt,
     slots: &[Value<'c, 'a>],
     locals: &[LocalInfo],
+    functions: &[HirFunction],
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     match &stmt.kind {
         HirStmtKind::LocalInit { id, value } | HirStmtKind::Assign { id, value } => {
-            let v = emit_expr(context, block, value, slots, locals, types, loc)?;
+            let v = emit_expr(context, block, value, slots, locals, functions, types, loc)?;
             emit_store(block, v, slots[id.0], loc);
         }
         HirStmtKind::Block { stmts } => {
-            emit_stmts(context, block, stmts, slots, locals, types, loc)?;
+            emit_stmts(context, block, stmts, slots, locals, functions, types, loc)?;
         }
         HirStmtKind::If {
             cond,
@@ -261,7 +343,8 @@ fn emit_stmt<'a, 'c>(
             else_body,
         } => {
             emit_if(
-                context, block, cond, then_body, elifs, else_body, slots, locals, types, loc,
+                context, block, cond, then_body, elifs, else_body, slots, locals, functions, types,
+                loc,
             )?;
         }
         HirStmtKind::While {
@@ -270,7 +353,7 @@ fn emit_stmt<'a, 'c>(
             break_id,
         } => {
             emit_while(
-                context, block, cond, body, *break_id, slots, locals, types, loc,
+                context, block, cond, body, *break_id, slots, locals, functions, types, loc,
             )?;
         }
         HirStmtKind::ForNumeric {
@@ -282,12 +365,12 @@ fn emit_stmt<'a, 'c>(
             break_id,
         } => {
             emit_for_numeric(
-                context, block, *var_id, start, stop, step, body, *break_id, slots, locals, types,
-                loc,
+                context, block, *var_id, start, stop, step, body, *break_id, slots, locals,
+                functions, types, loc,
             )?;
         }
         HirStmtKind::ExprStmt(expr) => {
-            emit_expr_stmt(context, block, expr, slots, locals, types, loc)?;
+            emit_expr_stmt(context, block, expr, slots, locals, functions, types, loc)?;
         }
     }
     Ok(())
@@ -350,12 +433,14 @@ fn emit_load<'a, 'c>(
     block.append_operation(load).result(0).unwrap().into()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_expr<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     expr: &HirExpr,
     slots: &[Value<'c, 'a>],
     locals: &[LocalInfo],
+    functions: &[HirFunction],
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Result<Value<'c, 'a>, CodegenError> {
@@ -392,11 +477,11 @@ fn emit_expr<'a, 'c>(
             // `and`/`or` short-circuit — must NOT eagerly evaluate rhs.
             if matches!(op, BinOp::And | BinOp::Or) {
                 return emit_short_circuit(
-                    context, block, *op, lhs, rhs, slots, locals, types, loc,
+                    context, block, *op, lhs, rhs, slots, locals, functions, types, loc,
                 );
             }
-            let lhs_val = emit_expr(context, block, lhs, slots, locals, types, loc)?;
-            let rhs_val = emit_expr(context, block, rhs, slots, locals, types, loc)?;
+            let lhs_val = emit_expr(context, block, lhs, slots, locals, functions, types, loc)?;
+            let rhs_val = emit_expr(context, block, rhs, slots, locals, functions, types, loc)?;
             emit_binop(context, block, *op, lhs_val, rhs_val, types, loc)
         }
         HirExprKind::UnaryOp { op, operand } => {
@@ -404,8 +489,10 @@ fn emit_expr<'a, 'c>(
             // first, then flip with xori. Other unaries (currently `-`)
             // pass through emit_unary unchanged.
             if matches!(op, UnaryOp::Not) {
-                let kind = infer_kind(operand, locals);
-                let v = emit_expr(context, block, operand, slots, locals, types, loc)?;
+                let kind = infer_kind(operand, locals, functions);
+                let v = emit_expr(
+                    context, block, operand, slots, locals, functions, types, loc,
+                )?;
                 let truth = emit_truthiness(context, block, v, kind, types, loc);
                 let one = arith::constant(context, IntegerAttribute::new(types.i1, 1).into(), loc);
                 let one_val: Value<'c, 'a> = block.append_operation(one).result(0).unwrap().into();
@@ -415,30 +502,71 @@ fn emit_expr<'a, 'c>(
                     .unwrap()
                     .into());
             }
-            let v = emit_expr(context, block, operand, slots, locals, types, loc)?;
+            let v = emit_expr(
+                context, block, operand, slots, locals, functions, types, loc,
+            )?;
             emit_unary(block, *op, v, loc)
         }
-        HirExprKind::Call { builtin, args } => match builtin {
-            Builtin::Print => {
-                let kind = infer_kind(&args[0], locals);
-                let arg_val = emit_expr(context, block, &args[0], slots, locals, types, loc)?;
+        HirExprKind::Call { callee, args } => match callee {
+            Callee::Builtin(Builtin::Print) => {
+                let kind = infer_kind(&args[0], locals, functions);
+                let arg_val = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, loc,
+                )?;
                 emit_print_value(context, block, arg_val, kind, types, loc);
                 Ok(arg_val)
+            }
+            Callee::User(FuncId(fid)) => {
+                let target = &functions[*fid];
+                let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
+                for a in args {
+                    arg_vals.push(emit_expr(
+                        context, block, a, slots, locals, functions, types, loc,
+                    )?);
+                }
+                let ret_types: &[Type<'c>] = match target.ret_kind {
+                    Some(_) => &[types.f64], // Phase 2.5a: only Number returns
+                    None => &[],
+                };
+                let call_op = func::call(
+                    context,
+                    FlatSymbolRefAttribute::new(context, &target.mangled_name),
+                    &arg_vals,
+                    ret_types,
+                    loc,
+                );
+                let op_ref = block.append_operation(call_op);
+                if target.ret_kind.is_some() {
+                    Ok(op_ref.result(0).unwrap().into())
+                } else {
+                    // Void call — synthesise a placeholder f64 0.0
+                    // value. It is never read; caller's `infer_kind`
+                    // returned Number, so consistent with our type
+                    // model.
+                    let zero = arith::constant(
+                        context,
+                        FloatAttribute::new(context, types.f64, 0.0).into(),
+                        loc,
+                    );
+                    Ok(block.append_operation(zero).result(0).unwrap().into())
+                }
             }
         },
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_expr_stmt<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     expr: &HirExpr,
     slots: &[Value<'c, 'a>],
     locals: &[LocalInfo],
+    functions: &[HirFunction],
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
-    emit_expr(context, block, expr, slots, locals, types, loc)?;
+    emit_expr(context, block, expr, slots, locals, functions, types, loc)?;
     Ok(())
 }
 
@@ -781,13 +909,14 @@ fn emit_short_circuit<'a, 'c>(
     rhs: &HirExpr,
     slots: &[Value<'c, 'a>],
     locals: &[LocalInfo],
+    functions: &[HirFunction],
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Result<Value<'c, 'a>, CodegenError> {
-    let kind = infer_kind(lhs, locals);
+    let kind = infer_kind(lhs, locals, functions);
     let result_ty = kind_to_mlir_type(kind, types);
 
-    let lhs_val = emit_expr(context, parent, lhs, slots, locals, types, loc)?;
+    let lhs_val = emit_expr(context, parent, lhs, slots, locals, functions, types, loc)?;
     let cond = emit_truthiness(context, parent, lhs_val, kind, types, loc);
 
     // For `and`: then = rhs, else = lhs. For `or`: then = lhs, else = rhs.
@@ -805,6 +934,7 @@ fn emit_short_circuit<'a, 'c>(
         then_yield_lhs,
         slots,
         locals,
+        functions,
         types,
         loc,
     )?;
@@ -816,6 +946,7 @@ fn emit_short_circuit<'a, 'c>(
         else_yield_lhs,
         slots,
         locals,
+        functions,
         types,
         loc,
     )?;
@@ -837,6 +968,7 @@ fn build_yield_region<'a, 'c>(
     yield_lhs: bool,
     slots: &[Value<'c, 'a>],
     locals: &[LocalInfo],
+    functions: &[HirFunction],
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Result<Region<'c>, CodegenError> {
@@ -850,7 +982,7 @@ fn build_yield_region<'a, 'c>(
         // scf.if's regions.
         unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(lhs_val) }
     } else {
-        emit_expr(context, &blk, rhs, blk_slots, locals, types, loc)?
+        emit_expr(context, &blk, rhs, blk_slots, locals, functions, types, loc)?
     };
     blk.append_operation(scf::r#yield(&[yielded], loc));
     region.append_block(blk);
@@ -871,15 +1003,18 @@ fn emit_if<'a, 'c>(
     else_body: &Option<Vec<HirStmt>>,
     slots: &[Value<'c, 'a>],
     locals: &[LocalInfo],
+    functions: &[HirFunction],
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
-    let cond_kind = infer_kind(cond, locals);
-    let cond_val = emit_expr(context, parent, cond, slots, locals, types, loc)?;
+    let cond_kind = infer_kind(cond, locals, functions);
+    let cond_val = emit_expr(context, parent, cond, slots, locals, functions, types, loc)?;
     let cond_i1 = emit_truthiness(context, parent, cond_val, cond_kind, types, loc);
 
-    let then_region = build_body_region(context, then_body, slots, locals, types, loc)?;
-    let else_region = build_else_region(context, elifs, else_body, slots, locals, types, loc)?;
+    let then_region = build_body_region(context, then_body, slots, locals, functions, types, loc)?;
+    let else_region = build_else_region(
+        context, elifs, else_body, slots, locals, functions, types, loc,
+    )?;
 
     let if_op = scf::r#if(cond_i1, &[], then_region, else_region, loc);
     parent.append_operation(if_op);
@@ -894,6 +1029,7 @@ fn build_else_region<'c>(
     else_body: &Option<Vec<HirStmt>>,
     slots: &[Value<'c, '_>],
     locals: &[LocalInfo],
+    functions: &[HirFunction],
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Result<Region<'c>, CodegenError> {
@@ -901,14 +1037,18 @@ fn build_else_region<'c>(
         // Nested scf.if for the next elseif/else arm.
         let region = Region::new();
         let blk = Block::new(&[]);
-        let cond_kind = infer_kind(cond, locals);
+        let cond_kind = infer_kind(cond, locals, functions);
         // Re-bind slots and emit into the new block.
         let blk_slots = transmute_slots(slots);
-        let cond_val = emit_expr(context, &blk, cond, blk_slots, locals, types, loc)?;
+        let cond_val = emit_expr(
+            context, &blk, cond, blk_slots, locals, functions, types, loc,
+        )?;
         let cond_i1 = emit_truthiness(context, &blk, cond_val, cond_kind, types, loc);
-        let nested_then = build_body_region(context, body, blk_slots, locals, types, loc)?;
-        let nested_else =
-            build_else_region(context, rest, else_body, blk_slots, locals, types, loc)?;
+        let nested_then =
+            build_body_region(context, body, blk_slots, locals, functions, types, loc)?;
+        let nested_else = build_else_region(
+            context, rest, else_body, blk_slots, locals, functions, types, loc,
+        )?;
         blk.append_operation(scf::r#if(cond_i1, &[], nested_then, nested_else, loc));
         blk.append_operation(scf::r#yield(&[], loc));
         region.append_block(blk);
@@ -916,7 +1056,7 @@ fn build_else_region<'c>(
     } else {
         // Leaf: either else_body or empty `scf.yield` for absent else.
         match else_body {
-            Some(body) => build_body_region(context, body, slots, locals, types, loc),
+            Some(body) => build_body_region(context, body, slots, locals, functions, types, loc),
             None => {
                 let region = Region::new();
                 let blk = Block::new(&[]);
@@ -934,13 +1074,16 @@ fn build_body_region<'c>(
     body: &[HirStmt],
     slots: &[Value<'c, '_>],
     locals: &[LocalInfo],
+    functions: &[HirFunction],
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Result<Region<'c>, CodegenError> {
     let region = Region::new();
     let blk = Block::new(&[]);
     let blk_slots = transmute_slots(slots);
-    emit_stmts(context, &blk, body, blk_slots, locals, types, loc)?;
+    emit_stmts(
+        context, &blk, body, blk_slots, locals, functions, types, loc,
+    )?;
     blk.append_operation(scf::r#yield(&[], loc));
     region.append_block(blk);
     Ok(region)
@@ -969,6 +1112,7 @@ fn emit_while<'a, 'c>(
     break_id: Option<LocalId>,
     slots: &[Value<'c, 'a>],
     locals: &[LocalInfo],
+    functions: &[HirFunction],
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
@@ -976,8 +1120,17 @@ fn emit_while<'a, 'c>(
     let before = Region::new();
     let before_blk = Block::new(&[]);
     let blk_slots = transmute_slots(slots);
-    let cond_kind = infer_kind(cond, locals);
-    let cond_val = emit_expr(context, &before_blk, cond, blk_slots, locals, types, loc)?;
+    let cond_kind = infer_kind(cond, locals, functions);
+    let cond_val = emit_expr(
+        context,
+        &before_blk,
+        cond,
+        blk_slots,
+        locals,
+        functions,
+        types,
+        loc,
+    )?;
     let mut cond_i1 = emit_truthiness(context, &before_blk, cond_val, cond_kind, types, loc);
     if let Some(id) = break_id {
         cond_i1 = and_not_broken(context, &before_blk, cond_i1, blk_slots, id, types, loc);
@@ -986,7 +1139,7 @@ fn emit_while<'a, 'c>(
     before.append_block(before_blk);
 
     // after region: body, scf.yield.
-    let after = build_body_region(context, body, slots, locals, types, loc)?;
+    let after = build_body_region(context, body, slots, locals, functions, types, loc)?;
 
     parent.append_operation(scf::r#while(&[], &[], before, after, loc));
     Ok(())
@@ -1039,14 +1192,15 @@ fn emit_for_numeric<'a, 'c>(
     break_id: Option<LocalId>,
     slots: &[Value<'c, 'a>],
     locals: &[LocalInfo],
+    functions: &[HirFunction],
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     // Evaluate start/stop/step once in the parent block, store into
     // dedicated slots (stop/step) and the loop variable's own slot.
-    let start_val = emit_expr(context, parent, start, slots, locals, types, loc)?;
-    let stop_val = emit_expr(context, parent, stop, slots, locals, types, loc)?;
-    let step_val = emit_expr(context, parent, step, slots, locals, types, loc)?;
+    let start_val = emit_expr(context, parent, start, slots, locals, functions, types, loc)?;
+    let stop_val = emit_expr(context, parent, stop, slots, locals, functions, types, loc)?;
+    let step_val = emit_expr(context, parent, step, slots, locals, functions, types, loc)?;
 
     let stop_slot = emit_alloca_slot_for_kind(context, parent, ValueKind::Number, types, loc);
     let step_slot = emit_alloca_slot_for_kind(context, parent, ValueKind::Number, types, loc);
@@ -1112,7 +1266,16 @@ fn emit_for_numeric<'a, 'c>(
     let after = Region::new();
     let after_blk = Block::new(&[]);
     let after_slots = transmute_slots(slots);
-    emit_stmts(context, &after_blk, body, after_slots, locals, types, loc)?;
+    emit_stmts(
+        context,
+        &after_blk,
+        body,
+        after_slots,
+        locals,
+        functions,
+        types,
+        loc,
+    )?;
     let i_now = emit_load(&after_blk, after_slots[var_id.0], types.f64, loc);
     let step_now_after = emit_load(
         &after_blk,
@@ -1372,6 +1535,72 @@ mod tests {
         )
         .expect("short-circuit module must verify");
         assert!(module.as_operation().verify());
+    }
+
+    #[test]
+    fn emit_function_def_creates_func_func_symbol() {
+        let ctx = new_context();
+        let module = emit_module(&ctx, &lower_src("local function f() end")).unwrap();
+        let mlir = module.as_operation().to_string();
+        assert!(
+            mlir.contains("func.func @user_f_0"),
+            "expected mangled `@user_f_0` symbol, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_user_function_call_uses_func_call() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src("local function f() return 1 end\nprint(f())"),
+        )
+        .unwrap();
+        let mlir = module.as_operation().to_string();
+        // Pretty-printer drops the `func.` prefix in context (it's
+        // unambiguous after dialect resolution); accept either form.
+        assert!(
+            mlir.contains("call @user_f_0"),
+            "expected a call to `@user_f_0`, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_recursive_function_module_verifies() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src(
+                "local function fact(n) if n == 0 then return 1 end\nreturn n * fact(n - 1) end\nprint(fact(5))",
+            ),
+        )
+        .expect("recursive module must verify");
+        assert!(module.as_operation().verify());
+    }
+
+    #[test]
+    fn emit_void_function_module_verifies() {
+        let ctx = new_context();
+        let module =
+            emit_module(&ctx, &lower_src("local function f() end\nf()")).expect("void must verify");
+        assert!(module.as_operation().verify());
+    }
+
+    #[test]
+    fn emit_return_via_returned_flag_emits_func_return() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src("local function f() return 42 end\nprint(f())"),
+        )
+        .unwrap();
+        let mlir = module.as_operation().to_string();
+        // The function's body wraps post-return stmts with the
+        // `_returned` flag and emits a single trailing `return`.
+        assert!(
+            mlir.contains("return"),
+            "expected `return` op in MLIR, got:\n{mlir}"
+        );
     }
 
     #[test]

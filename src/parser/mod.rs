@@ -87,6 +87,7 @@ impl<'t> Parser<'t> {
                 let tok = self.bump().clone();
                 Ok(Stmt::new(StmtKind::Break, tok.span))
             }
+            TokenKind::Keyword(Keyword::Return) => self.parse_return(),
             TokenKind::Ident(_) if matches!(self.peek_kind_at(1), Some(TokenKind::Equals)) => {
                 self.parse_assign()
             }
@@ -270,6 +271,11 @@ impl<'t> Parser<'t> {
 
     fn parse_local(&mut self) -> Result<Stmt, ParseError> {
         let local_tok = self.bump().clone();
+        // `local function NAME(PARAMS) BODY end` is the only local
+        // function form in Phase 2.5a. Dispatch on the next token.
+        if matches!(self.peek().kind, TokenKind::Keyword(Keyword::Function)) {
+            return self.parse_function_def(local_tok);
+        }
         let name_tok = self.peek().clone();
         let name = match name_tok.kind {
             TokenKind::Ident(ref n) => {
@@ -308,6 +314,83 @@ impl<'t> Parser<'t> {
         let value = self.parse_expr(0)?;
         let span = Span::new(local_tok.span.start, value.span.end);
         Ok(Stmt::new(StmtKind::Local { name, value }, span))
+    }
+
+    fn parse_function_def(&mut self, local_tok: Token) -> Result<Stmt, ParseError> {
+        self.bump(); // 'function'
+        let name_tok = self.peek().clone();
+        let name = match name_tok.kind {
+            TokenKind::Ident(n) => {
+                self.bump();
+                n
+            }
+            TokenKind::Eof => {
+                return Err(ParseError::UnexpectedEof {
+                    offset: name_tok.span.start,
+                });
+            }
+            other => {
+                return Err(ParseError::UnexpectedToken {
+                    actual: other,
+                    offset: name_tok.span.start,
+                });
+            }
+        };
+        self.expect_token(TokenKind::LParen)?;
+        let mut params = Vec::new();
+        if !matches!(self.peek().kind, TokenKind::RParen) {
+            loop {
+                let p_tok = self.peek().clone();
+                match p_tok.kind {
+                    TokenKind::Ident(n) => {
+                        self.bump();
+                        params.push(n);
+                    }
+                    other => {
+                        return Err(ParseError::UnexpectedToken {
+                            actual: other,
+                            offset: p_tok.span.start,
+                        });
+                    }
+                }
+                if matches!(self.peek().kind, TokenKind::Comma) {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect_token(TokenKind::RParen)?;
+        let body = self.parse_chunk_until(&[TokenKind::Keyword(Keyword::End), TokenKind::Eof])?;
+        let end_tok = self.expect_keyword(Keyword::End)?;
+        let span = Span::new(local_tok.span.start, end_tok.span.end);
+        Ok(Stmt::new(
+            StmtKind::FunctionDef { name, params, body },
+            span,
+        ))
+    }
+
+    fn parse_return(&mut self) -> Result<Stmt, ParseError> {
+        let return_tok = self.bump().clone(); // `return`
+        // `return` with no value: next token is a chunk terminator
+        // (`end`, `else`, `elseif`, EOF) or a `;`.
+        let has_value = !matches!(
+            self.peek().kind,
+            TokenKind::Eof
+                | TokenKind::Semicolon
+                | TokenKind::Keyword(Keyword::End)
+                | TokenKind::Keyword(Keyword::Else)
+                | TokenKind::Keyword(Keyword::Elseif)
+        );
+        let (value, span_end) = if has_value {
+            let v = self.parse_expr(0)?;
+            let end = v.span.end;
+            (Some(v), end)
+        } else {
+            (None, return_tok.span.end)
+        };
+        let span = Span::new(return_tok.span.start, span_end);
+        Ok(Stmt::new(StmtKind::Return { value }, span))
     }
 
     fn parse_expr(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
@@ -420,6 +503,10 @@ impl<'t> Parser<'t> {
             let mut args = Vec::new();
             if !matches!(self.peek().kind, TokenKind::RParen) {
                 args.push(self.parse_expr(0)?);
+                while matches!(self.peek().kind, TokenKind::Comma) {
+                    self.bump();
+                    args.push(self.parse_expr(0)?);
+                }
             }
             let closing = self.peek().clone();
             match closing.kind {
@@ -620,6 +707,14 @@ mod tests {
                 body: body.into_iter().map(strip_span_stmt).collect(),
             },
             StmtKind::Break => StmtKind::Break,
+            StmtKind::FunctionDef { name, params, body } => StmtKind::FunctionDef {
+                name,
+                params,
+                body: body.into_iter().map(strip_span_stmt).collect(),
+            },
+            StmtKind::Return { value } => StmtKind::Return {
+                value: value.map(strip_span_expr),
+            },
             StmtKind::ExprStmt(e) => StmtKind::ExprStmt(strip_span_expr(e)),
         };
         Stmt::new(kind, Span::new(0, 0))
@@ -1256,6 +1351,68 @@ mod tests {
             }
             other => panic!("expected While, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_local_function_no_args_no_return_yields_function_def() {
+        let stmt = parse_single_stmt("local function f() end").expect("must parse");
+        match stmt.kind {
+            StmtKind::FunctionDef {
+                name, params, body, ..
+            } => {
+                assert_eq!(name, "f");
+                assert!(params.is_empty());
+                assert!(body.is_empty());
+            }
+            other => panic!("expected FunctionDef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_local_function_with_params_and_return() {
+        let stmt =
+            parse_single_stmt("local function add(a, b) return a + b end").expect("must parse");
+        match stmt.kind {
+            StmtKind::FunctionDef { name, params, body } => {
+                assert_eq!(name, "add");
+                assert_eq!(params, vec!["a".to_owned(), "b".to_owned()]);
+                assert_eq!(body.len(), 1);
+                assert!(matches!(body[0].kind, StmtKind::Return { value: Some(_) }));
+            }
+            other => panic!("expected FunctionDef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_return_with_value() {
+        // `return` is only valid inside a function body in HIR, but
+        // the parser accepts it everywhere — semantics gate is HIR.
+        let chunk = parse("local function f() return 42 end").expect("must parse");
+        let StmtKind::FunctionDef { body, .. } = &chunk[0].kind else {
+            panic!("expected FunctionDef");
+        };
+        match &body[0].kind {
+            StmtKind::Return { value: Some(_) } => {}
+            other => panic!("expected Return with value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_return_without_value() {
+        let chunk = parse("local function f() return end").expect("must parse");
+        let StmtKind::FunctionDef { body, .. } = &chunk[0].kind else {
+            panic!("expected FunctionDef");
+        };
+        match &body[0].kind {
+            StmtKind::Return { value: None } => {}
+            other => panic!("expected Return without value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_local_function_missing_end_is_rejected() {
+        let err = parse("local function f()").expect_err("missing `end` must fail");
+        assert!(matches!(err, ParseError::UnexpectedEof { .. }));
     }
 
     #[test]

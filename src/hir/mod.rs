@@ -9,7 +9,10 @@ mod error;
 mod ir;
 
 pub use error::HirError;
-pub use ir::{Builtin, HirChunk, HirExpr, HirExprKind, HirStmt, HirStmtKind, LocalId, LocalInfo};
+pub use ir::{
+    Builtin, Callee, FuncId, HirChunk, HirExpr, HirExprKind, HirFunction, HirStmt, HirStmtKind,
+    LocalId, LocalInfo,
+};
 
 use std::collections::{HashMap, HashSet};
 
@@ -36,7 +39,7 @@ impl ValueKind {
     }
 }
 
-pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo]) -> ValueKind {
+pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction]) -> ValueKind {
     match &expr.kind {
         HirExprKind::Number(_) => ValueKind::Number,
         HirExprKind::Bool(_) => ValueKind::Bool,
@@ -55,12 +58,18 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo]) -> ValueKind {
             }
             // `and`/`or` preserve the operand kind (lower-time guard
             // ensures both sides share a kind).
-            BinOp::And | BinOp::Or => infer_kind(lhs, locals),
+            BinOp::And | BinOp::Or => infer_kind(lhs, locals, functions),
         },
-        // print() returns no value in Lua, but our HIR treats it as
-        // an expression. It can never appear as an operand to a
-        // comparison anyway (we'd have already errored on parse).
-        HirExprKind::Call { .. } => ValueKind::Number,
+        HirExprKind::Call { callee, .. } => match callee {
+            // print() has no useful value in our subset; treat as Number
+            // so existing arithmetic guards remain consistent (it never
+            // actually appears as a comparison operand).
+            Callee::Builtin(Builtin::Print) => ValueKind::Number,
+            // User function: look up its declared return kind. Phase
+            // 2.5a forces this to Number when present; void calls
+            // never appear in expression position legally.
+            Callee::User(FuncId(id)) => functions[*id].ret_kind.unwrap_or(ValueKind::Number),
+        },
     }
 }
 
@@ -136,13 +145,77 @@ fn binop_symbol(op: BinOp) -> &'static str {
 }
 
 /// Lower a parsed [`Chunk`] into a [`HirChunk`] with resolved names.
+///
+/// Phase 2.5a: top-level `local function` definitions are lifted into
+/// `chunk.functions`; the rest of the top-level statements (including
+/// `print(...)` calls into those functions) become the implicit `main`
+/// chunk's `stmts`.
 pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
-    let mut ctx = LowerCtx::new();
-    let stmts = ctx.lower_stmts(chunk)?;
+    // Pass 1: register every top-level `local function` in the
+    // function table so recursion and forward-reference work.
+    let mut functions: Vec<HirFunction> = Vec::new();
+    let mut function_names: HashMap<String, FuncId> = HashMap::new();
+    for stmt in chunk {
+        if let StmtKind::FunctionDef { name, params, .. } = &stmt.kind {
+            let id = FuncId(functions.len());
+            functions.push(HirFunction {
+                name: name.clone(),
+                mangled_name: format!("user_{}_{}", name, id.0),
+                params: params
+                    .iter()
+                    .map(|p| LocalInfo {
+                        name: p.clone(),
+                        kind: ValueKind::Number,
+                    })
+                    .collect(),
+                locals: Vec::new(), // filled in pass 2
+                body: Vec::new(),   // filled in pass 2
+                ret_kind: None,     // resolved in pass 2
+            });
+            function_names.insert(name.clone(), id);
+        }
+    }
+
+    // Pass 2: lower each function body in its own LowerCtx; then lower
+    // the `main` chunk (skipping FunctionDef stmts — they've been
+    // lifted out).
+    for (idx, stmt) in chunk.iter().enumerate() {
+        if let StmtKind::FunctionDef { params, body, .. } = &stmt.kind {
+            let id = FuncId(idx_of_funcdef(chunk, idx));
+            let mut fn_ctx = LowerCtx::for_function(&function_names, &functions, params);
+            let body_hir = fn_ctx.lower_function_body(body)?;
+            let ret_kind = fn_ctx.in_function_ret_kind;
+            functions[id.0].locals = fn_ctx.locals;
+            functions[id.0].body = body_hir;
+            functions[id.0].ret_kind = ret_kind;
+        }
+    }
+
+    let mut ctx = LowerCtx::new(function_names.clone(), functions.clone());
+    // Lower top-level stmts, skipping FunctionDef (already lifted).
+    let mut stmts = Vec::new();
+    for s in chunk {
+        if matches!(s.kind, StmtKind::FunctionDef { .. }) {
+            continue;
+        }
+        stmts.push(ctx.lower_stmt(s)?);
+    }
     Ok(HirChunk {
         locals: ctx.locals,
         stmts,
+        functions,
     })
+}
+
+/// Helper: count `FunctionDef`s up to (and including) position `idx` to
+/// get the FuncId. The stable ordering matches the pass-1 enumeration.
+fn idx_of_funcdef(chunk: &[Stmt], idx: usize) -> usize {
+    chunk
+        .iter()
+        .take(idx + 1)
+        .filter(|s| matches!(s.kind, StmtKind::FunctionDef { .. }))
+        .count()
+        - 1
 }
 
 struct LowerCtx {
@@ -161,16 +234,106 @@ struct LowerCtx {
     /// (impossible because we only push `None` when there is no
     /// `break` to target it). See ADR 0015.
     loop_break_targets: Vec<Option<LocalId>>,
+    /// Function namespace inherited from the top-level pass (Phase
+    /// 2.5a). Resolved at every `Call` to dispatch user vs builtin.
+    function_names: HashMap<String, FuncId>,
+    /// Mirror of [`HirChunk::functions`] — needed by `infer_kind` for
+    /// user-call return-type lookup. Phase 2.5a clones it into each
+    /// `LowerCtx`; the cost is negligible at this scale.
+    functions: Vec<HirFunction>,
+    /// `Some((returned_id, ret_value_id))` while lowering inside a
+    /// function body; `None` at top level. `ret_value_id` is `None`
+    /// for void functions (no value ever stored).
+    in_function: Option<(LocalId, Option<LocalId>)>,
+    /// The return kind discovered while lowering the current function
+    /// body: `None` (uninitialised) → `Some(Number)` once a value-
+    /// returning `return` is seen. Phase 2.5a fixes value returns to
+    /// Number so this never widens.
+    in_function_ret_kind: Option<ValueKind>,
 }
 
 impl LowerCtx {
-    fn new() -> Self {
+    fn new(function_names: HashMap<String, FuncId>, functions: Vec<HirFunction>) -> Self {
         Self {
             locals: Vec::new(),
             scopes: vec![HashMap::new()],
             readonly_locals: HashSet::new(),
             loop_break_targets: Vec::new(),
+            function_names,
+            functions,
+            in_function: None,
+            in_function_ret_kind: None,
         }
+    }
+
+    /// Build a `LowerCtx` for lowering a function body in isolation
+    /// (separate locals, scopes, loop break stack). The function's
+    /// parameters are pre-declared as the first locals.
+    fn for_function(
+        function_names: &HashMap<String, FuncId>,
+        functions: &[HirFunction],
+        params: &[String],
+    ) -> Self {
+        let mut ctx = Self::new(function_names.clone(), functions.to_vec());
+        // Declare each param as a Number local in the body's outermost scope.
+        for p in params {
+            ctx.declare_local(p.clone(), ValueKind::Number);
+        }
+        ctx
+    }
+
+    /// Lower a function body. Allocates the synthetic `_returned` and
+    /// `_ret_value` slots, sets `in_function`, and applies the same
+    /// body-guard wrap pattern used by `break` (ADR 0015) so that
+    /// post-`return` statements are skipped at runtime.
+    fn lower_function_body(&mut self, stmts: &[Stmt]) -> Result<Vec<HirStmt>, HirError> {
+        // Synthetic flag + value slot, declared at the top of the
+        // body's outermost scope (after parameters).
+        let returned_id = self.declare_local("_returned".to_owned(), ValueKind::Bool);
+        let ret_value_id = self.declare_local("_ret_value".to_owned(), ValueKind::Number);
+        self.in_function = Some((returned_id, Some(ret_value_id)));
+
+        // The implicit Span for synthetic locals — pick the chunk's
+        // first stmt's span if available, else a zero-width sentinel.
+        let span = stmts.first().map(|s| s.span).unwrap_or(Span::new(0, 0));
+        let mut out = Vec::with_capacity(stmts.len() + 2);
+        out.push(HirStmt {
+            kind: HirStmtKind::LocalInit {
+                id: returned_id,
+                value: HirExpr {
+                    kind: HirExprKind::Bool(false),
+                    span,
+                },
+            },
+            span,
+        });
+        out.push(HirStmt {
+            kind: HirStmtKind::LocalInit {
+                id: ret_value_id,
+                value: HirExpr {
+                    kind: HirExprKind::Number(0.0),
+                    span,
+                },
+            },
+            span,
+        });
+
+        // Lower body statements with the `_returned` guard wrap (same
+        // pattern as `break`). Reuse `loop_break_targets` machinery by
+        // pushing the returned flag — every body stmt becomes
+        // `if not _returned then stmt`.
+        self.loop_break_targets.push(Some(returned_id));
+        let lowered = self.lower_stmts(stmts)?;
+        self.loop_break_targets.pop();
+
+        // Apply the guard wrap manually (lower_stmts doesn't wrap on
+        // its own — only `lower_stmts_maybe_guarded` does, and that
+        // helper is loop-specific). Reuse `wrap_with_broken_guard`
+        // since the shape is identical.
+        for stmt in lowered {
+            out.push(wrap_with_broken_guard(stmt, returned_id));
+        }
+        Ok(out)
     }
 
     fn lower_stmts(&mut self, stmts: &[Stmt]) -> Result<Vec<HirStmt>, HirError> {
@@ -242,7 +405,7 @@ impl LowerCtx {
         match &stmt.kind {
             StmtKind::Local { name, value } => {
                 let value = self.lower_expr(value)?;
-                let kind = infer_kind(&value, &self.locals);
+                let kind = infer_kind(&value, &self.locals, &self.functions);
                 let id = self.declare_local(name.clone(), kind);
                 Ok(HirStmt {
                     kind: HirStmtKind::LocalInit { id, value },
@@ -262,7 +425,7 @@ impl LowerCtx {
                 }
                 let value = self.lower_expr(value)?;
                 let slot_kind = self.locals[id.0].kind;
-                let value_kind = infer_kind(&value, &self.locals);
+                let value_kind = infer_kind(&value, &self.locals, &self.functions);
                 if slot_kind != value_kind {
                     return Err(HirError::TypeMismatch {
                         op: "=".to_owned(),
@@ -360,6 +523,59 @@ impl LowerCtx {
                     Ok(while_stmt)
                 }
             }
+            StmtKind::FunctionDef { .. } => {
+                // FunctionDef at top level is lifted out into
+                // `chunk.functions` by `lower()`. Inside a function
+                // body, nested function definitions are not yet
+                // supported (Phase 2.5b will introduce them).
+                unimplemented!(
+                    "Nested function definitions arrive in Phase 2.5b — \
+                     top-level `local function` is hoisted in `lower()`"
+                );
+            }
+            StmtKind::Return { value } => {
+                let (returned_id, ret_value_id) =
+                    self.in_function.ok_or(HirError::ReturnOutsideFunction {
+                        offset: stmt.span.start,
+                    })?;
+                let mut block_stmts = Vec::new();
+                if let Some(expr) = value {
+                    let v = self.lower_expr(expr)?;
+                    let v_kind = infer_kind(&v, &self.locals, &self.functions);
+                    if v_kind != ValueKind::Number {
+                        return Err(HirError::TypeMismatch {
+                            op: "return".to_owned(),
+                            lhs_kind: "number".to_owned(),
+                            rhs_kind: v_kind.name().to_owned(),
+                            offset: stmt.span.start,
+                        });
+                    }
+                    self.in_function_ret_kind = Some(ValueKind::Number);
+                    let ret_value_id = ret_value_id
+                        .expect("_ret_value slot allocated whenever any return has a value");
+                    block_stmts.push(HirStmt {
+                        kind: HirStmtKind::Assign {
+                            id: ret_value_id,
+                            value: v,
+                        },
+                        span: stmt.span,
+                    });
+                }
+                block_stmts.push(HirStmt {
+                    kind: HirStmtKind::Assign {
+                        id: returned_id,
+                        value: HirExpr {
+                            kind: HirExprKind::Bool(true),
+                            span: stmt.span,
+                        },
+                    },
+                    span: stmt.span,
+                });
+                Ok(HirStmt {
+                    kind: HirStmtKind::Block { stmts: block_stmts },
+                    span: stmt.span,
+                })
+            }
             StmtKind::Break => {
                 // `break` lowers to `Assign { _broken_<n>, true }` —
                 // the AND-extension of the loop cond and the per-stmt
@@ -411,7 +627,7 @@ impl LowerCtx {
                     ("stop", &stop_hir),
                     ("step", &step_hir),
                 ] {
-                    let k = infer_kind(ex, &self.locals);
+                    let k = infer_kind(ex, &self.locals, &self.functions);
                     if k != ValueKind::Number {
                         return Err(HirError::TypeMismatch {
                             op: format!("for-{label}"),
@@ -500,8 +716,8 @@ impl LowerCtx {
             ExprKind::BinOp { op, lhs, rhs } => {
                 let lhs_hir = self.lower_expr(lhs)?;
                 let rhs_hir = self.lower_expr(rhs)?;
-                let lk = infer_kind(&lhs_hir, &self.locals);
-                let rk = infer_kind(&rhs_hir, &self.locals);
+                let lk = infer_kind(&lhs_hir, &self.locals, &self.functions);
+                let rk = infer_kind(&rhs_hir, &self.locals, &self.functions);
                 match op {
                     // Arithmetic: both sides must be Number.
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow => {
@@ -602,10 +818,47 @@ impl LowerCtx {
                 });
             }
         };
+        // User functions take precedence over builtins. (Phase 2.5a
+        // doesn't allow shadowing `print` since users can't define a
+        // function called `print` without explicit conflict — but we
+        // resolve user names first for forward-compatibility with
+        // 2.5b's first-class function values.)
+        if let Some(&fid) = self.function_names.get(name) {
+            let user_fn = &self.functions[fid.0];
+            let expected = user_fn.params.len();
+            if args.len() != expected {
+                return Err(HirError::ArityMismatch {
+                    builtin: name.clone(),
+                    expected,
+                    actual: args.len(),
+                    offset: whole.span.start,
+                });
+            }
+            let lowered_args = args
+                .iter()
+                .map(|a| self.lower_expr(a))
+                .collect::<Result<Vec<_>, _>>()?;
+            // Phase 2.5a: each user-function argument must be Number.
+            for arg in &lowered_args {
+                let k = infer_kind(arg, &self.locals, &self.functions);
+                if k != ValueKind::Number {
+                    return Err(HirError::TypeMismatch {
+                        op: format!("call-{name}"),
+                        lhs_kind: "number".to_owned(),
+                        rhs_kind: k.name().to_owned(),
+                        offset: arg.span.start,
+                    });
+                }
+            }
+            return Ok(HirExprKind::Call {
+                callee: Callee::User(fid),
+                args: lowered_args,
+            });
+        }
         let builtin = match Builtin::from_name(name) {
             Some(b) => b,
             None => {
-                return Err(HirError::UnknownBuiltin {
+                return Err(HirError::UnknownFunction {
                     name: name.clone(),
                     offset: callee.span.start,
                 });
@@ -625,7 +878,7 @@ impl LowerCtx {
             .map(|a| self.lower_expr(a))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(HirExprKind::Call {
-            builtin,
+            callee: Callee::Builtin(builtin),
             args: lowered_args,
         })
     }
@@ -650,8 +903,8 @@ mod tests {
             panic!("expected ExprStmt");
         };
         match &e.kind {
-            HirExprKind::Call { builtin, args } => {
-                assert_eq!(*builtin, Builtin::Print);
+            HirExprKind::Call { callee, args } => {
+                assert!(matches!(callee, Callee::Builtin(Builtin::Print)));
                 assert_eq!(args.len(), 1);
                 assert!(matches!(args[0].kind, HirExprKind::Number(42.0)));
             }
@@ -667,10 +920,10 @@ mod tests {
         let HirStmtKind::ExprStmt(call) = &hir.stmts[1].kind else {
             panic!("expected ExprStmt for print(x)");
         };
-        let HirExprKind::Call { builtin, args } = &call.kind else {
+        let HirExprKind::Call { callee, args } = &call.kind else {
             panic!("expected Call for print(x)");
         };
-        assert_eq!(*builtin, Builtin::Print);
+        assert!(matches!(callee, Callee::Builtin(Builtin::Print)));
         assert!(matches!(args[0].kind, HirExprKind::Local(LocalId(0))));
     }
 
@@ -762,9 +1015,11 @@ mod tests {
     }
 
     #[test]
-    fn lower_unknown_builtin_errors() {
-        let err = lower_src("foo(1)").expect_err("unknown builtin must fail");
-        assert!(matches!(err, HirError::UnknownBuiltin { .. }));
+    fn lower_unknown_function_errors() {
+        // Phase 2.5a renamed `UnknownBuiltin` to `UnknownFunction`
+        // because user-defined functions now share the dispatch path.
+        let err = lower_src("foo(1)").expect_err("unknown call target must fail");
+        assert!(matches!(err, HirError::UnknownFunction { .. }));
     }
 
     #[test]
@@ -997,7 +1252,10 @@ mod tests {
             panic!("expected Call");
         };
         let arg = &args[0];
-        assert_eq!(infer_kind(arg, &hir.locals), ValueKind::Bool);
+        assert_eq!(
+            infer_kind(arg, &hir.locals, &hir.functions),
+            ValueKind::Bool
+        );
     }
 
     #[test]
@@ -1161,6 +1419,84 @@ mod tests {
         let err =
             lower_src("do break end").expect_err("break in do-block outside loop must reject");
         assert!(matches!(err, HirError::BreakOutsideLoop { .. }));
+    }
+
+    #[test]
+    fn lower_function_def_registers_in_function_table() {
+        let hir = lower_src("local function f() end").expect("must lower");
+        assert_eq!(hir.functions.len(), 1);
+        assert_eq!(hir.functions[0].name, "f");
+        assert_eq!(hir.functions[0].mangled_name, "user_f_0");
+        assert!(hir.functions[0].params.is_empty());
+        assert_eq!(hir.functions[0].ret_kind, None);
+    }
+
+    #[test]
+    fn lower_function_call_resolves_to_user_func_id() {
+        let hir = lower_src("local function f() return 1 end\nprint(f())").expect("must lower");
+        // The print arg is a Call to user f.
+        let HirStmtKind::ExprStmt(call) = &hir.stmts[0].kind else {
+            panic!("expected ExprStmt");
+        };
+        let HirExprKind::Call { callee, args } = &call.kind else {
+            panic!("expected Call");
+        };
+        assert!(matches!(callee, Callee::Builtin(Builtin::Print)));
+        // The single arg is a user-function call.
+        assert_eq!(args.len(), 1);
+        let HirExprKind::Call { callee: inner, .. } = &args[0].kind else {
+            panic!("expected nested Call");
+        };
+        assert!(matches!(inner, Callee::User(FuncId(0))));
+    }
+
+    #[test]
+    fn lower_function_recursion_supported() {
+        let src = "local function f(n) if n == 0 then return 0 end\nreturn f(n) end";
+        let hir = lower_src(src).expect("recursion must lower (name registered before body)");
+        assert_eq!(hir.functions.len(), 1);
+        assert_eq!(hir.functions[0].params.len(), 1);
+    }
+
+    #[test]
+    fn lower_call_to_unknown_function_errors() {
+        let err = lower_src("foo()").expect_err("unknown function name must reject");
+        // Either UnknownBuiltin or UnknownFunction is acceptable as a
+        // surface error — the message should mention `foo`.
+        let msg = format!("{err}");
+        assert!(msg.contains("foo"), "got: {msg}");
+    }
+
+    #[test]
+    fn lower_return_outside_function_errors() {
+        let err = lower_src("return 1").expect_err("top-level return must reject");
+        assert!(matches!(err, HirError::ReturnOutsideFunction { .. }));
+    }
+
+    #[test]
+    fn lower_return_with_value_inside_function() {
+        let hir = lower_src("local function f() return 42 end").expect("must lower");
+        assert_eq!(hir.functions.len(), 1);
+        let body = &hir.functions[0].body;
+        // The body's first user statement is the return; the lowering
+        // wraps it in the same body-guard pattern as break, so we just
+        // inspect the function's ret_kind here.
+        assert_eq!(hir.functions[0].ret_kind, Some(ValueKind::Number));
+        assert!(!body.is_empty());
+    }
+
+    #[test]
+    fn lower_function_body_locals_are_independent_of_outer() {
+        // Outer `x` is a Number; the function body's `x` parameter is
+        // its own slot, not the outer one. The function shouldn't see
+        // the outer x at all.
+        let hir = lower_src("local x = 1\nlocal function f(x) return x end\nprint(f(2))")
+            .expect("must lower");
+        // Outer chunk has one local (`x`).
+        assert_eq!(hir.locals.len(), 1);
+        assert_eq!(hir.locals[0].name, "x");
+        // Function f has its own params and locals (independent).
+        assert_eq!(hir.functions[0].params.len(), 1);
     }
 
     #[test]

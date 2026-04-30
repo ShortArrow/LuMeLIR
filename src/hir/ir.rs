@@ -15,10 +15,41 @@ pub struct LocalInfo {
 }
 
 /// A name-resolved program — the input to codegen.
+///
+/// `functions` carries every `local function` definition discovered at
+/// the top level (Phase 2.5a; ADR 0016). `locals` and `stmts` describe
+/// the implicit `main` chunk only.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirChunk {
     pub locals: Vec<LocalInfo>,
     pub stmts: Vec<HirStmt>,
+    pub functions: Vec<HirFunction>,
+}
+
+/// Index into [`HirChunk::functions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FuncId(pub usize);
+
+/// A user-defined function. The body is a fully-lowered statement
+/// sequence with its own private `locals` table. Phase 2.5a allows
+/// only `Number` parameters and an optional `Number` return type;
+/// later sub-phases (2.5b/c/d) widen this. See ADR 0016.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HirFunction {
+    /// Source-level Lua name.
+    pub name: String,
+    /// MLIR symbol name — `user_<name>_<idx>`.
+    pub mangled_name: String,
+    /// Declared parameters in source order. Each is also the prefix of
+    /// `locals` so that `LocalId(i)` for `i < params.len()` refers to
+    /// the i-th parameter slot.
+    pub params: Vec<LocalInfo>,
+    /// All locals (params first, then body-introduced locals + the
+    /// synthetic `_returned` / `_ret_value` slots).
+    pub locals: Vec<LocalInfo>,
+    pub body: Vec<HirStmt>,
+    /// `None` ⇒ `void` return; `Some(k)` ⇒ a value of kind `k`.
+    pub ret_kind: Option<ValueKind>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,9 +128,18 @@ pub enum HirExprKind {
         operand: Box<HirExpr>,
     },
     Call {
-        builtin: Builtin,
+        callee: Callee,
         args: Vec<HirExpr>,
     },
+}
+
+/// Discriminates whether a [`HirExprKind::Call`] hits a built-in
+/// function (Phase 2.0 baseline) or a user-defined function (Phase
+/// 2.5a; ADR 0016).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Callee {
+    Builtin(Builtin),
+    User(FuncId),
 }
 
 /// Recognised builtin functions. Phase 2.0 has only `print`.
