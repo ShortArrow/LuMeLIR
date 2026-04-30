@@ -197,8 +197,8 @@ fn param_mlir_type<'c>(context: &'c Context, kind: ValueKind, types: &Types<'c>)
 
 /// MLIR result types for a function whose HIR return-kind is `ret_kind`.
 /// Used both at function declaration time and at every call site to
-/// keep the operand types in lock-step. Phase 2.5b.3 (ADR 0019) widens
-/// Phase 2.5a's "Number only" rule to also allow Function(arity).
+/// keep the operand types in lock-step. Phase 2.5b.3 (ADR 0019) added
+/// Function returns; Phase 2.5e (ADR 0020) adds Bool and Nil.
 fn ret_mlir_types<'c>(
     context: &'c Context,
     ret_kind: Option<ValueKind>,
@@ -206,11 +206,11 @@ fn ret_mlir_types<'c>(
 ) -> Vec<Type<'c>> {
     match ret_kind {
         Some(ValueKind::Number) => vec![types.f64],
+        Some(ValueKind::Bool) | Some(ValueKind::Nil) => vec![types.i1],
         Some(ValueKind::Function(arity)) => {
             let p_types: Vec<Type<'c>> = (0..arity).map(|_| types.f64).collect();
             vec![FunctionType::new(context, &p_types, &[types.f64]).into()]
         }
-        Some(other) => unreachable!("Phase 2.5b.3 returns Number or Function only, got {other:?}"),
         None => vec![],
     }
 }
@@ -303,6 +303,10 @@ fn emit_function<'c>(
             let ret_value_idx = hir_fn.params.len() + 1;
             vec![emit_load(&block, slots[ret_value_idx], types.f64, loc)]
         }
+        Some(ValueKind::Bool) | Some(ValueKind::Nil) => {
+            let ret_value_idx = hir_fn.params.len() + 1;
+            vec![emit_load(&block, slots[ret_value_idx], types.i1, loc)]
+        }
         Some(ValueKind::Function(arity)) => {
             let ret_value_idx = hir_fn.params.len() + 1;
             let ptr_val = emit_load(&block, slots[ret_value_idx], types.ptr, loc);
@@ -310,7 +314,6 @@ fn emit_function<'c>(
             let fn_ty: Type<'c> = FunctionType::new(context, &p_types, &[types.f64]).into();
             vec![emit_unrealized_cast(&block, ptr_val, fn_ty, loc)]
         }
-        Some(other) => unreachable!("Phase 2.5b.3 returns Number/Function only, got {other:?}"),
         None => vec![],
     };
     block.append_operation(func::r#return(&ret_values, loc));
@@ -2225,6 +2228,53 @@ mod tests {
             ),
         )
         .expect("get_doubler full module must verify");
+        assert!(module.as_operation().verify());
+    }
+
+    // -----------------------------------------------------------
+    // Phase 2.5e — Bool/Nil signatures (ADR 0020).
+    // -----------------------------------------------------------
+
+    #[test]
+    fn emit_function_with_bool_return_uses_i1_result() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src("local function pos(x) return x > 0 end\nprint(pos(5))"),
+        )
+        .expect("Bool-return module must verify");
+        let mlir = module.as_operation().to_string();
+        assert!(
+            mlir.contains("@user_pos_") && mlir.contains("-> i1"),
+            "expected `pos` to return i1, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_function_with_nil_return_uses_i1_result() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src("local function n() return nil end\nprint(n())"),
+        )
+        .expect("Nil-return module must verify");
+        let mlir = module.as_operation().to_string();
+        assert!(
+            mlir.contains("@user_n_") && mlir.contains("-> i1"),
+            "expected `n` to return i1 (for nil), got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_module_with_bool_predicate_verifies() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src(
+                "local function is_zero(n) return n == 0 end\nlocal b = is_zero(0)\nprint(b)",
+            ),
+        )
+        .expect("Bool predicate module must verify");
         assert!(module.as_operation().verify());
     }
 }
