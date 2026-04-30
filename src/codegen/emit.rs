@@ -195,24 +195,26 @@ fn param_mlir_type<'c>(context: &'c Context, kind: ValueKind, types: &Types<'c>)
     }
 }
 
-/// MLIR result types for a function whose HIR return-kind is `ret_kind`.
-/// Used both at function declaration time and at every call site to
-/// keep the operand types in lock-step. Phase 2.5b.3 (ADR 0019) added
-/// Function returns; Phase 2.5e (ADR 0020) adds Bool and Nil.
+/// MLIR result types for a function whose HIR return-kinds list is
+/// `ret_kinds`. Phase 2.5b.3 (ADR 0019) added Function returns; 2.5e
+/// (ADR 0020) added Bool and Nil; 2.5d (ADR 0021) generalises to a
+/// `Vec` so multi-result functions emit a result type per position.
 fn ret_mlir_types<'c>(
     context: &'c Context,
-    ret_kind: Option<ValueKind>,
+    ret_kinds: &[ValueKind],
     types: &Types<'c>,
 ) -> Vec<Type<'c>> {
-    match ret_kind {
-        Some(ValueKind::Number) => vec![types.f64],
-        Some(ValueKind::Bool) | Some(ValueKind::Nil) => vec![types.i1],
-        Some(ValueKind::Function(arity)) => {
-            let p_types: Vec<Type<'c>> = (0..arity).map(|_| types.f64).collect();
-            vec![FunctionType::new(context, &p_types, &[types.f64]).into()]
-        }
-        None => vec![],
-    }
+    ret_kinds
+        .iter()
+        .map(|k| match k {
+            ValueKind::Number => types.f64,
+            ValueKind::Bool | ValueKind::Nil => types.i1,
+            ValueKind::Function(arity) => {
+                let p_types: Vec<Type<'c>> = (0..*arity).map(|_| types.f64).collect();
+                FunctionType::new(context, &p_types, &[types.f64]).into()
+            }
+        })
+        .collect()
 }
 
 /// `builtin.unrealized_conversion_cast` — used to bridge `!func.func`
@@ -294,32 +296,32 @@ fn emit_function<'c>(
         loc,
     )?;
 
-    // Trailing return: load `_ret_value` (Phase 2.5a places it at
-    // `params.len() + 1` — params, then `_returned`, then `_ret_value`).
-    // Phase 2.5b.3: Function-kind returns load the slot as `ptr` and
-    // bridge back to the function type via unrealized_conversion_cast.
-    let ret_values: Vec<Value<'c, '_>> = match hir_fn.ret_kind {
-        Some(ValueKind::Number) => {
-            let ret_value_idx = hir_fn.params.len() + 1;
-            vec![emit_load(&block, slots[ret_value_idx], types.f64, loc)]
-        }
-        Some(ValueKind::Bool) | Some(ValueKind::Nil) => {
-            let ret_value_idx = hir_fn.params.len() + 1;
-            vec![emit_load(&block, slots[ret_value_idx], types.i1, loc)]
-        }
-        Some(ValueKind::Function(arity)) => {
-            let ret_value_idx = hir_fn.params.len() + 1;
-            let ptr_val = emit_load(&block, slots[ret_value_idx], types.ptr, loc);
-            let p_types: Vec<Type<'c>> = (0..arity).map(|_| types.f64).collect();
-            let fn_ty: Type<'c> = FunctionType::new(context, &p_types, &[types.f64]).into();
-            vec![emit_unrealized_cast(&block, ptr_val, fn_ty, loc)]
-        }
-        None => vec![],
-    };
+    // Trailing return: load each `_ret_value_N` slot (Phase 2.5d
+    // ADR 0021) — slots are placed sequentially after `_returned`,
+    // i.e. at `params.len() + 1 + i` for the i-th return position.
+    // Function-kind returns load the slot as `ptr` and bridge back
+    // to the function type via unrealized_conversion_cast (ADR 0019).
+    let mut ret_values: Vec<Value<'c, '_>> = Vec::with_capacity(hir_fn.ret_kinds.len());
+    for (i, k) in hir_fn.ret_kinds.iter().enumerate() {
+        let ret_value_idx = hir_fn.params.len() + 1 + i;
+        let v = match k {
+            ValueKind::Number => emit_load(&block, slots[ret_value_idx], types.f64, loc),
+            ValueKind::Bool | ValueKind::Nil => {
+                emit_load(&block, slots[ret_value_idx], types.i1, loc)
+            }
+            ValueKind::Function(arity) => {
+                let ptr_val = emit_load(&block, slots[ret_value_idx], types.ptr, loc);
+                let p_types: Vec<Type<'c>> = (0..*arity).map(|_| types.f64).collect();
+                let fn_ty: Type<'c> = FunctionType::new(context, &p_types, &[types.f64]).into();
+                emit_unrealized_cast(&block, ptr_val, fn_ty, loc)
+            }
+        };
+        ret_values.push(v);
+    }
     block.append_operation(func::r#return(&ret_values, loc));
     region.append_block(block);
 
-    let ret_types = ret_mlir_types(context, hir_fn.ret_kind, types);
+    let ret_types = ret_mlir_types(context, &hir_fn.ret_kinds, types);
     let fn_type = FunctionType::new(context, &param_types, &ret_types);
     let func_op = func::func(
         context,
@@ -488,6 +490,68 @@ fn emit_stmt<'a, 'c>(
                 context, block, expr, slots, locals, functions, types, params_len, loc,
             )?;
         }
+        HirStmtKind::MultiAssignFromCall {
+            dst_ids,
+            callee,
+            args,
+        } => {
+            emit_multi_assign_from_call(
+                context, block, dst_ids, *callee, args, slots, locals, functions, types,
+                params_len, loc,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Phase 2.5d (ADR 0021): emit a multi-result `func.call` and store
+/// each result into the matching destination slot. Currently only
+/// `Callee::User` is supported — `Callee::Indirect` lacks
+/// statically-tracked ret arity, and builtins have a fixed shape.
+#[allow(clippy::too_many_arguments)]
+fn emit_multi_assign_from_call<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    dst_ids: &[LocalId],
+    callee: Callee,
+    args: &[HirExpr],
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    let Callee::User(FuncId(fid)) = callee else {
+        unreachable!("HIR rejects non-User callees in MultiAssignFromCall");
+    };
+    let target = &functions[fid];
+    let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
+    for a in args {
+        arg_vals.push(emit_expr(
+            context, block, a, slots, locals, functions, types, params_len, loc,
+        )?);
+    }
+    let ret_types = ret_mlir_types(context, &target.ret_kinds, types);
+    let call_op = func::call(
+        context,
+        FlatSymbolRefAttribute::new(context, &target.mangled_name),
+        &arg_vals,
+        &ret_types,
+        loc,
+    );
+    let op_ref = block.append_operation(call_op);
+    for (i, dst) in dst_ids.iter().enumerate() {
+        let v: Value<'c, 'a> = op_ref.result(i).unwrap().into();
+        let info = &locals[dst.0];
+        // Function-kind slots need the same ucast bridge used by
+        // ordinary LocalInit (Phase 2.5b.3).
+        let store_val = if matches!(info.kind, ValueKind::Function(_)) {
+            emit_unrealized_cast(block, v, types.ptr, loc)
+        } else {
+            v
+        };
+        emit_store(block, store_val, slots[dst.0], loc);
     }
     Ok(())
 }
@@ -610,7 +674,7 @@ fn emit_expr<'a, 'c>(
                             .iter()
                             .map(|p| param_mlir_type(context, p.kind, types))
                             .collect();
-                        let r_types = ret_mlir_types(context, target.ret_kind, types);
+                        let r_types = ret_mlir_types(context, &target.ret_kinds, types);
                         let fn_type = FunctionType::new(context, &p_types, &r_types);
                         let constant = func::constant(
                             context,
@@ -684,7 +748,7 @@ fn emit_expr<'a, 'c>(
                         context, block, a, slots, locals, functions, types, params_len, loc,
                     )?);
                 }
-                let ret_types = ret_mlir_types(context, target.ret_kind, types);
+                let ret_types = ret_mlir_types(context, &target.ret_kinds, types);
                 let call_op = func::call(
                     context,
                     FlatSymbolRefAttribute::new(context, &target.mangled_name),
@@ -693,7 +757,9 @@ fn emit_expr<'a, 'c>(
                     loc,
                 );
                 let op_ref = block.append_operation(call_op);
-                if target.ret_kind.is_some() {
+                if !target.ret_kinds.is_empty() {
+                    // Multi-result calls in expression position
+                    // truncate to the first value (Lua semantics).
                     Ok(op_ref.result(0).unwrap().into())
                 } else {
                     // Void call — synthesise a placeholder f64 0.0
@@ -751,7 +817,7 @@ fn emit_expr<'a, 'c>(
                 .iter()
                 .map(|p| param_mlir_type(context, p.kind, types))
                 .collect();
-            let r_types = ret_mlir_types(context, target.ret_kind, types);
+            let r_types = ret_mlir_types(context, &target.ret_kinds, types);
             let fn_type = FunctionType::new(context, &p_types, &r_types);
             let constant = func::constant(
                 context,
