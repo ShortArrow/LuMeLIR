@@ -336,6 +336,19 @@ impl<'t> Parser<'t> {
                 });
             }
         };
+        let (params, body, end_tok) = self.parse_function_signature_and_body()?;
+        let span = Span::new(local_tok.span.start, end_tok.span.end);
+        Ok(Stmt::new(
+            StmtKind::FunctionDef { name, params, body },
+            span,
+        ))
+    }
+
+    /// Parse `(params) body end` — shared between `parse_function_def`
+    /// (named) and `parse_function_expr` (anonymous, Phase 2.5b).
+    fn parse_function_signature_and_body(
+        &mut self,
+    ) -> Result<(Vec<String>, Chunk, Token), ParseError> {
         self.expect_token(TokenKind::LParen)?;
         let mut params = Vec::new();
         if !matches!(self.peek().kind, TokenKind::RParen) {
@@ -363,11 +376,7 @@ impl<'t> Parser<'t> {
         self.expect_token(TokenKind::RParen)?;
         let body = self.parse_chunk_until(&[TokenKind::Keyword(Keyword::End), TokenKind::Eof])?;
         let end_tok = self.expect_keyword(Keyword::End)?;
-        let span = Span::new(local_tok.span.start, end_tok.span.end);
-        Ok(Stmt::new(
-            StmtKind::FunctionDef { name, params, body },
-            span,
-        ))
+        Ok((params, body, end_tok))
     }
 
     fn parse_return(&mut self) -> Result<Stmt, ParseError> {
@@ -468,6 +477,12 @@ impl<'t> Parser<'t> {
             TokenKind::Keyword(Keyword::Nil) => {
                 self.bump();
                 Ok(Expr::new(ExprKind::Nil, tok.span))
+            }
+            TokenKind::Keyword(Keyword::Function) => {
+                self.bump();
+                let (params, body, end_tok) = self.parse_function_signature_and_body()?;
+                let span = Span::new(tok.span.start, end_tok.span.end);
+                Ok(Expr::new(ExprKind::FunctionExpr { params, body }, span))
             }
             TokenKind::LParen => {
                 self.bump();
@@ -652,6 +667,10 @@ mod tests {
             ExprKind::UnaryOp { op, operand } => ExprKind::UnaryOp {
                 op,
                 operand: Box::new(strip_span_expr(*operand)),
+            },
+            ExprKind::FunctionExpr { params, body } => ExprKind::FunctionExpr {
+                params,
+                body: body.into_iter().map(strip_span_stmt).collect(),
             },
         };
         Expr::new(kind, Span::new(0, 0))
@@ -1413,6 +1432,42 @@ mod tests {
     fn parse_local_function_missing_end_is_rejected() {
         let err = parse("local function f()").expect_err("missing `end` must fail");
         assert!(matches!(err, ParseError::UnexpectedEof { .. }));
+    }
+
+    #[test]
+    fn parse_anonymous_function_expr_yields_function_expr() {
+        let kind = parse_single_expr("function() return 1 end").expect("must parse");
+        match kind {
+            ExprKind::FunctionExpr { params, body } => {
+                assert!(params.is_empty());
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("expected FunctionExpr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_function_expr_in_local_init() {
+        let stmt = parse_single_stmt("local f = function(x) return x end").expect("must parse");
+        match stmt.kind {
+            StmtKind::Local { name, value } => {
+                assert_eq!(name, "f");
+                assert!(matches!(value.kind, ExprKind::FunctionExpr { .. }));
+            }
+            other => panic!("expected Local with FunctionExpr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_function_expr_with_params_and_body() {
+        let kind = parse_single_expr("function(a, b) return a + b end").expect("must parse");
+        match kind {
+            ExprKind::FunctionExpr { params, body } => {
+                assert_eq!(params, vec!["a".to_owned(), "b".to_owned()]);
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("expected FunctionExpr, got {other:?}"),
+        }
     }
 
     #[test]

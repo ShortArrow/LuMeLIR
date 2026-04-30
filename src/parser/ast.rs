@@ -33,6 +33,13 @@ pub enum ExprKind {
         op: UnaryOp,
         operand: Box<Expr>,
     },
+    /// `function(params) body end` — anonymous function expression
+    /// (Phase 2.5b, ADR 0017). Lowered to a `HirFunction` registered
+    /// with the mangled name `user_anon_<idx>`.
+    FunctionExpr {
+        params: Vec<String>,
+        body: Chunk,
+    },
 }
 
 /// Binary operators. Phase 2.2a covers all arithmetic operators
