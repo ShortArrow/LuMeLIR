@@ -195,6 +195,45 @@ fn param_mlir_type<'c>(context: &'c Context, kind: ValueKind, types: &Types<'c>)
     }
 }
 
+/// MLIR result types for a function whose HIR return-kind is `ret_kind`.
+/// Used both at function declaration time and at every call site to
+/// keep the operand types in lock-step. Phase 2.5b.3 (ADR 0019) widens
+/// Phase 2.5a's "Number only" rule to also allow Function(arity).
+fn ret_mlir_types<'c>(
+    context: &'c Context,
+    ret_kind: Option<ValueKind>,
+    types: &Types<'c>,
+) -> Vec<Type<'c>> {
+    match ret_kind {
+        Some(ValueKind::Number) => vec![types.f64],
+        Some(ValueKind::Function(arity)) => {
+            let p_types: Vec<Type<'c>> = (0..arity).map(|_| types.f64).collect();
+            vec![FunctionType::new(context, &p_types, &[types.f64]).into()]
+        }
+        Some(other) => unreachable!("Phase 2.5b.3 returns Number or Function only, got {other:?}"),
+        None => vec![],
+    }
+}
+
+/// `builtin.unrealized_conversion_cast` — used to bridge `!func.func`
+/// values to/from `!llvm.ptr` so the value can be stored in an LLVM
+/// alloca slot. Subsequent `--convert-func-to-llvm` lowers `!func.func`
+/// to `!llvm.ptr`, and `--reconcile-unrealized-casts` then erases the
+/// pair as a no-op. Phase 2.5b.3 (ADR 0019).
+fn emit_unrealized_cast<'a, 'c>(
+    block: &'a Block<'c>,
+    value: Value<'c, 'a>,
+    target_ty: Type<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let op = OperationBuilder::new("builtin.unrealized_conversion_cast", loc)
+        .add_operands(&[value])
+        .add_results(&[target_ty])
+        .build()
+        .expect("builtin.unrealized_conversion_cast");
+    block.append_operation(op).result(0).unwrap().into()
+}
+
 /// Emit a `func.func @<mangled_name>(...) -> (...)` for a user-defined
 /// function. Phase 2.5a constrains every parameter and the optional
 /// return value to `Number` (f64). The `_returned` / `_ret_value`
@@ -251,26 +290,33 @@ fn emit_function<'c>(
         &hir_fn.locals,
         functions,
         types,
+        hir_fn.params.len(),
         loc,
     )?;
 
     // Trailing return: load `_ret_value` (Phase 2.5a places it at
     // `params.len() + 1` — params, then `_returned`, then `_ret_value`).
+    // Phase 2.5b.3: Function-kind returns load the slot as `ptr` and
+    // bridge back to the function type via unrealized_conversion_cast.
     let ret_values: Vec<Value<'c, '_>> = match hir_fn.ret_kind {
         Some(ValueKind::Number) => {
             let ret_value_idx = hir_fn.params.len() + 1;
             vec![emit_load(&block, slots[ret_value_idx], types.f64, loc)]
         }
-        Some(other) => unreachable!("Phase 2.5a returns Number only, got {other:?}"),
+        Some(ValueKind::Function(arity)) => {
+            let ret_value_idx = hir_fn.params.len() + 1;
+            let ptr_val = emit_load(&block, slots[ret_value_idx], types.ptr, loc);
+            let p_types: Vec<Type<'c>> = (0..arity).map(|_| types.f64).collect();
+            let fn_ty: Type<'c> = FunctionType::new(context, &p_types, &[types.f64]).into();
+            vec![emit_unrealized_cast(&block, ptr_val, fn_ty, loc)]
+        }
+        Some(other) => unreachable!("Phase 2.5b.3 returns Number/Function only, got {other:?}"),
         None => vec![],
     };
     block.append_operation(func::r#return(&ret_values, loc));
     region.append_block(block);
 
-    let ret_types: Vec<Type<'c>> = match hir_fn.ret_kind {
-        Some(_) => vec![types.f64],
-        None => vec![],
-    };
+    let ret_types = ret_mlir_types(context, hir_fn.ret_kind, types);
     let fn_type = FunctionType::new(context, &param_types, &ret_types);
     let func_op = func::func(
         context,
@@ -308,6 +354,7 @@ fn emit_main<'c>(
         &chunk.locals,
         &chunk.functions,
         types,
+        0,
         loc,
     )?;
 
@@ -339,10 +386,13 @@ fn emit_stmts<'a, 'c>(
     locals: &[LocalInfo],
     functions: &[HirFunction],
     types: &Types<'c>,
+    params_len: usize,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     for stmt in stmts {
-        emit_stmt(context, block, stmt, slots, locals, functions, types, loc)?;
+        emit_stmt(
+            context, block, stmt, slots, locals, functions, types, params_len, loc,
+        )?;
     }
     Ok(())
 }
@@ -356,21 +406,45 @@ fn emit_stmt<'a, 'c>(
     locals: &[LocalInfo],
     functions: &[HirFunction],
     types: &Types<'c>,
+    params_len: usize,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     match &stmt.kind {
         HirStmtKind::LocalInit { id, value } | HirStmtKind::Assign { id, value } => {
-            // Phase 2.5b.2: Function-kind locals don't store into a
-            // physical slot — their value is recovered at every use
-            // site via `func.constant` (FuncId-known) or block argument
-            // (param). Skip the store entirely for those.
-            if !matches!(locals[id.0].kind, ValueKind::Function(_)) {
-                let v = emit_expr(context, block, value, slots, locals, functions, types, loc)?;
-                emit_store(block, v, slots[id.0], loc);
+            // Phase 2.5b.3: Function-kind locals fall into three buckets:
+            //   - Param slot (id < params_len): the slot already holds
+            //     the block argument SSA value; never write.
+            //   - Known FuncId (`local f = function() end` or alias):
+            //     the value is reproducible via `func.constant` at use
+            //     sites; we skip the store as a small optimisation.
+            //   - Otherwise (e.g. `local g = get_f()` or the synthetic
+            //     `_ret_value` slot): evaluate the rhs, bridge the
+            //     `!func.func` value to `!llvm.ptr`, and store.
+            let info = &locals[id.0];
+            match info.kind {
+                ValueKind::Function(_) => {
+                    let is_param = id.0 < params_len;
+                    let known_fid = info.func_id.is_some();
+                    if !is_param && !known_fid {
+                        let v = emit_expr(
+                            context, block, value, slots, locals, functions, types, params_len, loc,
+                        )?;
+                        let ptr_val = emit_unrealized_cast(block, v, types.ptr, loc);
+                        emit_store(block, ptr_val, slots[id.0], loc);
+                    }
+                }
+                _ => {
+                    let v = emit_expr(
+                        context, block, value, slots, locals, functions, types, params_len, loc,
+                    )?;
+                    emit_store(block, v, slots[id.0], loc);
+                }
             }
         }
         HirStmtKind::Block { stmts } => {
-            emit_stmts(context, block, stmts, slots, locals, functions, types, loc)?;
+            emit_stmts(
+                context, block, stmts, slots, locals, functions, types, params_len, loc,
+            )?;
         }
         HirStmtKind::If {
             cond,
@@ -380,7 +454,7 @@ fn emit_stmt<'a, 'c>(
         } => {
             emit_if(
                 context, block, cond, then_body, elifs, else_body, slots, locals, functions, types,
-                loc,
+                params_len, loc,
             )?;
         }
         HirStmtKind::While {
@@ -389,7 +463,8 @@ fn emit_stmt<'a, 'c>(
             break_id,
         } => {
             emit_while(
-                context, block, cond, body, *break_id, slots, locals, functions, types, loc,
+                context, block, cond, body, *break_id, slots, locals, functions, types, params_len,
+                loc,
             )?;
         }
         HirStmtKind::ForNumeric {
@@ -402,11 +477,13 @@ fn emit_stmt<'a, 'c>(
         } => {
             emit_for_numeric(
                 context, block, *var_id, start, stop, step, body, *break_id, slots, locals,
-                functions, types, loc,
+                functions, types, params_len, loc,
             )?;
         }
         HirStmtKind::ExprStmt(expr) => {
-            emit_expr_stmt(context, block, expr, slots, locals, functions, types, loc)?;
+            emit_expr_stmt(
+                context, block, expr, slots, locals, functions, types, params_len, loc,
+            )?;
         }
     }
     Ok(())
@@ -424,7 +501,11 @@ fn emit_alloca_slot_for_kind<'a, 'c>(
         // Bool: 1-bit. Nil: nominally 1-bit too — the value is never
         // observed (heterogeneous `==` and print(nil) both bypass
         // the slot via static dispatch), but storage is uniform.
-        ValueKind::Bool | ValueKind::Nil | ValueKind::Function(_) => types.i1,
+        ValueKind::Bool | ValueKind::Nil => types.i1,
+        // Phase 2.5b.3 (ADR 0019): Function values stored as opaque
+        // pointers — `!func.func<...>` values are bridged via
+        // `unrealized_conversion_cast` at store/load.
+        ValueKind::Function(_) => types.ptr,
     };
 
     let one = arith::constant(context, IntegerAttribute::new(types.i32, 1).into(), loc);
@@ -478,6 +559,7 @@ fn emit_expr<'a, 'c>(
     locals: &[LocalInfo],
     functions: &[HirFunction],
     types: &Types<'c>,
+    params_len: usize,
     loc: Location<'c>,
 ) -> Result<Value<'c, 'a>, CodegenError> {
     match &expr.kind {
@@ -509,24 +591,23 @@ fn emit_expr<'a, 'c>(
                 ValueKind::Bool | ValueKind::Nil => {
                     Ok(emit_load(block, slots[*idx], types.i1, loc))
                 }
-                ValueKind::Function(_) => {
-                    // Phase 2.5b.2: Function-kind locals don't use
-                    // alloca/load. If we have a known FuncId
-                    // (`local f = function() end` or alias), re-emit
-                    // a `func.constant`. Otherwise the local is a
-                    // function parameter; `slots[idx]` already holds
-                    // the block-argument SSA value.
-                    if let Some(fid) = info.func_id {
+                ValueKind::Function(arity) => {
+                    // Three buckets (Phase 2.5b.3, ADR 0019):
+                    //   - Function param: slots[idx] is the block arg.
+                    //   - Known FuncId: re-emit `func.constant`; the slot
+                    //     value is never read on this path.
+                    //   - Otherwise: alloca'd `ptr` slot — load it and
+                    //     bridge back to `!func.func` via ucast.
+                    if *idx < params_len {
+                        Ok(slots[*idx])
+                    } else if let Some(fid) = info.func_id {
                         let target = &functions[fid.0];
                         let p_types: Vec<Type<'c>> = target
                             .params
                             .iter()
                             .map(|p| param_mlir_type(context, p.kind, types))
                             .collect();
-                        let r_types: Vec<Type<'c>> = match target.ret_kind {
-                            Some(_) => vec![types.f64],
-                            None => vec![],
-                        };
+                        let r_types = ret_mlir_types(context, target.ret_kind, types);
                         let fn_type = FunctionType::new(context, &p_types, &r_types);
                         let constant = func::constant(
                             context,
@@ -536,9 +617,11 @@ fn emit_expr<'a, 'c>(
                         );
                         Ok(block.append_operation(constant).result(0).unwrap().into())
                     } else {
-                        // Function-kind param: slots[idx] holds the
-                        // block argument value already.
-                        Ok(slots[*idx])
+                        let ptr_val = emit_load(block, slots[*idx], types.ptr, loc);
+                        let p_types: Vec<Type<'c>> = (0..arity).map(|_| types.f64).collect();
+                        let fn_ty: Type<'c> =
+                            FunctionType::new(context, &p_types, &[types.f64]).into();
+                        Ok(emit_unrealized_cast(block, ptr_val, fn_ty, loc))
                     }
                 }
             }
@@ -547,11 +630,15 @@ fn emit_expr<'a, 'c>(
             // `and`/`or` short-circuit — must NOT eagerly evaluate rhs.
             if matches!(op, BinOp::And | BinOp::Or) {
                 return emit_short_circuit(
-                    context, block, *op, lhs, rhs, slots, locals, functions, types, loc,
+                    context, block, *op, lhs, rhs, slots, locals, functions, types, params_len, loc,
                 );
             }
-            let lhs_val = emit_expr(context, block, lhs, slots, locals, functions, types, loc)?;
-            let rhs_val = emit_expr(context, block, rhs, slots, locals, functions, types, loc)?;
+            let lhs_val = emit_expr(
+                context, block, lhs, slots, locals, functions, types, params_len, loc,
+            )?;
+            let rhs_val = emit_expr(
+                context, block, rhs, slots, locals, functions, types, params_len, loc,
+            )?;
             emit_binop(context, block, *op, lhs_val, rhs_val, types, loc)
         }
         HirExprKind::UnaryOp { op, operand } => {
@@ -561,7 +648,7 @@ fn emit_expr<'a, 'c>(
             if matches!(op, UnaryOp::Not) {
                 let kind = infer_kind(operand, locals, functions);
                 let v = emit_expr(
-                    context, block, operand, slots, locals, functions, types, loc,
+                    context, block, operand, slots, locals, functions, types, params_len, loc,
                 )?;
                 let truth = emit_truthiness(context, block, v, kind, types, loc);
                 let one = arith::constant(context, IntegerAttribute::new(types.i1, 1).into(), loc);
@@ -573,7 +660,7 @@ fn emit_expr<'a, 'c>(
                     .into());
             }
             let v = emit_expr(
-                context, block, operand, slots, locals, functions, types, loc,
+                context, block, operand, slots, locals, functions, types, params_len, loc,
             )?;
             emit_unary(block, *op, v, loc)
         }
@@ -581,7 +668,7 @@ fn emit_expr<'a, 'c>(
             Callee::Builtin(Builtin::Print) => {
                 let kind = infer_kind(&args[0], locals, functions);
                 let arg_val = emit_expr(
-                    context, block, &args[0], slots, locals, functions, types, loc,
+                    context, block, &args[0], slots, locals, functions, types, params_len, loc,
                 )?;
                 emit_print_value(context, block, arg_val, kind, types, loc);
                 Ok(arg_val)
@@ -591,18 +678,15 @@ fn emit_expr<'a, 'c>(
                 let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
                 for a in args {
                     arg_vals.push(emit_expr(
-                        context, block, a, slots, locals, functions, types, loc,
+                        context, block, a, slots, locals, functions, types, params_len, loc,
                     )?);
                 }
-                let ret_types: &[Type<'c>] = match target.ret_kind {
-                    Some(_) => &[types.f64], // Phase 2.5a: only Number returns
-                    None => &[],
-                };
+                let ret_types = ret_mlir_types(context, target.ret_kind, types);
                 let call_op = func::call(
                     context,
                     FlatSymbolRefAttribute::new(context, &target.mangled_name),
                     &arg_vals,
-                    ret_types,
+                    &ret_types,
                     loc,
                 );
                 let op_ref = block.append_operation(call_op);
@@ -622,38 +706,28 @@ fn emit_expr<'a, 'c>(
                 }
             }
             Callee::Indirect(LocalId(idx)) => {
-                // Phase 2.5b.2: load the function value from the local
-                // (a block argument for function-kind params), then
-                // emit `func.call_indirect`.
-                let callee_val = if locals[*idx].func_id.is_some() {
-                    // Aliased local with known FuncId — re-emit constant.
-                    let fid = locals[*idx].func_id.unwrap();
-                    let target = &functions[fid.0];
-                    let p_types: Vec<Type<'c>> = target
-                        .params
-                        .iter()
-                        .map(|p| param_mlir_type(context, p.kind, types))
-                        .collect();
-                    let r_types: Vec<Type<'c>> = match target.ret_kind {
-                        Some(_) => vec![types.f64],
-                        None => vec![],
-                    };
-                    let fn_type = FunctionType::new(context, &p_types, &r_types);
-                    let constant = func::constant(
-                        context,
-                        FlatSymbolRefAttribute::new(context, &target.mangled_name),
-                        fn_type,
-                        loc,
-                    );
-                    block.append_operation(constant).result(0).unwrap().into()
-                } else {
-                    // Function-kind param: block argument value.
+                // Phase 2.5b.2/b.3: a Function-kind local with no
+                // statically known FuncId. Either it is a function
+                // parameter (slot is the block argument) or it was
+                // bound from a call/expression and lives in an
+                // alloca'd `ptr` slot.
+                let callee_val = if *idx < params_len {
                     slots[*idx]
+                } else {
+                    let info = &locals[*idx];
+                    let arity = match info.kind {
+                        ValueKind::Function(a) => a,
+                        _ => unreachable!("Callee::Indirect on non-Function local"),
+                    };
+                    let ptr_val = emit_load(block, slots[*idx], types.ptr, loc);
+                    let p_types: Vec<Type<'c>> = (0..arity).map(|_| types.f64).collect();
+                    let fn_ty: Type<'c> = FunctionType::new(context, &p_types, &[types.f64]).into();
+                    emit_unrealized_cast(block, ptr_val, fn_ty, loc)
                 };
                 let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
                 for a in args {
                     arg_vals.push(emit_expr(
-                        context, block, a, slots, locals, functions, types, loc,
+                        context, block, a, slots, locals, functions, types, params_len, loc,
                     )?);
                 }
                 let call_op = func::call_indirect(callee_val, &arg_vals, &[types.f64], loc);
@@ -661,13 +735,28 @@ fn emit_expr<'a, 'c>(
                 Ok(op_ref.result(0).unwrap().into())
             }
         },
-        HirExprKind::FunctionRef(_) => {
-            // Phase 2.5b: a function reference is HIR-only metadata.
-            // Codegen never reads the slot value; emitting an i1 0
-            // gives the LocalInit a benign placeholder. ADR 0017.
-            let attr = IntegerAttribute::new(types.i1, 0);
-            let op = arith::constant(context, attr.into(), loc);
-            Ok(block.append_operation(op).result(0).unwrap().into())
+        HirExprKind::FunctionRef(FuncId(id)) => {
+            // Phase 2.5b.3: a function reference materialises as a
+            // `func.constant` SSA value so it can flow through stores
+            // (e.g. into the synthetic `_ret_value` slot when a
+            // function body does `return function() ... end`) and into
+            // call-site arguments. Storage-skipping LocalInit paths
+            // never reach here, so this is always a real use.
+            let target = &functions[*id];
+            let p_types: Vec<Type<'c>> = target
+                .params
+                .iter()
+                .map(|p| param_mlir_type(context, p.kind, types))
+                .collect();
+            let r_types = ret_mlir_types(context, target.ret_kind, types);
+            let fn_type = FunctionType::new(context, &p_types, &r_types);
+            let constant = func::constant(
+                context,
+                FlatSymbolRefAttribute::new(context, &target.mangled_name),
+                fn_type,
+                loc,
+            );
+            Ok(block.append_operation(constant).result(0).unwrap().into())
         }
     }
 }
@@ -681,9 +770,12 @@ fn emit_expr_stmt<'a, 'c>(
     locals: &[LocalInfo],
     functions: &[HirFunction],
     types: &Types<'c>,
+    params_len: usize,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
-    emit_expr(context, block, expr, slots, locals, functions, types, loc)?;
+    emit_expr(
+        context, block, expr, slots, locals, functions, types, params_len, loc,
+    )?;
     Ok(())
 }
 
@@ -1036,12 +1128,15 @@ fn emit_short_circuit<'a, 'c>(
     locals: &[LocalInfo],
     functions: &[HirFunction],
     types: &Types<'c>,
+    params_len: usize,
     loc: Location<'c>,
 ) -> Result<Value<'c, 'a>, CodegenError> {
     let kind = infer_kind(lhs, locals, functions);
     let result_ty = kind_to_mlir_type(kind, types);
 
-    let lhs_val = emit_expr(context, parent, lhs, slots, locals, functions, types, loc)?;
+    let lhs_val = emit_expr(
+        context, parent, lhs, slots, locals, functions, types, params_len, loc,
+    )?;
     let cond = emit_truthiness(context, parent, lhs_val, kind, types, loc);
 
     // For `and`: then = rhs, else = lhs. For `or`: then = lhs, else = rhs.
@@ -1061,6 +1156,7 @@ fn emit_short_circuit<'a, 'c>(
         locals,
         functions,
         types,
+        params_len,
         loc,
     )?;
     let else_region = build_yield_region(
@@ -1073,6 +1169,7 @@ fn emit_short_circuit<'a, 'c>(
         locals,
         functions,
         types,
+        params_len,
         loc,
     )?;
 
@@ -1095,6 +1192,7 @@ fn build_yield_region<'a, 'c>(
     locals: &[LocalInfo],
     functions: &[HirFunction],
     types: &Types<'c>,
+    params_len: usize,
     loc: Location<'c>,
 ) -> Result<Region<'c>, CodegenError> {
     let region = Region::new();
@@ -1107,7 +1205,9 @@ fn build_yield_region<'a, 'c>(
         // scf.if's regions.
         unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(lhs_val) }
     } else {
-        emit_expr(context, &blk, rhs, blk_slots, locals, functions, types, loc)?
+        emit_expr(
+            context, &blk, rhs, blk_slots, locals, functions, types, params_len, loc,
+        )?
     };
     blk.append_operation(scf::r#yield(&[yielded], loc));
     region.append_block(blk);
@@ -1130,15 +1230,20 @@ fn emit_if<'a, 'c>(
     locals: &[LocalInfo],
     functions: &[HirFunction],
     types: &Types<'c>,
+    params_len: usize,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     let cond_kind = infer_kind(cond, locals, functions);
-    let cond_val = emit_expr(context, parent, cond, slots, locals, functions, types, loc)?;
+    let cond_val = emit_expr(
+        context, parent, cond, slots, locals, functions, types, params_len, loc,
+    )?;
     let cond_i1 = emit_truthiness(context, parent, cond_val, cond_kind, types, loc);
 
-    let then_region = build_body_region(context, then_body, slots, locals, functions, types, loc)?;
+    let then_region = build_body_region(
+        context, then_body, slots, locals, functions, types, params_len, loc,
+    )?;
     let else_region = build_else_region(
-        context, elifs, else_body, slots, locals, functions, types, loc,
+        context, elifs, else_body, slots, locals, functions, types, params_len, loc,
     )?;
 
     let if_op = scf::r#if(cond_i1, &[], then_region, else_region, loc);
@@ -1156,6 +1261,7 @@ fn build_else_region<'c>(
     locals: &[LocalInfo],
     functions: &[HirFunction],
     types: &Types<'c>,
+    params_len: usize,
     loc: Location<'c>,
 ) -> Result<Region<'c>, CodegenError> {
     if let Some(((cond, body), rest)) = elifs.split_first() {
@@ -1166,13 +1272,14 @@ fn build_else_region<'c>(
         // Re-bind slots and emit into the new block.
         let blk_slots = transmute_slots(slots);
         let cond_val = emit_expr(
-            context, &blk, cond, blk_slots, locals, functions, types, loc,
+            context, &blk, cond, blk_slots, locals, functions, types, params_len, loc,
         )?;
         let cond_i1 = emit_truthiness(context, &blk, cond_val, cond_kind, types, loc);
-        let nested_then =
-            build_body_region(context, body, blk_slots, locals, functions, types, loc)?;
+        let nested_then = build_body_region(
+            context, body, blk_slots, locals, functions, types, params_len, loc,
+        )?;
         let nested_else = build_else_region(
-            context, rest, else_body, blk_slots, locals, functions, types, loc,
+            context, rest, else_body, blk_slots, locals, functions, types, params_len, loc,
         )?;
         blk.append_operation(scf::r#if(cond_i1, &[], nested_then, nested_else, loc));
         blk.append_operation(scf::r#yield(&[], loc));
@@ -1181,7 +1288,9 @@ fn build_else_region<'c>(
     } else {
         // Leaf: either else_body or empty `scf.yield` for absent else.
         match else_body {
-            Some(body) => build_body_region(context, body, slots, locals, functions, types, loc),
+            Some(body) => build_body_region(
+                context, body, slots, locals, functions, types, params_len, loc,
+            ),
             None => {
                 let region = Region::new();
                 let blk = Block::new(&[]);
@@ -1194,6 +1303,7 @@ fn build_else_region<'c>(
 }
 
 /// Build a Region containing one Block: the body, terminated by `scf.yield`.
+#[allow(clippy::too_many_arguments)]
 fn build_body_region<'c>(
     context: &'c Context,
     body: &[HirStmt],
@@ -1201,13 +1311,14 @@ fn build_body_region<'c>(
     locals: &[LocalInfo],
     functions: &[HirFunction],
     types: &Types<'c>,
+    params_len: usize,
     loc: Location<'c>,
 ) -> Result<Region<'c>, CodegenError> {
     let region = Region::new();
     let blk = Block::new(&[]);
     let blk_slots = transmute_slots(slots);
     emit_stmts(
-        context, &blk, body, blk_slots, locals, functions, types, loc,
+        context, &blk, body, blk_slots, locals, functions, types, params_len, loc,
     )?;
     blk.append_operation(scf::r#yield(&[], loc));
     region.append_block(blk);
@@ -1239,6 +1350,7 @@ fn emit_while<'a, 'c>(
     locals: &[LocalInfo],
     functions: &[HirFunction],
     types: &Types<'c>,
+    params_len: usize,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     // before region: evaluate cond, optionally AND with `not _broken`.
@@ -1254,6 +1366,7 @@ fn emit_while<'a, 'c>(
         locals,
         functions,
         types,
+        params_len,
         loc,
     )?;
     let mut cond_i1 = emit_truthiness(context, &before_blk, cond_val, cond_kind, types, loc);
@@ -1264,7 +1377,9 @@ fn emit_while<'a, 'c>(
     before.append_block(before_blk);
 
     // after region: body, scf.yield.
-    let after = build_body_region(context, body, slots, locals, functions, types, loc)?;
+    let after = build_body_region(
+        context, body, slots, locals, functions, types, params_len, loc,
+    )?;
 
     parent.append_operation(scf::r#while(&[], &[], before, after, loc));
     Ok(())
@@ -1319,13 +1434,20 @@ fn emit_for_numeric<'a, 'c>(
     locals: &[LocalInfo],
     functions: &[HirFunction],
     types: &Types<'c>,
+    params_len: usize,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     // Evaluate start/stop/step once in the parent block, store into
     // dedicated slots (stop/step) and the loop variable's own slot.
-    let start_val = emit_expr(context, parent, start, slots, locals, functions, types, loc)?;
-    let stop_val = emit_expr(context, parent, stop, slots, locals, functions, types, loc)?;
-    let step_val = emit_expr(context, parent, step, slots, locals, functions, types, loc)?;
+    let start_val = emit_expr(
+        context, parent, start, slots, locals, functions, types, params_len, loc,
+    )?;
+    let stop_val = emit_expr(
+        context, parent, stop, slots, locals, functions, types, params_len, loc,
+    )?;
+    let step_val = emit_expr(
+        context, parent, step, slots, locals, functions, types, params_len, loc,
+    )?;
 
     let stop_slot = emit_alloca_slot_for_kind(context, parent, ValueKind::Number, types, loc);
     let step_slot = emit_alloca_slot_for_kind(context, parent, ValueKind::Number, types, loc);
@@ -1399,6 +1521,7 @@ fn emit_for_numeric<'a, 'c>(
         locals,
         functions,
         types,
+        params_len,
         loc,
     )?;
     let i_now = emit_load(&after_blk, after_slots[var_id.0], types.f64, loc);
@@ -2047,5 +2170,61 @@ mod tests {
             mlir.contains("llvm.store") && mlir.contains("llvm.load"),
             "expected llvm.store/load for local, got:\n{mlir}"
         );
+    }
+
+    // -----------------------------------------------------------
+    // Phase 2.5b.3 — function return values (ADR 0019).
+    // -----------------------------------------------------------
+
+    #[test]
+    fn emit_function_with_function_return_type() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src(
+                "local function d(x) return x*2 end\nlocal function gd() return d end\nlocal f = gd()\nprint(f(5))",
+            ),
+        )
+        .expect("get_doubler module must verify");
+        let mlir = module.as_operation().to_string();
+        // The signature of `gd` should declare a function-typed return.
+        // Pretty-printer renders this as `() -> ((f64) -> f64)` (the
+        // outer `() -> ...` is gd's signature; the inner is its return).
+        assert!(
+            mlir.contains("@user_gd_") && mlir.contains("(f64) -> f64"),
+            "expected function-typed return for gd, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_call_with_function_result_threads_value_to_caller() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src(
+                "local function d(x) return x*2 end\nlocal function gd() return d end\nlocal f = gd()\nprint(f(5))",
+            ),
+        )
+        .unwrap();
+        let mlir = module.as_operation().to_string();
+        // The call-site to `gd` must produce a function-typed value
+        // and the subsequent `f(5)` must dispatch via call_indirect.
+        assert!(
+            mlir.contains("call @user_gd_") && mlir.contains("call_indirect"),
+            "expected `call @user_gd_*` then `call_indirect`, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_module_with_get_doubler_pattern_verifies() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src(
+                "local function d(x) return x*2 end\nlocal function gd() return d end\nlocal f = gd()\nprint(f(5))",
+            ),
+        )
+        .expect("get_doubler full module must verify");
+        assert!(module.as_operation().verify());
     }
 }
