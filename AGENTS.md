@@ -32,7 +32,9 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.3c short-circuit | **Done** | `and`/`or`/`not` via `scf.if` expression form + `arith.xori` (ADR 0013) |
 | ‣ 2.3d numeric for | **Done** | `for i=s,e[,step] do ... end` via `scf.while` desugar + read-only loop var (ADR 0014) |
 | ‣ 2.4 break | **Done** | `break` via HIR-time desugar to hidden `_broken` flag + body guard wrap (ADR 0015) |
-| ‣ 2.5 functions | Next | `function`/`return`, function values, calls |
+| ‣ 2.5a top-level functions | **Done** | `local function`, `return`, recursion (Number-only params/ret) (ADR 0016) |
+| ‣ 2.5b first-class / closures | Next | anonymous `function() end`, closures, multi-return |
+| ‣ 2.5c kind variation | Not started | Bool/Nil params + returns |
 | ‣ 2.6+ tables / strings | Not started | tables, metatables, generic for, strings, GC |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |
 
