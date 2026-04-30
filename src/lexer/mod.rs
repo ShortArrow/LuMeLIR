@@ -257,6 +257,14 @@ mod tests {
     }
 
     #[test]
+    fn lex_break_keyword_yields_keyword_token() {
+        assert_eq!(
+            kinds("break"),
+            vec![TokenKind::Keyword(Keyword::Break), TokenKind::Eof],
+        );
+    }
+
+    #[test]
     fn lex_comma_yields_comma_token() {
         assert_eq!(
             kinds("1,2"),
