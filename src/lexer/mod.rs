@@ -257,6 +257,18 @@ mod tests {
     }
 
     #[test]
+    fn lex_function_and_return_keywords_yield_keyword_tokens() {
+        assert_eq!(
+            kinds("function return"),
+            vec![
+                TokenKind::Keyword(Keyword::Function),
+                TokenKind::Keyword(Keyword::Return),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
     fn lex_break_keyword_yields_keyword_token() {
         assert_eq!(
             kinds("break"),
