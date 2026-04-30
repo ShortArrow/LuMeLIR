@@ -51,6 +51,7 @@ pub enum TokenKind {
     LtEq,
     Gt,
     GtEq,
+    Comma,
     Semicolon,
     /// End-of-source sentinel. Always present as the last element of a
     /// successful [`super::lex`] result.
@@ -59,7 +60,7 @@ pub enum TokenKind {
 
 /// Reserved words. Grows phase by phase: 2.0 `local`, 2.1 `do`/`end`,
 /// 2.2b `true`/`false`, 2.3a `nil`, 2.3b `if`/`then`/`else`/`elseif`/`while`,
-/// 2.3c `and`/`or`/`not`.
+/// 2.3c `and`/`or`/`not`, 2.3d `for`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keyword {
     Local,
@@ -76,6 +77,7 @@ pub enum Keyword {
     And,
     Or,
     Not,
+    For,
 }
 
 impl Keyword {
@@ -95,6 +97,7 @@ impl Keyword {
             "and" => Some(Keyword::And),
             "or" => Some(Keyword::Or),
             "not" => Some(Keyword::Not),
+            "for" => Some(Keyword::For),
             _ => None,
         }
     }

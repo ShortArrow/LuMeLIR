@@ -75,6 +75,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
             '/' => Some(TokenKind::Slash),
             '%' => Some(TokenKind::Percent),
             '^' => Some(TokenKind::Caret),
+            ',' => Some(TokenKind::Comma),
             ';' => Some(TokenKind::Semicolon),
             _ => None,
         };
@@ -252,6 +253,27 @@ mod tests {
                 TokenKind::Keyword(Keyword::End),
                 TokenKind::Eof,
             ],
+        );
+    }
+
+    #[test]
+    fn lex_comma_yields_comma_token() {
+        assert_eq!(
+            kinds("1,2"),
+            vec![
+                TokenKind::Number(1.0),
+                TokenKind::Comma,
+                TokenKind::Number(2.0),
+                TokenKind::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn lex_for_keyword_yields_keyword_token() {
+        assert_eq!(
+            kinds("for"),
+            vec![TokenKind::Keyword(Keyword::For), TokenKind::Eof],
         );
     }
 
