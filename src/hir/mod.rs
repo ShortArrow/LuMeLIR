@@ -139,6 +139,162 @@ fn wrap_with_broken_guard(stmt: HirStmt, broken_id: LocalId) -> HirStmt {
     }
 }
 
+/// Phase 2.5e (ADR 0020): static value-kind of an AST expression used
+/// as a literal call argument, for cross-function param-kind
+/// inference. Only the four kinds with literal forms (`true`/`false`,
+/// `nil`, number literals, and unary-minus over them) are recognised
+/// — anything else falls back to `Number`, matching the historical
+/// default.
+fn ast_arg_kind(expr: &Expr) -> ValueKind {
+    match &expr.kind {
+        ExprKind::Bool(_) => ValueKind::Bool,
+        ExprKind::Nil => ValueKind::Nil,
+        ExprKind::Number(_) => ValueKind::Number,
+        ExprKind::UnaryOp { op, operand }
+            if matches!(op, UnaryOp::Neg) && matches!(operand.kind, ExprKind::Number(_)) =>
+        {
+            ValueKind::Number
+        }
+        _ => ValueKind::Number,
+    }
+}
+
+/// Phase 2.5e (ADR 0020): walk the chunk AST to discover every call
+/// site whose callee is a top-level `FunctionDef` name, recording the
+/// static literal kind of each argument. The first call site for a
+/// function determines that function's param kinds; later call sites
+/// with different kinds are caught at HIR-time by `lower_call`'s
+/// existing arg-vs-param kind check. Falls back to `Number` for any
+/// unobserved param.
+fn infer_user_function_param_kinds(
+    chunk: &[Stmt],
+    function_names: &HashMap<String, FuncId>,
+    arities: &[usize],
+) -> Vec<Vec<ValueKind>> {
+    let mut kinds: Vec<Vec<ValueKind>> = arities
+        .iter()
+        .map(|n| vec![ValueKind::Number; *n])
+        .collect();
+    let mut seen: Vec<bool> = vec![false; arities.len()];
+
+    fn visit_stmt(
+        s: &Stmt,
+        names: &HashMap<String, FuncId>,
+        kinds: &mut Vec<Vec<ValueKind>>,
+        seen: &mut Vec<bool>,
+    ) {
+        match &s.kind {
+            StmtKind::Local { value, .. } | StmtKind::Assign { value, .. } => {
+                visit_expr(value, names, kinds, seen);
+            }
+            StmtKind::ExprStmt(e) => visit_expr(e, names, kinds, seen),
+            StmtKind::Return { value: Some(e) } => visit_expr(e, names, kinds, seen),
+            StmtKind::Return { value: None } => {}
+            StmtKind::Block(b) => {
+                for st in b {
+                    visit_stmt(st, names, kinds, seen);
+                }
+            }
+            StmtKind::If {
+                cond,
+                then_body,
+                elifs,
+                else_body,
+            } => {
+                visit_expr(cond, names, kinds, seen);
+                for st in then_body {
+                    visit_stmt(st, names, kinds, seen);
+                }
+                for (c, b) in elifs {
+                    visit_expr(c, names, kinds, seen);
+                    for st in b {
+                        visit_stmt(st, names, kinds, seen);
+                    }
+                }
+                if let Some(b) = else_body {
+                    for st in b {
+                        visit_stmt(st, names, kinds, seen);
+                    }
+                }
+            }
+            StmtKind::While { cond, body } => {
+                visit_expr(cond, names, kinds, seen);
+                for st in body {
+                    visit_stmt(st, names, kinds, seen);
+                }
+            }
+            StmtKind::ForNumeric {
+                start,
+                stop,
+                step,
+                body,
+                ..
+            } => {
+                visit_expr(start, names, kinds, seen);
+                visit_expr(stop, names, kinds, seen);
+                if let Some(s) = step {
+                    visit_expr(s, names, kinds, seen);
+                }
+                for st in body {
+                    visit_stmt(st, names, kinds, seen);
+                }
+            }
+            // FunctionDef bodies are also walked — recursive calls and
+            // calls into sibling top-level functions count.
+            StmtKind::FunctionDef { body, .. } => {
+                for st in body {
+                    visit_stmt(st, names, kinds, seen);
+                }
+            }
+            StmtKind::Break => {}
+        }
+    }
+
+    fn visit_expr(
+        e: &Expr,
+        names: &HashMap<String, FuncId>,
+        kinds: &mut Vec<Vec<ValueKind>>,
+        seen: &mut Vec<bool>,
+    ) {
+        match &e.kind {
+            ExprKind::Call { callee, args } => {
+                if let ExprKind::Ident(name) = &callee.kind
+                    && let Some(&FuncId(idx)) = names.get(name)
+                    && !seen[idx]
+                    && args.len() == kinds[idx].len()
+                {
+                    for (i, a) in args.iter().enumerate() {
+                        kinds[idx][i] = ast_arg_kind(a);
+                    }
+                    seen[idx] = true;
+                }
+                visit_expr(callee, names, kinds, seen);
+                for a in args {
+                    visit_expr(a, names, kinds, seen);
+                }
+            }
+            ExprKind::BinOp { lhs, rhs, .. } => {
+                visit_expr(lhs, names, kinds, seen);
+                visit_expr(rhs, names, kinds, seen);
+            }
+            ExprKind::UnaryOp { operand, .. } => {
+                visit_expr(operand, names, kinds, seen);
+            }
+            ExprKind::FunctionExpr { body, .. } => {
+                for st in body {
+                    visit_stmt(st, names, kinds, seen);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for s in chunk {
+        visit_stmt(s, function_names, &mut kinds, &mut seen);
+    }
+    kinds
+}
+
 /// Phase 2.5b.2 (ADR 0018): Pre-scan a function body's AST to discover
 /// which named parameters are used as callees (`g(args)`). For each
 /// such parameter, infer `ValueKind::Function(arity)` where `arity` is
@@ -298,6 +454,18 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
             function_names.insert(name.clone(), id);
         }
     }
+    // Phase 2.5e (ADR 0020): pre-scan all call sites for top-level
+    // function names, refining each function's param kinds from
+    // literal arg kinds at the first observed call. Without this,
+    // every param defaults to Number and Bool/Nil call args get
+    // rejected by `lower_call`'s kind check.
+    let arities: Vec<usize> = functions.iter().map(|f| f.params.len()).collect();
+    let inferred = infer_user_function_param_kinds(chunk, &function_names, &arities);
+    for (i, kinds) in inferred.iter().enumerate() {
+        for (j, k) in kinds.iter().enumerate() {
+            functions[i].params[j].kind = *k;
+        }
+    }
 
     // Pass 2: lower each function body in its own LowerCtx; then lower
     // the `main` chunk (skipping FunctionDef stmts — they've been
@@ -306,7 +474,13 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
         if let StmtKind::FunctionDef { params, body, .. } = &stmt.kind {
             let id = FuncId(idx_of_funcdef(chunk, idx));
             let pre_count = functions.len();
-            let mut fn_ctx = LowerCtx::for_function(&function_names, &functions, params, body);
+            // Phase 2.5e: hand the call-site-inferred param kinds to
+            // the inner LowerCtx so body type-checks see the right
+            // kinds for the params.
+            let external_kinds: Vec<ValueKind> =
+                functions[id.0].params.iter().map(|p| p.kind).collect();
+            let mut fn_ctx =
+                LowerCtx::for_function(&function_names, &functions, params, body, &external_kinds);
             let body_hir = fn_ctx.lower_function_body(body)?;
             let ret_kind = fn_ctx.in_function_ret_kind;
             // Phase 2.5b.2: copy the inferred param kinds (the first
@@ -411,17 +585,26 @@ impl LowerCtx {
     ///
     /// Phase 2.5b.2 (ADR 0018): the body AST is pre-scanned with
     /// [`infer_param_kinds`] so any parameter used as a callee gets
-    /// `ValueKind::Function(arity)` instead of the default Number.
+    /// `ValueKind::Function(arity)`. Phase 2.5e (ADR 0020): the
+    /// caller may also pass `external_kinds` from a chunk-level
+    /// pre-scan of call sites, supplying Bool/Nil/Number kinds. The
+    /// body-pre-scan wins for Function (body-callsite is decisive);
+    /// `external_kinds` wins otherwise.
     fn for_function(
         function_names: &HashMap<String, FuncId>,
         functions: &[HirFunction],
         params: &[String],
         body: &[Stmt],
+        external_kinds: &[ValueKind],
     ) -> Self {
         let mut ctx = Self::new(function_names.clone(), functions.to_vec());
-        let kinds = infer_param_kinds(body, params);
-        for (p, k) in params.iter().zip(kinds.iter()) {
-            ctx.declare_local(p.clone(), *k);
+        let body_kinds = infer_param_kinds(body, params);
+        for (i, p) in params.iter().enumerate() {
+            let kind = match body_kinds[i] {
+                ValueKind::Function(_) => body_kinds[i],
+                _ => external_kinds[i],
+            };
+            ctx.declare_local(p.clone(), kind);
         }
         ctx
     }
@@ -458,19 +641,21 @@ impl LowerCtx {
             },
             span,
         });
-        // Phase 2.5b.3: only initialise `_ret_value` when its slot kind
-        // is Number — there is no sensible default for a Function-kind
-        // slot, and the body-guard pattern guarantees that any path
-        // reading the trailing return load has already assigned to the
-        // slot first.
-        if matches!(self.locals[ret_value_id.0].kind, ValueKind::Number) {
+        // Phase 2.5b.3 + 2.5e: emit a kind-appropriate default init
+        // for `_ret_value` so an early-exit path still loads a sane
+        // value. Function-kind slots have no sensible default — the
+        // body-guard pattern guarantees a real value before load.
+        let init_value = match self.locals[ret_value_id.0].kind {
+            ValueKind::Number => Some(HirExprKind::Number(0.0)),
+            ValueKind::Bool => Some(HirExprKind::Bool(false)),
+            ValueKind::Nil => Some(HirExprKind::Nil),
+            ValueKind::Function(_) => None,
+        };
+        if let Some(kind) = init_value {
             out.push(HirStmt {
                 kind: HirStmtKind::LocalInit {
                     id: ret_value_id,
-                    value: HirExpr {
-                        kind: HirExprKind::Number(0.0),
-                        span,
-                    },
+                    value: HirExpr { kind, span },
                 },
                 span,
             });
@@ -706,16 +891,10 @@ impl LowerCtx {
                 if let Some(expr) = value {
                     let v = self.lower_expr(expr)?;
                     let v_kind = infer_kind(&v, &self.locals, &self.functions);
-                    // Phase 2.5b.3 (ADR 0019): allow Number or
-                    // Function(arity) returns; reject Bool/Nil for now.
-                    if !matches!(v_kind, ValueKind::Number | ValueKind::Function(_)) {
-                        return Err(HirError::TypeMismatch {
-                            op: "return".to_owned(),
-                            lhs_kind: "number or function".to_owned(),
-                            rhs_kind: v_kind.name().to_owned(),
-                            offset: stmt.span.start,
-                        });
-                    }
+                    // Phase 2.5e (ADR 0020): all four kinds may be
+                    // returned. Cross-check below ensures every
+                    // return in a body agrees on the kind.
+                    let _ = v_kind;
                     // All returns in a function body must share a kind.
                     if let Some(prev) = self.in_function_ret_kind
                         && prev != v_kind
@@ -1009,8 +1188,18 @@ impl LowerCtx {
                     body: Vec::new(),
                     ret_kind: None,
                 });
-                let mut fn_ctx =
-                    LowerCtx::for_function(&self.function_names, &self.functions, params, body);
+                // Anonymous functions have no caller-name to scan
+                // for call-site arg kinds; default to Number for all
+                // params. Body-pre-scan still upgrades to Function
+                // when needed.
+                let external_kinds = vec![ValueKind::Number; params.len()];
+                let mut fn_ctx = LowerCtx::for_function(
+                    &self.function_names,
+                    &self.functions,
+                    params,
+                    body,
+                    &external_kinds,
+                );
                 let body_hir = fn_ctx.lower_function_body(body)?;
                 let ret_kind = fn_ctx.in_function_ret_kind;
                 self.functions[id.0].params = fn_ctx.locals[..params.len()].to_vec();
@@ -1108,14 +1297,16 @@ impl LowerCtx {
                 .iter()
                 .map(|a| self.lower_expr(a))
                 .collect::<Result<Vec<_>, _>>()?;
-            // Phase 2.5b.2: each arg's kind must match the corresponding
-            // param's kind (Number param ↔ Number arg, Function(arity)
-            // param ↔ Function(arity) arg).
+            // Phase 2.5b.2/2.5e: each arg's kind must match the
+            // corresponding param's kind (Number ↔ Number, Bool ↔
+            // Bool, Nil ↔ Nil, Function(arity) ↔ Function(arity)).
             for (i, arg) in lowered_args.iter().enumerate() {
                 let arg_kind = infer_kind(arg, &self.locals, &self.functions);
                 let expected_kind = param_kinds[i];
                 let compatible = match (expected_kind, arg_kind) {
                     (ValueKind::Number, ValueKind::Number) => true,
+                    (ValueKind::Bool, ValueKind::Bool) => true,
+                    (ValueKind::Nil, ValueKind::Nil) => true,
                     (ValueKind::Function(a), ValueKind::Function(b)) => a == b,
                     _ => false,
                 };
@@ -1987,5 +2178,61 @@ mod tests {
             result.is_err(),
             "arity mismatch on returned function must reject"
         );
+    }
+
+    // -----------------------------------------------------------
+    // Phase 2.5e — Bool/Nil params/returns (ADR 0020).
+    // -----------------------------------------------------------
+
+    #[test]
+    fn lower_function_returning_bool_has_bool_ret_kind() {
+        let src = "local function pos(x) return x > 0 end";
+        let hir = lower_src(src).expect("Phase 2.5e: Bool return must lower");
+        let pos = &hir.functions[0];
+        assert_eq!(pos.ret_kind, Some(ValueKind::Bool));
+    }
+
+    #[test]
+    fn lower_function_returning_nil_has_nil_ret_kind() {
+        let src = "local function n() return nil end";
+        let hir = lower_src(src).expect("Phase 2.5e: Nil return must lower");
+        let n = &hir.functions[0];
+        assert_eq!(n.ret_kind, Some(ValueKind::Nil));
+    }
+
+    #[test]
+    fn lower_inconsistent_bool_number_returns_error() {
+        // Body returns Bool in one branch, Number in another.
+        let src = concat!(
+            "local function bad(x)\n",
+            "  if x > 0 then return true end\n",
+            "  return 42\n",
+            "end\n",
+        );
+        let result = lower_src(src);
+        assert!(
+            result.is_err(),
+            "inconsistent Bool/Number returns must reject"
+        );
+    }
+
+    #[test]
+    fn lower_call_site_infers_bool_param() {
+        // negate(true) at the call site marks `b` as Bool.
+        let src = "local function negate(b) return not b end\nprint(negate(true))";
+        let hir = lower_src(src).expect("Phase 2.5e: Bool param inference must lower");
+        let neg = &hir.functions[0];
+        assert_eq!(neg.params[0].kind, ValueKind::Bool);
+        assert_eq!(neg.ret_kind, Some(ValueKind::Bool));
+    }
+
+    #[test]
+    fn lower_call_site_infers_nil_param() {
+        // is_nil(nil): the call site infers x as Nil. Body's `x == nil`
+        // folds to a constant Bool(true) at HIR-time.
+        let src = "local function is_nil(x) return x == nil end\nprint(is_nil(nil))";
+        let hir = lower_src(src).expect("Phase 2.5e: Nil param inference must lower");
+        let f = &hir.functions[0];
+        assert_eq!(f.params[0].kind, ValueKind::Nil);
     }
 }
