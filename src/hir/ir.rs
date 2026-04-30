@@ -7,11 +7,17 @@ use crate::parser::{BinOp, UnaryOp};
 pub struct LocalId(pub usize);
 
 /// Per-local metadata. Phase 2.3a adds the static value kind that
-/// determines the stack slot type at codegen time.
+/// determines the stack slot type at codegen time. Phase 2.5b.2 adds
+/// `func_id`: when a Function-kind local was bound to a known
+/// function (`local f = function() end` or alias), this carries that
+/// `FuncId`; for function parameters whose value is only known at
+/// runtime, it is `None` and the call site uses `Callee::Indirect`
+/// (ADR 0018).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalInfo {
     pub name: String,
     pub kind: ValueKind,
+    pub func_id: Option<FuncId>,
 }
 
 /// A name-resolved program — the input to codegen.
@@ -140,12 +146,15 @@ pub enum HirExprKind {
 }
 
 /// Discriminates whether a [`HirExprKind::Call`] hits a built-in
-/// function (Phase 2.0 baseline) or a user-defined function (Phase
-/// 2.5a; ADR 0016).
+/// function (Phase 2.0 baseline), a statically-known user-defined
+/// function (Phase 2.5a; ADR 0016), or a runtime function value
+/// reached through a Function-kind local — typically a parameter
+/// (Phase 2.5b.2; ADR 0018).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Callee {
     Builtin(Builtin),
     User(FuncId),
+    Indirect(LocalId),
 }
 
 /// Recognised builtin functions. Phase 2.0 has only `print`.

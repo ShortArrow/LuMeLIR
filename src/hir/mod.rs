@@ -23,16 +23,16 @@ use crate::parser::{BinOp, Chunk, Expr, ExprKind, Stmt, StmtKind, UnaryOp};
 /// in-HIR type guard, the heterogeneous-`==` fold, and by codegen to
 /// dispatch the `print` path and the per-slot alloca type.
 ///
-/// Phase 2.5b adds `Function(FuncId)` for HIR-time-resolvable function
-/// values (ADR 0017). Function-kind locals can only appear as a
-/// `Call`'s callee; using them anywhere else surfaces
-/// `HirError::FunctionUsedAsValue`.
+/// Phase 2.5b.2 (ADR 0018) changes `Function`'s payload from `FuncId`
+/// to `arity: usize`, since function values passed as parameters do
+/// not have a statically-known FuncId. The actual `FuncId` (when
+/// known) lives in [`LocalInfo::func_id`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueKind {
     Number,
     Bool,
     Nil,
-    Function(FuncId),
+    Function(usize),
 }
 
 impl ValueKind {
@@ -76,8 +76,14 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.
             Callee::User(FuncId(id)) => functions[*id].ret_kind.unwrap_or(ValueKind::Number),
+            // Indirect call (function-kind local): Phase 2.5b.2 fixes
+            // returns to Number, so that's the answer.
+            Callee::Indirect(_) => ValueKind::Number,
         },
-        HirExprKind::FunctionRef(fid) => ValueKind::Function(*fid),
+        HirExprKind::FunctionRef(FuncId(id)) => {
+            // Phase 2.5b.2: kind tracks arity, FuncId lives in LocalInfo.
+            ValueKind::Function(functions[*id].params.len())
+        }
     }
 }
 
@@ -133,6 +139,114 @@ fn wrap_with_broken_guard(stmt: HirStmt, broken_id: LocalId) -> HirStmt {
     }
 }
 
+/// Phase 2.5b.2 (ADR 0018): Pre-scan a function body's AST to discover
+/// which named parameters are used as callees (`g(args)`). For each
+/// such parameter, infer `ValueKind::Function(arity)` where `arity` is
+/// the number of arguments at the call site. Other parameters default
+/// to `ValueKind::Number`. Conflicting arities are caught later by
+/// `lower_call`'s arity check.
+fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
+    use std::collections::HashMap as Map;
+    let mut kinds: Vec<ValueKind> = param_names.iter().map(|_| ValueKind::Number).collect();
+    let name_to_idx: Map<&str, usize> = param_names
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
+
+    fn visit_stmt(stmt: &Stmt, name_to_idx: &Map<&str, usize>, kinds: &mut Vec<ValueKind>) {
+        match &stmt.kind {
+            StmtKind::Local { value, .. } | StmtKind::Assign { value, .. } => {
+                visit_expr(value, name_to_idx, kinds);
+            }
+            StmtKind::ExprStmt(e) => visit_expr(e, name_to_idx, kinds),
+            StmtKind::Return { value: Some(e) } => visit_expr(e, name_to_idx, kinds),
+            StmtKind::Return { value: None } => {}
+            StmtKind::Block(b) => {
+                for s in b {
+                    visit_stmt(s, name_to_idx, kinds);
+                }
+            }
+            StmtKind::If {
+                cond,
+                then_body,
+                elifs,
+                else_body,
+            } => {
+                visit_expr(cond, name_to_idx, kinds);
+                for s in then_body {
+                    visit_stmt(s, name_to_idx, kinds);
+                }
+                for (c, b) in elifs {
+                    visit_expr(c, name_to_idx, kinds);
+                    for s in b {
+                        visit_stmt(s, name_to_idx, kinds);
+                    }
+                }
+                if let Some(b) = else_body {
+                    for s in b {
+                        visit_stmt(s, name_to_idx, kinds);
+                    }
+                }
+            }
+            StmtKind::While { cond, body } => {
+                visit_expr(cond, name_to_idx, kinds);
+                for s in body {
+                    visit_stmt(s, name_to_idx, kinds);
+                }
+            }
+            StmtKind::ForNumeric {
+                start,
+                stop,
+                step,
+                body,
+                ..
+            } => {
+                visit_expr(start, name_to_idx, kinds);
+                visit_expr(stop, name_to_idx, kinds);
+                if let Some(s) = step {
+                    visit_expr(s, name_to_idx, kinds);
+                }
+                for s in body {
+                    visit_stmt(s, name_to_idx, kinds);
+                }
+            }
+            StmtKind::Break => {}
+            StmtKind::FunctionDef { .. } => {} // nested fn defs not in 2.5b.2
+        }
+    }
+
+    fn visit_expr(expr: &Expr, name_to_idx: &Map<&str, usize>, kinds: &mut Vec<ValueKind>) {
+        match &expr.kind {
+            ExprKind::Call { callee, args } => {
+                if let ExprKind::Ident(name) = &callee.kind {
+                    if let Some(&idx) = name_to_idx.get(name.as_str()) {
+                        kinds[idx] = ValueKind::Function(args.len());
+                    }
+                }
+                visit_expr(callee, name_to_idx, kinds);
+                for a in args {
+                    visit_expr(a, name_to_idx, kinds);
+                }
+            }
+            ExprKind::BinOp { lhs, rhs, .. } => {
+                visit_expr(lhs, name_to_idx, kinds);
+                visit_expr(rhs, name_to_idx, kinds);
+            }
+            ExprKind::UnaryOp { operand, .. } => {
+                visit_expr(operand, name_to_idx, kinds);
+            }
+            ExprKind::FunctionExpr { .. } => {} // not recursed (own scope)
+            _ => {}
+        }
+    }
+
+    for s in body {
+        visit_stmt(s, &name_to_idx, &mut kinds);
+    }
+    kinds
+}
+
 fn binop_symbol(op: BinOp) -> &'static str {
     match op {
         BinOp::Add => "+",
@@ -174,6 +288,7 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
                     .map(|p| LocalInfo {
                         name: p.clone(),
                         kind: ValueKind::Number,
+                        func_id: None,
                     })
                     .collect(),
                 locals: Vec::new(), // filled in pass 2
@@ -190,9 +305,14 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
     for (idx, stmt) in chunk.iter().enumerate() {
         if let StmtKind::FunctionDef { params, body, .. } = &stmt.kind {
             let id = FuncId(idx_of_funcdef(chunk, idx));
-            let mut fn_ctx = LowerCtx::for_function(&function_names, &functions, params);
+            let mut fn_ctx = LowerCtx::for_function(&function_names, &functions, params, body);
             let body_hir = fn_ctx.lower_function_body(body)?;
             let ret_kind = fn_ctx.in_function_ret_kind;
+            // Phase 2.5b.2: copy the inferred param kinds (the first
+            // `params.len()` locals carry them) into the public
+            // `HirFunction.params` slice so callers see the right
+            // arity check at indirect-call sites.
+            functions[id.0].params = fn_ctx.locals[..params.len()].to_vec();
             functions[id.0].locals = fn_ctx.locals;
             functions[id.0].body = body_hir;
             functions[id.0].ret_kind = ret_kind;
@@ -279,15 +399,20 @@ impl LowerCtx {
     /// Build a `LowerCtx` for lowering a function body in isolation
     /// (separate locals, scopes, loop break stack). The function's
     /// parameters are pre-declared as the first locals.
+    ///
+    /// Phase 2.5b.2 (ADR 0018): the body AST is pre-scanned with
+    /// [`infer_param_kinds`] so any parameter used as a callee gets
+    /// `ValueKind::Function(arity)` instead of the default Number.
     fn for_function(
         function_names: &HashMap<String, FuncId>,
         functions: &[HirFunction],
         params: &[String],
+        body: &[Stmt],
     ) -> Self {
         let mut ctx = Self::new(function_names.clone(), functions.to_vec());
-        // Declare each param as a Number local in the body's outermost scope.
-        for p in params {
-            ctx.declare_local(p.clone(), ValueKind::Number);
+        let kinds = infer_param_kinds(body, params);
+        for (p, k) in params.iter().zip(kinds.iter()) {
+            ctx.declare_local(p.clone(), *k);
         }
         ctx
     }
@@ -399,10 +524,20 @@ impl LowerCtx {
     }
 
     fn declare_local(&mut self, name: String, kind: ValueKind) -> LocalId {
+        self.declare_local_with_func_id(name, kind, None)
+    }
+
+    fn declare_local_with_func_id(
+        &mut self,
+        name: String,
+        kind: ValueKind,
+        func_id: Option<FuncId>,
+    ) -> LocalId {
         let id = LocalId(self.locals.len());
         self.locals.push(LocalInfo {
             name: name.clone(),
             kind,
+            func_id,
         });
         self.scopes
             .last_mut()
@@ -416,7 +551,15 @@ impl LowerCtx {
             StmtKind::Local { name, value } => {
                 let value = self.lower_expr(value)?;
                 let kind = infer_kind(&value, &self.locals, &self.functions);
-                let id = self.declare_local(name.clone(), kind);
+                // Phase 2.5b.2: when the rhs is a function reference
+                // (literal `function() end` or alias of a Function-kind
+                // local), record its FuncId so static dispatch works.
+                let func_id = match &value.kind {
+                    HirExprKind::FunctionRef(fid) => Some(*fid),
+                    HirExprKind::Local(LocalId(idx)) => self.locals[*idx].func_id,
+                    _ => None,
+                };
+                let id = self.declare_local_with_func_id(name.clone(), kind, func_id);
                 Ok(HirStmt {
                     kind: HirStmtKind::LocalInit { id, value },
                     span: stmt.span,
@@ -830,6 +973,7 @@ impl LowerCtx {
                         .map(|p| LocalInfo {
                             name: p.clone(),
                             kind: ValueKind::Number,
+                            func_id: None,
                         })
                         .collect(),
                     locals: Vec::new(),
@@ -837,9 +981,10 @@ impl LowerCtx {
                     ret_kind: None,
                 });
                 let mut fn_ctx =
-                    LowerCtx::for_function(&self.function_names, &self.functions, params);
+                    LowerCtx::for_function(&self.function_names, &self.functions, params, body);
                 let body_hir = fn_ctx.lower_function_body(body)?;
                 let ret_kind = fn_ctx.in_function_ret_kind;
+                self.functions[id.0].params = fn_ctx.locals[..params.len()].to_vec();
                 self.functions[id.0].locals = fn_ctx.locals;
                 self.functions[id.0].body = body_hir;
                 self.functions[id.0].ret_kind = ret_kind;
@@ -867,17 +1012,17 @@ impl LowerCtx {
                 });
             }
         };
-        // Phase 2.5b: a Function-kind local takes precedence over the
-        // function-name table. This handles `local f = function() end;
-        // f()` and the alias case `local g = f; g()`.
+        // Phase 2.5b/2.5b.2: a Function-kind local takes precedence
+        // over the function-name table. The kind's arity must match
+        // `args.len()`. If the local has a known FuncId we dispatch
+        // statically; otherwise (function passed as a parameter) we
+        // emit `Callee::Indirect`.
         if let Some(local_id) = self.resolve(name) {
-            if let ValueKind::Function(fid) = self.locals[local_id.0].kind {
-                let user_fn = &self.functions[fid.0];
-                let expected = user_fn.params.len();
-                if args.len() != expected {
+            if let ValueKind::Function(arity) = self.locals[local_id.0].kind {
+                if args.len() != arity {
                     return Err(HirError::ArityMismatch {
                         builtin: name.clone(),
-                        expected,
+                        expected: arity,
                         actual: args.len(),
                         offset: whole.span.start,
                     });
@@ -888,17 +1033,21 @@ impl LowerCtx {
                     .collect::<Result<Vec<_>, _>>()?;
                 for arg in &lowered_args {
                     let k = infer_kind(arg, &self.locals, &self.functions);
-                    if k != ValueKind::Number {
+                    if !matches!(k, ValueKind::Number | ValueKind::Function(_)) {
                         return Err(HirError::TypeMismatch {
                             op: format!("call-{name}"),
-                            lhs_kind: "number".to_owned(),
+                            lhs_kind: "number or function".to_owned(),
                             rhs_kind: k.name().to_owned(),
                             offset: arg.span.start,
                         });
                     }
                 }
+                let callee = match self.locals[local_id.0].func_id {
+                    Some(fid) => Callee::User(fid),
+                    None => Callee::Indirect(local_id),
+                };
                 return Ok(HirExprKind::Call {
-                    callee: Callee::User(fid),
+                    callee,
                     args: lowered_args,
                 });
             }
@@ -909,8 +1058,15 @@ impl LowerCtx {
         // resolve user names first for forward-compatibility with
         // 2.5b's first-class function values.)
         if let Some(&fid) = self.function_names.get(name) {
-            let user_fn = &self.functions[fid.0];
-            let expected = user_fn.params.len();
+            // Snapshot what the lower_call closure needs from the
+            // function's signature *before* recursing through
+            // `lower_expr` (which mutably borrows `self`).
+            let param_kinds: Vec<ValueKind> = self.functions[fid.0]
+                .params
+                .iter()
+                .map(|p| p.kind)
+                .collect();
+            let expected = param_kinds.len();
             if args.len() != expected {
                 return Err(HirError::ArityMismatch {
                     builtin: name.clone(),
@@ -923,14 +1079,22 @@ impl LowerCtx {
                 .iter()
                 .map(|a| self.lower_expr(a))
                 .collect::<Result<Vec<_>, _>>()?;
-            // Phase 2.5a: each user-function argument must be Number.
-            for arg in &lowered_args {
-                let k = infer_kind(arg, &self.locals, &self.functions);
-                if k != ValueKind::Number {
+            // Phase 2.5b.2: each arg's kind must match the corresponding
+            // param's kind (Number param ↔ Number arg, Function(arity)
+            // param ↔ Function(arity) arg).
+            for (i, arg) in lowered_args.iter().enumerate() {
+                let arg_kind = infer_kind(arg, &self.locals, &self.functions);
+                let expected_kind = param_kinds[i];
+                let compatible = match (expected_kind, arg_kind) {
+                    (ValueKind::Number, ValueKind::Number) => true,
+                    (ValueKind::Function(a), ValueKind::Function(b)) => a == b,
+                    _ => false,
+                };
+                if !compatible {
                     return Err(HirError::TypeMismatch {
                         op: format!("call-{name}"),
-                        lhs_kind: "number".to_owned(),
-                        rhs_kind: k.name().to_owned(),
+                        lhs_kind: expected_kind.name().to_owned(),
+                        rhs_kind: arg_kind.name().to_owned(),
                         offset: arg.span.start,
                     });
                 }
@@ -1614,7 +1778,9 @@ mod tests {
         let hir = lower_src("local f = function(x) return x end").expect("must lower");
         assert_eq!(hir.locals.len(), 1);
         assert_eq!(hir.locals[0].name, "f");
-        assert!(matches!(hir.locals[0].kind, ValueKind::Function(FuncId(0))));
+        // Phase 2.5b.2: Function(arity); FuncId moved to func_id field.
+        assert!(matches!(hir.locals[0].kind, ValueKind::Function(1)));
+        assert_eq!(hir.locals[0].func_id, Some(FuncId(0)));
     }
 
     #[test]
@@ -1622,9 +1788,11 @@ mod tests {
         let hir =
             lower_src("local f = function() return 1 end\nlocal g = f").expect("alias must lower");
         assert_eq!(hir.locals.len(), 2);
-        // Both locals share the same Function(FuncId(0)) kind.
-        assert!(matches!(hir.locals[0].kind, ValueKind::Function(FuncId(0))));
-        assert!(matches!(hir.locals[1].kind, ValueKind::Function(FuncId(0))));
+        // Both locals share Function(0) (zero-arity) and the same FuncId.
+        assert!(matches!(hir.locals[0].kind, ValueKind::Function(0)));
+        assert!(matches!(hir.locals[1].kind, ValueKind::Function(0)));
+        assert_eq!(hir.locals[0].func_id, Some(FuncId(0)));
+        assert_eq!(hir.locals[1].func_id, Some(FuncId(0)));
     }
 
     #[test]
@@ -1655,15 +1823,66 @@ mod tests {
     }
 
     #[test]
-    fn lower_function_passed_as_arg_errors() {
-        // Note: `apply` is not defined here — so the message could be
-        // either UnknownFunction (apply) or FunctionUsedAsValue (f).
-        // Both are acceptable; just make sure it does NOT silently
-        // succeed with f passed as a value.
+    fn lower_function_passed_as_arg_now_succeeds_in_2_5b2() {
+        // Phase 2.5b: this errored (no `func.call_indirect` infrastructure).
+        // Phase 2.5b.2: passing a function with matching arity is the
+        // whole point of this phase, so it must succeed.
         let result = lower_src(
             "local f = function() return 1 end\nlocal function apply(g) return g() end\napply(f)",
         );
-        assert!(result.is_err(), "expected an error for f-as-arg");
+        assert!(result.is_ok(), "f as arg should lower in 2.5b.2");
+    }
+
+    #[test]
+    fn lower_function_kind_carries_arity() {
+        // Phase 2.5b.2: Function payload is arity, not FuncId.
+        let hir = lower_src("local f = function(x, y) return x + y end").expect("lower");
+        assert!(matches!(hir.locals[0].kind, ValueKind::Function(2)));
+        assert_eq!(hir.locals[0].func_id, Some(FuncId(0)));
+    }
+
+    #[test]
+    fn lower_function_arg_param_has_no_func_id() {
+        // The g param in `apply(g, x)` is Function(1) with func_id None.
+        let hir = lower_src(
+            "local function apply(g, x) return g(x) end\nlocal f = function(x) return x end\nprint(apply(f, 5))",
+        )
+        .expect("lower");
+        // `apply` is functions[0]; its first param `g` should be
+        // Function(1) with func_id None.
+        let apply_fn = &hir.functions[0];
+        assert_eq!(apply_fn.name, "apply");
+        assert!(matches!(apply_fn.params[0].kind, ValueKind::Function(1)));
+        assert_eq!(apply_fn.params[0].func_id, None);
+        assert!(matches!(apply_fn.params[1].kind, ValueKind::Number));
+    }
+
+    #[test]
+    fn lower_call_via_function_arg_uses_indirect_callee() {
+        let hir = lower_src(
+            "local function apply(g, x) return g(x) end\nlocal f = function(x) return x end\nprint(apply(f, 5))",
+        )
+        .expect("lower");
+        let apply_fn = &hir.functions[0];
+        // The apply body has a return that lowers to: assign _ret_value
+        // = call(g, x). Find the user-call inside.
+        // Quick structural check: the call to g goes through Indirect.
+        let body_str = format!("{:?}", apply_fn.body);
+        assert!(
+            body_str.contains("Indirect"),
+            "expected `Callee::Indirect` somewhere in apply's body, got:\n{body_str}"
+        );
+    }
+
+    #[test]
+    fn lower_arity_mismatch_on_function_arg_errors() {
+        // f has arity 2 but apply's g param is called with 1 arg.
+        // The call `apply(f, 5)` should fail because f's arity (2)
+        // doesn't match what apply expects of g (1, inferred from g(x)).
+        let result = lower_src(
+            "local function apply(g, x) return g(x) end\nlocal f = function(a, b) return a + b end\nprint(apply(f, 5))",
+        );
+        assert!(result.is_err(), "arity mismatch must reject");
     }
 
     #[test]
