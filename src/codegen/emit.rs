@@ -180,6 +180,21 @@ fn emit_libm_decls<'c>(
     module.body().append_operation(floor_op.into());
 }
 
+/// MLIR type for a function parameter of static [`ValueKind`]. Number
+/// is f64; Function(arity) is `!func.func<(f64, ...) -> f64>` (arity
+/// f64 params, single Number return — Phase 2.5b.2 fixes the return
+/// to Number).
+fn param_mlir_type<'c>(context: &'c Context, kind: ValueKind, types: &Types<'c>) -> Type<'c> {
+    match kind {
+        ValueKind::Number => types.f64,
+        ValueKind::Function(arity) => {
+            let p_types: Vec<Type<'c>> = (0..arity).map(|_| types.f64).collect();
+            FunctionType::new(context, &p_types, &[types.f64]).into()
+        }
+        ValueKind::Bool | ValueKind::Nil => types.i1,
+    }
+}
+
 /// Emit a `func.func @<mangled_name>(...) -> (...)` for a user-defined
 /// function. Phase 2.5a constrains every parameter and the optional
 /// return value to `Number` (f64). The `_returned` / `_ret_value`
@@ -194,23 +209,38 @@ fn emit_function<'c>(
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     let region = Region::new();
-    // Phase 2.5a: every parameter is f64.
-    let param_types: Vec<Type<'c>> = hir_fn.params.iter().map(|_| types.f64).collect();
-    // Block argument list = parameter types, each tagged with `loc`.
+    // Phase 2.5b.2: each parameter's MLIR type is determined by its
+    // ValueKind. Number → f64, Function(arity) → !func.func<...>.
+    let param_types: Vec<Type<'c>> = hir_fn
+        .params
+        .iter()
+        .map(|info| param_mlir_type(context, info.kind, types))
+        .collect();
     let block_args: Vec<(Type<'c>, Location<'c>)> = param_types.iter().map(|t| (*t, loc)).collect();
     let block = Block::new(&block_args);
 
-    // Allocate every local's slot at function entry (params first).
+    // Allocate slots for every local. Function-kind params are special:
+    // their `slot` is the block argument value itself (not a pointer);
+    // we never load/store those. Non-param Function-kind locals get an
+    // i1 placeholder slot — their value is reproduced at every use site
+    // via `func.constant` from `LocalInfo.func_id`.
     let slots: Vec<Value<'c, '_>> = hir_fn
         .locals
         .iter()
-        .map(|info| emit_alloca_slot_for_kind(context, &block, info.kind, types, loc))
+        .enumerate()
+        .map(|(i, info)| match info.kind {
+            ValueKind::Function(_) if i < hir_fn.params.len() => block.argument(i).unwrap().into(),
+            _ => emit_alloca_slot_for_kind(context, &block, info.kind, types, loc),
+        })
         .collect();
 
-    // Store each parameter (block argument) into its alloca slot.
-    for (i, _) in hir_fn.params.iter().enumerate() {
-        let arg: Value<'c, '_> = block.argument(i).unwrap().into();
-        emit_store(&block, arg, slots[i], loc);
+    // Store each Number parameter (block argument) into its alloca slot.
+    // Function-kind params are already wired up in `slots` above.
+    for (i, info) in hir_fn.params.iter().enumerate() {
+        if !matches!(info.kind, ValueKind::Function(_)) {
+            let arg: Value<'c, '_> = block.argument(i).unwrap().into();
+            emit_store(&block, arg, slots[i], loc);
+        }
     }
 
     emit_stmts(
@@ -330,8 +360,14 @@ fn emit_stmt<'a, 'c>(
 ) -> Result<(), CodegenError> {
     match &stmt.kind {
         HirStmtKind::LocalInit { id, value } | HirStmtKind::Assign { id, value } => {
-            let v = emit_expr(context, block, value, slots, locals, functions, types, loc)?;
-            emit_store(block, v, slots[id.0], loc);
+            // Phase 2.5b.2: Function-kind locals don't store into a
+            // physical slot — their value is recovered at every use
+            // site via `func.constant` (FuncId-known) or block argument
+            // (param). Skip the store entirely for those.
+            if !matches!(locals[id.0].kind, ValueKind::Function(_)) {
+                let v = emit_expr(context, block, value, slots, locals, functions, types, loc)?;
+                emit_store(block, v, slots[id.0], loc);
+            }
         }
         HirStmtKind::Block { stmts } => {
             emit_stmts(context, block, stmts, slots, locals, functions, types, loc)?;
@@ -467,11 +503,45 @@ fn emit_expr<'a, 'c>(
             Ok(block.append_operation(op).result(0).unwrap().into())
         }
         HirExprKind::Local(LocalId(idx)) => {
-            let slot_ty = match locals[*idx].kind {
-                ValueKind::Number => types.f64,
-                ValueKind::Bool | ValueKind::Nil | ValueKind::Function(_) => types.i1,
-            };
-            Ok(emit_load(block, slots[*idx], slot_ty, loc))
+            let info = &locals[*idx];
+            match info.kind {
+                ValueKind::Number => Ok(emit_load(block, slots[*idx], types.f64, loc)),
+                ValueKind::Bool | ValueKind::Nil => {
+                    Ok(emit_load(block, slots[*idx], types.i1, loc))
+                }
+                ValueKind::Function(_) => {
+                    // Phase 2.5b.2: Function-kind locals don't use
+                    // alloca/load. If we have a known FuncId
+                    // (`local f = function() end` or alias), re-emit
+                    // a `func.constant`. Otherwise the local is a
+                    // function parameter; `slots[idx]` already holds
+                    // the block-argument SSA value.
+                    if let Some(fid) = info.func_id {
+                        let target = &functions[fid.0];
+                        let p_types: Vec<Type<'c>> = target
+                            .params
+                            .iter()
+                            .map(|p| param_mlir_type(context, p.kind, types))
+                            .collect();
+                        let r_types: Vec<Type<'c>> = match target.ret_kind {
+                            Some(_) => vec![types.f64],
+                            None => vec![],
+                        };
+                        let fn_type = FunctionType::new(context, &p_types, &r_types);
+                        let constant = func::constant(
+                            context,
+                            FlatSymbolRefAttribute::new(context, &target.mangled_name),
+                            fn_type,
+                            loc,
+                        );
+                        Ok(block.append_operation(constant).result(0).unwrap().into())
+                    } else {
+                        // Function-kind param: slots[idx] holds the
+                        // block argument value already.
+                        Ok(slots[*idx])
+                    }
+                }
+            }
         }
         HirExprKind::BinOp { op, lhs, rhs } => {
             // `and`/`or` short-circuit — must NOT eagerly evaluate rhs.
@@ -550,6 +620,45 @@ fn emit_expr<'a, 'c>(
                     );
                     Ok(block.append_operation(zero).result(0).unwrap().into())
                 }
+            }
+            Callee::Indirect(LocalId(idx)) => {
+                // Phase 2.5b.2: load the function value from the local
+                // (a block argument for function-kind params), then
+                // emit `func.call_indirect`.
+                let callee_val = if locals[*idx].func_id.is_some() {
+                    // Aliased local with known FuncId — re-emit constant.
+                    let fid = locals[*idx].func_id.unwrap();
+                    let target = &functions[fid.0];
+                    let p_types: Vec<Type<'c>> = target
+                        .params
+                        .iter()
+                        .map(|p| param_mlir_type(context, p.kind, types))
+                        .collect();
+                    let r_types: Vec<Type<'c>> = match target.ret_kind {
+                        Some(_) => vec![types.f64],
+                        None => vec![],
+                    };
+                    let fn_type = FunctionType::new(context, &p_types, &r_types);
+                    let constant = func::constant(
+                        context,
+                        FlatSymbolRefAttribute::new(context, &target.mangled_name),
+                        fn_type,
+                        loc,
+                    );
+                    block.append_operation(constant).result(0).unwrap().into()
+                } else {
+                    // Function-kind param: block argument value.
+                    slots[*idx]
+                };
+                let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
+                for a in args {
+                    arg_vals.push(emit_expr(
+                        context, block, a, slots, locals, functions, types, loc,
+                    )?);
+                }
+                let call_op = func::call_indirect(callee_val, &arg_vals, &[types.f64], loc);
+                let op_ref = block.append_operation(call_op);
+                Ok(op_ref.result(0).unwrap().into())
             }
         },
         HirExprKind::FunctionRef(_) => {
@@ -1550,6 +1659,55 @@ mod tests {
             &lower_src("if (1 < 2) and (2 < 3) then print(true) end"),
         )
         .expect("short-circuit module must verify");
+        assert!(module.as_operation().verify());
+    }
+
+    #[test]
+    fn emit_function_arg_param_uses_func_func_type() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src(
+                "local function apply(g, x) return g(x) end\nlocal f = function(x) return x*2 end\nprint(apply(f, 7))",
+            ),
+        )
+        .expect("apply pattern must verify");
+        let mlir = module.as_operation().to_string();
+        // Pretty-printer prints `(f64) -> f64` rather than the
+        // longer `!func.func<(f64) -> f64>` form for params.
+        assert!(
+            mlir.contains("%arg0: (f64) -> f64"),
+            "expected an `(f64) -> f64` param, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_indirect_call_via_local_uses_call_indirect() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src(
+                "local function apply(g, x) return g(x) end\nlocal f = function(x) return x*2 end\nprint(apply(f, 7))",
+            ),
+        )
+        .unwrap();
+        let mlir = module.as_operation().to_string();
+        assert!(
+            mlir.contains("call_indirect"),
+            "expected `call_indirect`, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_module_with_apply_pattern_verifies() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src(
+                "local function apply(g, x) return g(x) end\nlocal f = function(x) return x*2 end\nprint(apply(f, 7))",
+            ),
+        )
+        .expect("apply module must verify");
         assert!(module.as_operation().verify());
     }
 
