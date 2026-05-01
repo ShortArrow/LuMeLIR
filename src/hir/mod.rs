@@ -83,6 +83,8 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // `and`/`or` preserve the operand kind (lower-time guard
             // ensures both sides share a kind).
             BinOp::And | BinOp::Or => infer_kind(lhs, locals, functions),
+            // Phase 2.7b (ADR 0025): `..` always produces String.
+            BinOp::Concat => ValueKind::String,
         },
         HirExprKind::Call { callee, .. } => match callee {
             // print() has no useful value in our subset; treat as Number
@@ -226,6 +228,10 @@ fn ast_arg_kind(expr: &Expr) -> ValueKind {
         ExprKind::Bool(_) => ValueKind::Bool,
         ExprKind::Nil => ValueKind::Nil,
         ExprKind::Number(_) => ValueKind::Number,
+        // Phase 2.7b (ADR 0025): a string literal at a call site
+        // refines that parameter to ValueKind::String, so functions
+        // like `greet(name)` lower with a String-kind `name`.
+        ExprKind::Str(_) => ValueKind::String,
         ExprKind::UnaryOp { op, operand }
             if matches!(op, UnaryOp::Neg) && matches!(operand.kind, ExprKind::Number(_)) =>
         {
@@ -513,6 +519,7 @@ fn binop_symbol(op: BinOp) -> &'static str {
         BinOp::BitXor => "~",
         BinOp::Shl => "<<",
         BinOp::Shr => ">>",
+        BinOp::Concat => "..",
         BinOp::Lt => "<",
         BinOp::Le => "<=",
         BinOp::Gt => ">",
@@ -1415,6 +1422,23 @@ impl LowerCtx {
                             rhs: Box::new(rhs_hir),
                         }
                     }
+                    // Phase 2.7b (ADR 0025): `..` requires both
+                    // operands to be String. Result is String.
+                    BinOp::Concat => {
+                        if !(lk == ValueKind::String && rk == ValueKind::String) {
+                            return Err(HirError::TypeMismatch {
+                                op: "..".to_owned(),
+                                lhs_kind: lk.name().to_owned(),
+                                rhs_kind: rk.name().to_owned(),
+                                offset: expr.span.start,
+                            });
+                        }
+                        HirExprKind::BinOp {
+                            op: *op,
+                            lhs: Box::new(lhs_hir),
+                            rhs: Box::new(rhs_hir),
+                        }
+                    }
                 }
             }
             ExprKind::UnaryOp { op, operand } => {
@@ -1577,6 +1601,7 @@ impl LowerCtx {
                     (ValueKind::Number, ValueKind::Number) => true,
                     (ValueKind::Bool, ValueKind::Bool) => true,
                     (ValueKind::Nil, ValueKind::Nil) => true,
+                    (ValueKind::String, ValueKind::String) => true,
                     (ValueKind::Function(a), ValueKind::Function(b)) => a == b,
                     _ => false,
                 };
