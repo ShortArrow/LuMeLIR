@@ -56,6 +56,7 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.8c block comments | **Done** | `--[[ ... ]]` multi-line via `skip_block_comment` helper (ADR 0034) |
 | ‣ 2.7j long-bracket strings + level-N block comments | **Done** | `[==[ ... ]==]` and `--[==[ ... ]==]` via shared `scan_long_bracket_body` (ADR 0038) |
 | ‣ 2.7k extended string escapes | **Done** | `\a \b \f \v \xHH \ddd` (ASCII range) via `read_hex_escape` / `read_decimal_escape` (ADR 0039) |
+| ‣ 2.7l `\u{XXXX}` + `\z` | **Done** | Unicode codepoint → UTF-8 via `read_unicode_escape`; `\z` skips whitespace run (ADR 0040) |
 | ‣ 2.5c closures | Not started | upvalue capture, heap-allocated environments |
 | ‣ 2.6+ tables / metatables | Not started | tables, metatables, generic for, GC |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |

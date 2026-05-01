@@ -77,7 +77,9 @@ fn unterminated_string_is_lex_error() {
 
 #[test]
 fn invalid_escape_is_lex_error() {
-    assert!(lumelir::parser::parse("print(\"a\\zb\")").is_err());
+    // `\q` is unrecognised. (`\z` was the original sample but
+    // became valid in Phase 2.7l (ADR 0040).)
+    assert!(lumelir::parser::parse("print(\"a\\qb\")").is_err());
 }
 
 #[test]

@@ -347,12 +347,13 @@ where
 }
 
 /// Scan a string literal `"..."` or `'...'` (Phase 2.7a, ADR 0024).
-/// Recognised escapes match the Lua subset documented in ADRs 0024
-/// and 0039: `\n`, `\t`, `\r`, `\\`, `\"`, `\'`, `\a`, `\b`, `\f`,
-/// `\v`, `\xHH` (hex byte, 0..=0x7F), and `\ddd` (1-3 decimal
-/// digits, 0..=127). Anything else after a backslash is
-/// `LexError::InvalidEscape`. EOF before the closing quote is
-/// `LexError::UnterminatedString`.
+/// Recognised escapes match the Lua subset documented in ADRs 0024,
+/// 0039, and 0040: `\n`, `\t`, `\r`, `\\`, `\"`, `\'`, `\a`, `\b`,
+/// `\f`, `\v`, `\xHH` (hex byte, 0..=0x7F), `\ddd` (1-3 decimal
+/// digits, 0..=127), `\u{XXXX}` (Unicode codepoint → UTF-8), and
+/// `\z` (skip a run of whitespace, including newlines). Anything
+/// else after a backslash is `LexError::InvalidEscape`. EOF before
+/// the closing quote is `LexError::UnterminatedString`.
 fn scan_string<I>(
     _src: &str,
     chars: &mut std::iter::Peekable<I>,
@@ -397,6 +398,20 @@ where
                 });
             }
         };
+        // Phase 2.7l (ADR 0040): `\z` skips a run of whitespace —
+        // including newlines — letting source split a long string
+        // across lines without embedding the line break. Handled
+        // before the match so it can short-circuit `value.push`.
+        if esc_ch == 'z' {
+            while let Some(&(_, c)) = chars.peek() {
+                if c.is_ascii_whitespace() {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
         let mapped = match esc_ch {
             'n' => '\n',
             't' => '\t',
@@ -411,6 +426,10 @@ where
             'v' => '\x0B',
             // Phase 2.7k (ADR 0039): `\xHH` hex byte.
             'x' => read_hex_escape(chars, esc_off)?,
+            // Phase 2.7l (ADR 0040): `\u{XXXX}` Unicode codepoint
+            // → UTF-8 bytes. Rust's `char` *is* a codepoint, so
+            // `String::push(char)` does the UTF-8 encoding for us.
+            'u' => read_unicode_escape(chars, esc_off)?,
             // Phase 2.7k (ADR 0039): `\ddd` decimal byte. The first
             // digit was already consumed; the helper reads up to two
             // more.
@@ -490,6 +509,65 @@ where
     } else {
         Ok(value as u8 as char)
     }
+}
+
+/// Phase 2.7l (ADR 0040): read `\u{XXXX}` and return the codepoint
+/// as a Rust `char`. Caller pushes via `String::push`, which
+/// UTF-8-encodes automatically. Accepts 1+ hex digits between the
+/// braces; rejects empty digit runs, missing braces, codepoints
+/// outside the Unicode scalar range (surrogates 0xD800..=0xDFFF
+/// and values >0x10FFFF). `esc_off` points at the `u` for
+/// diagnostics.
+fn read_unicode_escape<I>(
+    chars: &mut std::iter::Peekable<I>,
+    esc_off: usize,
+) -> Result<char, LexError>
+where
+    I: Iterator<Item = (usize, char)>,
+{
+    if !matches!(chars.next(), Some((_, '{'))) {
+        return Err(LexError::InvalidEscape {
+            seq: "\\u".into(),
+            offset: esc_off,
+        });
+    }
+    let mut value: u32 = 0;
+    let mut digits = 0usize;
+    loop {
+        match chars.peek() {
+            Some(&(_, '}')) => {
+                chars.next();
+                break;
+            }
+            Some(&(_, c)) if c.is_ascii_hexdigit() => {
+                value = value
+                    .checked_mul(16)
+                    .and_then(|v| v.checked_add(c.to_digit(16).unwrap()))
+                    .ok_or_else(|| LexError::InvalidEscape {
+                        seq: "\\u{...}".into(),
+                        offset: esc_off,
+                    })?;
+                digits += 1;
+                chars.next();
+            }
+            _ => {
+                return Err(LexError::InvalidEscape {
+                    seq: "\\u{".into(),
+                    offset: esc_off,
+                });
+            }
+        }
+    }
+    if digits == 0 {
+        return Err(LexError::InvalidEscape {
+            seq: "\\u{}".into(),
+            offset: esc_off,
+        });
+    }
+    char::from_u32(value).ok_or_else(|| LexError::InvalidEscape {
+        seq: format!("\\u{{{value:x}}}"),
+        offset: esc_off,
+    })
 }
 
 fn scan_ident<I>(src: &str, chars: &mut std::iter::Peekable<I>) -> (Span, String)
@@ -892,7 +970,9 @@ mod tests {
 
     #[test]
     fn lex_invalid_escape_returns_error() {
-        let err = lex("\"a\\zb\"").expect_err("\\z is not in our escape set");
+        // `\q` is unrecognised. (`\z` was the original sample but
+        // became valid in Phase 2.7l (ADR 0040).)
+        let err = lex("\"a\\qb\"").expect_err("\\q is not in our escape set");
         assert!(matches!(err, LexError::InvalidEscape { .. }));
     }
 
@@ -1164,5 +1244,84 @@ mod tests {
         // `\xZ` — first hex digit invalid.
         let err = lex("\"\\xZ\"").expect_err("\\x must be followed by 2 hex digits");
         assert!(matches!(err, LexError::InvalidEscape { .. }));
+    }
+
+    // -----------------------------------------------------------
+    // Phase 2.7l — `\u{XXXX}` codepoint and `\z` whitespace skip
+    // (ADR 0040).
+    // -----------------------------------------------------------
+
+    #[test]
+    fn lex_string_with_unicode_escape_ascii() {
+        // `\u{41}` = 'A' (1 UTF-8 byte).
+        assert_eq!(
+            kinds("\"\\u{41}\""),
+            vec![TokenKind::Str("A".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_string_with_unicode_escape_two_byte() {
+        // `\u{e9}` = 'é' (2 UTF-8 bytes 0xC3 0xA9).
+        assert_eq!(
+            kinds("\"\\u{e9}\""),
+            vec![TokenKind::Str("é".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_string_with_unicode_escape_three_byte() {
+        // `\u{3042}` = 'あ' (3 UTF-8 bytes).
+        assert_eq!(
+            kinds("\"\\u{3042}\""),
+            vec![TokenKind::Str("あ".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_string_with_unicode_escape_emoji() {
+        // `\u{1F600}` = 😀 (4 UTF-8 bytes).
+        assert_eq!(
+            kinds("\"\\u{1F600}\""),
+            vec![TokenKind::Str("😀".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_string_with_unicode_escape_missing_open_brace_is_error() {
+        let err = lex("\"\\u41\"").expect_err("\\u requires `{`");
+        assert!(matches!(err, LexError::InvalidEscape { .. }));
+    }
+
+    #[test]
+    fn lex_string_with_unicode_escape_missing_close_brace_is_error() {
+        let err = lex("\"\\u{41\"").expect_err("\\u{ requires closing `}`");
+        assert!(matches!(err, LexError::InvalidEscape { .. }));
+    }
+
+    #[test]
+    fn lex_string_with_unicode_escape_invalid_codepoint_is_error() {
+        // 0xD800 is a UTF-16 surrogate, invalid as a Unicode scalar.
+        let err = lex("\"\\u{D800}\"").expect_err("surrogates are not valid scalars");
+        assert!(matches!(err, LexError::InvalidEscape { .. }));
+    }
+
+    #[test]
+    fn lex_string_with_z_skip_consumes_whitespace_run() {
+        // `\z` skips the `\n` + spaces run; the result is "ab".
+        assert_eq!(
+            kinds("\"a\\z   \n  b\""),
+            vec![TokenKind::Str("ab".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_string_with_z_at_eos_is_noop() {
+        // `\z` followed immediately by the closing quote: nothing
+        // to skip, the string is just "a".
+        assert_eq!(
+            kinds("\"a\\z\""),
+            vec![TokenKind::Str("a".into()), TokenKind::Eof]
+        );
     }
 }
