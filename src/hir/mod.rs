@@ -1661,14 +1661,19 @@ impl LowerCtx {
                 });
             }
         };
-        let arity = builtin.arity();
-        if args.len() != arity {
-            return Err(HirError::ArityMismatch {
-                builtin: name.clone(),
-                expected: arity,
-                actual: args.len(),
-                offset: whole.span.start,
-            });
+        // Phase 2.8b (ADR 0032): `print` is the one variadic builtin
+        // — accepts any arity ≥ 0. Every other builtin keeps its
+        // fixed arity from `Builtin::arity()`.
+        if !matches!(builtin, Builtin::Print) {
+            let arity = builtin.arity();
+            if args.len() != arity {
+                return Err(HirError::ArityMismatch {
+                    builtin: name.clone(),
+                    expected: arity,
+                    actual: args.len(),
+                    offset: whole.span.start,
+                });
+            }
         }
         let lowered_args = args
             .iter()
@@ -1865,9 +1870,10 @@ mod tests {
     }
 
     #[test]
-    fn lower_print_arity_mismatch_errors() {
-        let err = lower_src("print()").expect_err("print arity must match");
-        assert!(matches!(err, HirError::ArityMismatch { .. }));
+    fn lower_print_zero_arg_lowers_after_2_8b() {
+        // Phase 2.8b (ADR 0032): `print()` is now legal — outputs
+        // a bare newline. Pre-2.8b this surfaced as `ArityMismatch`.
+        assert!(lower_src("print()").is_ok());
     }
 
     #[test]

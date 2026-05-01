@@ -115,6 +115,12 @@ fn emit_fmt_global<'c>(
     emit_string_global(context, module, i8_type, "s_false", "false\0", loc);
     // Phase 2.3a: nil string for `print(nil)`.
     emit_string_global(context, module, i8_type, "s_nil", "nil\0", loc);
+    // Phase 2.8b (ADR 0032): no-newline siblings of `fmt`/`fmt_str`,
+    // plus literal `\t`/`\n` payloads, for multi-arg `print(a, b, ...)`.
+    emit_string_global(context, module, i8_type, "fmt_raw", "%g\0", loc);
+    emit_string_global(context, module, i8_type, "fmt_str_raw", "%s\0", loc);
+    emit_string_global(context, module, i8_type, "s_tab", "\t\0", loc);
+    emit_string_global(context, module, i8_type, "s_newline", "\n\0", loc);
     // Phase 2.7c (ADR 0026): `%.14g` is the Lua-spec format for
     // `tostring(number)`. The trailing `\0` lets snprintf consume it
     // as a C string.
@@ -1065,12 +1071,33 @@ fn emit_expr<'a, 'c>(
         }
         HirExprKind::Call { callee, args } => match callee {
             Callee::Builtin(Builtin::Print) => {
-                let kind = infer_kind(&args[0], locals, functions);
-                let arg_val = emit_expr(
-                    context, block, &args[0], slots, locals, functions, types, params_len, loc,
-                )?;
-                emit_print_value(context, block, arg_val, kind, types, loc);
-                Ok(arg_val)
+                // Phase 2.8b (ADR 0032): variadic. `print()` outputs
+                // a bare newline; `print(a, b, ...)` outputs each
+                // value (kind-dispatched, no inline `\n`), with a
+                // tab between values and a single `\n` at the end.
+                if args.is_empty() {
+                    emit_print_literal(context, block, "s_newline", types, loc);
+                } else {
+                    for (i, a) in args.iter().enumerate() {
+                        if i > 0 {
+                            emit_print_literal(context, block, "s_tab", types, loc);
+                        }
+                        let kind = infer_kind(a, locals, functions);
+                        let v = emit_expr(
+                            context, block, a, slots, locals, functions, types, params_len, loc,
+                        )?;
+                        emit_print_value_raw(context, block, v, kind, types, loc);
+                    }
+                    emit_print_literal(context, block, "s_newline", types, loc);
+                }
+                // print() returns nothing useful — yield a placeholder
+                // f64 0.0 for the expression-position contract.
+                let zero = arith::constant(
+                    context,
+                    FloatAttribute::new(context, types.f64, 0.0).into(),
+                    loc,
+                );
+                Ok(block.append_operation(zero).result(0).unwrap().into())
             }
             // Phase 2.7c (ADR 0026): `tostring(x)` materialises a
             // String for the four supported kinds. Function values
@@ -1908,11 +1935,13 @@ fn emit_libm_call<'a, 'c>(
     block.append_operation(call_op).result(0).unwrap().into()
 }
 
-/// Dispatch print to the right libc path based on the static value
-/// kind of the argument. Numbers go through `printf("%g\n", v)`;
-/// booleans select between `s_true`/`s_false` via `llvm.select` and
-/// print through `printf("%s\n", ptr)`.
-fn emit_print_value<'a, 'c>(
+/// Phase 2.8b (ADR 0032): per-arg print path. Multi-arg
+/// `print(a, b, ...)` calls this once per argument with the
+/// no-newline format globals (`fmt_raw`, `fmt_str_raw`) and
+/// composes tab separators / a single trailing newline around the
+/// loop. Single-arg `print(x)` is the same loop with N = 1, so
+/// every print call funnels through here.
+fn emit_print_value_raw<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     value: Value<'c, 'a>,
@@ -1921,14 +1950,29 @@ fn emit_print_value<'a, 'c>(
     loc: Location<'c>,
 ) {
     match kind {
-        ValueKind::Number => emit_printf_g(context, block, value, types, loc),
-        ValueKind::Bool => emit_print_bool(context, block, value, types, loc),
-        ValueKind::Nil => emit_print_nil(context, block, types, loc),
-        // Phase 2.7a (ADR 0024): a String value is already a `ptr`
-        // into the static C-string pool; printf with `%s\n` is the
-        // direct path.
+        ValueKind::Number => {
+            let fmt_ptr = emit_addressof(context, block, "fmt_raw", types, loc);
+            emit_printf(context, block, fmt_ptr, value, types, loc);
+        }
+        ValueKind::Bool => {
+            let true_ptr = emit_addressof(context, block, "s_true", types, loc);
+            let false_ptr = emit_addressof(context, block, "s_false", types, loc);
+            let select_op = OperationBuilder::new("llvm.select", loc)
+                .add_operands(&[value, true_ptr, false_ptr])
+                .add_results(&[types.ptr])
+                .build()
+                .expect("llvm.select");
+            let chosen: Value<'c, 'a> = block.append_operation(select_op).result(0).unwrap().into();
+            let fmt_ptr = emit_addressof(context, block, "fmt_str_raw", types, loc);
+            emit_printf(context, block, fmt_ptr, chosen, types, loc);
+        }
+        ValueKind::Nil => {
+            let nil_ptr = emit_addressof(context, block, "s_nil", types, loc);
+            let fmt_ptr = emit_addressof(context, block, "fmt_str_raw", types, loc);
+            emit_printf(context, block, fmt_ptr, nil_ptr, types, loc);
+        }
         ValueKind::String => {
-            let fmt_ptr = emit_addressof(context, block, "fmt_str", types, loc);
+            let fmt_ptr = emit_addressof(context, block, "fmt_str_raw", types, loc);
             emit_printf(context, block, fmt_ptr, value, types, loc);
         }
         ValueKind::Function(_) => unreachable!(
@@ -1938,15 +1982,18 @@ fn emit_print_value<'a, 'c>(
     }
 }
 
-fn emit_print_nil<'c>(
+/// Phase 2.8b (ADR 0032): emit `printf("%s", @<global_name>)` for
+/// the literal tab / newline separators in multi-arg print.
+fn emit_print_literal<'c>(
     context: &'c Context,
     block: &Block<'c>,
+    global_name: &str,
     types: &Types<'c>,
     loc: Location<'c>,
 ) {
-    let nil_ptr = emit_addressof(context, block, "s_nil", types, loc);
-    let fmt_ptr = emit_addressof(context, block, "fmt_str", types, loc);
-    emit_printf(context, block, fmt_ptr, nil_ptr, types, loc);
+    let fmt_ptr = emit_addressof(context, block, "fmt_str_raw", types, loc);
+    let payload = emit_addressof(context, block, global_name, types, loc);
+    emit_printf(context, block, fmt_ptr, payload, types, loc);
 }
 
 /// Phase 2.7g (ADR 0030): runtime check for `assert(cond)`. When
@@ -2024,36 +2071,6 @@ fn emit_assert<'a, 'c>(
     else_region.append_block(else_blk);
 
     block.append_operation(scf::r#if(not_cond, &[], then_region, else_region, loc));
-}
-
-fn emit_printf_g<'a, 'c>(
-    context: &'c Context,
-    block: &'a Block<'c>,
-    value: Value<'c, 'a>,
-    types: &Types<'c>,
-    loc: Location<'c>,
-) {
-    let fmt_ptr = emit_addressof(context, block, "fmt", types, loc);
-    emit_printf(context, block, fmt_ptr, value, types, loc);
-}
-
-fn emit_print_bool<'a, 'c>(
-    context: &'c Context,
-    block: &'a Block<'c>,
-    cond_i1: Value<'c, 'a>,
-    types: &Types<'c>,
-    loc: Location<'c>,
-) {
-    let true_ptr = emit_addressof(context, block, "s_true", types, loc);
-    let false_ptr = emit_addressof(context, block, "s_false", types, loc);
-    let select_op = OperationBuilder::new("llvm.select", loc)
-        .add_operands(&[cond_i1, true_ptr, false_ptr])
-        .add_results(&[types.ptr])
-        .build()
-        .expect("llvm.select i1, ptr, ptr");
-    let selected = block.append_operation(select_op).result(0).unwrap().into();
-    let fmt_ptr = emit_addressof(context, block, "fmt_str", types, loc);
-    emit_printf(context, block, fmt_ptr, selected, types, loc);
 }
 
 fn emit_addressof<'a, 'c>(
