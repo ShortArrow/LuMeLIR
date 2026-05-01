@@ -614,6 +614,67 @@ fn binop_symbol(op: BinOp) -> &'static str {
 /// `chunk.functions`; the rest of the top-level statements (including
 /// `print(...)` calls into those functions) become the implicit `main`
 /// chunk's `stmts`.
+/// Phase 2.5f (ADR 0036): pass-1 registration step shared between
+/// top-level `lower()` and the nested-FunctionDef arm of
+/// `lower_function_body`. Allocates a `FuncId`, pushes a placeholder
+/// `HirFunction` (params with default Number kinds; body filled in
+/// at pass 2), and inserts the name into `function_names` so
+/// recursion + sibling forward-reference work. Pure relative to
+/// its mutable arguments.
+fn register_function_signature(
+    name: &str,
+    params: &[String],
+    function_names: &mut HashMap<String, FuncId>,
+    functions: &mut Vec<HirFunction>,
+) -> FuncId {
+    let id = FuncId(functions.len());
+    functions.push(HirFunction {
+        name: name.to_owned(),
+        mangled_name: format!("user_{}_{}", name, id.0),
+        params: params
+            .iter()
+            .map(|p| LocalInfo {
+                name: p.clone(),
+                kind: ValueKind::Number,
+                func_id: None,
+            })
+            .collect(),
+        locals: Vec::new(),
+        body: Vec::new(),
+        ret_kinds: Vec::new(),
+    });
+    function_names.insert(name.to_owned(), id);
+    id
+}
+
+/// Phase 2.5f (ADR 0036): pass-2 body lowering step shared between
+/// top-level `lower()` and the nested-FunctionDef arm of
+/// `lower_function_body`. Lowers `body` into a fresh `LowerCtx`,
+/// fills in `functions[fid.0]`, and hoists any anonymous functions
+/// registered during inner lowering into the outer table.
+fn lower_into_function(
+    fid: FuncId,
+    params: &[String],
+    body: &[Stmt],
+    function_names: &HashMap<String, FuncId>,
+    functions: &mut Vec<HirFunction>,
+) -> Result<(), HirError> {
+    let pre_count = functions.len();
+    let external_kinds: Vec<ValueKind> = functions[fid.0].params.iter().map(|p| p.kind).collect();
+    let mut sub_ctx =
+        LowerCtx::for_function(function_names, functions, params, body, &external_kinds);
+    let body_hir = sub_ctx.lower_function_body(body)?;
+    let ret_kinds = sub_ctx.in_function_ret_kinds.unwrap_or_default();
+    functions[fid.0].params = sub_ctx.locals[..params.len()].to_vec();
+    functions[fid.0].locals = sub_ctx.locals;
+    functions[fid.0].body = body_hir;
+    functions[fid.0].ret_kinds = ret_kinds;
+    for new_fn in sub_ctx.functions.into_iter().skip(pre_count) {
+        functions.push(new_fn);
+    }
+    Ok(())
+}
+
 pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
     // Pass 1: register every top-level `local function` in the
     // function table so recursion and forward-reference work.
@@ -621,23 +682,7 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
     let mut function_names: HashMap<String, FuncId> = HashMap::new();
     for stmt in chunk {
         if let StmtKind::FunctionDef { name, params, .. } = &stmt.kind {
-            let id = FuncId(functions.len());
-            functions.push(HirFunction {
-                name: name.clone(),
-                mangled_name: format!("user_{}_{}", name, id.0),
-                params: params
-                    .iter()
-                    .map(|p| LocalInfo {
-                        name: p.clone(),
-                        kind: ValueKind::Number,
-                        func_id: None,
-                    })
-                    .collect(),
-                locals: Vec::new(),    // filled in pass 2
-                body: Vec::new(),      // filled in pass 2
-                ret_kinds: Vec::new(), // resolved in pass 2
-            });
-            function_names.insert(name.clone(), id);
+            register_function_signature(name, params, &mut function_names, &mut functions);
         }
     }
     // Phase 2.5e (ADR 0020): pre-scan all call sites for top-level
@@ -659,32 +704,7 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
     for (idx, stmt) in chunk.iter().enumerate() {
         if let StmtKind::FunctionDef { params, body, .. } = &stmt.kind {
             let id = FuncId(idx_of_funcdef(chunk, idx));
-            let pre_count = functions.len();
-            // Phase 2.5e: hand the call-site-inferred param kinds to
-            // the inner LowerCtx so body type-checks see the right
-            // kinds for the params.
-            let external_kinds: Vec<ValueKind> =
-                functions[id.0].params.iter().map(|p| p.kind).collect();
-            let mut fn_ctx =
-                LowerCtx::for_function(&function_names, &functions, params, body, &external_kinds);
-            let body_hir = fn_ctx.lower_function_body(body)?;
-            let ret_kinds = fn_ctx.in_function_ret_kinds.unwrap_or_default();
-            // Phase 2.5b.2: copy the inferred param kinds (the first
-            // `params.len()` locals carry them) into the public
-            // `HirFunction.params` slice so callers see the right
-            // arity check at indirect-call sites.
-            functions[id.0].params = fn_ctx.locals[..params.len()].to_vec();
-            functions[id.0].locals = fn_ctx.locals;
-            functions[id.0].body = body_hir;
-            functions[id.0].ret_kinds = ret_kinds;
-            // Phase 2.5b.3: anonymous functions registered while lowering
-            // this body live only in `fn_ctx.functions`; hoist the new
-            // ones (indices ≥ pre_count) into the outer table so codegen
-            // can emit them. FuncIds remain stable because the inner
-            // table was a clone and indices only grew.
-            for new_fn in fn_ctx.functions.into_iter().skip(pre_count) {
-                functions.push(new_fn);
-            }
+            lower_into_function(id, params, body, &function_names, &mut functions)?;
         }
     }
 
@@ -813,6 +833,22 @@ impl LowerCtx {
             ret_value_ids.push(id);
         }
         self.in_function = Some((returned_id, ret_value_ids.clone()));
+
+        // Phase 2.5f (ADR 0036): pre-register every body-level
+        // `local function NAME ...` so sibling forward references
+        // (`g` calling `h` declared later in the same body) work.
+        // Mirrors the pass-1 / pass-2 split that `lower()` already
+        // does for top-level FunctionDefs.
+        for s in stmts {
+            if let StmtKind::FunctionDef { name, params, .. } = &s.kind {
+                register_function_signature(
+                    name,
+                    params,
+                    &mut self.function_names,
+                    &mut self.functions,
+                );
+            }
+        }
 
         let span = stmts.first().map(|s| s.span).unwrap_or(Span::new(0, 0));
         self.loop_break_targets.push(Some(returned_id));
@@ -1079,15 +1115,28 @@ impl LowerCtx {
                 };
                 Ok(wrap_with_break_init(repeat_stmt, break_id, stmt.span))
             }
-            StmtKind::FunctionDef { .. } => {
-                // FunctionDef at top level is lifted out into
-                // `chunk.functions` by `lower()`. Inside a function
-                // body, nested function definitions are not yet
-                // supported (Phase 2.5b will introduce them).
-                unimplemented!(
-                    "Nested function definitions arrive in Phase 2.5b — \
-                     top-level `local function` is hoisted in `lower()`"
+            // Phase 2.5f (ADR 0036): nested `local function NAME ...`.
+            // Top-level FunctionDef is hoisted in `lower()` and
+            // never reaches this arm; what we lower here is a
+            // FunctionDef found *inside* another function's body.
+            // `lower_function_body`'s pass-1 has already registered
+            // the name in `self.function_names` and a placeholder
+            // `HirFunction` in `self.functions`. We delegate the
+            // body lowering / locals copy / anon-function hoist to
+            // the same `lower_into_function` helper used at top-
+            // level, and emit an empty Block as the definition's
+            // runtime no-op (the function code is read from
+            // `chunk.functions`, not the enclosing body).
+            StmtKind::FunctionDef { name, params, body } => {
+                let &fid = self.function_names.get(name).expect(
+                    "lower_function_body's pass 1 always registers nested \
+                     FunctionDef names",
                 );
+                lower_into_function(fid, params, body, &self.function_names, &mut self.functions)?;
+                Ok(HirStmt {
+                    kind: HirStmtKind::Block { stmts: Vec::new() },
+                    span: stmt.span,
+                })
             }
             StmtKind::Return { value } => {
                 let values: Vec<HirExpr> = match value {
@@ -2015,6 +2064,55 @@ mod tests {
     fn lower_repeat_cond_referencing_undefined_name_errors() {
         let err =
             lower_src("repeat until missing_var").expect_err("undefined cond name must reject");
+        assert!(matches!(err, HirError::UndefinedName { .. }));
+    }
+
+    // -----------------------------------------------------------
+    // Phase 2.5f — nested `local function` definitions (ADR 0036).
+    // -----------------------------------------------------------
+
+    #[test]
+    fn lower_nested_local_function_does_not_panic() {
+        // Pre-2.5f this hit `unimplemented!`. The nested function
+        // is hoisted into the chunk's `functions` table just like
+        // a top-level one.
+        let src = "local function outer()
+  local function inner()
+    return 7
+  end
+  return inner()
+end";
+        let hir = lower_src(src).expect("nested fn def must lower");
+        // Two functions registered: outer + inner.
+        assert_eq!(hir.functions.len(), 2);
+        let names: Vec<&str> = hir.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"outer"));
+        assert!(names.contains(&"inner"));
+    }
+
+    #[test]
+    fn lower_nested_local_function_supports_recursion() {
+        // The nested function's name is in scope inside its own body.
+        let src = "local function outer(x)
+  local function fib(n)
+    if n < 2 then return n end
+    return fib(n - 1) + fib(n - 2)
+  end
+  return fib(x)
+end";
+        assert!(lower_src(src).is_ok(), "fib recursion must lower");
+    }
+
+    #[test]
+    fn lower_nested_function_referencing_outer_local_errors() {
+        // No closures yet — body cannot reach into outer scope.
+        let src = "local function outer(x)
+  local function inner()
+    return x
+  end
+  return inner()
+end";
+        let err = lower_src(src).expect_err("upvalue capture not yet supported");
         assert!(matches!(err, HirError::UndefinedName { .. }));
     }
 
