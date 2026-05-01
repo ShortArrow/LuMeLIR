@@ -17,6 +17,9 @@ impl Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
     Number(f64),
+    /// String literal, escapes already processed by the lexer
+    /// (Phase 2.7a, ADR 0024).
+    Str(String),
     Bool(bool),
     Nil,
     Ident(String),
@@ -80,13 +83,16 @@ pub enum BinOp {
 
 /// Unary prefix operators. Phase 2.2a introduces arithmetic negation.
 /// Phase 2.3c adds logical `not`. Phase 2.2c (ADR 0022) adds bitwise
-/// NOT (the unary `~`).
+/// NOT (the unary `~`). Phase 2.7a (ADR 0024) adds the length
+/// operator (the unary `#`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
     Neg,
     Not,
     /// `~x` bitwise complement (Phase 2.2c, ADR 0022).
     BitNot,
+    /// `#s` string length in bytes (Phase 2.7a, ADR 0024).
+    Len,
 }
 
 /// A statement. Phase 2.0 introduced `local` declarations and bare

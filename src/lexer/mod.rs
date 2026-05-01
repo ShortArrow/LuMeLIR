@@ -29,6 +29,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
             continue;
         }
 
+        if matches!(ch, '"' | '\'') {
+            let (span, s) = scan_string(src, &mut chars, ch, offset)?;
+            tokens.push(Token::new(TokenKind::Str(s), span));
+            continue;
+        }
+
         if is_ident_start(ch) {
             let (span, name) = scan_ident(src, &mut chars);
             let kind = match Keyword::from_lexeme(&name) {
@@ -80,6 +86,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
             '^' => Some(TokenKind::Caret),
             '&' => Some(TokenKind::Amp),
             '|' => Some(TokenKind::Pipe),
+            '#' => Some(TokenKind::Hash),
             ',' => Some(TokenKind::Comma),
             ';' => Some(TokenKind::Semicolon),
             _ => None,
@@ -183,6 +190,77 @@ where
         .parse::<f64>()
         .expect("scan_number recognised a valid f64 lexeme");
     (Span::new(start, end), value)
+}
+
+/// Scan a string literal `"..."` or `'...'` (Phase 2.7a, ADR 0024).
+/// Recognised escapes match the Lua subset documented in the ADR:
+/// `\n`, `\t`, `\r`, `\\`, `\"`, `\'`, `\0`. Anything else after a
+/// backslash is `LexError::InvalidEscape`. EOF before the closing
+/// quote is `LexError::UnterminatedString`.
+fn scan_string<I>(
+    _src: &str,
+    chars: &mut std::iter::Peekable<I>,
+    quote: char,
+    open_offset: usize,
+) -> Result<(Span, String), LexError>
+where
+    I: Iterator<Item = (usize, char)>,
+{
+    chars.next(); // consume opening quote
+    let mut value = String::new();
+    loop {
+        let (offset, ch) = match chars.next() {
+            Some(t) => t,
+            None => {
+                return Err(LexError::UnterminatedString {
+                    offset: open_offset,
+                });
+            }
+        };
+        if ch == quote {
+            // The closing quote is one byte (always ASCII for our subset).
+            return Ok((Span::new(open_offset, offset + 1), value));
+        }
+        if ch == '\n' {
+            // Lua disallows a literal newline inside a short string;
+            // surface the same UnterminatedString error so the caller
+            // sees the open quote location.
+            return Err(LexError::UnterminatedString {
+                offset: open_offset,
+            });
+        }
+        if ch != '\\' {
+            value.push(ch);
+            continue;
+        }
+        let (esc_off, esc_ch) = match chars.next() {
+            Some(t) => t,
+            None => {
+                return Err(LexError::UnterminatedString {
+                    offset: open_offset,
+                });
+            }
+        };
+        let mapped = match esc_ch {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            '\\' => '\\',
+            '"' => '"',
+            '\'' => '\'',
+            '0' => '\0',
+            other => {
+                let mut seq = String::with_capacity(2);
+                seq.push('\\');
+                seq.push(other);
+                return Err(LexError::InvalidEscape {
+                    seq,
+                    offset: esc_off,
+                });
+            }
+        };
+        value.push(mapped);
+    }
 }
 
 fn scan_ident<I>(src: &str, chars: &mut std::iter::Peekable<I>) -> (Span, String)
@@ -539,5 +617,58 @@ mod tests {
                 TokenKind::Eof,
             ]
         );
+    }
+
+    // -----------------------------------------------------------
+    // Phase 2.7a — string literals + `#` (ADR 0024).
+    // -----------------------------------------------------------
+
+    #[test]
+    fn lex_double_quoted_string_yields_str_token() {
+        assert_eq!(
+            kinds("\"hello\""),
+            vec![TokenKind::Str("hello".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_single_quoted_string_yields_str_token() {
+        assert_eq!(
+            kinds("'world'"),
+            vec![TokenKind::Str("world".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_string_with_basic_escapes() {
+        assert_eq!(
+            kinds("\"a\\nb\\tc\""),
+            vec![TokenKind::Str("a\nb\tc".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_string_with_escaped_backslash_and_quote() {
+        assert_eq!(
+            kinds("\"a\\\\b\\\"c\""),
+            vec![TokenKind::Str("a\\b\"c".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_unterminated_string_returns_error() {
+        let err = lex("\"oops").expect_err("missing closing quote must error");
+        assert!(matches!(err, LexError::UnterminatedString { offset: 0 }));
+    }
+
+    #[test]
+    fn lex_invalid_escape_returns_error() {
+        let err = lex("\"a\\zb\"").expect_err("\\z is not in our escape set");
+        assert!(matches!(err, LexError::InvalidEscape { .. }));
+    }
+
+    #[test]
+    fn lex_hash_yields_dedicated_token() {
+        assert_eq!(kinds("#"), vec![TokenKind::Hash, TokenKind::Eof]);
     }
 }

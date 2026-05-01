@@ -8,4 +8,13 @@ use thiserror::Error;
 pub enum LexError {
     #[error("unexpected character {ch:?} at byte offset {offset}")]
     Unexpected { ch: char, offset: usize },
+
+    /// String literal whose closing quote is missing or eclipsed by EOF
+    /// (Phase 2.7a, ADR 0024).
+    #[error("unterminated string literal starting at byte offset {offset}")]
+    UnterminatedString { offset: usize },
+
+    /// Backslash escape with an unrecognised follower (Phase 2.7a).
+    #[error("invalid escape sequence {seq:?} at byte offset {offset}")]
+    InvalidEscape { seq: String, offset: usize },
 }

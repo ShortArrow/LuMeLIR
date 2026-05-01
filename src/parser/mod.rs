@@ -476,6 +476,8 @@ impl<'t> Parser<'t> {
             // is bitwise NOT. (`~=` is its own token; in infix position
             // a bare `~` is bitwise XOR.)
             TokenKind::Tilde => Some(UnaryOp::BitNot),
+            // Phase 2.7a (ADR 0024): `#s` is the length operator.
+            TokenKind::Hash => Some(UnaryOp::Len),
             _ => None,
         };
         if let Some(op) = unary_op {
@@ -501,6 +503,10 @@ impl<'t> Parser<'t> {
             TokenKind::Number(value) => {
                 self.bump();
                 Ok(Expr::new(ExprKind::Number(value), tok.span))
+            }
+            TokenKind::Str(ref s) => {
+                self.bump();
+                Ok(Expr::new(ExprKind::Str(s.clone()), tok.span))
             }
             TokenKind::Ident(ref name) => {
                 self.bump();
@@ -725,6 +731,7 @@ mod tests {
     fn strip_span_expr(expr: Expr) -> Expr {
         let kind = match expr.kind {
             ExprKind::Number(v) => ExprKind::Number(v),
+            ExprKind::Str(s) => ExprKind::Str(s),
             ExprKind::Bool(b) => ExprKind::Bool(b),
             ExprKind::Nil => ExprKind::Nil,
             ExprKind::Ident(n) => ExprKind::Ident(n),
