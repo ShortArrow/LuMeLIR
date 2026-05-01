@@ -347,10 +347,12 @@ where
 }
 
 /// Scan a string literal `"..."` or `'...'` (Phase 2.7a, ADR 0024).
-/// Recognised escapes match the Lua subset documented in the ADR:
-/// `\n`, `\t`, `\r`, `\\`, `\"`, `\'`, `\0`. Anything else after a
-/// backslash is `LexError::InvalidEscape`. EOF before the closing
-/// quote is `LexError::UnterminatedString`.
+/// Recognised escapes match the Lua subset documented in ADRs 0024
+/// and 0039: `\n`, `\t`, `\r`, `\\`, `\"`, `\'`, `\a`, `\b`, `\f`,
+/// `\v`, `\xHH` (hex byte, 0..=0x7F), and `\ddd` (1-3 decimal
+/// digits, 0..=127). Anything else after a backslash is
+/// `LexError::InvalidEscape`. EOF before the closing quote is
+/// `LexError::UnterminatedString`.
 fn scan_string<I>(
     _src: &str,
     chars: &mut std::iter::Peekable<I>,
@@ -402,7 +404,17 @@ where
             '\\' => '\\',
             '"' => '"',
             '\'' => '\'',
-            '0' => '\0',
+            // Phase 2.7k (ADR 0039): C-style single-char escapes.
+            'a' => '\x07',
+            'b' => '\x08',
+            'f' => '\x0C',
+            'v' => '\x0B',
+            // Phase 2.7k (ADR 0039): `\xHH` hex byte.
+            'x' => read_hex_escape(chars, esc_off)?,
+            // Phase 2.7k (ADR 0039): `\ddd` decimal byte. The first
+            // digit was already consumed; the helper reads up to two
+            // more.
+            d if d.is_ascii_digit() => read_decimal_escape(chars, d, esc_off)?,
             other => {
                 let mut seq = String::with_capacity(2);
                 seq.push('\\');
@@ -414,6 +426,69 @@ where
             }
         };
         value.push(mapped);
+    }
+}
+
+/// Phase 2.7k (ADR 0039): read exactly two hex digits after `\x` and
+/// return the resulting byte as a `char`. Restricts to the
+/// ASCII-safe range 0x00..=0x7F so values flow cleanly through Rust
+/// `String` (UTF-8) without splitting into multi-byte sequences.
+/// `esc_off` points at the `x` so diagnostics carry that location.
+fn read_hex_escape<I>(chars: &mut std::iter::Peekable<I>, esc_off: usize) -> Result<char, LexError>
+where
+    I: Iterator<Item = (usize, char)>,
+{
+    let d1 = chars.next().and_then(|(_, c)| c.to_digit(16));
+    let d2 = chars.next().and_then(|(_, c)| c.to_digit(16));
+    match (d1, d2) {
+        (Some(a), Some(b)) => {
+            let v = a * 16 + b;
+            if v > 0x7F {
+                Err(LexError::InvalidEscape {
+                    seq: format!("\\x{v:02x}"),
+                    offset: esc_off,
+                })
+            } else {
+                Ok(v as u8 as char)
+            }
+        }
+        _ => Err(LexError::InvalidEscape {
+            seq: "\\x".into(),
+            offset: esc_off,
+        }),
+    }
+}
+
+/// Phase 2.7k (ADR 0039): read a 1-3 digit decimal escape. The
+/// caller has already consumed the first digit and passes it as
+/// `first`. Subsequent digits are taken greedily; scanning stops at
+/// the first non-digit (which remains in the iterator). Restricts
+/// to 0..=127 so the value fits in one UTF-8 byte.
+fn read_decimal_escape<I>(
+    chars: &mut std::iter::Peekable<I>,
+    first: char,
+    esc_off: usize,
+) -> Result<char, LexError>
+where
+    I: Iterator<Item = (usize, char)>,
+{
+    let mut value: u32 = first.to_digit(10).expect("first must be a digit");
+    for _ in 0..2 {
+        match chars.peek() {
+            Some(&(_, c)) if c.is_ascii_digit() => {
+                value = value * 10 + c.to_digit(10).unwrap();
+                chars.next();
+            }
+            _ => break,
+        }
+    }
+    if value > 127 {
+        Err(LexError::InvalidEscape {
+            seq: format!("\\{value}"),
+            offset: esc_off,
+        })
+    } else {
+        Ok(value as u8 as char)
     }
 }
 
@@ -1009,5 +1084,85 @@ mod tests {
         // start a long-bracket scan.
         let err = lex("[ x]").expect_err("bare `[` should be unexpected");
         assert!(matches!(err, LexError::Unexpected { ch: '[', .. }));
+    }
+
+    // -----------------------------------------------------------
+    // Phase 2.7k — extended string escapes (ADR 0039).
+    // `\a \b \f \v` (single-char), `\xHH` (hex byte, 0..=0x7F),
+    // `\ddd` (decimal byte, 0..=127, 1-3 digits).
+    // -----------------------------------------------------------
+
+    #[test]
+    fn lex_string_with_alert_and_backspace_escapes() {
+        assert_eq!(
+            kinds("\"\\a\\b\""),
+            vec![TokenKind::Str("\x07\x08".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_string_with_form_feed_and_vtab_escapes() {
+        assert_eq!(
+            kinds("\"\\f\\v\""),
+            vec![TokenKind::Str("\x0C\x0B".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_string_with_hex_escape() {
+        // `\x41` = 'A'.
+        assert_eq!(
+            kinds("\"\\x41\""),
+            vec![TokenKind::Str("A".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_string_with_hex_escape_lowercase_digits() {
+        // Hex digits accept either case.
+        assert_eq!(
+            kinds("\"\\x7e\""),
+            vec![TokenKind::Str("~".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_string_with_decimal_escape_three_digits() {
+        // `\065` = 'A'.
+        assert_eq!(
+            kinds("\"\\065\""),
+            vec![TokenKind::Str("A".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_string_with_decimal_escape_short_terminates_at_non_digit() {
+        // `\65` followed by 'X' — the decimal scanner must stop at
+        // the non-digit, leaving 'X' as part of the string.
+        assert_eq!(
+            kinds("\"\\65X\""),
+            vec![TokenKind::Str("AX".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_string_with_hex_escape_out_of_ascii_range_is_error() {
+        // `\xff` = 255 > 127, deferred until raw-byte string support.
+        let err = lex("\"\\xff\"").expect_err("0x80+ hex escapes deferred");
+        assert!(matches!(err, LexError::InvalidEscape { .. }));
+    }
+
+    #[test]
+    fn lex_string_with_decimal_escape_out_of_ascii_range_is_error() {
+        // `\200` = 200 > 127, same restriction.
+        let err = lex("\"\\200\"").expect_err("decimal escapes >127 deferred");
+        assert!(matches!(err, LexError::InvalidEscape { .. }));
+    }
+
+    #[test]
+    fn lex_string_with_short_hex_escape_is_error() {
+        // `\xZ` — first hex digit invalid.
+        let err = lex("\"\\xZ\"").expect_err("\\x must be followed by 2 hex digits");
+        assert!(matches!(err, LexError::InvalidEscape { .. }));
     }
 }
