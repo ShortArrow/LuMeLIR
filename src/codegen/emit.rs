@@ -84,6 +84,7 @@ pub(crate) fn emit_module_unverified<'c>(
     emit_printf_decl(context, &module, &types, loc);
     emit_libm_decls(context, &module, &types, loc);
     emit_strlen_decl(context, &module, &types, loc);
+    emit_string_runtime_decls(context, &module, &types, loc);
     for hir_fn in &chunk.functions {
         emit_function(context, &module, hir_fn, &chunk.functions, &types, loc)?;
     }
@@ -296,6 +297,51 @@ fn emit_strlen_decl<'c>(
         ))
         .build();
     module.body().append_operation(strlen_op.into());
+}
+
+/// Phase 2.7b (ADR 0025): declare libc `malloc`, `memcpy`, and
+/// `strcmp` for the runtime side of `..` concat and String equality.
+fn emit_string_runtime_decls<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let malloc_ty = llvm::r#type::function(types.ptr, &[types.i64], false);
+    let malloc_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "malloc"))
+        .function_type(TypeAttribute::new(malloc_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(malloc_op.into());
+
+    let memcpy_ty = llvm::r#type::function(types.ptr, &[types.ptr, types.ptr, types.i64], false);
+    let memcpy_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "memcpy"))
+        .function_type(TypeAttribute::new(memcpy_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(memcpy_op.into());
+
+    let strcmp_ty = llvm::r#type::function(types.i32, &[types.ptr, types.ptr], false);
+    let strcmp_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "strcmp"))
+        .function_type(TypeAttribute::new(strcmp_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(strcmp_op.into());
 }
 
 fn emit_libm_decls<'c>(
@@ -879,6 +925,20 @@ fn emit_expr<'a, 'c>(
             let rhs_val = emit_expr(
                 context, block, rhs, slots, locals, functions, types, params_len, loc,
             )?;
+            // Phase 2.7b (ADR 0025): String operands need a different
+            // backend than the f64-typed `arith.cmpf` / arithmetic
+            // path. Concat is always String; Eq/Ne dispatches on the
+            // operand kind so the runtime path is `strcmp`.
+            if matches!(op, BinOp::Concat) {
+                return Ok(emit_concat(context, block, lhs_val, rhs_val, types, loc));
+            }
+            if matches!(op, BinOp::Eq | BinOp::Ne)
+                && infer_kind(lhs, locals, functions) == ValueKind::String
+            {
+                return Ok(emit_string_eq(
+                    context, block, *op, lhs_val, rhs_val, types, loc,
+                ));
+            }
             emit_binop(context, block, *op, lhs_val, rhs_val, types, loc)
         }
         HirExprKind::UnaryOp { op, operand } => {
@@ -1113,6 +1173,9 @@ fn emit_binop<'a, 'c>(
             // emit_short_circuit special case once that exists.
             unimplemented!("BinOp::And/Or — Phase 2.3c Step 4");
         }
+        BinOp::Concat => {
+            unreachable!("BinOp::Concat is intercepted in emit_expr — should not reach emit_binop")
+        }
     };
     Ok(result)
 }
@@ -1236,6 +1299,181 @@ fn emit_i2f<'a, 'c>(
         .build()
         .expect("arith.sitofp");
     block.append_operation(op).result(0).unwrap().into()
+}
+
+/// Phase 2.7b (ADR 0025): runtime concat via libc `malloc` + `memcpy`.
+/// Allocates `strlen(a) + strlen(b) + 1` bytes, copies `a` then `b`
+/// (the second copy includes `b`'s NUL terminator). Returned `ptr`
+/// is the freshly-allocated buffer; intentionally leaks since we
+/// have no GC yet.
+fn emit_concat<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    lhs: Value<'c, 'a>,
+    rhs: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let la = emit_libc_call_i64(context, block, "strlen", &[lhs], types, loc);
+    let lb = emit_libc_call_i64(context, block, "strlen", &[rhs], types, loc);
+    let one = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let lab = block
+        .append_operation(arith::addi(la, lb, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let total = block
+        .append_operation(arith::addi(lab, one, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let buf = emit_libc_call_ptr(context, block, "malloc", &[total], types, loc);
+    // memcpy(buf, lhs, la)
+    let _ = emit_libc_call_ptr(context, block, "memcpy", &[buf, lhs, la], types, loc);
+    // memcpy(buf + la, rhs, lb + 1)
+    let dst2 = block
+        .append_operation(
+            OperationBuilder::new("llvm.getelementptr", loc)
+                .add_operands(&[buf, la])
+                .add_attributes(&[
+                    (
+                        Identifier::new(context, "elem_type"),
+                        TypeAttribute::new(IntegerType::new(context, 8).into()).into(),
+                    ),
+                    (
+                        Identifier::new(context, "rawConstantIndices"),
+                        DenseI32ArrayAttribute::new(context, &[i32::MIN]).into(),
+                    ),
+                ])
+                .add_results(&[types.ptr])
+                .build()
+                .expect("llvm.getelementptr"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let lb_plus_one = block
+        .append_operation(arith::addi(lb, one, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let _ = emit_libc_call_ptr(
+        context,
+        block,
+        "memcpy",
+        &[dst2, rhs, lb_plus_one],
+        types,
+        loc,
+    );
+    buf
+}
+
+/// Phase 2.7b (ADR 0025): String equality via `strcmp`. `a == b` is
+/// `strcmp(a, b) == 0`; `a ~= b` is the negation.
+fn emit_string_eq<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    op: BinOp,
+    lhs: Value<'c, 'a>,
+    rhs: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let cmp = emit_libc_call_i32(context, block, "strcmp", &[lhs, rhs], types, loc);
+    let zero = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i32, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let pred = match op {
+        BinOp::Eq => arith::CmpiPredicate::Eq,
+        BinOp::Ne => arith::CmpiPredicate::Ne,
+        _ => unreachable!("emit_string_eq called with non-Eq/Ne op"),
+    };
+    block
+        .append_operation(arith::cmpi(context, pred, cmp, zero, loc))
+        .result(0)
+        .unwrap()
+        .into()
+}
+
+/// Generic single-result libc helper — `i64` return type.
+fn emit_libc_call_i64<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    name: &str,
+    args: &[Value<'c, 'a>],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    emit_libc_call_with_result(context, block, name, args, types.i64, loc)
+}
+
+/// Generic single-result libc helper — `i32` return type.
+fn emit_libc_call_i32<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    name: &str,
+    args: &[Value<'c, 'a>],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    emit_libc_call_with_result(context, block, name, args, types.i32, loc)
+}
+
+/// Generic single-result libc helper — `ptr` return type.
+fn emit_libc_call_ptr<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    name: &str,
+    args: &[Value<'c, 'a>],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    emit_libc_call_with_result(context, block, name, args, types.ptr, loc)
+}
+
+fn emit_libc_call_with_result<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    name: &str,
+    args: &[Value<'c, 'a>],
+    result_ty: Type<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let n = i32::try_from(args.len()).expect("call arity fits in i32");
+    let call_op = OperationBuilder::new("llvm.call", loc)
+        .add_operands(args)
+        .add_attributes(&[
+            (
+                Identifier::new(context, "callee"),
+                FlatSymbolRefAttribute::new(context, name).into(),
+            ),
+            (
+                Identifier::new(context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(context, &[n, 0]).into(),
+            ),
+            (
+                Identifier::new(context, "op_bundle_sizes"),
+                DenseI32ArrayAttribute::new(context, &[]).into(),
+            ),
+        ])
+        .add_results(&[result_ty])
+        .build()
+        .unwrap_or_else(|_| panic!("llvm.call @{name}"));
+    block.append_operation(call_op).result(0).unwrap().into()
 }
 
 /// `a % b` per Lua 5.4: floor modulo, sign follows divisor.
