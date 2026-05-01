@@ -47,6 +47,7 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.7e `tonumber` (NaN sentinel) | **Done** | `tonumber(n)` identity, `tonumber(s)` via sscanf, NaN on parse fail (ADR 0028) |
 | ‣ 2.7f `type(x)` | **Done** | static kind→typename ptr, Function values admissible (ADR 0029) |
 | ‣ 2.7g `assert(cond)` | **Done** | Bool-only assert with libc exit(1) on failure (ADR 0030) |
+| ‣ 2.8a single-line comments | **Done** | `-- ...` skipped by lexer (ADR 0031) |
 | ‣ 2.5c closures | Not started | upvalue capture, heap-allocated environments |
 | ‣ 2.6+ tables / metatables | Not started | tables, metatables, generic for, GC |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |

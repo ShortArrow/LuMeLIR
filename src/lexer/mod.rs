@@ -16,10 +16,27 @@ pub use token::{Keyword, Span, Token, TokenKind};
 pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
     let mut tokens = Vec::new();
     let mut chars = src.char_indices().peekable();
+    let bytes = src.as_bytes();
 
     while let Some(&(offset, ch)) = chars.peek() {
         if ch.is_ascii_whitespace() {
             chars.next();
+            continue;
+        }
+
+        // Phase 2.8a (ADR 0031): Lua single-line comment `-- ...`.
+        // Treated as whitespace — consumed up to (but not
+        // including) the next `\n`, or EOF. Long-bracket and `[[...]]`
+        // forms are deferred.
+        if ch == '-' && bytes.get(offset + 1) == Some(&b'-') {
+            chars.next(); // first '-'
+            chars.next(); // second '-'
+            while let Some(&(_, c)) = chars.peek() {
+                if c == '\n' {
+                    break;
+                }
+                chars.next();
+            }
             continue;
         }
 
@@ -674,5 +691,45 @@ mod tests {
     #[test]
     fn lex_hash_yields_dedicated_token() {
         assert_eq!(kinds("#"), vec![TokenKind::Hash, TokenKind::Eof]);
+    }
+
+    // -----------------------------------------------------------
+    // Phase 2.8a — single-line comments (ADR 0031).
+    // -----------------------------------------------------------
+
+    #[test]
+    fn lex_single_line_comment_to_eof_is_skipped() {
+        assert_eq!(kinds("-- comment"), vec![TokenKind::Eof]);
+    }
+
+    #[test]
+    fn lex_single_line_comment_terminates_at_newline() {
+        assert_eq!(
+            kinds("-- skip\n42"),
+            vec![TokenKind::Number(42.0), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_inline_comment_after_expression() {
+        assert_eq!(
+            kinds("1 + 2 -- sum\n3"),
+            vec![
+                TokenKind::Number(1.0),
+                TokenKind::Plus,
+                TokenKind::Number(2.0),
+                TokenKind::Number(3.0),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_single_minus_is_not_a_comment() {
+        // A bare `-` keeps its arithmetic-minus meaning.
+        assert_eq!(
+            kinds("- 1"),
+            vec![TokenKind::Minus, TokenKind::Number(1.0), TokenKind::Eof]
+        );
     }
 }
