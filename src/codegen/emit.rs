@@ -39,6 +39,10 @@ struct Types<'c> {
     i64: Type<'c>,
     f64: Type<'c>,
     ptr: Type<'c>,
+    /// Phase 2.7a (ADR 0024): string literal payload → MLIR global
+    /// symbol name. Built by [`collect_string_pool`] before any
+    /// `emit_*` runs and read at every `HirExprKind::Str` use site.
+    string_pool: std::collections::HashMap<String, String>,
 }
 
 /// Emit a verified MLIR module from a resolved HIR chunk.
@@ -62,17 +66,24 @@ pub(crate) fn emit_module_unverified<'c>(
     let module = Module::new(loc);
 
     let i8_type = IntegerType::new(context, 8).into();
+    // Phase 2.7a: collect unique string literals across the chunk so
+    // the codegen can emit one global per payload up front, before
+    // any `HirExprKind::Str` use site asks for an `addressof`.
+    let string_pool = collect_string_pool(chunk);
     let types = Types {
         i1: IntegerType::new(context, 1).into(),
         i32: IntegerType::new(context, 32).into(),
         i64: IntegerType::new(context, 64).into(),
         f64: Type::float64(context),
         ptr: llvm::r#type::pointer(context, 0),
+        string_pool,
     };
 
     emit_fmt_global(context, &module, i8_type, loc);
+    emit_user_string_globals(context, &module, i8_type, &types, loc);
     emit_printf_decl(context, &module, &types, loc);
     emit_libm_decls(context, &module, &types, loc);
+    emit_strlen_decl(context, &module, &types, loc);
     for hir_fn in &chunk.functions {
         emit_function(context, &module, hir_fn, &chunk.functions, &types, loc)?;
     }
@@ -147,6 +158,146 @@ fn emit_printf_decl<'c>(
     module.body().append_operation(printf_op.into());
 }
 
+/// Phase 2.7a (ADR 0024): walk the HIR, collect every `HirExprKind::Str`
+/// payload, deduplicate, and assign a stable `lstr_<i>` global symbol
+/// name to each. The order is the BTreeSet's natural sort so the
+/// emitted IR is deterministic regardless of source order.
+fn collect_string_pool(chunk: &HirChunk) -> std::collections::HashMap<String, String> {
+    use std::collections::BTreeSet;
+    fn visit_expr(e: &HirExpr, set: &mut BTreeSet<String>) {
+        match &e.kind {
+            HirExprKind::Str(s) => {
+                set.insert(s.clone());
+            }
+            HirExprKind::BinOp { lhs, rhs, .. } => {
+                visit_expr(lhs, set);
+                visit_expr(rhs, set);
+            }
+            HirExprKind::UnaryOp { operand, .. } => visit_expr(operand, set),
+            HirExprKind::Call { args, .. } => {
+                for a in args {
+                    visit_expr(a, set);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn visit_stmt(s: &HirStmt, set: &mut BTreeSet<String>) {
+        match &s.kind {
+            HirStmtKind::LocalInit { value, .. } | HirStmtKind::Assign { value, .. } => {
+                visit_expr(value, set);
+            }
+            HirStmtKind::Block { stmts } => {
+                for st in stmts {
+                    visit_stmt(st, set);
+                }
+            }
+            HirStmtKind::If {
+                cond,
+                then_body,
+                elifs,
+                else_body,
+            } => {
+                visit_expr(cond, set);
+                for st in then_body {
+                    visit_stmt(st, set);
+                }
+                for (c, b) in elifs {
+                    visit_expr(c, set);
+                    for st in b {
+                        visit_stmt(st, set);
+                    }
+                }
+                if let Some(b) = else_body {
+                    for st in b {
+                        visit_stmt(st, set);
+                    }
+                }
+            }
+            HirStmtKind::While { cond, body, .. } => {
+                visit_expr(cond, set);
+                for st in body {
+                    visit_stmt(st, set);
+                }
+            }
+            HirStmtKind::ForNumeric {
+                start,
+                stop,
+                step,
+                body,
+                ..
+            } => {
+                visit_expr(start, set);
+                visit_expr(stop, set);
+                visit_expr(step, set);
+                for st in body {
+                    visit_stmt(st, set);
+                }
+            }
+            HirStmtKind::ExprStmt(e) => visit_expr(e, set),
+            HirStmtKind::MultiAssignFromCall { args, .. } => {
+                for a in args {
+                    visit_expr(a, set);
+                }
+            }
+        }
+    }
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for st in &chunk.stmts {
+        visit_stmt(st, &mut set);
+    }
+    for f in &chunk.functions {
+        for st in &f.body {
+            visit_stmt(st, &mut set);
+        }
+    }
+    set.into_iter()
+        .enumerate()
+        .map(|(i, s)| (s, format!("lstr_{i}")))
+        .collect()
+}
+
+/// Phase 2.7a (ADR 0024): emit one `llvm.mlir.global` per entry in
+/// the string pool, terminating each payload with a NUL byte so it
+/// can be passed to libc `printf`/`strlen` directly.
+fn emit_user_string_globals<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    i8_type: Type<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let mut entries: Vec<(&String, &String)> = types.string_pool.iter().collect();
+    entries.sort_by(|a, b| a.1.cmp(b.1));
+    for (payload, name) in entries {
+        let mut value = payload.clone();
+        value.push('\0');
+        emit_string_global(context, module, i8_type, name, &value, loc);
+    }
+}
+
+/// Phase 2.7a (ADR 0024): declare libc `strlen(ptr) -> i64` so the
+/// `#s` length operator can compile to a single call without
+/// statically tracking each string's byte length.
+fn emit_strlen_decl<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let strlen_ty = llvm::r#type::function(types.i64, &[types.ptr], false);
+    let strlen_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "strlen"))
+        .function_type(TypeAttribute::new(strlen_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(strlen_op.into());
+}
+
 fn emit_libm_decls<'c>(
     context: &'c Context,
     module: &Module<'c>,
@@ -192,6 +343,9 @@ fn param_mlir_type<'c>(context: &'c Context, kind: ValueKind, types: &Types<'c>)
             FunctionType::new(context, &p_types, &[types.f64]).into()
         }
         ValueKind::Bool | ValueKind::Nil => types.i1,
+        // Phase 2.7a (ADR 0024): a String value is a `!llvm.ptr`
+        // into the static C-string pool.
+        ValueKind::String => types.ptr,
     }
 }
 
@@ -213,6 +367,7 @@ fn ret_mlir_types<'c>(
                 let p_types: Vec<Type<'c>> = (0..*arity).map(|_| types.f64).collect();
                 FunctionType::new(context, &p_types, &[types.f64]).into()
             }
+            ValueKind::String => types.ptr,
         })
         .collect()
 }
@@ -315,6 +470,10 @@ fn emit_function<'c>(
                 let fn_ty: Type<'c> = FunctionType::new(context, &p_types, &[types.f64]).into();
                 emit_unrealized_cast(&block, ptr_val, fn_ty, loc)
             }
+            // Phase 2.7a: String returns surface the slot's `ptr`
+            // value directly — no cast is needed since the slot type
+            // already matches the function signature.
+            ValueKind::String => emit_load(&block, slots[ret_value_idx], types.ptr, loc),
         };
         ret_values.push(v);
     }
@@ -569,6 +728,9 @@ fn emit_alloca_slot_for_kind<'a, 'c>(
         // observed (heterogeneous `==` and print(nil) both bypass
         // the slot via static dispatch), but storage is uniform.
         ValueKind::Bool | ValueKind::Nil => types.i1,
+        // Phase 2.7a (ADR 0024): a String slot stores a `ptr` to a
+        // static C-string global.
+        ValueKind::String => types.ptr,
         // Phase 2.5b.3 (ADR 0019): Function values stored as opaque
         // pointers — `!func.func<...>` values are bridged via
         // `unrealized_conversion_cast` at store/load.
@@ -651,6 +813,16 @@ fn emit_expr<'a, 'c>(
             let op = arith::constant(context, attr.into(), loc);
             Ok(block.append_operation(op).result(0).unwrap().into())
         }
+        // Phase 2.7a (ADR 0024): a string literal materialises as
+        // `llvm.mlir.addressof @lstr_<i>`. The corresponding global
+        // was emitted by `emit_user_string_globals` at module top.
+        HirExprKind::Str(s) => {
+            let global_name = types
+                .string_pool
+                .get(s)
+                .expect("collect_string_pool seeds every literal before codegen");
+            Ok(emit_addressof(context, block, global_name, types, loc))
+        }
         HirExprKind::Local(LocalId(idx)) => {
             let info = &locals[*idx];
             match info.kind {
@@ -658,6 +830,7 @@ fn emit_expr<'a, 'c>(
                 ValueKind::Bool | ValueKind::Nil => {
                     Ok(emit_load(block, slots[*idx], types.i1, loc))
                 }
+                ValueKind::String => Ok(emit_load(block, slots[*idx], types.ptr, loc)),
                 ValueKind::Function(arity) => {
                     // Three buckets (Phase 2.5b.3, ADR 0019):
                     //   - Function param: slots[idx] is the block arg.
@@ -1001,6 +1174,33 @@ fn emit_unary<'a, 'c>(
                 .into();
             Ok(emit_i2f(block, r_i, types, loc))
         }
+        // Phase 2.7a (ADR 0024): `#s` calls libc strlen on the
+        // string ptr, then promotes the i64 byte count to f64 to
+        // match our Number-typed expression world.
+        UnaryOp::Len => {
+            let n = i32::try_from(1usize).unwrap();
+            let call_op = OperationBuilder::new("llvm.call", loc)
+                .add_operands(&[operand])
+                .add_attributes(&[
+                    (
+                        Identifier::new(context, "callee"),
+                        FlatSymbolRefAttribute::new(context, "strlen").into(),
+                    ),
+                    (
+                        Identifier::new(context, "operandSegmentSizes"),
+                        DenseI32ArrayAttribute::new(context, &[n, 0]).into(),
+                    ),
+                    (
+                        Identifier::new(context, "op_bundle_sizes"),
+                        DenseI32ArrayAttribute::new(context, &[]).into(),
+                    ),
+                ])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.call @strlen");
+            let len_i64: Value<'c, 'a> = block.append_operation(call_op).result(0).unwrap().into();
+            Ok(emit_i2f(block, len_i64, types, loc))
+        }
     }
 }
 
@@ -1130,6 +1330,13 @@ fn emit_print_value<'a, 'c>(
         ValueKind::Number => emit_printf_g(context, block, value, types, loc),
         ValueKind::Bool => emit_print_bool(context, block, value, types, loc),
         ValueKind::Nil => emit_print_nil(context, block, types, loc),
+        // Phase 2.7a (ADR 0024): a String value is already a `ptr`
+        // into the static C-string pool; printf with `%s\n` is the
+        // direct path.
+        ValueKind::String => {
+            let fmt_ptr = emit_addressof(context, block, "fmt_str", types, loc);
+            emit_printf(context, block, fmt_ptr, value, types, loc);
+        }
         ValueKind::Function(_) => unreachable!(
             "Function-kind args are rejected at HIR-time \
              (HirError::FunctionUsedAsValue) — should not reach codegen"
@@ -1262,6 +1469,16 @@ fn emit_truthiness<'a, 'c>(
                 .unwrap()
                 .into()
         }
+        // Phase 2.7a (ADR 0024): every string is truthy in Lua,
+        // including the empty string. Same fold as Number.
+        ValueKind::String => {
+            let attr = IntegerAttribute::new(types.i1, 1);
+            block
+                .append_operation(arith::constant(context, attr.into(), loc))
+                .result(0)
+                .unwrap()
+                .into()
+        }
         ValueKind::Function(_) => unreachable!(
             "Function-kind values do not flow through truthiness \
              (HIR rejects them at use sites) — ADR 0017"
@@ -1276,6 +1493,7 @@ fn kind_to_mlir_type<'c>(kind: ValueKind, types: &Types<'c>) -> Type<'c> {
     match kind {
         ValueKind::Number => types.f64,
         ValueKind::Bool | ValueKind::Nil | ValueKind::Function(_) => types.i1,
+        ValueKind::String => types.ptr,
     }
 }
 

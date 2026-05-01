@@ -40,8 +40,10 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.5b.3 functions as return values | **Done** | `return f`, ret_kind→Function, ptr-slot+ucast bridging (ADR 0019) |
 | ‣ 2.5e Bool/Nil params/return | **Done** | predicates (`return x > 0`), `not b`, `nil`-returning helpers; call-site param inference (ADR 0020) |
 | ‣ 2.5d multi-return | **Done** | `return a, b`, `local x, y = call()`, parallel binding, multi-result `func.call` (ADR 0021) |
-| ‣ 2.5c closures | Next | upvalue capture, heap-allocated environments |
-| ‣ 2.6+ tables / strings | Not started | tables, metatables, generic for, strings, GC |
+| ‣ 2.7a string literals + `#` | **Done** | `"..."`/`'...'`, basic escapes, `print(s)`, `#s` via strlen, deduped LLVM globals (ADR 0024) |
+| ‣ 2.7b string concat / equality | Not started | `a..b`, `s1 == s2`, runtime concat helper (heap) |
+| ‣ 2.5c closures | Not started | upvalue capture, heap-allocated environments |
+| ‣ 2.6+ tables / metatables | Not started | tables, metatables, generic for, GC |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |
 
 **How to read TBD markers:** sections marked `TBD: Phase N, ADR XXXX` indicate the rule is undecided until that ADR lands. Do not invent answers — surface the question instead.
