@@ -43,6 +43,7 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.7a string literals + `#` | **Done** | `"..."`/`'...'`, basic escapes, `print(s)`, `#s` via strlen, deduped LLVM globals (ADR 0024) |
 | ‣ 2.7b string concat / equality | **Done** | `a..b` via malloc+memcpy, `s1 == s2` via strcmp, call-site String inference (ADR 0025) |
 | ‣ 2.7c `tostring` + concat auto-coerce | **Done** | `tostring(x)` builtin, `"x"..1`/`..true`/`..nil` desugar via tostring (ADR 0026) |
+| ‣ 2.7d lexicographic string compare | **Done** | `<` `<=` `>` `>=` for String operands via strcmp (ADR 0027) |
 | ‣ 2.5c closures | Not started | upvalue capture, heap-allocated environments |
 | ‣ 2.6+ tables / metatables | Not started | tables, metatables, generic for, GC |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |

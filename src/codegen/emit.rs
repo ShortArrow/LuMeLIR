@@ -949,10 +949,16 @@ fn emit_expr<'a, 'c>(
             if matches!(op, BinOp::Concat) {
                 return Ok(emit_concat(context, block, lhs_val, rhs_val, types, loc));
             }
-            if matches!(op, BinOp::Eq | BinOp::Ne)
-                && infer_kind(lhs, locals, functions) == ValueKind::String
+            if matches!(
+                op,
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+            ) && infer_kind(lhs, locals, functions) == ValueKind::String
             {
-                return Ok(emit_string_eq(
+                // Phase 2.7b/d: equality and ordering on String
+                // operands both go through `strcmp` + integer
+                // compare. Same helper, different `arith.cmpi`
+                // predicate per BinOp.
+                return Ok(emit_string_cmp(
                     context, block, *op, lhs_val, rhs_val, types, loc,
                 ));
             }
@@ -1485,9 +1491,12 @@ fn emit_tostring<'a, 'c>(
     }
 }
 
-/// Phase 2.7b (ADR 0025): String equality via `strcmp`. `a == b` is
-/// `strcmp(a, b) == 0`; `a ~= b` is the negation.
-fn emit_string_eq<'a, 'c>(
+/// Phase 2.7b/d (ADRs 0025, 0027): String equality and ordering via
+/// `strcmp`. `strcmp(a, b)` returns negative / zero / positive; the
+/// per-op predicate then projects that to an i1. Lexicographic
+/// ordering uses **signed** comparisons (`Slt` / `Sle` / `Sgt` /
+/// `Sge`) since `strcmp` returns a signed `int`.
+fn emit_string_cmp<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     op: BinOp,
@@ -1509,7 +1518,11 @@ fn emit_string_eq<'a, 'c>(
     let pred = match op {
         BinOp::Eq => arith::CmpiPredicate::Eq,
         BinOp::Ne => arith::CmpiPredicate::Ne,
-        _ => unreachable!("emit_string_eq called with non-Eq/Ne op"),
+        BinOp::Lt => arith::CmpiPredicate::Slt,
+        BinOp::Le => arith::CmpiPredicate::Sle,
+        BinOp::Gt => arith::CmpiPredicate::Sgt,
+        BinOp::Ge => arith::CmpiPredicate::Sge,
+        _ => unreachable!("emit_string_cmp called with non-comparison op"),
     };
     block
         .append_operation(arith::cmpi(context, pred, cmp, zero, loc))

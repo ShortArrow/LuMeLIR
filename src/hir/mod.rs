@@ -1394,9 +1394,14 @@ impl LowerCtx {
                             rhs: Box::new(rhs_hir),
                         }
                     }
-                    // Ordering: both sides must be Number (nil/bool reject).
+                    // Ordering: both sides must share a comparable
+                    // kind. Phase 2.7d (ADR 0027) widens the rule
+                    // from "Number only" to "Number-Number or
+                    // String-String"; cross-kind still rejects.
                     BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                        if !(lk == ValueKind::Number && rk == ValueKind::Number) {
+                        let ok = (lk == ValueKind::Number && rk == ValueKind::Number)
+                            || (lk == ValueKind::String && rk == ValueKind::String);
+                        if !ok {
                             return Err(HirError::TypeMismatch {
                                 op: binop_symbol(*op).to_owned(),
                                 lhs_kind: lk.name().to_owned(),
