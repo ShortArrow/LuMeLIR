@@ -1996,44 +1996,21 @@ fn emit_print_literal<'c>(
     emit_printf(context, block, fmt_ptr, payload, types, loc);
 }
 
-/// Phase 2.7g (ADR 0030): runtime check for `assert(cond)`. When
-/// `cond` is false, emit the diagnostic via `printf("assertion
-/// failed!\n")` then call libc `exit(1)`. The `scf.if` here uses
-/// the void form (no result) — the assert call's return value is
-/// the cond itself, which is yielded by the caller in `emit_expr`.
-fn emit_assert<'a, 'c>(
+/// Phase 2.7h (ADR 0033, Tidy First): emit `printf("%s\n", msg_ptr)`
+/// followed by `exit(1)` into `block`. Pure-by-construction —
+/// only depends on its arguments — so it composes cleanly into
+/// both the conditional `assert` failure path and the
+/// unconditional `error(msg)` builtin (Phase 2.7h follow-up).
+fn emit_exit_with_message<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
-    cond: Value<'c, 'a>,
+    msg_ptr: Value<'c, 'a>,
     types: &Types<'c>,
     loc: Location<'c>,
 ) {
-    // Invert cond: scf.if dispatches "then" on truthy, but we want
-    // the failure path to fire when cond is false.
-    let one = block
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(types.i1, 1).into(),
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    let not_cond: Value<'c, 'a> = block
-        .append_operation(arith::xori(cond, one, loc))
-        .result(0)
-        .unwrap()
-        .into();
-
-    // Then-region: print the diagnostic, exit(1), then yield. The
-    // exit call is `noreturn` so the yield is unreachable but
-    // satisfies scf.if's structural requirement.
-    let then_region = Region::new();
-    let then_blk = Block::new(&[]);
-    let msg_ptr = emit_addressof(context, &then_blk, "s_assert_failed", types, loc);
-    let fmt_ptr = emit_addressof(context, &then_blk, "fmt_str", types, loc);
-    emit_printf(context, &then_blk, fmt_ptr, msg_ptr, types, loc);
-    let one_i32 = then_blk
+    let fmt_ptr = emit_addressof(context, block, "fmt_str", types, loc);
+    emit_printf(context, block, fmt_ptr, msg_ptr, types, loc);
+    let one_i32 = block
         .append_operation(arith::constant(
             context,
             IntegerAttribute::new(types.i32, 1).into(),
@@ -2060,7 +2037,43 @@ fn emit_assert<'a, 'c>(
         ])
         .build()
         .expect("llvm.call @exit");
-    then_blk.append_operation(exit_call);
+    block.append_operation(exit_call);
+}
+
+/// Phase 2.7g (ADR 0030): runtime check for `assert(cond)`. When
+/// `cond` is false, prints "assertion failed!" and `exit(1)`s via
+/// the shared `emit_exit_with_message` helper. The `scf.if` here
+/// uses the void form — the assert call's return value is `cond`
+/// itself, yielded by the caller in `emit_expr`.
+fn emit_assert<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    cond: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let one = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i1, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let not_cond: Value<'c, 'a> = block
+        .append_operation(arith::xori(cond, one, loc))
+        .result(0)
+        .unwrap()
+        .into();
+
+    // Then-region: emit the failure path via the shared helper,
+    // then a structurally-required (but unreachable) yield. exit()
+    // is noreturn so control never falls through.
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    let msg_ptr = emit_addressof(context, &then_blk, "s_assert_failed", types, loc);
+    emit_exit_with_message(context, &then_blk, msg_ptr, types, loc);
     then_blk.append_operation(scf::r#yield(&[], loc));
     then_region.append_block(then_blk);
 
