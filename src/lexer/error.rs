@@ -21,4 +21,9 @@ pub enum LexError {
     /// Block comment whose closing `]]` is missing (Phase 2.8c, ADR 0034).
     #[error("unterminated block comment starting at byte offset {offset}")]
     UnterminatedComment { offset: usize },
+
+    /// Long-bracket string whose closing `]==]` is missing
+    /// (Phase 2.7j, ADR 0038).
+    #[error("unterminated long-bracket string starting at byte offset {offset}")]
+    UnterminatedBracket { offset: usize },
 }

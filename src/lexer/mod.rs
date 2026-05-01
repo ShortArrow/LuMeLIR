@@ -60,6 +60,27 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
             continue;
         }
 
+        // Phase 2.7j (ADR 0038): `[==[ ... ]==]` long-bracket
+        // string. A bare `[` (no matching opener) keeps its
+        // historical "unexpected" status until table indexing
+        // arrives — the long-string match must be exact.
+        if ch == '[' {
+            if let Some(level) = try_match_long_open(bytes, offset) {
+                for _ in 0..(level + 2) {
+                    chars.next();
+                }
+                let body = scan_long_bracket_body(&mut chars, bytes, level)
+                    .map_err(|_| LexError::UnterminatedBracket { offset })?;
+                // The body scanner consumed up to and including the
+                // closing `]==]`. The next char's offset (or EOF)
+                // is therefore the token's end.
+                let end = chars.peek().map(|&(o, _)| o).unwrap_or(src.len());
+                tokens.push(Token::new(TokenKind::Str(body), Span::new(offset, end)));
+                continue;
+            }
+            // Bare `[` — fall through to the unexpected-character path.
+        }
+
         if is_ident_start(ch) {
             let (span, name) = scan_ident(src, &mut chars);
             let kind = match Keyword::from_lexeme(&name) {
@@ -917,5 +938,76 @@ mod tests {
             kinds("until"),
             vec![TokenKind::Keyword(Keyword::Until), TokenKind::Eof]
         );
+    }
+
+    // -----------------------------------------------------------
+    // Phase 2.7j — long-bracket strings + level-N comments (ADR 0038).
+    // -----------------------------------------------------------
+
+    #[test]
+    fn lex_level0_long_bracket_string() {
+        assert_eq!(
+            kinds("[[hello]]"),
+            vec![TokenKind::Str("hello".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_level1_long_bracket_string() {
+        // Level-1 brackets `[=[ ... ]=]` allow `]]` inside the body.
+        assert_eq!(
+            kinds("[=[has ]] inside]=]"),
+            vec![TokenKind::Str("has ]] inside".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_long_bracket_strips_leading_newline() {
+        // Lua spec: an immediate `\n` after the opener is dropped.
+        assert_eq!(
+            kinds("[[\nhello]]"),
+            vec![TokenKind::Str("hello".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_long_bracket_keeps_internal_newlines() {
+        assert_eq!(
+            kinds("[[a\nb]]"),
+            vec![TokenKind::Str("a\nb".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_long_bracket_does_not_process_escapes() {
+        // Body is raw — `\n` is two chars, not LF.
+        assert_eq!(
+            kinds("[[a\\nb]]"),
+            vec![TokenKind::Str("a\\nb".into()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_unterminated_long_bracket_returns_error() {
+        let err = lex("[[no close").expect_err("missing `]]` must error");
+        assert!(matches!(err, LexError::UnterminatedBracket { .. }));
+    }
+
+    #[test]
+    fn lex_level1_block_comment_is_skipped() {
+        // Level-1 block comment lets `]]` survive in the body.
+        assert_eq!(
+            kinds("--[=[ has ]] inside ]=] 1"),
+            vec![TokenKind::Number(1.0), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_open_bracket_without_long_form_is_unexpected() {
+        // `[` alone is not yet a token (no table indexing yet).
+        // It must surface as a lex error rather than silently
+        // start a long-bracket scan.
+        let err = lex("[ x]").expect_err("bare `[` should be unexpected");
+        assert!(matches!(err, LexError::Unexpected { ch: '[', .. }));
     }
 }
