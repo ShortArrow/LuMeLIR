@@ -119,6 +119,9 @@ fn emit_fmt_global<'c>(
     // `tostring(number)`. The trailing `\0` lets snprintf consume it
     // as a C string.
     emit_string_global(context, module, i8_type, "fmt_tostring_g", "%.14g\0", loc);
+    // Phase 2.7e (ADR 0028): `%lf` parses an f64 from a string for
+    // `tonumber(string)` via `sscanf`.
+    emit_string_global(context, module, i8_type, "fmt_tonumber_lf", "%lf\0", loc);
 }
 
 fn emit_string_global<'c>(
@@ -359,6 +362,19 @@ fn emit_string_runtime_decls<'c>(
         ))
         .build();
     module.body().append_operation(snprintf_op.into());
+
+    // sscanf(ptr, ptr, ...) -> i32  (variadic, Phase 2.7e)
+    let sscanf_ty = llvm::r#type::function(types.i32, &[types.ptr, types.ptr], true);
+    let sscanf_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "sscanf"))
+        .function_type(TypeAttribute::new(sscanf_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(sscanf_op.into());
 }
 
 fn emit_libm_decls<'c>(
@@ -1006,6 +1022,16 @@ fn emit_expr<'a, 'c>(
                 )?;
                 Ok(emit_tostring(context, block, arg_val, kind, types, loc))
             }
+            // Phase 2.7e (ADR 0028): `tonumber(x)`. Number identity
+            // path; String dispatched through `sscanf("%lf")` with a
+            // NaN sentinel on parse failure.
+            Callee::Builtin(Builtin::ToNumber) => {
+                let kind = infer_kind(&args[0], locals, functions);
+                let arg_val = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len, loc,
+                )?;
+                Ok(emit_tonumber(context, block, arg_val, kind, types, loc))
+            }
             Callee::User(FuncId(fid)) => {
                 let target = &functions[*fid];
                 let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
@@ -1487,6 +1513,121 @@ fn emit_tostring<'a, 'c>(
         ValueKind::Function(_) => unreachable!(
             "Function-kind tostring is rejected at HIR-time \
              (FunctionUsedAsValue) — should not reach codegen"
+        ),
+    }
+}
+
+/// Phase 2.7e (ADR 0028): convert `value` (of static `kind`) into a
+/// Number. Number → identity. String → `sscanf("%lf", buf, &out)`
+/// into an alloca'd f64; if the call returned 1 the parsed value
+/// is yielded, otherwise NaN. Other kinds reject at HIR time and
+/// never reach codegen.
+fn emit_tonumber<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    value: Value<'c, 'a>,
+    kind: ValueKind,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    match kind {
+        ValueKind::Number => value,
+        ValueKind::String => {
+            // alloca an f64 receiver — `sscanf` writes through the
+            // pointer when the conversion succeeds.
+            let one = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i32, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let receiver: Value<'c, 'a> = block
+                .append_operation(
+                    OperationBuilder::new("llvm.alloca", loc)
+                        .add_operands(&[one])
+                        .add_attributes(&[(
+                            Identifier::new(context, "elem_type"),
+                            TypeAttribute::new(types.f64).into(),
+                        )])
+                        .add_results(&[types.ptr])
+                        .build()
+                        .expect("llvm.alloca f64 (tonumber receiver)"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let fmt_ptr = emit_addressof(context, block, "fmt_tonumber_lf", types, loc);
+            let sscanf_callee_ty =
+                llvm::r#type::function(types.i32, &[types.ptr, types.ptr, types.ptr], true);
+            let n = i32::try_from(3usize).unwrap();
+            let call_op = OperationBuilder::new("llvm.call", loc)
+                .add_operands(&[value, fmt_ptr, receiver])
+                .add_attributes(&[
+                    (
+                        Identifier::new(context, "callee"),
+                        FlatSymbolRefAttribute::new(context, "sscanf").into(),
+                    ),
+                    (
+                        Identifier::new(context, "var_callee_type"),
+                        TypeAttribute::new(sscanf_callee_ty).into(),
+                    ),
+                    (
+                        Identifier::new(context, "operandSegmentSizes"),
+                        DenseI32ArrayAttribute::new(context, &[n, 0]).into(),
+                    ),
+                    (
+                        Identifier::new(context, "op_bundle_sizes"),
+                        DenseI32ArrayAttribute::new(context, &[]).into(),
+                    ),
+                ])
+                .add_results(&[types.i32])
+                .build()
+                .expect("llvm.call @sscanf");
+            let ret_i32: Value<'c, 'a> = block.append_operation(call_op).result(0).unwrap().into();
+            // If sscanf consumed one field, load the parsed f64;
+            // otherwise yield NaN. `arith.select` joins both arms.
+            let one_i32 = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i32, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let ok = block
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    ret_i32,
+                    one_i32,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let parsed = emit_load(block, receiver, types.f64, loc);
+            let nan = block
+                .append_operation(arith::constant(
+                    context,
+                    FloatAttribute::new(context, types.f64, f64::NAN).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            block
+                .append_operation(arith::select(ok, parsed, nan, loc))
+                .result(0)
+                .unwrap()
+                .into()
+        }
+        ValueKind::Bool | ValueKind::Nil | ValueKind::Function(_) => unreachable!(
+            "tonumber on Bool/Nil/Function is rejected at HIR-time \
+             (TypeMismatch / FunctionUsedAsValue) — should not reach codegen"
         ),
     }
 }

@@ -175,13 +175,18 @@ pub enum Callee {
 }
 
 /// Recognised builtin functions. Phase 2.0 had only `print`; Phase
-/// 2.7c (ADR 0026) adds `tostring`.
+/// 2.7c (ADR 0026) added `tostring`; Phase 2.7e (ADR 0028) adds
+/// `tonumber`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Builtin {
     Print,
     /// `tostring(x)` — converts Number/Bool/Nil/String to String.
     /// Function values are rejected (Phase 2.7c, ADR 0026).
     ToString,
+    /// `tonumber(x)` — Number→identity, String→`sscanf("%lf")`
+    /// with NaN sentinel on failure (Phase 2.7e, ADR 0028).
+    /// Other kinds rejected.
+    ToNumber,
 }
 
 impl Builtin {
@@ -189,6 +194,7 @@ impl Builtin {
         match name {
             "print" => Some(Builtin::Print),
             "tostring" => Some(Builtin::ToString),
+            "tonumber" => Some(Builtin::ToNumber),
             _ => None,
         }
     }
@@ -197,6 +203,7 @@ impl Builtin {
         match self {
             Builtin::Print => 1,
             Builtin::ToString => 1,
+            Builtin::ToNumber => 1,
         }
     }
 
@@ -204,6 +211,7 @@ impl Builtin {
         match self {
             Builtin::Print => "print",
             Builtin::ToString => "tostring",
+            Builtin::ToNumber => "tonumber",
         }
     }
 }

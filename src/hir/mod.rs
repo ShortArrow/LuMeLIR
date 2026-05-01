@@ -92,6 +92,7 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // actually appears as a comparison operand).
             Callee::Builtin(Builtin::Print) => ValueKind::Number,
             Callee::Builtin(Builtin::ToString) => ValueKind::String,
+            Callee::Builtin(Builtin::ToNumber) => ValueKind::Number,
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.
@@ -1675,7 +1676,8 @@ impl LowerCtx {
         // Function value (function values cannot be printed or otherwise
         // observed as values yet). Reject explicitly.
         for arg in &lowered_args {
-            if let ValueKind::Function(_) = infer_kind(arg, &self.locals, &self.functions) {
+            let k = infer_kind(arg, &self.locals, &self.functions);
+            if let ValueKind::Function(_) = k {
                 let arg_name = match &arg.kind {
                     HirExprKind::Local(LocalId(idx)) => self.locals[*idx].name.clone(),
                     HirExprKind::FunctionRef(_) => "<anonymous>".to_owned(),
@@ -1683,6 +1685,18 @@ impl LowerCtx {
                 };
                 return Err(HirError::FunctionUsedAsValue {
                     name: arg_name,
+                    offset: arg.span.start,
+                });
+            }
+            // Phase 2.7e (ADR 0028): `tonumber(x)` only accepts
+            // Number or String. Other kinds reject as TypeMismatch.
+            if matches!(builtin, Builtin::ToNumber)
+                && !matches!(k, ValueKind::Number | ValueKind::String)
+            {
+                return Err(HirError::TypeMismatch {
+                    op: "tonumber".to_owned(),
+                    lhs_kind: "number or string".to_owned(),
+                    rhs_kind: k.name().to_owned(),
                     offset: arg.span.start,
                 });
             }
