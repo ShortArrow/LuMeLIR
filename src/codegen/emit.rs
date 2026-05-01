@@ -281,6 +281,12 @@ fn collect_string_pool(chunk: &HirChunk) -> std::collections::HashMap<String, St
                     visit_stmt(st, set);
                 }
             }
+            HirStmtKind::Repeat { body, cond, .. } => {
+                for st in body {
+                    visit_stmt(st, set);
+                }
+                visit_expr(cond, set);
+            }
             HirStmtKind::ForNumeric {
                 start,
                 stop,
@@ -773,6 +779,16 @@ fn emit_stmt<'a, 'c>(
         } => {
             emit_while(
                 context, block, cond, body, *break_id, slots, locals, functions, types, params_len,
+                loc,
+            )?;
+        }
+        HirStmtKind::Repeat {
+            body,
+            cond,
+            break_id,
+        } => {
+            emit_repeat(
+                context, block, body, cond, *break_id, slots, locals, functions, types, params_len,
                 loc,
             )?;
         }
@@ -2486,6 +2502,86 @@ fn emit_while<'a, 'c>(
     let after = build_body_region(
         context, body, slots, locals, functions, types, params_len, loc,
     )?;
+
+    parent.append_operation(scf::r#while(&[], &[], before, after, loc));
+    Ok(())
+}
+
+/// Phase 2.4b (ADR 0035): `repeat body until cond`. Lowers to
+/// `scf.while` with body and cond evaluation packed into the
+/// `before` region and an empty `after` region — yielding the
+/// do-while semantics where the body executes before the cond is
+/// tested. `cond_i1` is **inverted** (we continue while `not
+/// cond`) and AND-extended with `not _broken` when a break flag
+/// was allocated, matching the existing `emit_while` discipline.
+#[allow(clippy::too_many_arguments)]
+fn emit_repeat<'a, 'c>(
+    context: &'c Context,
+    parent: &'a Block<'c>,
+    body: &[HirStmt],
+    cond: &HirExpr,
+    break_id: Option<LocalId>,
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    // Before region: body, then evaluate cond → not_cond [AND not_broken].
+    let before = Region::new();
+    let before_blk = Block::new(&[]);
+    let blk_slots = transmute_slots(slots);
+    emit_stmts(
+        context,
+        &before_blk,
+        body,
+        blk_slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        loc,
+    )?;
+    let cond_kind = infer_kind(cond, locals, functions);
+    let cond_val = emit_expr(
+        context,
+        &before_blk,
+        cond,
+        blk_slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        loc,
+    )?;
+    let cond_i1 = emit_truthiness(context, &before_blk, cond_val, cond_kind, types, loc);
+    let one = before_blk
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i1, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mut continue_i1: Value<'c, '_> = before_blk
+        .append_operation(arith::xori(cond_i1, one, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    if let Some(id) = break_id {
+        continue_i1 = and_not_broken(context, &before_blk, continue_i1, blk_slots, id, types, loc);
+    }
+    before_blk.append_operation(scf::condition(continue_i1, &[], loc));
+    before.append_block(before_blk);
+
+    // After region: empty — body already ran in `before`. The yield
+    // is structurally required by scf.while.
+    let after = Region::new();
+    let after_blk = Block::new(&[]);
+    after_blk.append_operation(scf::r#yield(&[], loc));
+    after.append_block(after_blk);
 
     parent.append_operation(scf::r#while(&[], &[], before, after, loc));
     Ok(())

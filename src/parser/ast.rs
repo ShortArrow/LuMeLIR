@@ -145,6 +145,13 @@ pub enum StmtKind {
         cond: Expr,
         body: Chunk,
     },
+    /// `repeat ... until cond` (Phase 2.4b, ADR 0035). The body
+    /// runs at least once; the cond is evaluated at the bottom and
+    /// — per Lua 5.4 §3.3.4 — sees locals declared in the body.
+    Repeat {
+        body: Chunk,
+        cond: Expr,
+    },
     /// `for var = start, stop[, step] do body end` (Lua 5.4 §3.3.5).
     /// `step` is `None` when the implicit `1` is used.
     ForNumeric {

@@ -95,6 +95,18 @@ pub enum HirStmtKind {
         body: Vec<HirStmt>,
         break_id: Option<LocalId>,
     },
+    /// `repeat body until cond` (Phase 2.4b, ADR 0035). Same
+    /// `break_id` treatment as `While`. The cond is lowered in the
+    /// body's lexical scope per Lua 5.4 §3.3.4 — body-introduced
+    /// locals are visible to the until-test. Codegen runs body +
+    /// cond eval inside `scf.while`'s `before` region and continues
+    /// while `not cond` (AND-extended with `not _broken` when the
+    /// body holds a reachable `break`).
+    Repeat {
+        body: Vec<HirStmt>,
+        cond: HirExpr,
+        break_id: Option<LocalId>,
+    },
     /// `for var = start, stop[, step] do body end` (Lua 5.4 §3.3.5).
     /// `step` is always present in the HIR — the parser's `Option`
     /// is materialised into a `HirExpr::Number(1.0)` at lowering time.

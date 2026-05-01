@@ -829,4 +829,24 @@ mod tests {
             ]
         );
     }
+
+    // -----------------------------------------------------------
+    // Phase 2.4b — `repeat` / `until` keywords (ADR 0035).
+    // -----------------------------------------------------------
+
+    #[test]
+    fn lex_repeat_keyword() {
+        assert_eq!(
+            kinds("repeat"),
+            vec![TokenKind::Keyword(Keyword::Repeat), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_until_keyword() {
+        assert_eq!(
+            kinds("until"),
+            vec![TokenKind::Keyword(Keyword::Until), TokenKind::Eof]
+        );
+    }
 }

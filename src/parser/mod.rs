@@ -82,6 +82,7 @@ impl<'t> Parser<'t> {
             TokenKind::Keyword(Keyword::Do) => self.parse_block(),
             TokenKind::Keyword(Keyword::If) => self.parse_if(),
             TokenKind::Keyword(Keyword::While) => self.parse_while(),
+            TokenKind::Keyword(Keyword::Repeat) => self.parse_repeat(),
             TokenKind::Keyword(Keyword::For) => self.parse_for(),
             TokenKind::Keyword(Keyword::Break) => {
                 let tok = self.bump().clone();
@@ -231,6 +232,15 @@ impl<'t> Parser<'t> {
         let end_tok = self.expect_keyword(Keyword::End)?;
         let span = Span::new(while_tok.span.start, end_tok.span.end);
         Ok(Stmt::new(StmtKind::While { cond, body }, span))
+    }
+
+    fn parse_repeat(&mut self) -> Result<Stmt, ParseError> {
+        let repeat_tok = self.bump().clone();
+        let body = self.parse_chunk_until(&[TokenKind::Keyword(Keyword::Until), TokenKind::Eof])?;
+        self.expect_keyword(Keyword::Until)?;
+        let cond = self.parse_expr(0)?;
+        let span = Span::new(repeat_tok.span.start, cond.span.end);
+        Ok(Stmt::new(StmtKind::Repeat { body, cond }, span))
     }
 
     fn peek_kind_at(&self, offset: usize) -> Option<&TokenKind> {
@@ -799,6 +809,10 @@ mod tests {
             StmtKind::While { cond, body } => StmtKind::While {
                 cond: strip_span_expr(cond),
                 body: body.into_iter().map(strip_span_stmt).collect(),
+            },
+            StmtKind::Repeat { body, cond } => StmtKind::Repeat {
+                body: body.into_iter().map(strip_span_stmt).collect(),
+                cond: strip_span_expr(cond),
             },
             StmtKind::ForNumeric {
                 var,

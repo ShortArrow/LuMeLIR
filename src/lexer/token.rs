@@ -81,7 +81,8 @@ pub enum TokenKind {
 
 /// Reserved words. Grows phase by phase: 2.0 `local`, 2.1 `do`/`end`,
 /// 2.2b `true`/`false`, 2.3a `nil`, 2.3b `if`/`then`/`else`/`elseif`/`while`,
-/// 2.3c `and`/`or`/`not`, 2.3d `for`, 2.4 `break`, 2.5a `function`/`return`.
+/// 2.3c `and`/`or`/`not`, 2.3d `for`, 2.4 `break`, 2.5a `function`/`return`,
+/// 2.4b (ADR 0035) `repeat`/`until`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keyword {
     Local,
@@ -102,6 +103,8 @@ pub enum Keyword {
     Break,
     Function,
     Return,
+    Repeat,
+    Until,
 }
 
 impl Keyword {
@@ -125,6 +128,8 @@ impl Keyword {
             "break" => Some(Keyword::Break),
             "function" => Some(Keyword::Function),
             "return" => Some(Keyword::Return),
+            "repeat" => Some(Keyword::Repeat),
+            "until" => Some(Keyword::Until),
             _ => None,
         }
     }

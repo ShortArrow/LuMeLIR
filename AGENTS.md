@@ -34,6 +34,7 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.3c short-circuit | **Done** | `and`/`or`/`not` via `scf.if` expression form + `arith.xori` (ADR 0013) |
 | ‣ 2.3d numeric for | **Done** | `for i=s,e[,step] do ... end` via `scf.while` desugar + read-only loop var (ADR 0014) |
 | ‣ 2.4 break | **Done** | `break` via HIR-time desugar to hidden `_broken` flag + body guard wrap (ADR 0015) |
+| ‣ 2.4b `repeat ... until` | **Done** | do-while loop, until-cond sees body locals, scf.while body-in-`before` (ADR 0035) |
 | ‣ 2.5a top-level functions | **Done** | `local function`, `return`, recursion (Number-only params/ret) (ADR 0016) |
 | ‣ 2.5b anonymous + first-class (HIR-time) | **Done** | `local f = function() end`, alias `local g = f`, static dispatch (ADR 0017) |
 | ‣ 2.5b.2 functions as args | **Done** | `apply(f, x)`, `func.call_indirect`, param-kind back-inference (ADR 0018) |

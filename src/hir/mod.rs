@@ -144,8 +144,39 @@ fn stmt_contains_break(s: &Stmt) -> bool {
         StmtKind::Block(b) => body_contains_break(b),
         // Nested loops have their own break scope — their breaks do
         // not escape to this loop.
-        StmtKind::While { .. } | StmtKind::ForNumeric { .. } => false,
+        StmtKind::While { .. } | StmtKind::ForNumeric { .. } | StmtKind::Repeat { .. } => false,
         _ => false,
+    }
+}
+
+/// Wrap a loop statement (`While`/`Repeat`/`ForNumeric`) with a
+/// preceding `LocalInit` of the `_broken` flag when one was
+/// allocated. Returning a fresh `Block` is the canonical
+/// representation: the outer chunk sees a single statement, the
+/// flag is initialised exactly once before the loop fires, and the
+/// loop's `break_id` reads the same slot. Pure relative to its
+/// inputs (Phase 2.4b shared between `While` and `Repeat`, ADR 0035).
+fn wrap_with_break_init(loop_stmt: HirStmt, break_id: Option<LocalId>, span: Span) -> HirStmt {
+    match break_id {
+        None => loop_stmt,
+        Some(id) => {
+            let init = HirStmt {
+                kind: HirStmtKind::LocalInit {
+                    id,
+                    value: HirExpr {
+                        kind: HirExprKind::Bool(false),
+                        span,
+                    },
+                },
+                span,
+            };
+            HirStmt {
+                kind: HirStmtKind::Block {
+                    stmts: vec![init, loop_stmt],
+                },
+                span,
+            }
+        }
     }
 }
 
@@ -355,6 +386,12 @@ fn infer_user_function_param_kinds(
                     visit_stmt(st, names, kinds, seen);
                 }
             }
+            StmtKind::Repeat { body, cond } => {
+                for st in body {
+                    visit_stmt(st, names, kinds, seen);
+                }
+                visit_expr(cond, names, kinds, seen);
+            }
             // FunctionDef bodies are also walked — recursive calls and
             // calls into sibling top-level functions count.
             StmtKind::FunctionDef { body, .. } => {
@@ -476,6 +513,12 @@ fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
                 for s in body {
                     visit_stmt(s, name_to_idx, kinds);
                 }
+            }
+            StmtKind::Repeat { body, cond } => {
+                for s in body {
+                    visit_stmt(s, name_to_idx, kinds);
+                }
+                visit_expr(cond, name_to_idx, kinds);
             }
             StmtKind::ForNumeric {
                 start,
@@ -1003,26 +1046,38 @@ impl LowerCtx {
                     },
                     span: stmt.span,
                 };
-                if let Some(id) = break_id {
-                    let init = HirStmt {
-                        kind: HirStmtKind::LocalInit {
-                            id,
-                            value: HirExpr {
-                                kind: HirExprKind::Bool(false),
-                                span: stmt.span,
-                            },
-                        },
-                        span: stmt.span,
+                Ok(wrap_with_break_init(while_stmt, break_id, stmt.span))
+            }
+            // Phase 2.4b (ADR 0035): `repeat body until cond`. Body
+            // and cond share a lexical scope; lower them as a
+            // single scoped unit so until-cond can resolve names
+            // declared in the body.
+            StmtKind::Repeat { body, cond } => {
+                let needs_break = body_contains_break(body);
+                let break_id =
+                    if needs_break {
+                        Some(self.declare_local(
+                            format!("_broken_{}", self.locals.len()),
+                            ValueKind::Bool,
+                        ))
+                    } else {
+                        None
                     };
-                    Ok(HirStmt {
-                        kind: HirStmtKind::Block {
-                            stmts: vec![init, while_stmt],
-                        },
-                        span: stmt.span,
-                    })
-                } else {
-                    Ok(while_stmt)
-                }
+                self.loop_break_targets.push(break_id);
+                self.scopes.push(HashMap::new());
+                let body_hir = self.lower_stmts_maybe_guarded(body)?;
+                let cond_hir = self.lower_expr(cond)?;
+                self.scopes.pop();
+                self.loop_break_targets.pop();
+                let repeat_stmt = HirStmt {
+                    kind: HirStmtKind::Repeat {
+                        body: body_hir,
+                        cond: cond_hir,
+                        break_id,
+                    },
+                    span: stmt.span,
+                };
+                Ok(wrap_with_break_init(repeat_stmt, break_id, stmt.span))
             }
             StmtKind::FunctionDef { .. } => {
                 // FunctionDef at top level is lifted out into
@@ -1140,26 +1195,7 @@ impl LowerCtx {
                     },
                     span: stmt.span,
                 };
-                if let Some(id) = break_id {
-                    let init = HirStmt {
-                        kind: HirStmtKind::LocalInit {
-                            id,
-                            value: HirExpr {
-                                kind: HirExprKind::Bool(false),
-                                span: stmt.span,
-                            },
-                        },
-                        span: stmt.span,
-                    };
-                    Ok(HirStmt {
-                        kind: HirStmtKind::Block {
-                            stmts: vec![init, for_stmt],
-                        },
-                        span: stmt.span,
-                    })
-                } else {
-                    Ok(for_stmt)
-                }
+                Ok(wrap_with_break_init(for_stmt, break_id, stmt.span))
             }
             StmtKind::ExprStmt(expr) => {
                 let hir_expr = self.lower_expr(expr)?;
@@ -1924,6 +1960,62 @@ mod tests {
     fn lower_error_with_zero_args_is_arity_mismatch() {
         let err = lower_src("error()").expect_err("error() must reject");
         assert!(matches!(err, HirError::ArityMismatch { .. }));
+    }
+
+    // -----------------------------------------------------------
+    // Phase 2.4b — `repeat ... until cond` (ADR 0035).
+    // -----------------------------------------------------------
+
+    #[test]
+    fn lower_repeat_until_lowers_to_repeat_variant() {
+        let hir =
+            lower_src("local i = 0\nrepeat i = i + 1 until i == 3").expect("repeat must lower");
+        // The repeat lowers to a top-level Repeat (no break flag).
+        let HirStmtKind::Repeat { body, break_id, .. } = &hir.stmts[1].kind else {
+            panic!("expected Repeat at stmts[1], got {:?}", hir.stmts[1].kind);
+        };
+        assert!(break_id.is_none(), "no break in body → no flag");
+        assert!(!body.is_empty());
+    }
+
+    #[test]
+    fn lower_repeat_with_break_allocates_break_id() {
+        let src = "repeat if true then break end until false";
+        let hir = lower_src(src).expect("repeat+break must lower");
+        // With a break, Repeat is wrapped in an enclosing Block
+        // that initialises the `_broken` flag, mirroring the
+        // existing While/ForNumeric pattern.
+        let HirStmtKind::Block { stmts } = &hir.stmts[0].kind else {
+            panic!("expected enclosing Block for repeat+break");
+        };
+        assert!(matches!(stmts[0].kind, HirStmtKind::LocalInit { .. }));
+        let HirStmtKind::Repeat { break_id, .. } = &stmts[1].kind else {
+            panic!("expected inner Repeat");
+        };
+        assert!(break_id.is_some());
+    }
+
+    #[test]
+    fn lower_repeat_cond_sees_body_local() {
+        // Lua 5.4 §3.3.4: the until-cond is evaluated inside the
+        // body's scope and may reference body-introduced locals.
+        let src = "repeat local x = 5 until x == 5";
+        let hir = lower_src(src).expect("until-cond must see body local");
+        let HirStmtKind::Repeat { cond, .. } = &hir.stmts[0].kind else {
+            panic!("expected Repeat");
+        };
+        // The cond resolves `x` to the body's local id (LocalId(0)).
+        let HirExprKind::BinOp { lhs, .. } = &cond.kind else {
+            panic!("expected BinOp in cond");
+        };
+        assert!(matches!(lhs.kind, HirExprKind::Local(LocalId(0))));
+    }
+
+    #[test]
+    fn lower_repeat_cond_referencing_undefined_name_errors() {
+        let err =
+            lower_src("repeat until missing_var").expect_err("undefined cond name must reject");
+        assert!(matches!(err, HirError::UndefinedName { .. }));
     }
 
     #[test]
