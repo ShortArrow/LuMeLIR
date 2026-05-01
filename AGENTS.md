@@ -45,6 +45,7 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.7c `tostring` + concat auto-coerce | **Done** | `tostring(x)` builtin, `"x"..1`/`..true`/`..nil` desugar via tostring (ADR 0026) |
 | ‣ 2.7d lexicographic string compare | **Done** | `<` `<=` `>` `>=` for String operands via strcmp (ADR 0027) |
 | ‣ 2.7e `tonumber` (NaN sentinel) | **Done** | `tonumber(n)` identity, `tonumber(s)` via sscanf, NaN on parse fail (ADR 0028) |
+| ‣ 2.7f `type(x)` | **Done** | static kind→typename ptr, Function values admissible (ADR 0029) |
 | ‣ 2.5c closures | Not started | upvalue capture, heap-allocated environments |
 | ‣ 2.6+ tables / metatables | Not started | tables, metatables, generic for, GC |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |

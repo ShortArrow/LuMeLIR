@@ -93,6 +93,7 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             Callee::Builtin(Builtin::Print) => ValueKind::Number,
             Callee::Builtin(Builtin::ToString) => ValueKind::String,
             Callee::Builtin(Builtin::ToNumber) => ValueKind::Number,
+            Callee::Builtin(Builtin::Type) => ValueKind::String,
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.
@@ -1677,7 +1678,12 @@ impl LowerCtx {
         // observed as values yet). Reject explicitly.
         for arg in &lowered_args {
             let k = infer_kind(arg, &self.locals, &self.functions);
-            if let ValueKind::Function(_) = k {
+            // Phase 2.7f (ADR 0029): `type(f)` is the one builtin
+            // that legitimately accepts a Function value — every
+            // other call site keeps treating it as a hard error.
+            if let ValueKind::Function(_) = k
+                && !matches!(builtin, Builtin::Type)
+            {
                 let arg_name = match &arg.kind {
                     HirExprKind::Local(LocalId(idx)) => self.locals[*idx].name.clone(),
                     HirExprKind::FunctionRef(_) => "<anonymous>".to_owned(),

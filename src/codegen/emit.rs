@@ -122,6 +122,42 @@ fn emit_fmt_global<'c>(
     // Phase 2.7e (ADR 0028): `%lf` parses an f64 from a string for
     // `tonumber(string)` via `sscanf`.
     emit_string_global(context, module, i8_type, "fmt_tonumber_lf", "%lf\0", loc);
+    // Phase 2.7f (ADR 0029): per-kind Lua type-name strings for the
+    // `type(x)` builtin. Each is NUL-terminated so they can flow
+    // straight through `print(type(x))` / concat without any copy.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_typename_number",
+        "number\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_typename_string",
+        "string\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_typename_boolean",
+        "boolean\0",
+        loc,
+    );
+    emit_string_global(context, module, i8_type, "s_typename_nil", "nil\0", loc);
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_typename_function",
+        "function\0",
+        loc,
+    );
 }
 
 fn emit_string_global<'c>(
@@ -1031,6 +1067,30 @@ fn emit_expr<'a, 'c>(
                     context, block, &args[0], slots, locals, functions, types, params_len, loc,
                 )?;
                 Ok(emit_tonumber(context, block, arg_val, kind, types, loc))
+            }
+            // Phase 2.7f (ADR 0029): `type(x)` is pure static
+            // dispatch — the arg's value is irrelevant, only its
+            // kind matters. We still emit_expr the arg because Lua
+            // semantics evaluate it for side effects (e.g. when the
+            // arg is itself a function call that prints).
+            Callee::Builtin(Builtin::Type) => {
+                let kind = infer_kind(&args[0], locals, functions);
+                if !matches!(
+                    args[0].kind,
+                    HirExprKind::FunctionRef(_) | HirExprKind::Local(_)
+                ) {
+                    let _ = emit_expr(
+                        context, block, &args[0], slots, locals, functions, types, params_len, loc,
+                    )?;
+                }
+                let global = match kind {
+                    ValueKind::Number => "s_typename_number",
+                    ValueKind::String => "s_typename_string",
+                    ValueKind::Bool => "s_typename_boolean",
+                    ValueKind::Nil => "s_typename_nil",
+                    ValueKind::Function(_) => "s_typename_function",
+                };
+                Ok(emit_addressof(context, block, global, types, loc))
             }
             Callee::User(FuncId(fid)) => {
                 let target = &functions[*fid];

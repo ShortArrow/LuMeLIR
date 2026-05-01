@@ -175,8 +175,8 @@ pub enum Callee {
 }
 
 /// Recognised builtin functions. Phase 2.0 had only `print`; Phase
-/// 2.7c (ADR 0026) added `tostring`; Phase 2.7e (ADR 0028) adds
-/// `tonumber`.
+/// 2.7c (ADR 0026) added `tostring`; Phase 2.7e (ADR 0028) added
+/// `tonumber`; Phase 2.7f (ADR 0029) adds `type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Builtin {
     Print,
@@ -187,6 +187,10 @@ pub enum Builtin {
     /// with NaN sentinel on failure (Phase 2.7e, ADR 0028).
     /// Other kinds rejected.
     ToNumber,
+    /// `type(x)` — returns the Lua type name as a String. Accepts
+    /// every kind including Function values (the only builtin that
+    /// does so; Phase 2.7f, ADR 0029).
+    Type,
 }
 
 impl Builtin {
@@ -195,6 +199,7 @@ impl Builtin {
             "print" => Some(Builtin::Print),
             "tostring" => Some(Builtin::ToString),
             "tonumber" => Some(Builtin::ToNumber),
+            "type" => Some(Builtin::Type),
             _ => None,
         }
     }
@@ -204,6 +209,7 @@ impl Builtin {
             Builtin::Print => 1,
             Builtin::ToString => 1,
             Builtin::ToNumber => 1,
+            Builtin::Type => 1,
         }
     }
 
@@ -212,6 +218,7 @@ impl Builtin {
             Builtin::Print => "print",
             Builtin::ToString => "tostring",
             Builtin::ToNumber => "tonumber",
+            Builtin::Type => "type",
         }
     }
 }
