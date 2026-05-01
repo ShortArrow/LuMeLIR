@@ -91,6 +91,7 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // so existing arithmetic guards remain consistent (it never
             // actually appears as a comparison operand).
             Callee::Builtin(Builtin::Print) => ValueKind::Number,
+            Callee::Builtin(Builtin::ToString) => ValueKind::String,
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.
@@ -161,6 +162,32 @@ fn wrap_with_broken_guard(stmt: HirStmt, broken_id: LocalId) -> HirStmt {
             else_body: None,
         },
         span,
+    }
+}
+
+/// Phase 2.7c (ADR 0026): auto-wrap a non-String value in a
+/// `tostring(...)` builtin call so `..` accepts mixed operands.
+/// Function-kind values are still rejected — there is no useful
+/// string representation in the current scope.
+fn coerce_to_string(expr: HirExpr, kind: ValueKind, offset: usize) -> Result<HirExpr, HirError> {
+    match kind {
+        ValueKind::String => Ok(expr),
+        ValueKind::Function(_) => Err(HirError::TypeMismatch {
+            op: "..".to_owned(),
+            lhs_kind: "string".to_owned(),
+            rhs_kind: kind.name().to_owned(),
+            offset,
+        }),
+        ValueKind::Number | ValueKind::Bool | ValueKind::Nil => {
+            let span = expr.span;
+            Ok(HirExpr {
+                kind: HirExprKind::Call {
+                    callee: Callee::Builtin(Builtin::ToString),
+                    args: vec![expr],
+                },
+                span,
+            })
+        }
     }
 }
 
@@ -1422,21 +1449,19 @@ impl LowerCtx {
                             rhs: Box::new(rhs_hir),
                         }
                     }
-                    // Phase 2.7b (ADR 0025): `..` requires both
-                    // operands to be String. Result is String.
+                    // Phase 2.7b (ADR 0025): `..` produces a String.
+                    // Phase 2.7c (ADR 0026): non-String operands —
+                    // Number, Bool, Nil — are silently wrapped in
+                    // a `tostring(...)` call so `"x"..1` works the
+                    // same way it does in stock Lua. Function-kind
+                    // operands remain a TypeMismatch.
                     BinOp::Concat => {
-                        if !(lk == ValueKind::String && rk == ValueKind::String) {
-                            return Err(HirError::TypeMismatch {
-                                op: "..".to_owned(),
-                                lhs_kind: lk.name().to_owned(),
-                                rhs_kind: rk.name().to_owned(),
-                                offset: expr.span.start,
-                            });
-                        }
+                        let lhs_coerced = coerce_to_string(lhs_hir, lk, expr.span.start)?;
+                        let rhs_coerced = coerce_to_string(rhs_hir, rk, expr.span.start)?;
                         HirExprKind::BinOp {
                             op: *op,
-                            lhs: Box::new(lhs_hir),
-                            rhs: Box::new(rhs_hir),
+                            lhs: Box::new(lhs_coerced),
+                            rhs: Box::new(rhs_coerced),
                         }
                     }
                 }

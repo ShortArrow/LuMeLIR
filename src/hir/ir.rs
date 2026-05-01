@@ -174,16 +174,21 @@ pub enum Callee {
     Indirect(LocalId),
 }
 
-/// Recognised builtin functions. Phase 2.0 has only `print`.
+/// Recognised builtin functions. Phase 2.0 had only `print`; Phase
+/// 2.7c (ADR 0026) adds `tostring`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Builtin {
     Print,
+    /// `tostring(x)` — converts Number/Bool/Nil/String to String.
+    /// Function values are rejected (Phase 2.7c, ADR 0026).
+    ToString,
 }
 
 impl Builtin {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "print" => Some(Builtin::Print),
+            "tostring" => Some(Builtin::ToString),
             _ => None,
         }
     }
@@ -191,12 +196,14 @@ impl Builtin {
     pub fn arity(self) -> usize {
         match self {
             Builtin::Print => 1,
+            Builtin::ToString => 1,
         }
     }
 
     pub fn name(self) -> &'static str {
         match self {
             Builtin::Print => "print",
+            Builtin::ToString => "tostring",
         }
     }
 }
