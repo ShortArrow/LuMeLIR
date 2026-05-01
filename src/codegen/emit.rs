@@ -115,6 +115,10 @@ fn emit_fmt_global<'c>(
     emit_string_global(context, module, i8_type, "s_false", "false\0", loc);
     // Phase 2.3a: nil string for `print(nil)`.
     emit_string_global(context, module, i8_type, "s_nil", "nil\0", loc);
+    // Phase 2.7c (ADR 0026): `%.14g` is the Lua-spec format for
+    // `tostring(number)`. The trailing `\0` lets snprintf consume it
+    // as a C string.
+    emit_string_global(context, module, i8_type, "fmt_tostring_g", "%.14g\0", loc);
 }
 
 fn emit_string_global<'c>(
@@ -342,6 +346,19 @@ fn emit_string_runtime_decls<'c>(
         ))
         .build();
     module.body().append_operation(strcmp_op.into());
+
+    // snprintf(ptr, i64, ptr, ...) -> i32  (variadic, Phase 2.7c)
+    let snprintf_ty = llvm::r#type::function(types.i32, &[types.ptr, types.i64, types.ptr], true);
+    let snprintf_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "snprintf"))
+        .function_type(TypeAttribute::new(snprintf_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(snprintf_op.into());
 }
 
 fn emit_libm_decls<'c>(
@@ -973,6 +990,16 @@ fn emit_expr<'a, 'c>(
                 emit_print_value(context, block, arg_val, kind, types, loc);
                 Ok(arg_val)
             }
+            // Phase 2.7c (ADR 0026): `tostring(x)` materialises a
+            // String for the four supported kinds. Function values
+            // are rejected at HIR-time and never reach codegen.
+            Callee::Builtin(Builtin::ToString) => {
+                let kind = infer_kind(&args[0], locals, functions);
+                let arg_val = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len, loc,
+                )?;
+                Ok(emit_tostring(context, block, arg_val, kind, types, loc))
+            }
             Callee::User(FuncId(fid)) => {
                 let target = &functions[*fid];
                 let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
@@ -1374,6 +1401,88 @@ fn emit_concat<'a, 'c>(
         loc,
     );
     buf
+}
+
+/// Phase 2.7c (ADR 0026): convert `value` (of static `kind`) into a
+/// String. Number → `snprintf("%.14g", n)` into a malloc'd buffer.
+/// Bool / Nil reuse the existing `s_true` / `s_false` / `s_nil`
+/// global strings. String values are returned as-is.
+fn emit_tostring<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    value: Value<'c, 'a>,
+    kind: ValueKind,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    match kind {
+        ValueKind::String => value,
+        ValueKind::Bool => {
+            // Materialise an i1 → ptr select between `s_true` /
+            // `s_false`. Mirrors the existing emit_print_bool path
+            // but yields a ptr instead of consuming it directly.
+            let true_ptr = emit_addressof(context, block, "s_true", types, loc);
+            let false_ptr = emit_addressof(context, block, "s_false", types, loc);
+            let select = OperationBuilder::new("llvm.select", loc)
+                .add_operands(&[value, true_ptr, false_ptr])
+                .add_results(&[types.ptr])
+                .build()
+                .expect("llvm.select");
+            block.append_operation(select).result(0).unwrap().into()
+        }
+        ValueKind::Nil => emit_addressof(context, block, "s_nil", types, loc),
+        ValueKind::Number => {
+            // Allocate a fixed-size buffer (32 bytes — covers any f64
+            // formatted with %.14g plus sign, dot, exponent, NUL),
+            // then `snprintf(buf, 32, "%.14g", n)`. Returns the buf
+            // ptr; intentionally leaks (no GC, ADR 0025).
+            let buf_size = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 32).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let buf = emit_libc_call_ptr(context, block, "malloc", &[buf_size], types, loc);
+            let fmt_ptr = emit_addressof(context, block, "fmt_tostring_g", types, loc);
+            // snprintf is variadic — needs the same callee_type
+            // attribute pattern as printf.
+            let snprintf_callee_ty =
+                llvm::r#type::function(types.i32, &[types.ptr, types.i64, types.ptr], true);
+            let n = i32::try_from(4usize).unwrap();
+            let call_op = OperationBuilder::new("llvm.call", loc)
+                .add_operands(&[buf, buf_size, fmt_ptr, value])
+                .add_attributes(&[
+                    (
+                        Identifier::new(context, "callee"),
+                        FlatSymbolRefAttribute::new(context, "snprintf").into(),
+                    ),
+                    (
+                        Identifier::new(context, "var_callee_type"),
+                        TypeAttribute::new(snprintf_callee_ty).into(),
+                    ),
+                    (
+                        Identifier::new(context, "operandSegmentSizes"),
+                        DenseI32ArrayAttribute::new(context, &[n, 0]).into(),
+                    ),
+                    (
+                        Identifier::new(context, "op_bundle_sizes"),
+                        DenseI32ArrayAttribute::new(context, &[]).into(),
+                    ),
+                ])
+                .add_results(&[types.i32])
+                .build()
+                .expect("llvm.call @snprintf");
+            block.append_operation(call_op);
+            buf
+        }
+        ValueKind::Function(_) => unreachable!(
+            "Function-kind tostring is rejected at HIR-time \
+             (FunctionUsedAsValue) — should not reach codegen"
+        ),
+    }
 }
 
 /// Phase 2.7b (ADR 0025): String equality via `strcmp`. `a == b` is

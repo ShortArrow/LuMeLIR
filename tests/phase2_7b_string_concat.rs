@@ -100,9 +100,15 @@ if s == \"hello\" then print(1) else print(0) end";
 }
 
 #[test]
-fn concat_number_to_string_is_static_error() {
-    // `..` requires both operands to be String. Number → reject.
-    let chunk = lumelir::parser::parse("print(\"x\" .. 1)").unwrap();
+fn concat_function_value_is_static_error() {
+    // After Phase 2.7c (ADR 0026) Number/Bool/Nil auto-coerce, but
+    // Function values still have no useful string form and must
+    // surface a HIR-time TypeMismatch.
+    let chunk = lumelir::parser::parse(
+        "local f = function() return 1 end
+print(\"x\" .. f)",
+    )
+    .unwrap();
     assert!(lumelir::hir::lower(&chunk).is_err());
 }
 
