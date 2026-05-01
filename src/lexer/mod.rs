@@ -24,19 +24,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
             continue;
         }
 
-        // Phase 2.8a (ADR 0031): Lua single-line comment `-- ...`.
-        // Treated as whitespace — consumed up to (but not
-        // including) the next `\n`, or EOF. Long-bracket and `[[...]]`
-        // forms are deferred.
+        // Phase 2.8a (ADR 0031) / 2.8c (ADR 0034): Lua comments.
+        // Both forms are treated as whitespace post-tokenisation —
+        // dispatched here, never escape into the token stream.
         if ch == '-' && bytes.get(offset + 1) == Some(&b'-') {
             chars.next(); // first '-'
             chars.next(); // second '-'
-            while let Some(&(_, c)) = chars.peek() {
-                if c == '\n' {
-                    break;
-                }
-                chars.next();
-            }
+            skip_line_comment(&mut chars);
             continue;
         }
 
@@ -126,6 +120,23 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
     let end = src.len();
     tokens.push(Token::new(TokenKind::Eof, Span::new(end, end)));
     Ok(tokens)
+}
+
+/// Phase 2.8a (ADR 0031): consume a `-- ...` single-line comment
+/// up to (but not including) the next newline or EOF. The two
+/// leading `-`s are consumed by the caller so this helper sees the
+/// comment's payload only. Pure relative to its inputs — the only
+/// effect is advancing `chars`.
+fn skip_line_comment<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = (usize, char)>,
+{
+    while let Some(&(_, c)) = chars.peek() {
+        if c == '\n' {
+            break;
+        }
+        chars.next();
+    }
 }
 
 fn is_ident_start(ch: char) -> bool {
