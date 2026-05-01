@@ -47,6 +47,7 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.7e `tonumber` (NaN sentinel) | **Done** | `tonumber(n)` identity, `tonumber(s)` via sscanf, NaN on parse fail (ADR 0028) |
 | ‣ 2.7f `type(x)` | **Done** | static kind→typename ptr, Function values admissible (ADR 0029) |
 | ‣ 2.7g `assert(cond)` | **Done** | Bool-only assert with libc exit(1) on failure (ADR 0030) |
+| ‣ 2.7h `error(msg)` | **Done** | unconditional failure via shared `emit_exit_with_message` helper (ADR 0033) |
 | ‣ 2.8a single-line comments | **Done** | `-- ...` skipped by lexer (ADR 0031) |
 | ‣ 2.8b variadic `print` | **Done** | `print()`/`print(a)`/`print(a, b, ...)` with `\t` separator + `\n` (ADR 0032) |
 | ‣ 2.5c closures | Not started | upvalue capture, heap-allocated environments |

@@ -95,6 +95,10 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             Callee::Builtin(Builtin::ToNumber) => ValueKind::Number,
             Callee::Builtin(Builtin::Type) => ValueKind::String,
             Callee::Builtin(Builtin::Assert) => ValueKind::Bool,
+            // Phase 2.7h (ADR 0033): error never returns at run-
+            // time. The kind is a Number placeholder for static
+            // typing only — code after `error(...)` is unreachable.
+            Callee::Builtin(Builtin::Error) => ValueKind::Number,
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.
@@ -1723,6 +1727,17 @@ impl LowerCtx {
                     offset: arg.span.start,
                 });
             }
+            // Phase 2.7h (ADR 0033): `error(msg)` requires a String
+            // operand. Lua's table-as-message form is deferred
+            // until tables exist.
+            if matches!(builtin, Builtin::Error) && k != ValueKind::String {
+                return Err(HirError::TypeMismatch {
+                    op: "error".to_owned(),
+                    lhs_kind: "string".to_owned(),
+                    rhs_kind: k.name().to_owned(),
+                    offset: arg.span.start,
+                });
+            }
         }
         Ok(HirExprKind::Call {
             callee: Callee::Builtin(builtin),
@@ -1874,6 +1889,41 @@ mod tests {
         // Phase 2.8b (ADR 0032): `print()` is now legal — outputs
         // a bare newline. Pre-2.8b this surfaced as `ArityMismatch`.
         assert!(lower_src("print()").is_ok());
+    }
+
+    // -----------------------------------------------------------
+    // Phase 2.7h (ADR 0033) — error(msg) builtin.
+    // -----------------------------------------------------------
+
+    #[test]
+    fn lower_error_with_string_arg_resolves_to_error_builtin() {
+        let hir = lower_src("error(\"oops\")").expect("error(string) must lower");
+        let HirStmtKind::ExprStmt(call) = &hir.stmts[0].kind else {
+            panic!("expected ExprStmt");
+        };
+        let HirExprKind::Call { callee, args } = &call.kind else {
+            panic!("expected Call");
+        };
+        assert!(matches!(callee, Callee::Builtin(Builtin::Error)));
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn lower_error_with_number_arg_is_static_error() {
+        let err = lower_src("error(42)").expect_err("error(number) must reject");
+        assert!(matches!(err, HirError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn lower_error_with_bool_arg_is_static_error() {
+        let err = lower_src("error(true)").expect_err("error(bool) must reject");
+        assert!(matches!(err, HirError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn lower_error_with_zero_args_is_arity_mismatch() {
+        let err = lower_src("error()").expect_err("error() must reject");
+        assert!(matches!(err, HirError::ArityMismatch { .. }));
     }
 
     #[test]

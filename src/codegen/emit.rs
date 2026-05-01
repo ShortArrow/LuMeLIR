@@ -1128,6 +1128,23 @@ fn emit_expr<'a, 'c>(
                 emit_assert(context, block, cond_val, types, loc);
                 Ok(cond_val)
             }
+            // Phase 2.7h (ADR 0033): `error(msg)` — unconditional
+            // exit. Print the message and `exit(1)` via the shared
+            // helper extracted in the preceding Tidy First commit.
+            // The placeholder f64 0.0 result satisfies the
+            // expression-position contract; control never reaches it.
+            Callee::Builtin(Builtin::Error) => {
+                let msg_val = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len, loc,
+                )?;
+                emit_exit_with_message(context, block, msg_val, types, loc);
+                let zero = arith::constant(
+                    context,
+                    FloatAttribute::new(context, types.f64, 0.0).into(),
+                    loc,
+                );
+                Ok(block.append_operation(zero).result(0).unwrap().into())
+            }
             // Phase 2.7f (ADR 0029): `type(x)` is pure static
             // dispatch — the arg's value is irrelevant, only its
             // kind matters. We still emit_expr the arg because Lua

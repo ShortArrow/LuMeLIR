@@ -196,6 +196,10 @@ pub enum Builtin {
     /// `false`. Phase 2.7g (ADR 0030); the broader Lua signature
     /// (any kind, optional message arg, return value) is deferred.
     Assert,
+    /// `error(msg)` — unconditional failure. Prints `msg` then
+    /// `exit(1)`s. Phase 2.7h (ADR 0033); the optional `level`
+    /// arg and table-as-message form are deferred.
+    Error,
 }
 
 impl Builtin {
@@ -206,6 +210,7 @@ impl Builtin {
             "tonumber" => Some(Builtin::ToNumber),
             "type" => Some(Builtin::Type),
             "assert" => Some(Builtin::Assert),
+            "error" => Some(Builtin::Error),
             _ => None,
         }
     }
@@ -217,6 +222,7 @@ impl Builtin {
             Builtin::ToNumber => 1,
             Builtin::Type => 1,
             Builtin::Assert => 1,
+            Builtin::Error => 1,
         }
     }
 
@@ -227,6 +233,7 @@ impl Builtin {
             Builtin::ToNumber => "tonumber",
             Builtin::Type => "type",
             Builtin::Assert => "assert",
+            Builtin::Error => "error",
         }
     }
 }
