@@ -11,7 +11,7 @@ mod ir;
 pub use error::HirError;
 pub use ir::{
     Builtin, Callee, FuncId, HirChunk, HirExpr, HirExprKind, HirFunction, HirStmt, HirStmtKind,
-    LocalId, LocalInfo,
+    LocalId, LocalInfo, UpvalueInfo,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -639,6 +639,7 @@ fn register_function_signature(
                 func_id: None,
             })
             .collect(),
+        upvalues: Vec::new(),
         locals: Vec::new(),
         body: Vec::new(),
         ret_kinds: Vec::new(),
@@ -658,14 +659,22 @@ fn lower_into_function(
     body: &[Stmt],
     function_names: &HashMap<String, FuncId>,
     functions: &mut Vec<HirFunction>,
+    outer_visible: HashMap<String, (LocalId, ValueKind)>,
 ) -> Result<(), HirError> {
     let pre_count = functions.len();
     let external_kinds: Vec<ValueKind> = functions[fid.0].params.iter().map(|p| p.kind).collect();
-    let mut sub_ctx =
-        LowerCtx::for_function(function_names, functions, params, body, &external_kinds);
+    let mut sub_ctx = LowerCtx::for_function(
+        function_names,
+        functions,
+        params,
+        body,
+        &external_kinds,
+        outer_visible,
+    );
     let body_hir = sub_ctx.lower_function_body(body)?;
     let ret_kinds = sub_ctx.in_function_ret_kinds.unwrap_or_default();
     functions[fid.0].params = sub_ctx.locals[..params.len()].to_vec();
+    functions[fid.0].upvalues = sub_ctx.upvalues;
     functions[fid.0].locals = sub_ctx.locals;
     functions[fid.0].body = body_hir;
     functions[fid.0].ret_kinds = ret_kinds;
@@ -704,7 +713,17 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
     for (idx, stmt) in chunk.iter().enumerate() {
         if let StmtKind::FunctionDef { params, body, .. } = &stmt.kind {
             let id = FuncId(idx_of_funcdef(chunk, idx));
-            lower_into_function(id, params, body, &function_names, &mut functions)?;
+            // Top-level functions have no enclosing scope — pass an
+            // empty visible map so any upvalue would surface as an
+            // UndefinedName, which is the historical behaviour.
+            lower_into_function(
+                id,
+                params,
+                body,
+                &function_names,
+                &mut functions,
+                HashMap::new(),
+            )?;
         }
     }
 
@@ -739,6 +758,16 @@ fn idx_of_funcdef(chunk: &[Stmt], idx: usize) -> usize {
 
 struct LowerCtx {
     locals: Vec<LocalInfo>,
+    /// Phase 2.5c-min (ADR 0037): captured locals from the enclosing
+    /// scope at the moment this LowerCtx was created via
+    /// `for_function`. `name → (outer LocalId, kind)`. An ident
+    /// lookup that misses `scopes` and `function_names` consults
+    /// this map; a hit registers an upvalue and declares a fresh
+    /// local in the current ctx (param-style binding).
+    outer_visible: HashMap<String, (LocalId, ValueKind)>,
+    /// Upvalues recorded during this body's lowering. Copied to
+    /// `HirFunction.upvalues` after the body finishes lowering.
+    upvalues: Vec<UpvalueInfo>,
     /// Scope stack: innermost scope is the last element. `local` always
     /// pushes into the top frame, allowing same-scope shadowing per Lua
     /// 5.4 semantics. See ADR 0008.
@@ -778,6 +807,8 @@ impl LowerCtx {
     fn new(function_names: HashMap<String, FuncId>, functions: Vec<HirFunction>) -> Self {
         Self {
             locals: Vec::new(),
+            outer_visible: HashMap::new(),
+            upvalues: Vec::new(),
             scopes: vec![HashMap::new()],
             readonly_locals: HashSet::new(),
             loop_break_targets: Vec::new(),
@@ -805,8 +836,10 @@ impl LowerCtx {
         params: &[String],
         body: &[Stmt],
         external_kinds: &[ValueKind],
+        outer_visible: HashMap<String, (LocalId, ValueKind)>,
     ) -> Self {
         let mut ctx = Self::new(function_names.clone(), functions.to_vec());
+        ctx.outer_visible = outer_visible;
         let body_kinds = infer_param_kinds(body, params);
         for (i, p) in params.iter().enumerate() {
             let kind = match body_kinds[i] {
@@ -816,6 +849,63 @@ impl LowerCtx {
             ctx.declare_local(p.clone(), kind);
         }
         ctx
+    }
+
+    /// Build a snapshot of names currently visible in this ctx for
+    /// upvalue lookup by a nested function/closure (Phase 2.5c-min,
+    /// ADR 0037). Walks the scope stack so the latest binding for
+    /// each name wins, matching the existing `resolve` semantics.
+    fn outer_visible_snapshot(&self) -> HashMap<String, (LocalId, ValueKind)> {
+        let mut out: HashMap<String, (LocalId, ValueKind)> = HashMap::new();
+        for frame in &self.scopes {
+            for (name, id) in frame {
+                out.insert(name.clone(), (*id, self.locals[id.0].kind));
+            }
+        }
+        out
+    }
+
+    /// Phase 2.5c-min (ADR 0037): try to capture `name` as an
+    /// upvalue from the enclosing scope. On a hit, registers a new
+    /// upvalue (deduplicated), declares a fresh local in the
+    /// current ctx that shadows future lookups, and returns its
+    /// `LocalId`. On a miss, returns `Ok(None)` — the caller
+    /// continues to the `function_names` / `UndefinedName` cascade.
+    /// Phase 2.5c-min restricts captures to `ValueKind::Number`;
+    /// other kinds surface a `TypeMismatch`.
+    fn lookup_or_capture_upvalue(
+        &mut self,
+        name: &str,
+        span: Span,
+    ) -> Result<Option<LocalId>, HirError> {
+        let Some(&(outer_id, outer_kind)) = self.outer_visible.get(name) else {
+            return Ok(None);
+        };
+        if outer_kind != ValueKind::Number {
+            return Err(HirError::TypeMismatch {
+                op: "upvalue capture".to_owned(),
+                lhs_kind: "number".to_owned(),
+                rhs_kind: outer_kind.name().to_owned(),
+                offset: span.start,
+            });
+        }
+        // De-dup: repeated references to the same outer name share
+        // a single captured local.
+        if let Some(existing) = self.upvalues.iter().find(|u| u.name == name) {
+            return Ok(Some(existing.inner_local_id));
+        }
+        // First capture: declare a fresh local in the current ctx
+        // so subsequent uses resolve via `scopes`, then record the
+        // upvalue with its inner LocalId so codegen can wire the
+        // block argument into the right slot.
+        let inner_local_id = self.declare_local(name.to_owned(), outer_kind);
+        self.upvalues.push(UpvalueInfo {
+            name: name.to_owned(),
+            kind: outer_kind,
+            outer_local_id: outer_id,
+            inner_local_id,
+        });
+        Ok(Some(inner_local_id))
     }
 
     /// Lower a function body. Allocates the synthetic `_returned` and
@@ -1132,7 +1222,18 @@ impl LowerCtx {
                     "lower_function_body's pass 1 always registers nested \
                      FunctionDef names",
                 );
-                lower_into_function(fid, params, body, &self.function_names, &mut self.functions)?;
+                // Phase 2.5c-min: the nested local function can
+                // capture the enclosing function's currently-visible
+                // locals.
+                let outer_visible = self.outer_visible_snapshot();
+                lower_into_function(
+                    fid,
+                    params,
+                    body,
+                    &self.function_names,
+                    &mut self.functions,
+                    outer_visible,
+                )?;
                 Ok(HirStmt {
                     kind: HirStmtKind::Block { stmts: Vec::new() },
                     span: stmt.span,
@@ -1434,13 +1535,17 @@ impl LowerCtx {
             ExprKind::Ident(name) => match self.resolve(name) {
                 Some(id) => HirExprKind::Local(id),
                 None => {
-                    // Phase 2.5b: a top-level `local function f` registers
-                    // `f` in `function_names` but does *not* (in 2.5a)
-                    // create a local. Resolve identifiers that hit this
-                    // map as a `FunctionRef` so they can be aliased via
-                    // `local g = f` and called via `f(args)`.
                     if let Some(&fid) = self.function_names.get(name) {
+                        // Phase 2.5b: a top-level `local function f`
+                        // registers `f` in `function_names` but does
+                        // *not* (in 2.5a) create a local.
                         HirExprKind::FunctionRef(fid)
+                    } else if let Some(local_id) =
+                        self.lookup_or_capture_upvalue(name, expr.span)?
+                    {
+                        // Phase 2.5c-min (ADR 0037): the name is in
+                        // the enclosing scope — capture it.
+                        HirExprKind::Local(local_id)
                     } else {
                         return Err(HirError::UndefinedName {
                             name: name.clone(),
@@ -1600,6 +1705,7 @@ impl LowerCtx {
                             func_id: None,
                         })
                         .collect(),
+                    upvalues: Vec::new(),
                     locals: Vec::new(),
                     body: Vec::new(),
                     ret_kinds: Vec::new(),
@@ -1609,16 +1715,21 @@ impl LowerCtx {
                 // params. Body-pre-scan still upgrades to Function
                 // when needed.
                 let external_kinds = vec![ValueKind::Number; params.len()];
+                // Phase 2.5c-min: the body can capture the
+                // currently-visible bindings from this LowerCtx.
+                let outer_visible = self.outer_visible_snapshot();
                 let mut fn_ctx = LowerCtx::for_function(
                     &self.function_names,
                     &self.functions,
                     params,
                     body,
                     &external_kinds,
+                    outer_visible,
                 );
                 let body_hir = fn_ctx.lower_function_body(body)?;
                 let ret_kinds = fn_ctx.in_function_ret_kinds.unwrap_or_default();
                 self.functions[id.0].params = fn_ctx.locals[..params.len()].to_vec();
+                self.functions[id.0].upvalues = fn_ctx.upvalues;
                 self.functions[id.0].locals = fn_ctx.locals;
                 self.functions[id.0].body = body_hir;
                 self.functions[id.0].ret_kinds = ret_kinds;
@@ -1680,9 +1791,25 @@ impl LowerCtx {
                     Some(fid) => Callee::User(fid),
                     None => Callee::Indirect(local_id),
                 };
+                // Phase 2.5c-min (ADR 0037): direct calls to a
+                // closure with upvalues append the captured values
+                // as extra arguments, mirroring the matching code
+                // in the function_names dispatch path below.
+                let mut all_args = lowered_args;
+                if let Callee::User(fid) = callee {
+                    let upvalue_args: Vec<HirExpr> = self.functions[fid.0]
+                        .upvalues
+                        .iter()
+                        .map(|uv| HirExpr {
+                            kind: HirExprKind::Local(uv.outer_local_id),
+                            span: whole.span,
+                        })
+                        .collect();
+                    all_args.extend(upvalue_args);
+                }
                 return Ok(HirExprKind::Call {
                     callee,
-                    args: lowered_args,
+                    args: all_args,
                 });
             }
         }
@@ -1736,9 +1863,28 @@ impl LowerCtx {
                     });
                 }
             }
+            // Phase 2.5c-min (ADR 0037): if the callee captured
+            // upvalues, append them as extra arguments. The
+            // captured value is reloaded at each call site by
+            // referencing the outer `LocalId` recorded during the
+            // closure's lowering — equivalent to a snapshot taken
+            // when the closure expression was evaluated, since the
+            // outer slot is what was current at that moment and
+            // `lower_call` runs after FunctionExpr lowering for
+            // sibling closures.
+            let upvalue_args: Vec<HirExpr> = self.functions[fid.0]
+                .upvalues
+                .iter()
+                .map(|uv| HirExpr {
+                    kind: HirExprKind::Local(uv.outer_local_id),
+                    span: whole.span,
+                })
+                .collect();
+            let mut all_args = lowered_args;
+            all_args.extend(upvalue_args);
             return Ok(HirExprKind::Call {
                 callee: Callee::User(fid),
-                args: lowered_args,
+                args: all_args,
             });
         }
         let builtin = match Builtin::from_name(name) {
@@ -2105,14 +2251,57 @@ end";
 
     #[test]
     fn lower_nested_function_referencing_outer_local_errors() {
-        // No closures yet — body cannot reach into outer scope.
+        // Phase 2.5c-min lifts this for `local function`. A nested
+        // `local function` body that references an outer Number
+        // local is now valid (capture-by-value).
         let src = "local function outer(x)
   local function inner()
     return x
   end
   return inner()
 end";
-        let err = lower_src(src).expect_err("upvalue capture not yet supported");
+        assert!(lower_src(src).is_ok(), "Phase 2.5c-min: capture must lower");
+    }
+
+    // -----------------------------------------------------------
+    // Phase 2.5c-min — capture-by-value closures (ADR 0037).
+    // -----------------------------------------------------------
+
+    #[test]
+    fn lower_anonymous_closure_records_upvalue() {
+        let src = "local x = 5
+local f = function() return x end";
+        let hir = lower_src(src).expect("anon closure must lower");
+        // The anon function (single FuncId 0) should record one
+        // upvalue referencing the outer chunk's `x`.
+        assert_eq!(hir.functions.len(), 1);
+        let f = &hir.functions[0];
+        assert_eq!(f.upvalues.len(), 1);
+        assert_eq!(f.upvalues[0].name, "x");
+        assert_eq!(f.upvalues[0].kind, ValueKind::Number);
+    }
+
+    #[test]
+    fn lower_closure_with_no_outer_reference_has_no_upvalues() {
+        let src = "local f = function() return 42 end";
+        let hir = lower_src(src).expect("must lower");
+        assert!(hir.functions[0].upvalues.is_empty());
+    }
+
+    #[test]
+    fn lower_closure_capturing_bool_is_static_error() {
+        // Phase 2.5c-min: only Number captures supported.
+        let src = "local b = true
+local f = function() return b end";
+        let err = lower_src(src).expect_err("Bool capture must reject");
+        assert!(matches!(err, HirError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn lower_closure_capturing_unknown_name_errors() {
+        // No outer scope match → UndefinedName, same as before.
+        let src = "local f = function() return missing end";
+        let err = lower_src(src).expect_err("undefined upvalue must reject");
         assert!(matches!(err, HirError::UndefinedName { .. }));
     }
 

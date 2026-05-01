@@ -558,12 +558,26 @@ fn emit_function<'c>(
     let region = Region::new();
     // Phase 2.5b.2: each parameter's MLIR type is determined by its
     // ValueKind. Number → f64, Function(arity) → !func.func<...>.
+    // Phase 2.5c-min (ADR 0037): upvalues become extra MLIR
+    // parameters appended after the Lua params; the callsite-side
+    // `lower_call` already passes their values as extra args.
     let param_types: Vec<Type<'c>> = hir_fn
         .params
         .iter()
         .map(|info| param_mlir_type(context, info.kind, types))
         .collect();
-    let block_args: Vec<(Type<'c>, Location<'c>)> = param_types.iter().map(|t| (*t, loc)).collect();
+    let upvalue_types: Vec<Type<'c>> = hir_fn
+        .upvalues
+        .iter()
+        .map(|uv| param_mlir_type(context, uv.kind, types))
+        .collect();
+    let all_param_types: Vec<Type<'c>> = param_types
+        .iter()
+        .chain(upvalue_types.iter())
+        .copied()
+        .collect();
+    let block_args: Vec<(Type<'c>, Location<'c>)> =
+        all_param_types.iter().map(|t| (*t, loc)).collect();
     let block = Block::new(&block_args);
 
     // Allocate slots for every local. Function-kind params are special:
@@ -588,6 +602,16 @@ fn emit_function<'c>(
             let arg: Value<'c, '_> = block.argument(i).unwrap().into();
             emit_store(&block, arg, slots[i], loc);
         }
+    }
+
+    // Phase 2.5c-min: store each upvalue's incoming block argument
+    // into the slot allocated for its inner local. Body code loads
+    // from `slots[uv.inner_local_id.0]` via the standard
+    // `HirExprKind::Local` path — no special-case in body codegen.
+    for (i, uv) in hir_fn.upvalues.iter().enumerate() {
+        let block_arg_idx = hir_fn.params.len() + i;
+        let arg: Value<'c, '_> = block.argument(block_arg_idx).unwrap().into();
+        emit_store(&block, arg, slots[uv.inner_local_id.0], loc);
     }
 
     emit_stmts(
@@ -632,7 +656,9 @@ fn emit_function<'c>(
     region.append_block(block);
 
     let ret_types = ret_mlir_types(context, &hir_fn.ret_kinds, types);
-    let fn_type = FunctionType::new(context, &param_types, &ret_types);
+    // Phase 2.5c-min: function signature widens to include upvalue
+    // params. `all_param_types` is `param_types ++ upvalue_types`.
+    let fn_type = FunctionType::new(context, &all_param_types, &ret_types);
     let func_op = func::func(
         context,
         StringAttribute::new(context, &hir_fn.mangled_name),

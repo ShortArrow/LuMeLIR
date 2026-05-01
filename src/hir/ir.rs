@@ -39,9 +39,8 @@ pub struct FuncId(pub usize);
 /// A user-defined function. The body is a fully-lowered statement
 /// sequence with its own private `locals` table. Phase 2.5d (ADR
 /// 0021) generalises the return type from `Option<ValueKind>` to a
-/// `Vec<ValueKind>` — empty for void, length 1 for the historical
-/// single-return case, length ≥2 for multi-return. See ADRs 0016,
-/// 0019, 0020, 0021.
+/// `Vec<ValueKind>`. Phase 2.5c-min (ADR 0037) adds upvalues for
+/// capture-by-value closures.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirFunction {
     /// Source-level Lua name.
@@ -52,12 +51,40 @@ pub struct HirFunction {
     /// `locals` so that `LocalId(i)` for `i < params.len()` refers to
     /// the i-th parameter slot.
     pub params: Vec<LocalInfo>,
-    /// All locals (params first, then body-introduced locals + the
-    /// synthetic `_returned` / `_ret_value_*` slots).
+    /// Captured outer-scope locals (Phase 2.5c-min, ADR 0037).
+    /// Filled by HIR upvalue analysis; codegen prepends them to the
+    /// generated function's MLIR signature so direct call sites can
+    /// pass the captured values as extra arguments.
+    pub upvalues: Vec<UpvalueInfo>,
+    /// All locals (params first, then upvalue-bound locals, then
+    /// body-introduced locals + the synthetic `_returned` /
+    /// `_ret_value_*` slots).
     pub locals: Vec<LocalInfo>,
     pub body: Vec<HirStmt>,
     /// Empty ⇒ void; length N ⇒ N return values, in source order.
     pub ret_kinds: Vec<ValueKind>,
+}
+
+/// One captured value for a closure (Phase 2.5c-min, ADR 0037).
+/// `outer_local_id` is the LocalId in the enclosing scope where the
+/// captured binding was declared; `inner_local_id` is where the
+/// captured value lands inside this function's locals table.
+/// Codegen emits the upvalue as an extra MLIR parameter after the
+/// regular Lua params and stores the incoming block argument into
+/// `slots[inner_local_id.0]` at function entry.
+///
+/// Capture is **by value**: the closure sees the outer slot's
+/// content at the moment of each call (codegen reloads from the
+/// caller's slot for `outer_local_id` and passes it as the extra
+/// argument). This matches Lua's "upvalue is the binding" only
+/// when the binding is never reassigned — Phase 2.5c-min users
+/// either don't reassign captured locals or accept the snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpvalueInfo {
+    pub name: String,
+    pub kind: ValueKind,
+    pub outer_local_id: LocalId,
+    pub inner_local_id: LocalId,
 }
 
 #[derive(Debug, Clone, PartialEq)]

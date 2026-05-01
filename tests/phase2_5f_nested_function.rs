@@ -71,19 +71,18 @@ print(outer())";
 }
 
 #[test]
-fn nested_function_referencing_outer_param_is_static_error() {
-    // Phase 2.5c (closures) will lift this restriction. For now
-    // we want a clean static error rather than miscompilation.
-    let chunk = lumelir::parser::parse(
-        "local function outer(x)
+fn nested_function_referencing_outer_param_now_lowers_after_2_5c_min() {
+    // Phase 2.5c-min lifted the no-capture restriction for Number
+    // upvalues. The test that previously asserted the static error
+    // is reframed as a regression check for the capture path.
+    let src = "local function outer(x)
   local function inner()
-    return x
+    return x + 100
   end
   return inner()
-end",
-    )
-    .unwrap();
-    assert!(lumelir::hir::lower(&chunk).is_err());
+end
+print(outer(5))";
+    assert_eq!(run(src, "lumelir_25f_capture_now").trim(), "105");
 }
 
 #[test]
