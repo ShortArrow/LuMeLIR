@@ -191,6 +191,11 @@ pub enum Builtin {
     /// every kind including Function values (the only builtin that
     /// does so; Phase 2.7f, ADR 0029).
     Type,
+    /// `assert(v)` — passes the Bool unchanged on `true`, prints a
+    /// fixed "assertion failed!" diagnostic and `exit(1)`s on
+    /// `false`. Phase 2.7g (ADR 0030); the broader Lua signature
+    /// (any kind, optional message arg, return value) is deferred.
+    Assert,
 }
 
 impl Builtin {
@@ -200,6 +205,7 @@ impl Builtin {
             "tostring" => Some(Builtin::ToString),
             "tonumber" => Some(Builtin::ToNumber),
             "type" => Some(Builtin::Type),
+            "assert" => Some(Builtin::Assert),
             _ => None,
         }
     }
@@ -210,6 +216,7 @@ impl Builtin {
             Builtin::ToString => 1,
             Builtin::ToNumber => 1,
             Builtin::Type => 1,
+            Builtin::Assert => 1,
         }
     }
 
@@ -219,6 +226,7 @@ impl Builtin {
             Builtin::ToString => "tostring",
             Builtin::ToNumber => "tonumber",
             Builtin::Type => "type",
+            Builtin::Assert => "assert",
         }
     }
 }

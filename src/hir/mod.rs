@@ -94,6 +94,7 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             Callee::Builtin(Builtin::ToString) => ValueKind::String,
             Callee::Builtin(Builtin::ToNumber) => ValueKind::Number,
             Callee::Builtin(Builtin::Type) => ValueKind::String,
+            Callee::Builtin(Builtin::Assert) => ValueKind::Bool,
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.
@@ -1702,6 +1703,17 @@ impl LowerCtx {
                 return Err(HirError::TypeMismatch {
                     op: "tonumber".to_owned(),
                     lhs_kind: "number or string".to_owned(),
+                    rhs_kind: k.name().to_owned(),
+                    offset: arg.span.start,
+                });
+            }
+            // Phase 2.7g (ADR 0030): `assert(cond)` requires a Bool
+            // operand. The broader "any kind, return same kind"
+            // signature needs heterogeneous return support; defer.
+            if matches!(builtin, Builtin::Assert) && k != ValueKind::Bool {
+                return Err(HirError::TypeMismatch {
+                    op: "assert".to_owned(),
+                    lhs_kind: "bool".to_owned(),
                     rhs_kind: k.name().to_owned(),
                     offset: arg.span.start,
                 });

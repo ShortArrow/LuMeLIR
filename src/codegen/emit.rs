@@ -158,6 +158,17 @@ fn emit_fmt_global<'c>(
         "function\0",
         loc,
     );
+    // Phase 2.7g (ADR 0030): diagnostic for the `assert` failure
+    // path. The `printf("%s\n", _)` caller already adds the line
+    // terminator, so the payload itself ends with NUL only.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_assert_failed",
+        "assertion failed!\0",
+        loc,
+    );
 }
 
 fn emit_string_global<'c>(
@@ -411,6 +422,19 @@ fn emit_string_runtime_decls<'c>(
         ))
         .build();
     module.body().append_operation(sscanf_op.into());
+
+    // exit(i32) -> void  (Phase 2.7g, ADR 0030)
+    let exit_ty = llvm::r#type::function(llvm::r#type::void(context), &[types.i32], false);
+    let exit_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "exit"))
+        .function_type(TypeAttribute::new(exit_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(exit_op.into());
 }
 
 fn emit_libm_decls<'c>(
@@ -1067,6 +1091,15 @@ fn emit_expr<'a, 'c>(
                     context, block, &args[0], slots, locals, functions, types, params_len, loc,
                 )?;
                 Ok(emit_tonumber(context, block, arg_val, kind, types, loc))
+            }
+            // Phase 2.7g (ADR 0030): `assert(cond)` — pass through
+            // when truthy, otherwise emit the diagnostic and `exit(1)`.
+            Callee::Builtin(Builtin::Assert) => {
+                let cond_val = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len, loc,
+                )?;
+                emit_assert(context, block, cond_val, types, loc);
+                Ok(cond_val)
             }
             // Phase 2.7f (ADR 0029): `type(x)` is pure static
             // dispatch — the arg's value is irrelevant, only its
@@ -1914,6 +1947,83 @@ fn emit_print_nil<'c>(
     let nil_ptr = emit_addressof(context, block, "s_nil", types, loc);
     let fmt_ptr = emit_addressof(context, block, "fmt_str", types, loc);
     emit_printf(context, block, fmt_ptr, nil_ptr, types, loc);
+}
+
+/// Phase 2.7g (ADR 0030): runtime check for `assert(cond)`. When
+/// `cond` is false, emit the diagnostic via `printf("assertion
+/// failed!\n")` then call libc `exit(1)`. The `scf.if` here uses
+/// the void form (no result) — the assert call's return value is
+/// the cond itself, which is yielded by the caller in `emit_expr`.
+fn emit_assert<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    cond: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    // Invert cond: scf.if dispatches "then" on truthy, but we want
+    // the failure path to fire when cond is false.
+    let one = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i1, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let not_cond: Value<'c, 'a> = block
+        .append_operation(arith::xori(cond, one, loc))
+        .result(0)
+        .unwrap()
+        .into();
+
+    // Then-region: print the diagnostic, exit(1), then yield. The
+    // exit call is `noreturn` so the yield is unreachable but
+    // satisfies scf.if's structural requirement.
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    let msg_ptr = emit_addressof(context, &then_blk, "s_assert_failed", types, loc);
+    let fmt_ptr = emit_addressof(context, &then_blk, "fmt_str", types, loc);
+    emit_printf(context, &then_blk, fmt_ptr, msg_ptr, types, loc);
+    let one_i32 = then_blk
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i32, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let exit_call = OperationBuilder::new("llvm.call", loc)
+        .add_operands(&[one_i32])
+        .add_attributes(&[
+            (
+                Identifier::new(context, "callee"),
+                FlatSymbolRefAttribute::new(context, "exit").into(),
+            ),
+            (
+                Identifier::new(context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(context, &[1, 0]).into(),
+            ),
+            (
+                Identifier::new(context, "op_bundle_sizes"),
+                DenseI32ArrayAttribute::new(context, &[]).into(),
+            ),
+        ])
+        .build()
+        .expect("llvm.call @exit");
+    then_blk.append_operation(exit_call);
+    then_blk.append_operation(scf::r#yield(&[], loc));
+    then_region.append_block(then_blk);
+
+    // Else-region: empty yield (assertion passed, continue normally).
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+
+    block.append_operation(scf::r#if(not_cond, &[], then_region, else_region, loc));
 }
 
 fn emit_printf_g<'a, 'c>(
