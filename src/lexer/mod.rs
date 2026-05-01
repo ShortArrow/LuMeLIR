@@ -26,11 +26,19 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
 
         // Phase 2.8a (ADR 0031) / 2.8c (ADR 0034): Lua comments.
         // Both forms are treated as whitespace post-tokenisation —
-        // dispatched here, never escape into the token stream.
+        // dispatched here, never escape into the token stream. The
+        // `--[[` prefix opens a block comment; anything else after
+        // `--` is a single-line comment.
         if ch == '-' && bytes.get(offset + 1) == Some(&b'-') {
             chars.next(); // first '-'
             chars.next(); // second '-'
-            skip_line_comment(&mut chars);
+            if bytes.get(offset + 2) == Some(&b'[') && bytes.get(offset + 3) == Some(&b'[') {
+                chars.next(); // first '['
+                chars.next(); // second '['
+                skip_block_comment(&mut chars, offset)?;
+            } else {
+                skip_line_comment(&mut chars);
+            }
             continue;
         }
 
@@ -136,6 +144,30 @@ where
             break;
         }
         chars.next();
+    }
+}
+
+/// Phase 2.8c (ADR 0034): consume a `--[[ ... ]]` block comment.
+/// The four leading `--[[` characters are consumed by the caller
+/// so this helper sees the body only. Returns
+/// `LexError::UnterminatedComment` when EOF arrives before the
+/// closing `]]`. `open_offset` is the byte offset of the leading
+/// `-` so the diagnostic points back at the comment's start.
+fn skip_block_comment<I>(
+    chars: &mut std::iter::Peekable<I>,
+    open_offset: usize,
+) -> Result<(), LexError>
+where
+    I: Iterator<Item = (usize, char)>,
+{
+    loop {
+        let (_, c) = chars.next().ok_or(LexError::UnterminatedComment {
+            offset: open_offset,
+        })?;
+        if c == ']' && matches!(chars.peek(), Some(&(_, ']'))) {
+            chars.next(); // second ']'
+            return Ok(());
+        }
     }
 }
 
@@ -741,6 +773,60 @@ mod tests {
         assert_eq!(
             kinds("- 1"),
             vec![TokenKind::Minus, TokenKind::Number(1.0), TokenKind::Eof]
+        );
+    }
+
+    // -----------------------------------------------------------
+    // Phase 2.8c — block comments `--[[ ... ]]` (ADR 0034).
+    // -----------------------------------------------------------
+
+    #[test]
+    fn lex_block_comment_inline_is_skipped() {
+        assert_eq!(
+            kinds("1 --[[ in line ]] 2"),
+            vec![
+                TokenKind::Number(1.0),
+                TokenKind::Number(2.0),
+                TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_block_comment_spanning_multiple_lines_is_skipped() {
+        let src = "1\n--[[\nline two\nline three\n]]\n2";
+        assert_eq!(
+            kinds(src),
+            vec![
+                TokenKind::Number(1.0),
+                TokenKind::Number(2.0),
+                TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_block_comment_only_file_yields_empty_token_stream() {
+        assert_eq!(kinds("--[[ all comment ]]"), vec![TokenKind::Eof]);
+    }
+
+    #[test]
+    fn lex_unterminated_block_comment_returns_error() {
+        let err = lex("--[[ no close").expect_err("missing `]]` must error");
+        assert!(matches!(err, LexError::UnterminatedComment { .. }));
+    }
+
+    #[test]
+    fn lex_dash_dash_open_bracket_only_one_is_line_comment() {
+        // `--[ x` (single bracket) is a regular line comment that
+        // happens to start with `[`. It is NOT a block comment.
+        assert_eq!(
+            kinds("1 --[ rest of line\n2"),
+            vec![
+                TokenKind::Number(1.0),
+                TokenKind::Number(2.0),
+                TokenKind::Eof
+            ]
         );
     }
 }

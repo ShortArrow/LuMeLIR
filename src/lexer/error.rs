@@ -17,4 +17,8 @@ pub enum LexError {
     /// Backslash escape with an unrecognised follower (Phase 2.7a).
     #[error("invalid escape sequence {seq:?} at byte offset {offset}")]
     InvalidEscape { seq: String, offset: usize },
+
+    /// Block comment whose closing `]]` is missing (Phase 2.8c, ADR 0034).
+    #[error("unterminated block comment starting at byte offset {offset}")]
+    UnterminatedComment { offset: usize },
 }

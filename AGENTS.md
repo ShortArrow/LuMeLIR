@@ -50,6 +50,7 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.7h `error(msg)` | **Done** | unconditional failure via shared `emit_exit_with_message` helper (ADR 0033) |
 | ‣ 2.8a single-line comments | **Done** | `-- ...` skipped by lexer (ADR 0031) |
 | ‣ 2.8b variadic `print` | **Done** | `print()`/`print(a)`/`print(a, b, ...)` with `\t` separator + `\n` (ADR 0032) |
+| ‣ 2.8c block comments | **Done** | `--[[ ... ]]` multi-line via `skip_block_comment` helper (ADR 0034) |
 | ‣ 2.5c closures | Not started | upvalue capture, heap-allocated environments |
 | ‣ 2.6+ tables / metatables | Not started | tables, metatables, generic for, GC |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |
