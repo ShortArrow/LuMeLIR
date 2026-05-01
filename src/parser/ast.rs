@@ -45,7 +45,8 @@ pub enum ExprKind {
 /// Binary operators. Phase 2.2a covers all arithmetic operators
 /// except `//` (floor div, deferred). Phase 2.2b adds the six relational
 /// operators. Phase 2.3c adds the short-circuit logical operators.
-/// See ADRs 0009, 0010, 0013.
+/// Phase 2.2c (ADR 0022) adds floor div and the five bitwise operators.
+/// See ADRs 0009, 0010, 0013, 0022.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add,
@@ -54,6 +55,19 @@ pub enum BinOp {
     Div,
     Mod,
     Pow,
+    /// `//` floor division (Phase 2.2c, ADR 0022).
+    FloorDiv,
+    /// `&` bitwise AND (Phase 2.2c, ADR 0022).
+    BitAnd,
+    /// `|` bitwise OR (Phase 2.2c, ADR 0022).
+    BitOr,
+    /// `~` bitwise XOR (Phase 2.2c, ADR 0022). Distinguished from
+    /// the unary `~` (`UnaryOp::BitNot`) by parser context.
+    BitXor,
+    /// `<<` left shift (Phase 2.2c, ADR 0022).
+    Shl,
+    /// `>>` arithmetic right shift (Phase 2.2c, ADR 0022).
+    Shr,
     Lt,
     Le,
     Gt,
@@ -65,11 +79,14 @@ pub enum BinOp {
 }
 
 /// Unary prefix operators. Phase 2.2a introduces arithmetic negation.
-/// Phase 2.3c adds logical `not`.
+/// Phase 2.3c adds logical `not`. Phase 2.2c (ADR 0022) adds bitwise
+/// NOT (the unary `~`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
     Neg,
     Not,
+    /// `~x` bitwise complement (Phase 2.2c, ADR 0022).
+    BitNot,
 }
 
 /// A statement. Phase 2.0 introduced `local` declarations and bare

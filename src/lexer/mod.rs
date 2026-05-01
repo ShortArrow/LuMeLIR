@@ -39,26 +39,30 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
             continue;
         }
 
-        // Two-character punctuation with `=` as the second char.
-        // `=`/`<`/`>`/`~` may form `==`/`<=`/`>=`/`~=`. `~` alone is
-        // reserved for Phase 2.4 bitwise NOT and rejected here.
-        if matches!(ch, '=' | '<' | '>' | '~') {
+        // Two-character punctuation. `=`/`~` may form `==`/`~=`;
+        // `<`/`>` may form `<=`/`>=` or `<<`/`>>`; `/` may form `//`.
+        // `~` standalone is bitwise XOR/NOT (Phase 2.2c, ADR 0022).
+        if matches!(ch, '=' | '<' | '>' | '~' | '/') {
             chars.next();
-            let next_eq = matches!(chars.peek(), Some(&(_, '=')));
-            let kind = match (ch, next_eq) {
-                ('=', true) => TokenKind::EqEq,
-                ('=', false) => TokenKind::Equals,
-                ('<', true) => TokenKind::LtEq,
-                ('<', false) => TokenKind::Lt,
-                ('>', true) => TokenKind::GtEq,
-                ('>', false) => TokenKind::Gt,
-                ('~', true) => TokenKind::TildeEq,
-                ('~', false) => return Err(LexError::Unexpected { ch, offset }),
+            let next = chars.peek().map(|&(_, c)| c);
+            let (kind, two_char) = match (ch, next) {
+                ('=', Some('=')) => (TokenKind::EqEq, true),
+                ('=', _) => (TokenKind::Equals, false),
+                ('<', Some('=')) => (TokenKind::LtEq, true),
+                ('<', Some('<')) => (TokenKind::LtLt, true),
+                ('<', _) => (TokenKind::Lt, false),
+                ('>', Some('=')) => (TokenKind::GtEq, true),
+                ('>', Some('>')) => (TokenKind::GtGt, true),
+                ('>', _) => (TokenKind::Gt, false),
+                ('~', Some('=')) => (TokenKind::TildeEq, true),
+                ('~', _) => (TokenKind::Tilde, false),
+                ('/', Some('/')) => (TokenKind::SlashSlash, true),
+                ('/', _) => (TokenKind::Slash, false),
                 _ => unreachable!(),
             };
-            let end = if next_eq {
+            let end = if two_char {
                 chars.next();
-                offset + ch.len_utf8() + '='.len_utf8()
+                offset + ch.len_utf8() + 1
             } else {
                 offset + ch.len_utf8()
             };
@@ -72,9 +76,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
             '+' => Some(TokenKind::Plus),
             '-' => Some(TokenKind::Minus),
             '*' => Some(TokenKind::Star),
-            '/' => Some(TokenKind::Slash),
             '%' => Some(TokenKind::Percent),
             '^' => Some(TokenKind::Caret),
+            '&' => Some(TokenKind::Amp),
+            '|' => Some(TokenKind::Pipe),
             ',' => Some(TokenKind::Comma),
             ';' => Some(TokenKind::Semicolon),
             _ => None,
@@ -364,9 +369,25 @@ mod tests {
     }
 
     #[test]
-    fn lex_tilde_alone_returns_unexpected_error() {
-        let err = lex("~").expect_err("standalone `~` is reserved (bitwise NOT — Phase 2.4)");
-        assert_eq!(err, LexError::Unexpected { ch: '~', offset: 0 });
+    fn lex_tilde_alone_yields_tilde_token() {
+        // Phase 2.2c (ADR 0022): standalone `~` is bitwise XOR/NOT.
+        assert_eq!(kinds("~"), vec![TokenKind::Tilde, TokenKind::Eof]);
+    }
+
+    #[test]
+    fn lex_bitwise_punctuation_yields_dedicated_tokens() {
+        assert_eq!(
+            kinds("// & | ~ << >>"),
+            vec![
+                TokenKind::SlashSlash,
+                TokenKind::Amp,
+                TokenKind::Pipe,
+                TokenKind::Tilde,
+                TokenKind::LtLt,
+                TokenKind::GtGt,
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]

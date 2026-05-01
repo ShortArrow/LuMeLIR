@@ -472,6 +472,10 @@ impl<'t> Parser<'t> {
         let unary_op = match self.peek().kind {
             TokenKind::Minus => Some(UnaryOp::Neg),
             TokenKind::Keyword(Keyword::Not) => Some(UnaryOp::Not),
+            // Phase 2.2c (ADR 0022): standalone `~` in prefix position
+            // is bitwise NOT. (`~=` is its own token; in infix position
+            // a bare `~` is bitwise XOR.)
+            TokenKind::Tilde => Some(UnaryOp::BitNot),
             _ => None,
         };
         if let Some(op) = unary_op {
@@ -589,14 +593,23 @@ impl<'t> Parser<'t> {
     }
 }
 
-/// Precedence ladder per ADRs 0009, 0010, and 0013 (Lua 5.4 §3.4.8 subset).
+/// Precedence ladder per ADRs 0009, 0010, 0013, 0022 (Lua 5.4 §3.4.8
+/// subset). The bitwise tier (0022) sits between comparison (`<`, `==`,
+/// ...) and additive (`+`, `-`):
+///
+///   `or` < `and` < `<`/`==`/... < `|` < `~` < `&` < `<<`/`>>` < `+`/`-`
+///   < `*`/`/`/`//`/`%` < unary < `^`.
 const PREC_OR: u8 = 5;
 const PREC_AND: u8 = 6;
 const PREC_CMP: u8 = 8;
-const PREC_ADD: u8 = 10;
-const PREC_MUL: u8 = 11;
-const PREC_UNARY: u8 = 12;
-const PREC_POW: u8 = 13;
+const PREC_BOR: u8 = 9;
+const PREC_BXOR: u8 = 10;
+const PREC_BAND: u8 = 11;
+const PREC_SHIFT: u8 = 12;
+const PREC_ADD: u8 = 13;
+const PREC_MUL: u8 = 14;
+const PREC_UNARY: u8 = 15;
+const PREC_POW: u8 = 16;
 
 struct InfixInfo {
     prec: u8,
@@ -622,14 +635,32 @@ fn infix_op(kind: &TokenKind) -> Option<InfixInfo> {
             prec: PREC_CMP,
             right_assoc: false,
         }),
+        TokenKind::Pipe => Some(InfixInfo {
+            prec: PREC_BOR,
+            right_assoc: false,
+        }),
+        TokenKind::Tilde => Some(InfixInfo {
+            prec: PREC_BXOR,
+            right_assoc: false,
+        }),
+        TokenKind::Amp => Some(InfixInfo {
+            prec: PREC_BAND,
+            right_assoc: false,
+        }),
+        TokenKind::LtLt | TokenKind::GtGt => Some(InfixInfo {
+            prec: PREC_SHIFT,
+            right_assoc: false,
+        }),
         TokenKind::Plus | TokenKind::Minus => Some(InfixInfo {
             prec: PREC_ADD,
             right_assoc: false,
         }),
-        TokenKind::Star | TokenKind::Slash | TokenKind::Percent => Some(InfixInfo {
-            prec: PREC_MUL,
-            right_assoc: false,
-        }),
+        TokenKind::Star | TokenKind::Slash | TokenKind::SlashSlash | TokenKind::Percent => {
+            Some(InfixInfo {
+                prec: PREC_MUL,
+                right_assoc: false,
+            })
+        }
         TokenKind::Caret => Some(InfixInfo {
             prec: PREC_POW,
             right_assoc: true,
@@ -644,8 +675,14 @@ fn binop_from_token(kind: &TokenKind) -> Option<BinOp> {
         TokenKind::Minus => Some(BinOp::Sub),
         TokenKind::Star => Some(BinOp::Mul),
         TokenKind::Slash => Some(BinOp::Div),
+        TokenKind::SlashSlash => Some(BinOp::FloorDiv),
         TokenKind::Percent => Some(BinOp::Mod),
         TokenKind::Caret => Some(BinOp::Pow),
+        TokenKind::Amp => Some(BinOp::BitAnd),
+        TokenKind::Pipe => Some(BinOp::BitOr),
+        TokenKind::Tilde => Some(BinOp::BitXor),
+        TokenKind::LtLt => Some(BinOp::Shl),
+        TokenKind::GtGt => Some(BinOp::Shr),
         TokenKind::Lt => Some(BinOp::Lt),
         TokenKind::LtEq => Some(BinOp::Le),
         TokenKind::Gt => Some(BinOp::Gt),

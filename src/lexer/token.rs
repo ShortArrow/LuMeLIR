@@ -42,8 +42,22 @@ pub enum TokenKind {
     Minus,
     Star,
     Slash,
+    /// `//` floor division (Phase 2.2c, ADR 0022).
+    SlashSlash,
     Percent,
     Caret,
+    /// `&` bitwise AND (Phase 2.2c, ADR 0022).
+    Amp,
+    /// `|` bitwise OR (Phase 2.2c, ADR 0022).
+    Pipe,
+    /// `~` standalone — bitwise XOR (binary) and bitwise NOT
+    /// (unary). Disambiguated by parser context. `~=` (not-equal)
+    /// is a separate token, lexed eagerly. Phase 2.2c, ADR 0022.
+    Tilde,
+    /// `<<` arithmetic left shift (Phase 2.2c, ADR 0022).
+    LtLt,
+    /// `>>` arithmetic right shift (Phase 2.2c, ADR 0022).
+    GtGt,
     Equals,
     EqEq,
     TildeEq,
