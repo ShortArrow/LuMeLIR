@@ -729,7 +729,7 @@ fn emit_expr<'a, 'c>(
             let v = emit_expr(
                 context, block, operand, slots, locals, functions, types, params_len, loc,
             )?;
-            emit_unary(block, *op, v, loc)
+            emit_unary(context, block, *op, v, types, loc)
         }
         HirExprKind::Call { callee, args } => match callee {
             Callee::Builtin(Builtin::Print) => {
@@ -880,6 +880,52 @@ fn emit_binop<'a, 'c>(
             .into(),
         BinOp::Mod => emit_lua_mod(context, block, lhs, rhs, types, loc),
         BinOp::Pow => emit_libm_pow(context, block, lhs, rhs, types, loc),
+        // Phase 2.2c (ADR 0022): `a // b == floor(a / b)`.
+        BinOp::FloorDiv => {
+            let div = block
+                .append_operation(arith::divf(lhs, rhs, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            emit_libm_call(context, block, "floor", &[div], types, loc)
+        }
+        // Phase 2.2c bitwise — convert each f64 operand to i64 via
+        // `arith.fptosi`, do the integer op, then convert back via
+        // `arith.sitofp`. Lua 5.4 bitwise ops are integer-typed; we
+        // truncate the f64 representation just like `math.tointeger`.
+        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
+            let li = emit_f2i(block, lhs, types, loc);
+            let ri = emit_f2i(block, rhs, types, loc);
+            let res_i = match op {
+                BinOp::BitAnd => block
+                    .append_operation(arith::andi(li, ri, loc))
+                    .result(0)
+                    .unwrap()
+                    .into(),
+                BinOp::BitOr => block
+                    .append_operation(arith::ori(li, ri, loc))
+                    .result(0)
+                    .unwrap()
+                    .into(),
+                BinOp::BitXor => block
+                    .append_operation(arith::xori(li, ri, loc))
+                    .result(0)
+                    .unwrap()
+                    .into(),
+                BinOp::Shl => block
+                    .append_operation(arith::shli(li, ri, loc))
+                    .result(0)
+                    .unwrap()
+                    .into(),
+                BinOp::Shr => block
+                    .append_operation(arith::shrsi(li, ri, loc))
+                    .result(0)
+                    .unwrap()
+                    .into(),
+                _ => unreachable!(),
+            };
+            emit_i2f(block, res_i, types, loc)
+        }
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => {
             let predicate = cmpf_predicate(op);
             block
@@ -914,9 +960,11 @@ fn cmpf_predicate(op: BinOp) -> CmpfPredicate {
 }
 
 fn emit_unary<'a, 'c>(
+    context: &'c Context,
     block: &'a Block<'c>,
     op: UnaryOp,
     operand: Value<'c, 'a>,
+    types: &Types<'c>,
     loc: Location<'c>,
 ) -> Result<Value<'c, 'a>, CodegenError> {
     match op {
@@ -934,7 +982,60 @@ fn emit_unary<'a, 'c>(
                  operand kind is available for truthiness conversion"
             );
         }
+        // Phase 2.2c (ADR 0022): `~x = x XOR -1` after f64→i64.
+        UnaryOp::BitNot => {
+            let xi = emit_f2i(block, operand, types, loc);
+            let neg_one = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, -1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let r_i = block
+                .append_operation(arith::xori(xi, neg_one, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            Ok(emit_i2f(block, r_i, types, loc))
+        }
     }
+}
+
+/// Phase 2.2c (ADR 0022): convert an `f64` operand to a 64-bit signed
+/// integer via `arith.fptosi` for use in the bitwise ops, which are
+/// integer-typed in Lua 5.4 (truncates the float).
+fn emit_f2i<'a, 'c>(
+    block: &'a Block<'c>,
+    v: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let op = OperationBuilder::new("arith.fptosi", loc)
+        .add_operands(&[v])
+        .add_results(&[types.i64])
+        .build()
+        .expect("arith.fptosi");
+    block.append_operation(op).result(0).unwrap().into()
+}
+
+/// Phase 2.2c (ADR 0022): convert a 64-bit signed integer back to
+/// `f64` via `arith.sitofp`. Used after a bitwise op so the result
+/// flows back into the existing Number-typed expression world.
+fn emit_i2f<'a, 'c>(
+    block: &'a Block<'c>,
+    v: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let op = OperationBuilder::new("arith.sitofp", loc)
+        .add_operands(&[v])
+        .add_results(&[types.f64])
+        .build()
+        .expect("arith.sitofp");
+    block.append_operation(op).result(0).unwrap().into()
 }
 
 /// `a % b` per Lua 5.4: floor modulo, sign follows divisor.

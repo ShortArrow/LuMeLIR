@@ -55,11 +55,21 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
         HirExprKind::UnaryOp { op, .. } => match op {
             crate::parser::UnaryOp::Neg => ValueKind::Number,
             crate::parser::UnaryOp::Not => ValueKind::Bool,
+            crate::parser::UnaryOp::BitNot => ValueKind::Number,
         },
         HirExprKind::BinOp { op, lhs, .. } => match op {
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow => {
-                ValueKind::Number
-            }
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Mod
+            | BinOp::Pow
+            | BinOp::FloorDiv
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr => ValueKind::Number,
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => {
                 ValueKind::Bool
             }
@@ -488,8 +498,14 @@ fn binop_symbol(op: BinOp) -> &'static str {
         BinOp::Sub => "-",
         BinOp::Mul => "*",
         BinOp::Div => "/",
+        BinOp::FloorDiv => "//",
         BinOp::Mod => "%",
         BinOp::Pow => "^",
+        BinOp::BitAnd => "&",
+        BinOp::BitOr => "|",
+        BinOp::BitXor => "~",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
         BinOp::Lt => "<",
         BinOp::Le => "<=",
         BinOp::Gt => ">",
@@ -1302,8 +1318,21 @@ impl LowerCtx {
                 let lk = infer_kind(&lhs_hir, &self.locals, &self.functions);
                 let rk = infer_kind(&rhs_hir, &self.locals, &self.functions);
                 match op {
-                    // Arithmetic: both sides must be Number.
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow => {
+                    // Arithmetic + bitwise (Phase 2.2c, ADR 0022):
+                    // both sides must be Number. Bitwise ops convert
+                    // to i64 at codegen time; HIR enforces Number-only.
+                    BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Mod
+                    | BinOp::Pow
+                    | BinOp::FloorDiv
+                    | BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor
+                    | BinOp::Shl
+                    | BinOp::Shr => {
                         if !(lk == ValueKind::Number && rk == ValueKind::Number) {
                             return Err(HirError::TypeMismatch {
                                 op: binop_symbol(*op).to_owned(),
