@@ -32,10 +32,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
         if ch == '-' && bytes.get(offset + 1) == Some(&b'-') {
             chars.next(); // first '-'
             chars.next(); // second '-'
-            if bytes.get(offset + 2) == Some(&b'[') && bytes.get(offset + 3) == Some(&b'[') {
-                chars.next(); // first '['
-                chars.next(); // second '['
-                skip_block_comment(&mut chars, offset)?;
+            // Phase 2.7j (ADR 0038): `--[==[ ... ]==]` block comments
+            // share the long-bracket open match with strings. Try
+            // both at offset+2; on a match consume the `[==[` and
+            // delegate to the level-aware scanner. Otherwise fall
+            // through to the single-line skip.
+            if let Some(level) = try_match_long_open(bytes, offset + 2) {
+                for _ in 0..(level + 2) {
+                    chars.next();
+                }
+                skip_block_comment(&mut chars, bytes, offset, level)?;
             } else {
                 skip_line_comment(&mut chars);
             }
@@ -147,28 +153,91 @@ where
     }
 }
 
-/// Phase 2.8c (ADR 0034): consume a `--[[ ... ]]` block comment.
-/// The four leading `--[[` characters are consumed by the caller
-/// so this helper sees the body only. Returns
-/// `LexError::UnterminatedComment` when EOF arrives before the
-/// closing `]]`. `open_offset` is the byte offset of the leading
-/// `-` so the diagnostic points back at the comment's start.
+/// Phase 2.7j (ADR 0038): pattern-match a long-bracket opener
+/// starting at byte position `at`. Returns `Some(level)` when
+/// `bytes[at..]` begins with `[` + `=`*level + `[`, else `None`.
+/// Pure byte-index arithmetic; nothing is consumed.
+fn try_match_long_open(bytes: &[u8], at: usize) -> Option<usize> {
+    if bytes.get(at) != Some(&b'[') {
+        return None;
+    }
+    let mut level = 0usize;
+    while bytes.get(at + 1 + level) == Some(&b'=') {
+        level += 1;
+    }
+    if bytes.get(at + 1 + level) == Some(&b'[') {
+        Some(level)
+    } else {
+        None
+    }
+}
+
+/// Phase 2.8c / 2.7j (ADRs 0034, 0038): generic long-bracket body
+/// scanner. Reads characters from `chars` until it finds a matching
+/// `]` + `=`*level + `]` close, returning the accumulated body
+/// (`Ok(String)`) or `Err(())` on EOF before the close.
+///
+/// The opening `[` + `=`*level + `[` is consumed by the caller so
+/// this helper sees the body only. Lookahead for the close uses
+/// `bytes` (the source as bytes) — long brackets contain raw text,
+/// so we just count `=`s after a `]` to test for a level match.
+/// Per Lua spec, an immediate leading `\n` after the opener is
+/// stripped from the body.
+///
+/// Returning `Err(())` lets callers map to the variant they prefer
+/// (`UnterminatedBracket` for strings, `UnterminatedComment` for
+/// `--[[...]]` block comments). Pure relative to its inputs save
+/// for `chars` advancement.
+fn scan_long_bracket_body<I>(
+    chars: &mut std::iter::Peekable<I>,
+    bytes: &[u8],
+    level: usize,
+) -> Result<String, ()>
+where
+    I: Iterator<Item = (usize, char)>,
+{
+    // Lua spec: leading `\n` immediately after the opener is dropped.
+    if matches!(chars.peek(), Some(&(_, '\n'))) {
+        chars.next();
+    }
+    let mut body = String::new();
+    loop {
+        let (offset, c) = chars.next().ok_or(())?;
+        if c == ']' {
+            let mut k = 0usize;
+            while bytes.get(offset + 1 + k) == Some(&b'=') {
+                k += 1;
+            }
+            if k == level && bytes.get(offset + 1 + k) == Some(&b']') {
+                // Skip the matched `=`s and the final `]`.
+                for _ in 0..(level + 1) {
+                    chars.next();
+                }
+                return Ok(body);
+            }
+        }
+        body.push(c);
+    }
+}
+
+/// Phase 2.8c (ADR 0034) / 2.7j (ADR 0038): consume a `--[==[ ... ]==]`
+/// block comment of the given bracket level. `open_offset` is the
+/// byte offset of the leading `-` so the diagnostic points back at
+/// the comment's start. Delegates to `scan_long_bracket_body` and
+/// discards the result.
 fn skip_block_comment<I>(
     chars: &mut std::iter::Peekable<I>,
+    bytes: &[u8],
     open_offset: usize,
+    level: usize,
 ) -> Result<(), LexError>
 where
     I: Iterator<Item = (usize, char)>,
 {
-    loop {
-        let (_, c) = chars.next().ok_or(LexError::UnterminatedComment {
-            offset: open_offset,
-        })?;
-        if c == ']' && matches!(chars.peek(), Some(&(_, ']'))) {
-            chars.next(); // second ']'
-            return Ok(());
-        }
-    }
+    scan_long_bracket_body(chars, bytes, level).map_err(|_| LexError::UnterminatedComment {
+        offset: open_offset,
+    })?;
+    Ok(())
 }
 
 fn is_ident_start(ch: char) -> bool {
