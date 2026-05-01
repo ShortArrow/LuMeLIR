@@ -33,6 +33,10 @@ pub enum ValueKind {
     Bool,
     Nil,
     Function(usize),
+    /// String value (Phase 2.7a, ADR 0024). Storage is a `!llvm.ptr`
+    /// to a static C-string global; length is recovered via libc
+    /// `strlen` at the `#` use site rather than tracked statically.
+    String,
 }
 
 impl ValueKind {
@@ -42,6 +46,7 @@ impl ValueKind {
             ValueKind::Bool => "bool",
             ValueKind::Nil => "nil",
             ValueKind::Function(_) => "function",
+            ValueKind::String => "string",
         }
     }
 }
@@ -51,11 +56,13 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
         HirExprKind::Number(_) => ValueKind::Number,
         HirExprKind::Bool(_) => ValueKind::Bool,
         HirExprKind::Nil => ValueKind::Nil,
+        HirExprKind::Str(_) => ValueKind::String,
         HirExprKind::Local(LocalId(idx)) => locals[*idx].kind,
         HirExprKind::UnaryOp { op, .. } => match op {
             crate::parser::UnaryOp::Neg => ValueKind::Number,
             crate::parser::UnaryOp::Not => ValueKind::Bool,
             crate::parser::UnaryOp::BitNot => ValueKind::Number,
+            crate::parser::UnaryOp::Len => ValueKind::Number,
         },
         HirExprKind::BinOp { op, lhs, .. } => match op {
             BinOp::Add
@@ -747,7 +754,12 @@ impl LowerCtx {
                 ValueKind::Number => Some(HirExprKind::Number(0.0)),
                 ValueKind::Bool => Some(HirExprKind::Bool(false)),
                 ValueKind::Nil => Some(HirExprKind::Nil),
-                ValueKind::Function(_) => None,
+                // Function: no sensible default (ptr alloca, body-
+                // guard guarantees a real value before load).
+                // String: same — no empty-string sentinel needed since
+                // every non-trivial body assigns before the trailing
+                // load fires.
+                ValueKind::Function(_) | ValueKind::String => None,
             };
             if let Some(kind) = init_value {
                 out.push(HirStmt {
@@ -1292,6 +1304,7 @@ impl LowerCtx {
     fn lower_expr(&mut self, expr: &Expr) -> Result<HirExpr, HirError> {
         let kind = match &expr.kind {
             ExprKind::Number(n) => HirExprKind::Number(*n),
+            ExprKind::Str(s) => HirExprKind::Str(s.clone()),
             ExprKind::Ident(name) => match self.resolve(name) {
                 Some(id) => HirExprKind::Local(id),
                 None => {
@@ -1404,10 +1417,25 @@ impl LowerCtx {
                     }
                 }
             }
-            ExprKind::UnaryOp { op, operand } => HirExprKind::UnaryOp {
-                op: *op,
-                operand: Box::new(self.lower_expr(operand)?),
-            },
+            ExprKind::UnaryOp { op, operand } => {
+                let operand_hir = self.lower_expr(operand)?;
+                // Phase 2.7a (ADR 0024): `#x` requires a String operand.
+                if matches!(op, UnaryOp::Len) {
+                    let k = infer_kind(&operand_hir, &self.locals, &self.functions);
+                    if k != ValueKind::String {
+                        return Err(HirError::TypeMismatch {
+                            op: "#".to_owned(),
+                            lhs_kind: "string".to_owned(),
+                            rhs_kind: k.name().to_owned(),
+                            offset: expr.span.start,
+                        });
+                    }
+                }
+                HirExprKind::UnaryOp {
+                    op: *op,
+                    operand: Box::new(operand_hir),
+                }
+            }
             ExprKind::FunctionExpr { params, body } => {
                 // Register a fresh HirFunction with `name = ""` and
                 // mangled `user_anon_<idx>` (ADR 0017). The body is

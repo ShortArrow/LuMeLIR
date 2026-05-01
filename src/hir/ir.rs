@@ -134,6 +134,10 @@ pub struct HirExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HirExprKind {
     Number(f64),
+    /// String literal. Codegen materialises each unique payload as
+    /// an `llvm.mlir.global` and emits an `addressof` at every use
+    /// site. Phase 2.7a (ADR 0024).
+    Str(String),
     Bool(bool),
     Nil,
     Local(LocalId),
