@@ -61,6 +61,8 @@ pub enum TokenKind {
     LtLt,
     /// `>>` arithmetic right shift (Phase 2.2c, ADR 0022).
     GtGt,
+    /// `..` string concatenation (Phase 2.7b, ADR 0025).
+    DotDot,
     /// `#` length operator (Phase 2.7a, ADR 0024).
     Hash,
     Equals,

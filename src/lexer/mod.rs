@@ -47,8 +47,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
 
         // Two-character punctuation. `=`/`~` may form `==`/`~=`;
         // `<`/`>` may form `<=`/`>=` or `<<`/`>>`; `/` may form `//`.
+        // `.` (Phase 2.7b, ADR 0025) only forms `..`; the lone `.`
+        // remains a lex error until field access lands.
         // `~` standalone is bitwise XOR/NOT (Phase 2.2c, ADR 0022).
-        if matches!(ch, '=' | '<' | '>' | '~' | '/') {
+        if matches!(ch, '=' | '<' | '>' | '~' | '/' | '.') {
             chars.next();
             let next = chars.peek().map(|&(_, c)| c);
             let (kind, two_char) = match (ch, next) {
@@ -64,6 +66,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                 ('~', _) => (TokenKind::Tilde, false),
                 ('/', Some('/')) => (TokenKind::SlashSlash, true),
                 ('/', _) => (TokenKind::Slash, false),
+                ('.', Some('.')) => (TokenKind::DotDot, true),
+                ('.', _) => return Err(LexError::Unexpected { ch, offset }),
                 _ => unreachable!(),
             };
             let end = if two_char {

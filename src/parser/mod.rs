@@ -612,10 +612,13 @@ const PREC_BOR: u8 = 9;
 const PREC_BXOR: u8 = 10;
 const PREC_BAND: u8 = 11;
 const PREC_SHIFT: u8 = 12;
-const PREC_ADD: u8 = 13;
-const PREC_MUL: u8 = 14;
-const PREC_UNARY: u8 = 15;
-const PREC_POW: u8 = 16;
+/// `..` string concat (Phase 2.7b, ADR 0025): right-associative,
+/// between SHIFT and ADD per Lua 5.4 §3.4.8.
+const PREC_CONCAT: u8 = 13;
+const PREC_ADD: u8 = 14;
+const PREC_MUL: u8 = 15;
+const PREC_UNARY: u8 = 16;
+const PREC_POW: u8 = 17;
 
 struct InfixInfo {
     prec: u8,
@@ -657,6 +660,10 @@ fn infix_op(kind: &TokenKind) -> Option<InfixInfo> {
             prec: PREC_SHIFT,
             right_assoc: false,
         }),
+        TokenKind::DotDot => Some(InfixInfo {
+            prec: PREC_CONCAT,
+            right_assoc: true,
+        }),
         TokenKind::Plus | TokenKind::Minus => Some(InfixInfo {
             prec: PREC_ADD,
             right_assoc: false,
@@ -689,6 +696,7 @@ fn binop_from_token(kind: &TokenKind) -> Option<BinOp> {
         TokenKind::Tilde => Some(BinOp::BitXor),
         TokenKind::LtLt => Some(BinOp::Shl),
         TokenKind::GtGt => Some(BinOp::Shr),
+        TokenKind::DotDot => Some(BinOp::Concat),
         TokenKind::Lt => Some(BinOp::Lt),
         TokenKind::LtEq => Some(BinOp::Le),
         TokenKind::Gt => Some(BinOp::Gt),

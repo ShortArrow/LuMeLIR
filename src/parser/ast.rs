@@ -71,6 +71,10 @@ pub enum BinOp {
     Shl,
     /// `>>` arithmetic right shift (Phase 2.2c, ADR 0022).
     Shr,
+    /// `..` string concatenation (Phase 2.7b, ADR 0025).
+    /// Right-associative, between shift and additive in the
+    /// precedence ladder.
+    Concat,
     Lt,
     Le,
     Gt,
