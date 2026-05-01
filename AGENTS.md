@@ -28,6 +28,7 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.2a arithmetic operators | **Done** | `-` `*` `/` `%` `^` + unary `-`; libm pow/floor (ADR 0009) |
 | ‣ 2.2b comparisons + bool literals | **Done** | `<` `<=` `==` `~=` `>` `>=`, `true`/`false`; ordered cmpf, print(bool) (ADR 0010) |
 | ‣ 2.2c floor div + bitwise ops | **Done** | `//`, `&`/`\|`/`~`/`<<`/`>>`, unary `~`; f64↔i64 via fptosi/sitofp (ADR 0022) |
+| ‣ 2.2d hex / float / scientific literals | **Done** | `0xff`, `3.14`, `1e3`, `2.5e-1`; lexer-only change (ADR 0023) |
 | ‣ 2.3a nil + per-slot types + heterogeneous == | **Done** | `nil`, `local b = true`, `1 == nil` → false (ADR 0011) |
 | ‣ 2.3b control flow | **Done** | `if`/`elseif`/`else`/`while` via `scf`, truthiness helper (ADR 0012) |
 | ‣ 2.3c short-circuit | **Done** | `and`/`or`/`not` via `scf.if` expression form + `arith.xori` (ADR 0013) |

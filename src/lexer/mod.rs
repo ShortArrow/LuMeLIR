@@ -108,24 +108,80 @@ fn is_ident_continue(ch: char) -> bool {
     ch == '_' || ch.is_ascii_alphanumeric()
 }
 
+/// Scan a numeric literal. Phase 2.2d (ADR 0023) widens this from
+/// "ASCII digit run" to cover the three Lua 5.4 numeric forms our
+/// subset uses: decimal integers, hex integers (`0x`/`0X` prefix),
+/// decimal floats (`3.14`), and scientific notation (`1e3`,
+/// `2.5e-1`). Hex floats and binary literals are deferred.
+///
+/// Lookahead uses byte indexing on `src` directly (the input is
+/// ASCII for all numeric lexemes), advancing `chars` once per
+/// committed byte so the caller's iterator stays in sync.
 fn scan_number<I>(src: &str, chars: &mut std::iter::Peekable<I>) -> (Span, f64)
 where
     I: Iterator<Item = (usize, char)>,
 {
-    let &(start, _) = chars.peek().expect("scan_number requires a digit");
-    let mut end = start;
-    while let Some(&(offset, ch)) = chars.peek() {
-        if ch.is_ascii_digit() {
-            end = offset + ch.len_utf8();
+    let bytes = src.as_bytes();
+    let start = chars.peek().expect("scan_number requires a digit").0;
+
+    // Hex prefix: `0x` / `0X` followed by ≥1 hex digit. The prefix
+    // alone (e.g. trailing `0x` with no digit) falls back to the
+    // decimal scanner so the surrounding lex error is meaningful.
+    if bytes.get(start) == Some(&b'0')
+        && matches!(bytes.get(start + 1), Some(&b'x' | &b'X'))
+        && bytes.get(start + 2).is_some_and(|b| b.is_ascii_hexdigit())
+    {
+        chars.next(); // '0'
+        chars.next(); // 'x' / 'X'
+        let mut end = start + 2;
+        while bytes.get(end).is_some_and(|b| b.is_ascii_hexdigit()) {
+            end += 1;
             chars.next();
-        } else {
-            break;
+        }
+        let int_value = u64::from_str_radix(&src[start + 2..end], 16)
+            .expect("hex digit run is always a valid u64");
+        return (Span::new(start, end), int_value as f64);
+    }
+
+    // Decimal integer part — ≥1 digit (entry condition guaranteed it).
+    let mut end = start;
+    while bytes.get(end).is_some_and(|b| b.is_ascii_digit()) {
+        end += 1;
+        chars.next();
+    }
+    // Optional fractional part `.\d+`. Require at least one trailing
+    // digit so future `t.x` field syntax doesn't grab the dot.
+    if bytes.get(end) == Some(&b'.') && bytes.get(end + 1).is_some_and(|b| b.is_ascii_digit()) {
+        end += 1;
+        chars.next(); // '.'
+        while bytes.get(end).is_some_and(|b| b.is_ascii_digit()) {
+            end += 1;
+            chars.next();
         }
     }
-    let lexeme = &src[start..end];
-    let value = lexeme
+    // Optional exponent `[eE][+-]?\d+`. Same trailing-digit guard so
+    // a stray `e` doesn't get pulled in.
+    if matches!(bytes.get(end), Some(&b'e' | &b'E')) {
+        let mut probe = end + 1;
+        if matches!(bytes.get(probe), Some(&b'+' | &b'-')) {
+            probe += 1;
+        }
+        if bytes.get(probe).is_some_and(|b| b.is_ascii_digit()) {
+            end += 1;
+            chars.next(); // 'e' / 'E'
+            if matches!(bytes.get(end), Some(&b'+' | &b'-')) {
+                end += 1;
+                chars.next();
+            }
+            while bytes.get(end).is_some_and(|b| b.is_ascii_digit()) {
+                end += 1;
+                chars.next();
+            }
+        }
+    }
+    let value = src[start..end]
         .parse::<f64>()
-        .expect("ascii-digit run is always a valid f64");
+        .expect("scan_number recognised a valid f64 lexeme");
     (Span::new(start, end), value)
 }
 
@@ -429,5 +485,59 @@ mod tests {
             .map(|t| &src[t.span.start..t.span.end])
             .collect();
         assert_eq!(lexemes, vec!["print", "(", "1", ")"]);
+    }
+
+    // -----------------------------------------------------------
+    // Phase 2.2d — number-literal extensions (ADR 0023).
+    // -----------------------------------------------------------
+
+    #[test]
+    fn lex_hex_integer_literal_yields_f64() {
+        assert_eq!(
+            kinds("0xff"),
+            vec![TokenKind::Number(255.0), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_uppercase_hex_prefix_is_accepted() {
+        assert_eq!(kinds("0X1A"), vec![TokenKind::Number(26.0), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn lex_decimal_float_yields_f64() {
+        assert_eq!(kinds("1.5"), vec![TokenKind::Number(1.5), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn lex_scientific_notation_with_signed_exponent() {
+        assert_eq!(
+            kinds("2.5e-1"),
+            vec![TokenKind::Number(0.25), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_scientific_notation_without_fractional_part() {
+        assert_eq!(
+            kinds("1e3"),
+            vec![TokenKind::Number(1000.0), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_number_does_not_pull_in_trailing_punctuation() {
+        // Smoke check: a hex literal followed by `,` produces two
+        // tokens (number + comma), not one. Catches a regression where
+        // the scanner kept consuming non-hex bytes.
+        assert_eq!(
+            kinds("0xff,1"),
+            vec![
+                TokenKind::Number(255.0),
+                TokenKind::Comma,
+                TokenKind::Number(1.0),
+                TokenKind::Eof,
+            ]
+        );
     }
 }
