@@ -83,10 +83,13 @@ print(outer(41))";
 }
 
 #[test]
-fn closure_capturing_bool_is_static_error() {
+fn closure_capturing_function_is_static_error() {
+    // Phase 2.5c-min restricted captures to Number; 2.5c.2
+    // (ADR 0043) opened Bool/Nil/String. Function-kind captures
+    // still reject — see `tests/phase2_5c2_kind_captures.rs`.
     let chunk = lumelir::parser::parse(
-        "local b = true
-local f = function() return b end",
+        "local g = function(x) return x + 1 end
+local f = function() return g end",
     )
     .unwrap();
     assert!(lumelir::hir::lower(&chunk).is_err());

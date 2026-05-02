@@ -868,10 +868,16 @@ impl LowerCtx {
         let Some(&(outer_id, outer_kind)) = self.outer_visible.get(name) else {
             return Ok(None);
         };
-        if outer_kind != ValueKind::Number {
+        // Phase 2.5c.2 (ADR 0043): allow Number/Bool/Nil/String
+        // upvalues. Function-kind captures still error because
+        // codegen has no path to wire a function value through the
+        // alloca-backed inner slot — the existing Function-kind
+        // local treatment relies on `LocalInfo.func_id`, which the
+        // capture site doesn't reproduce.
+        if matches!(outer_kind, ValueKind::Function(_)) {
             return Err(HirError::TypeMismatch {
                 op: "upvalue capture".to_owned(),
-                lhs_kind: "number".to_owned(),
+                lhs_kind: "number/bool/nil/string".to_owned(),
                 rhs_kind: outer_kind.name().to_owned(),
                 offset: span.start,
             });
@@ -2276,12 +2282,27 @@ local f = function() return x end";
     }
 
     #[test]
-    fn lower_closure_capturing_bool_is_static_error() {
-        // Phase 2.5c-min: only Number captures supported.
+    fn lower_closure_capturing_function_is_static_error() {
+        // Phase 2.5c.2 (ADR 0043) opened captures for Number/Bool/
+        // Nil/String. Function-kind captures still reject — codegen
+        // has no path to wire a function value through the
+        // alloca-backed inner slot.
+        let src = "local g = function(x) return x + 1 end
+local f = function() return g end";
+        let err = lower_src(src).expect_err("Function capture must reject");
+        assert!(matches!(err, HirError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn lower_closure_capturing_bool_now_succeeds_after_2_5c2() {
+        // Boundary documentation: Bool was rejected in 2.5c-min and
+        // is allowed in 2.5c.2. The captured local appears in the
+        // closure's upvalue list.
         let src = "local b = true
 local f = function() return b end";
-        let err = lower_src(src).expect_err("Bool capture must reject");
-        assert!(matches!(err, HirError::TypeMismatch { .. }));
+        let hir = lower_src(src).expect("Bool capture must lower in 2.5c.2");
+        assert_eq!(hir.functions[0].upvalues.len(), 1);
+        assert_eq!(hir.functions[0].upvalues[0].kind, ValueKind::Bool);
     }
 
     #[test]
