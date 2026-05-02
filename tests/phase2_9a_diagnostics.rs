@@ -52,10 +52,16 @@ fn parse_error_renders_with_line_col() {
         stderr.contains("parse error:"),
         "expected parse error tag, got: {stderr}"
     );
-    // The error should reference some line/col, not a bare "byte offset".
+    // Phase 2.9c (ADR 0047): the redundant "byte offset N" /
+    // "(offset N)" suffix is dropped — line:col is in the prefix
+    // already.
     assert!(
-        !stderr.contains("byte offset 0\n"),
-        "raw byte offset should be replaced, got: {stderr}"
+        !stderr.contains("byte offset"),
+        "rendered error must not duplicate byte-offset, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("(offset "),
+        "rendered error must not include parenthesised offset, got: {stderr}"
     );
 }
 

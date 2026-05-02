@@ -6,25 +6,25 @@ use thiserror::Error;
 /// map them to line/column at the presentation layer. See ADR 0003.
 #[derive(Debug, Error, PartialEq)]
 pub enum LexError {
-    #[error("unexpected character {ch:?} at byte offset {offset}")]
+    #[error("unexpected character {ch:?}")]
     Unexpected { ch: char, offset: usize },
 
     /// String literal whose closing quote is missing or eclipsed by EOF
     /// (Phase 2.7a, ADR 0024).
-    #[error("unterminated string literal starting at byte offset {offset}")]
+    #[error("unterminated string literal")]
     UnterminatedString { offset: usize },
 
     /// Backslash escape with an unrecognised follower (Phase 2.7a).
-    #[error("invalid escape sequence {seq:?} at byte offset {offset}")]
+    #[error("invalid escape sequence {seq:?}")]
     InvalidEscape { seq: String, offset: usize },
 
     /// Block comment whose closing `]]` is missing (Phase 2.8c, ADR 0034).
-    #[error("unterminated block comment starting at byte offset {offset}")]
+    #[error("unterminated block comment")]
     UnterminatedComment { offset: usize },
 
     /// Long-bracket string whose closing `]==]` is missing
     /// (Phase 2.7j, ADR 0038).
-    #[error("unterminated long-bracket string starting at byte offset {offset}")]
+    #[error("unterminated long-bracket string")]
     UnterminatedBracket { offset: usize },
 }
 

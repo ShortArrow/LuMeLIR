@@ -10,10 +10,10 @@ pub enum ParseError {
     #[error(transparent)]
     Lex(#[from] LexError),
 
-    #[error("unexpected end of input at byte offset {offset}")]
+    #[error("unexpected end of input")]
     UnexpectedEof { offset: usize },
 
-    #[error("unexpected token {actual:?} at byte offset {offset}")]
+    #[error("unexpected token {actual:?}")]
     UnexpectedToken { actual: TokenKind, offset: usize },
 }
 
