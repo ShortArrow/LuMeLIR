@@ -1097,10 +1097,52 @@ impl LowerCtx {
                 })
             }
             StmtKind::Assign { name, value } => {
-                let id = self.resolve(name).ok_or_else(|| HirError::UndefinedName {
-                    name: name.clone(),
-                    offset: stmt.span.start,
-                })?;
+                // Phase 2.0a (ADR 0048): a bare `name = expr` at chunk
+                // top level (`in_function == None`) auto-declares the
+                // name as a chunk-level local with kind inferred from
+                // the rhs. Inside function bodies, the unresolved-name
+                // path still errors — globals don't propagate downward
+                // until full _ENV semantics arrive.
+                if self.resolve(name).is_none() {
+                    if self.in_function.is_some() {
+                        return Err(HirError::UndefinedName {
+                            name: name.clone(),
+                            offset: stmt.span.start,
+                        });
+                    }
+                    if self.function_names.contains_key(name) {
+                        return Err(HirError::TypeMismatch {
+                            op: "=".to_owned(),
+                            lhs_kind: "function".to_owned(),
+                            rhs_kind: "value".to_owned(),
+                            offset: stmt.span.start,
+                        });
+                    }
+                    let value = self.lower_expr(value)?;
+                    let kind = infer_kind(&value, &self.locals, &self.functions);
+                    let func_id = match &value.kind {
+                        HirExprKind::FunctionRef(fid) => Some(*fid),
+                        HirExprKind::Local(LocalId(idx)) => self.locals[*idx].func_id,
+                        _ => None,
+                    };
+                    // Globals live at chunk scope so a `do ... end`
+                    // block that auto-declares one keeps it visible
+                    // after the block ends. Insert into `scopes[0]`
+                    // rather than `scopes.last_mut()` (which would
+                    // put it in the innermost frame).
+                    let id = LocalId(self.locals.len());
+                    self.locals.push(LocalInfo {
+                        name: name.clone(),
+                        kind,
+                        func_id,
+                    });
+                    self.scopes[0].insert(name.clone(), id);
+                    return Ok(HirStmt {
+                        kind: HirStmtKind::LocalInit { id, value },
+                        span: stmt.span,
+                    });
+                }
+                let id = self.resolve(name).expect("checked above");
                 if self.readonly_locals.contains(&id) {
                     return Err(HirError::ReadOnlyAssign {
                         name: name.clone(),
@@ -2109,12 +2151,31 @@ mod tests {
     }
 
     #[test]
-    fn lower_assign_to_undefined_name_errors() {
-        let err = lower_src("y = 1").expect_err("assign-to-undef must fail");
+    fn lower_assign_to_undefined_name_inside_function_errors() {
+        // Phase 2.0a (ADR 0048): top-level `y = 1` now auto-declares.
+        // Inside a function body the unresolved-name path still
+        // errors — auto-declare is restricted to chunk top level.
+        let err = lower_src(
+            "local function f()
+  y = 1
+end
+f()",
+        )
+        .expect_err("assign-to-undef inside fn must fail");
         match err {
             HirError::UndefinedName { name, .. } => assert_eq!(name, "y"),
             other => panic!("expected UndefinedName, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lower_top_level_bare_assign_now_auto_declares_after_2_0a() {
+        // Boundary: `y = 1` at chunk scope is now legal — it
+        // declares `y` as a chunk-level local.
+        let hir = lower_src("y = 1\nprint(y)").expect("bare assign must lower in 2.0a");
+        assert_eq!(hir.locals.len(), 1);
+        assert_eq!(hir.locals[0].name, "y");
+        assert_eq!(hir.locals[0].kind, ValueKind::Number);
     }
 
     #[test]
