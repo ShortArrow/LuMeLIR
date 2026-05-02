@@ -74,3 +74,20 @@ fn lex_error_renders_with_line_col() {
         "expected line 1 prefix, got: {stderr}"
     );
 }
+
+#[test]
+fn hir_error_includes_source_snippet() {
+    // Phase 2.9b (ADR 0046): the rendered error includes a
+    // rustc-style snippet showing the offending line and a
+    // caret pointing at the column.
+    let (ok, stderr) = run_compile("local x = 1\nlocal y = z\n", "lumelir_29b_snippet");
+    assert!(!ok);
+    assert!(
+        stderr.contains("| local y = z"),
+        "expected source line in snippet, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("|           ^"),
+        "expected caret aligned under 'z', got: {stderr}"
+    );
+}

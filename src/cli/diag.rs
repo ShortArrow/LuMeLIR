@@ -48,29 +48,115 @@ impl HasOffset for crate::hir::HirError {
     }
 }
 
-/// Render an error as `path:line:col: <layer> error: <display>`.
-/// `layer` is a short tag like "parse" or "hir" so users can tell
-/// at a glance which stage rejected their source.
+/// Render an error as `path:line:col: <layer> error: <display>`,
+/// followed by a rustc-style source snippet pointing a caret at
+/// the offending column. `layer` is a short tag like "parse" or
+/// "hir" so users can tell at a glance which stage rejected
+/// their source.
 pub fn format_error<E: HasOffset + std::fmt::Display>(
     src: &str,
     path: &Path,
     layer: &str,
     err: &E,
 ) -> String {
-    let (line, col) = offset_to_line_col(src, err.offset());
+    let offset = err.offset();
+    let (line, col) = offset_to_line_col(src, offset);
+    let snip = snippet(src, offset);
     format!(
-        "{}:{}:{}: {} error: {}",
+        "{}:{}:{}: {} error: {}\n{}",
         path.display(),
         line,
         col,
         layer,
-        err
+        err,
+        snip
     )
+}
+
+/// Phase 2.9b (ADR 0046): render the source line containing
+/// `offset` and a caret aligned under the corresponding column.
+/// Output is exactly two lines plus a trailing newline:
+///
+/// ```text
+///   | <source line>
+///   |   <caret>
+/// ```
+///
+/// Caret column matches `offset_to_line_col`'s column count
+/// (Unicode scalar values from line start). Out-of-range offsets
+/// clamp to EOF, placing the caret one past the last char of the
+/// last line. Empty source produces a blank source line and a
+/// caret at column 1.
+pub fn snippet(src: &str, offset: usize) -> String {
+    let clamped = offset.min(src.len());
+    let line_start = src[..clamped].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = src[line_start..]
+        .find('\n')
+        .map(|i| line_start + i)
+        .unwrap_or(src.len());
+    let line = &src[line_start..line_end];
+    let col_chars = src[line_start..clamped].chars().count();
+    let mut out = String::new();
+    out.push_str("  | ");
+    out.push_str(line);
+    out.push('\n');
+    out.push_str("  | ");
+    for _ in 0..col_chars {
+        out.push(' ');
+    }
+    out.push('^');
+    out.push('\n');
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snippet_single_line_source() {
+        // 1-col-wide caret at the offset; gutter keeps two spaces.
+        let s = snippet("abc", 1);
+        assert_eq!(s, "  | abc\n  |  ^\n");
+    }
+
+    #[test]
+    fn snippet_caret_at_first_column() {
+        let s = snippet("xyz", 0);
+        assert_eq!(s, "  | xyz\n  | ^\n");
+    }
+
+    #[test]
+    fn snippet_picks_offending_line_in_multi_line_source() {
+        // The error is on line 2 ("def"), col 2.
+        let s = snippet("abc\ndef\nghi", 5);
+        assert_eq!(s, "  | def\n  |  ^\n");
+    }
+
+    #[test]
+    fn snippet_caret_aligns_under_multibyte_char() {
+        // 'あ' is 1 char wide. Offset 4 lands just after it in
+        // "aあb" (byte 4 == 'b'). Caret should be at col 3.
+        let s = snippet("aあb", 4);
+        assert_eq!(s, "  | aあb\n  |   ^\n");
+    }
+
+    #[test]
+    fn snippet_clamps_offset_past_eof_to_last_line() {
+        // Past EOF — caret lands one past the last char of the
+        // last line.
+        let s = snippet("abc", 99);
+        assert_eq!(s, "  | abc\n  |    ^\n");
+    }
+
+    #[test]
+    fn snippet_empty_source_emits_blank_line_and_caret() {
+        // Edge case — a totally empty source still renders a
+        // valid two-line snippet so the caller's format string
+        // doesn't have to special-case it.
+        let s = snippet("", 0);
+        assert_eq!(s, "  | \n  | ^\n");
+    }
 
     #[test]
     fn offset_zero_is_line_one_col_one() {

@@ -46,6 +46,7 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.5c.2 Bool / Nil / String upvalue captures | **Done** | one predicate flip in `lookup_or_capture_upvalue`; codegen unchanged (ADR 0043) |
 | ‣ 2.5c.3 closure-escape static rejection | **Done** | `HirError::ClosureEscapes` for closures-with-upvalues used as args / returns (ADR 0044) |
 | ‣ 2.9a line/column diagnostics | **Done** | CLI renders errors as `path:line:col: <layer> error: …` via `cli::diag` (ADR 0045) |
+| ‣ 2.9b source-snippet caret display | **Done** | `format_error` appends a rustc-style two-line snippet via `snippet` pure helper (ADR 0046) |
 | ‣ 2.5d multi-return | **Done** | `return a, b`, `local x, y = call()`, parallel binding, multi-result `func.call` (ADR 0021) |
 | ‣ 2.7a string literals + `#` | **Done** | `"..."`/`'...'`, basic escapes, `print(s)`, `#s` via strlen, deduped LLVM globals (ADR 0024) |
 | ‣ 2.7b string concat / equality | **Done** | `a..b` via malloc+memcpy, `s1 == s2` via strcmp, call-site String inference (ADR 0025) |
