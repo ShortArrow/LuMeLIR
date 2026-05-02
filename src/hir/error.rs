@@ -41,4 +41,14 @@ pub enum HirError {
 
     #[error("function value '{name}' can only be called, not used as a value (offset {offset})")]
     FunctionUsedAsValue { name: String, offset: usize },
+
+    /// A closure value carrying upvalues was used in a position that
+    /// would route it through `Callee::Indirect` (call argument or
+    /// return value). Indirect dispatch cannot thread upvalues, so
+    /// the closure must be reached via a direct call (Phase 2.5c.3,
+    /// ADR 0044).
+    #[error(
+        "closure with upvalues cannot escape via {position} — direct call only (offset {offset})"
+    )]
+    ClosureEscapes { position: String, offset: usize },
 }

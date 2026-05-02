@@ -901,6 +901,27 @@ impl LowerCtx {
         Ok(Some(inner_local_id))
     }
 
+    /// Phase 2.5c.3 (ADR 0044): does this lowered HIR expression
+    /// evaluate to a closure carrying upvalues? Returns the closure's
+    /// `FuncId` on hit so callers can incorporate it into diagnostics
+    /// or future analysis. A "closure with upvalues" is a Function
+    /// value whose target FuncId records a non-empty `upvalues` list;
+    /// such values can only be reached via direct calls
+    /// (`Callee::User`) since the call-site arg-extension that
+    /// threads upvalues lives only on that path.
+    fn closure_with_upvalues(&self, expr: &HirExpr) -> Option<FuncId> {
+        let fid = match &expr.kind {
+            HirExprKind::FunctionRef(fid) => *fid,
+            HirExprKind::Local(LocalId(idx)) => self.locals[*idx].func_id?,
+            _ => return None,
+        };
+        if self.functions[fid.0].upvalues.is_empty() {
+            None
+        } else {
+            Some(fid)
+        }
+    }
+
     /// Lower a function body. Allocates the synthetic `_returned` and
     /// `_ret_value_N` slots, sets `in_function`, and applies the same
     /// body-guard wrap pattern used by `break` (ADR 0015) so that
@@ -1369,6 +1390,17 @@ impl LowerCtx {
             .as_ref()
             .map(|(r, ids)| (*r, ids.clone()))
             .ok_or(HirError::ReturnOutsideFunction { offset: span.start })?;
+        // Phase 2.5c.3 (ADR 0044): a closure carrying upvalues
+        // returned from its creation scope would outlive the slots
+        // it observes. Reject statically.
+        for value in &lowered {
+            if self.closure_with_upvalues(value).is_some() {
+                return Err(HirError::ClosureEscapes {
+                    position: "return value".to_owned(),
+                    offset: value.span.start,
+                });
+            }
+        }
         let kinds: Vec<ValueKind> = lowered
             .iter()
             .map(|e| infer_kind(e, &self.locals, &self.functions))
@@ -1779,6 +1811,16 @@ impl LowerCtx {
                             offset: arg.span.start,
                         });
                     }
+                    // Phase 2.5c.3 (ADR 0044): a closure carrying
+                    // upvalues passed as a value reaches its eventual
+                    // call site via Callee::Indirect, which has no
+                    // path to thread upvalues. Reject statically.
+                    if self.closure_with_upvalues(arg).is_some() {
+                        return Err(HirError::ClosureEscapes {
+                            position: "call argument".to_owned(),
+                            offset: arg.span.start,
+                        });
+                    }
                 }
                 let callee = match self.locals[local_id.0].func_id {
                     Some(fid) => Callee::User(fid),
@@ -1852,6 +1894,15 @@ impl LowerCtx {
                         op: format!("call-{name}"),
                         lhs_kind: expected_kind.name().to_owned(),
                         rhs_kind: arg_kind.name().to_owned(),
+                        offset: arg.span.start,
+                    });
+                }
+                // Phase 2.5c.3 (ADR 0044): same escape check as the
+                // local-Function-kind path — a closure carrying
+                // upvalues cannot survive routing through Indirect.
+                if self.closure_with_upvalues(arg).is_some() {
+                    return Err(HirError::ClosureEscapes {
+                        position: "call argument".to_owned(),
                         offset: arg.span.start,
                     });
                 }
