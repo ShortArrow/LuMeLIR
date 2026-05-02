@@ -707,31 +707,29 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
         }
     }
 
-    // Pass 2: lower each function body in its own LowerCtx; then lower
-    // the `main` chunk (skipping FunctionDef stmts — they've been
-    // lifted out).
-    for (idx, stmt) in chunk.iter().enumerate() {
-        if let StmtKind::FunctionDef { params, body, .. } = &stmt.kind {
-            let id = FuncId(idx_of_funcdef(chunk, idx));
-            // Top-level functions have no enclosing scope — pass an
-            // empty visible map so any upvalue would surface as an
-            // UndefinedName, which is the historical behaviour.
+    // Pass 2 (Phase 2.5c.1, ADR 0042): walk the chunk in source
+    // order, lowering each function body at the position where its
+    // FunctionDef appears so the body can capture chunk-level
+    // locals declared above it. Earlier phases lowered all bodies
+    // first with an empty `outer_visible`, which made top-level
+    // captures statically unreachable; ADR 0037 documented that
+    // gap, ADR 0042 closes it.
+    let mut ctx = LowerCtx::new(function_names.clone(), functions);
+    let mut stmts = Vec::new();
+    let mut funcdef_seq: usize = 0;
+    for s in chunk {
+        if let StmtKind::FunctionDef { params, body, .. } = &s.kind {
+            let fid = FuncId(funcdef_seq);
+            funcdef_seq += 1;
+            let outer_visible = ctx.outer_visible_snapshot();
             lower_into_function(
-                id,
+                fid,
                 params,
                 body,
-                &function_names,
-                &mut functions,
-                HashMap::new(),
+                &ctx.function_names,
+                &mut ctx.functions,
+                outer_visible,
             )?;
-        }
-    }
-
-    let mut ctx = LowerCtx::new(function_names.clone(), functions);
-    // Lower top-level stmts, skipping FunctionDef (already lifted).
-    let mut stmts = Vec::new();
-    for s in chunk {
-        if matches!(s.kind, StmtKind::FunctionDef { .. }) {
             continue;
         }
         stmts.push(ctx.lower_stmt(s)?);
@@ -743,17 +741,6 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
         stmts,
         functions: ctx.functions,
     })
-}
-
-/// Helper: count `FunctionDef`s up to (and including) position `idx` to
-/// get the FuncId. The stable ordering matches the pass-1 enumeration.
-fn idx_of_funcdef(chunk: &[Stmt], idx: usize) -> usize {
-    chunk
-        .iter()
-        .take(idx + 1)
-        .filter(|s| matches!(s.kind, StmtKind::FunctionDef { .. }))
-        .count()
-        - 1
 }
 
 struct LowerCtx {

@@ -42,6 +42,7 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.5e Bool/Nil params/return | **Done** | predicates (`return x > 0`), `not b`, `nil`-returning helpers; call-site param inference (ADR 0020) |
 | ‣ 2.5f nested `local function` (no capture) | **Done** | sibling forward-reference + recursion via shared register/lower helpers (ADR 0036) |
 | ‣ 2.5c-min capture-by-value closures | **Done** | Number upvalues, direct-call only, MLIR signature widens to `[params + upvalues]` (ADR 0037) |
+| ‣ 2.5c.1 top-level `local function` captures chunk locals | **Done** | Pass 2 interleaved with main chunk walk; `idx_of_funcdef` removed (ADR 0042) |
 | ‣ 2.5d multi-return | **Done** | `return a, b`, `local x, y = call()`, parallel binding, multi-result `func.call` (ADR 0021) |
 | ‣ 2.7a string literals + `#` | **Done** | `"..."`/`'...'`, basic escapes, `print(s)`, `#s` via strlen, deduped LLVM globals (ADR 0024) |
 | ‣ 2.7b string concat / equality | **Done** | `a..b` via malloc+memcpy, `s1 == s2` via strcmp, call-site String inference (ADR 0025) |
