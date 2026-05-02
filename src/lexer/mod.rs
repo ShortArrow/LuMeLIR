@@ -18,6 +18,19 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
     let mut chars = src.char_indices().peekable();
     let bytes = src.as_bytes();
 
+    // Phase 2.8d (ADR 0041): a `#!` at byte 0 is a Unix shebang
+    // line. Skip everything up to (but not including) the first
+    // newline so the rest of the script lexes normally. Only
+    // honoured at offset 0 — a `#` anywhere else stays the length
+    // operator.
+    if bytes.starts_with(b"#!") {
+        for (_, c) in chars.by_ref() {
+            if c == '\n' {
+                break;
+            }
+        }
+    }
+
     while let Some(&(offset, ch)) = chars.peek() {
         if ch.is_ascii_whitespace() {
             chars.next();
@@ -1322,6 +1335,52 @@ mod tests {
         assert_eq!(
             kinds("\"a\\z\""),
             vec![TokenKind::Str("a".into()), TokenKind::Eof]
+        );
+    }
+
+    // -----------------------------------------------------------
+    // Phase 2.8d — `#!` shebang line skip (ADR 0041).
+    // -----------------------------------------------------------
+
+    #[test]
+    fn lex_shebang_at_offset_zero_is_skipped() {
+        // The `#!/usr/bin/env lumelir` header is dropped; the
+        // following `print(1)` lexes normally.
+        assert_eq!(
+            kinds("#!/usr/bin/env lumelir\nprint(1)"),
+            vec![
+                TokenKind::Ident("print".into()),
+                TokenKind::LParen,
+                TokenKind::Number(1.0),
+                TokenKind::RParen,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_shebang_only_yields_eof() {
+        assert_eq!(kinds("#!/usr/bin/env lua"), vec![TokenKind::Eof]);
+    }
+
+    #[test]
+    fn lex_hash_not_at_offset_zero_remains_length_operator() {
+        // A `#` that is not at byte 0 is still the length operator,
+        // even when followed by `!` (which surfaces as Unexpected).
+        let err = lex("local x = 1\n#!").expect_err("non-leading `#!` is not shebang");
+        assert!(matches!(err, LexError::Unexpected { ch: '!', .. }));
+    }
+
+    #[test]
+    fn lex_leading_hash_without_bang_is_length_operator() {
+        // `#x` at offset 0 is `Hash` + `Ident("x")`, not shebang.
+        assert_eq!(
+            kinds("#x"),
+            vec![
+                TokenKind::Hash,
+                TokenKind::Ident("x".into()),
+                TokenKind::Eof
+            ]
         );
     }
 }
