@@ -27,3 +27,17 @@ pub enum LexError {
     #[error("unterminated long-bracket string starting at byte offset {offset}")]
     UnterminatedBracket { offset: usize },
 }
+
+impl LexError {
+    /// Phase 2.9a (ADR 0045): byte offset associated with this error,
+    /// used by the CLI diagnostic layer to compute line/column.
+    pub fn offset(&self) -> usize {
+        match self {
+            LexError::Unexpected { offset, .. }
+            | LexError::UnterminatedString { offset }
+            | LexError::InvalidEscape { offset, .. }
+            | LexError::UnterminatedComment { offset }
+            | LexError::UnterminatedBracket { offset } => *offset,
+        }
+    }
+}

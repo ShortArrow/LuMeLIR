@@ -16,3 +16,16 @@ pub enum ParseError {
     #[error("unexpected token {actual:?} at byte offset {offset}")]
     UnexpectedToken { actual: TokenKind, offset: usize },
 }
+
+impl ParseError {
+    /// Phase 2.9a (ADR 0045): byte offset for the diagnostic layer.
+    /// `Lex` defers to the wrapped lexer error.
+    pub fn offset(&self) -> usize {
+        match self {
+            ParseError::Lex(e) => e.offset(),
+            ParseError::UnexpectedEof { offset } | ParseError::UnexpectedToken { offset, .. } => {
+                *offset
+            }
+        }
+    }
+}

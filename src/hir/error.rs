@@ -52,3 +52,21 @@ pub enum HirError {
     )]
     ClosureEscapes { position: String, offset: usize },
 }
+
+impl HirError {
+    /// Phase 2.9a (ADR 0045): byte offset for the diagnostic layer.
+    pub fn offset(&self) -> usize {
+        match self {
+            HirError::UndefinedName { offset, .. }
+            | HirError::ArityMismatch { offset, .. }
+            | HirError::UnsupportedCall { offset }
+            | HirError::TypeMismatch { offset, .. }
+            | HirError::ReadOnlyAssign { offset, .. }
+            | HirError::BreakOutsideLoop { offset }
+            | HirError::ReturnOutsideFunction { offset }
+            | HirError::UnknownFunction { offset, .. }
+            | HirError::FunctionUsedAsValue { offset, .. }
+            | HirError::ClosureEscapes { offset, .. } => *offset,
+        }
+    }
+}

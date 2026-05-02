@@ -1,4 +1,5 @@
 mod compile;
+pub(crate) mod diag;
 mod run;
 
 use std::path::PathBuf;
