@@ -1097,73 +1097,8 @@ impl LowerCtx {
                 })
             }
             StmtKind::Assign { name, value } => {
-                // Phase 2.0a (ADR 0048): a bare `name = expr` at chunk
-                // top level (`in_function == None`) auto-declares the
-                // name as a chunk-level local with kind inferred from
-                // the rhs. Inside function bodies, the unresolved-name
-                // path still errors — globals don't propagate downward
-                // until full _ENV semantics arrive.
-                if self.resolve(name).is_none() {
-                    if self.in_function.is_some() {
-                        return Err(HirError::UndefinedName {
-                            name: name.clone(),
-                            offset: stmt.span.start,
-                        });
-                    }
-                    if self.function_names.contains_key(name) {
-                        return Err(HirError::TypeMismatch {
-                            op: "=".to_owned(),
-                            lhs_kind: "function".to_owned(),
-                            rhs_kind: "value".to_owned(),
-                            offset: stmt.span.start,
-                        });
-                    }
-                    let value = self.lower_expr(value)?;
-                    let kind = infer_kind(&value, &self.locals, &self.functions);
-                    let func_id = match &value.kind {
-                        HirExprKind::FunctionRef(fid) => Some(*fid),
-                        HirExprKind::Local(LocalId(idx)) => self.locals[*idx].func_id,
-                        _ => None,
-                    };
-                    // Globals live at chunk scope so a `do ... end`
-                    // block that auto-declares one keeps it visible
-                    // after the block ends. Insert into `scopes[0]`
-                    // rather than `scopes.last_mut()` (which would
-                    // put it in the innermost frame).
-                    let id = LocalId(self.locals.len());
-                    self.locals.push(LocalInfo {
-                        name: name.clone(),
-                        kind,
-                        func_id,
-                    });
-                    self.scopes[0].insert(name.clone(), id);
-                    return Ok(HirStmt {
-                        kind: HirStmtKind::LocalInit { id, value },
-                        span: stmt.span,
-                    });
-                }
-                let id = self.resolve(name).expect("checked above");
-                if self.readonly_locals.contains(&id) {
-                    return Err(HirError::ReadOnlyAssign {
-                        name: name.clone(),
-                        offset: stmt.span.start,
-                    });
-                }
                 let value = self.lower_expr(value)?;
-                let slot_kind = self.locals[id.0].kind;
-                let value_kind = infer_kind(&value, &self.locals, &self.functions);
-                if slot_kind != value_kind {
-                    return Err(HirError::TypeMismatch {
-                        op: "=".to_owned(),
-                        lhs_kind: slot_kind.name().to_owned(),
-                        rhs_kind: value_kind.name().to_owned(),
-                        offset: stmt.span.start,
-                    });
-                }
-                Ok(HirStmt {
-                    kind: HirStmtKind::Assign { id, value },
-                    span: stmt.span,
-                })
+                self.lower_assign_target(name, value, stmt.span)
             }
             StmtKind::Block(body) => {
                 self.scopes.push(HashMap::new());
@@ -1419,66 +1354,117 @@ impl LowerCtx {
         }
     }
 
+    /// Phase 2.1c: shared resolver for assignment targets. Three
+    /// HIR sites — single Assign, parallel multi-target Assign,
+    /// multi-target from Call — all need the same logic:
+    ///
+    /// - **Existing local**: cross-check kind, reject readonly.
+    /// - **Unresolved name**: auto-declare at chunk scope per
+    ///   ADR 0048 *if* we're outside a function body and the
+    ///   name doesn't shadow a top-level FunctionDef; otherwise
+    ///   error.
+    ///
+    /// Returns the destination `LocalId` plus a flag distinguishing
+    /// "was this just declared?" — callers that want to emit
+    /// `LocalInit` (vs `Assign`) for the freshly-declared case use
+    /// the flag; callers wiring into `MultiAssignFromCall` ignore
+    /// it (codegen treats both the same).
+    fn resolve_or_declare_target(
+        &mut self,
+        name: &str,
+        expected_kind: ValueKind,
+        func_id: Option<FuncId>,
+        span: Span,
+    ) -> Result<(LocalId, bool), HirError> {
+        match self.resolve(name) {
+            Some(id) => {
+                if self.readonly_locals.contains(&id) {
+                    return Err(HirError::ReadOnlyAssign {
+                        name: name.to_owned(),
+                        offset: span.start,
+                    });
+                }
+                if self.locals[id.0].kind != expected_kind {
+                    return Err(HirError::TypeMismatch {
+                        op: "=".to_owned(),
+                        lhs_kind: self.locals[id.0].kind.name().to_owned(),
+                        rhs_kind: expected_kind.name().to_owned(),
+                        offset: span.start,
+                    });
+                }
+                Ok((id, false))
+            }
+            None => {
+                if self.in_function.is_some() {
+                    return Err(HirError::UndefinedName {
+                        name: name.to_owned(),
+                        offset: span.start,
+                    });
+                }
+                if self.function_names.contains_key(name) {
+                    return Err(HirError::TypeMismatch {
+                        op: "=".to_owned(),
+                        lhs_kind: "function".to_owned(),
+                        rhs_kind: "value".to_owned(),
+                        offset: span.start,
+                    });
+                }
+                let id = LocalId(self.locals.len());
+                self.locals.push(LocalInfo {
+                    name: name.to_owned(),
+                    kind: expected_kind,
+                    func_id,
+                });
+                self.scopes[0].insert(name.to_owned(), id);
+                Ok((id, true))
+            }
+        }
+    }
+
+    /// Phase 2.1c: thin wrapper that turns a (name, value) pair
+    /// into a complete `Assign` / `LocalInit` HirStmt via
+    /// `resolve_or_declare_target`. Used by single-target Assign
+    /// and the parallel multi-target path.
+    fn lower_assign_target(
+        &mut self,
+        name: &str,
+        value: HirExpr,
+        span: Span,
+    ) -> Result<HirStmt, HirError> {
+        let value_kind = infer_kind(&value, &self.locals, &self.functions);
+        let func_id = match &value.kind {
+            HirExprKind::FunctionRef(fid) => Some(*fid),
+            HirExprKind::Local(LocalId(idx)) => self.locals[*idx].func_id,
+            _ => None,
+        };
+        let (id, was_declared) = self.resolve_or_declare_target(name, value_kind, func_id, span)?;
+        let kind = if was_declared {
+            HirStmtKind::LocalInit { id, value }
+        } else {
+            HirStmtKind::Assign { id, value }
+        };
+        Ok(HirStmt { kind, span })
+    }
+
     /// Phase 2.1b (ADR 0050): resolve each target name in a
-    /// multi-target reassignment. Existing locals must match the
-    /// expected kind at their position; unresolved names auto-
-    /// declare at chunk scope per ADR 0048 (and reject inside
-    /// function bodies). Returns the destination LocalIds in the
-    /// same order as `names`.
+    /// multi-target reassignment. Thin wrapper around
+    /// `resolve_or_declare_target` that ignores the
+    /// freshly-declared flag (codegen's `MultiAssignFromCall`
+    /// treats fresh and existing slots the same way).
     fn resolve_or_declare_multi_targets(
         &mut self,
         names: &[String],
         kinds: &[ValueKind],
         span: Span,
     ) -> Result<Vec<LocalId>, HirError> {
-        let mut dst_ids: Vec<LocalId> = Vec::with_capacity(names.len());
-        for (n, k) in names.iter().zip(kinds.iter()) {
-            let id = match self.resolve(n) {
-                Some(id) => {
-                    if self.readonly_locals.contains(&id) {
-                        return Err(HirError::ReadOnlyAssign {
-                            name: n.clone(),
-                            offset: span.start,
-                        });
-                    }
-                    if self.locals[id.0].kind != *k {
-                        return Err(HirError::TypeMismatch {
-                            op: "=".to_owned(),
-                            lhs_kind: self.locals[id.0].kind.name().to_owned(),
-                            rhs_kind: k.name().to_owned(),
-                            offset: span.start,
-                        });
-                    }
-                    id
-                }
-                None => {
-                    if self.in_function.is_some() {
-                        return Err(HirError::UndefinedName {
-                            name: n.clone(),
-                            offset: span.start,
-                        });
-                    }
-                    if self.function_names.contains_key(n) {
-                        return Err(HirError::TypeMismatch {
-                            op: "=".to_owned(),
-                            lhs_kind: "function".to_owned(),
-                            rhs_kind: "value".to_owned(),
-                            offset: span.start,
-                        });
-                    }
-                    let id = LocalId(self.locals.len());
-                    self.locals.push(LocalInfo {
-                        name: n.clone(),
-                        kind: *k,
-                        func_id: None,
-                    });
-                    self.scopes[0].insert(n.clone(), id);
-                    id
-                }
-            };
-            dst_ids.push(id);
-        }
-        Ok(dst_ids)
+        names
+            .iter()
+            .zip(kinds.iter())
+            .map(|(n, k)| {
+                self.resolve_or_declare_target(n, *k, None, span)
+                    .map(|(id, _)| id)
+            })
+            .collect()
     }
 
     /// Phase 2.1a (ADR 0049): lower a multi-target reassignment
@@ -1562,68 +1548,15 @@ impl LowerCtx {
                 span,
             });
         }
-        // Stage 2: write each temp to its target. The target may
-        // already exist as a local, or — at chunk scope — auto-
-        // declare per ADR 0048.
+        // Stage 2: write each temp to its target via the shared
+        // resolver — handles both existing-local kind check and
+        // chunk-scope auto-declare uniformly (Phase 2.1c).
         for (name, tmp_id) in names.iter().zip(tmp_ids.iter()) {
             let value = HirExpr {
                 kind: HirExprKind::Local(*tmp_id),
                 span,
             };
-            let value_kind = self.locals[tmp_id.0].kind;
-            let dst_id = match self.resolve(name) {
-                Some(id) => {
-                    if self.readonly_locals.contains(&id) {
-                        return Err(HirError::ReadOnlyAssign {
-                            name: name.clone(),
-                            offset: span.start,
-                        });
-                    }
-                    let slot_kind = self.locals[id.0].kind;
-                    if slot_kind != value_kind {
-                        return Err(HirError::TypeMismatch {
-                            op: "=".to_owned(),
-                            lhs_kind: slot_kind.name().to_owned(),
-                            rhs_kind: value_kind.name().to_owned(),
-                            offset: span.start,
-                        });
-                    }
-                    id
-                }
-                None => {
-                    if self.in_function.is_some() {
-                        return Err(HirError::UndefinedName {
-                            name: name.clone(),
-                            offset: span.start,
-                        });
-                    }
-                    if self.function_names.contains_key(name) {
-                        return Err(HirError::TypeMismatch {
-                            op: "=".to_owned(),
-                            lhs_kind: "function".to_owned(),
-                            rhs_kind: "value".to_owned(),
-                            offset: span.start,
-                        });
-                    }
-                    // Auto-declare at chunk scope (ADR 0048).
-                    let id = LocalId(self.locals.len());
-                    self.locals.push(LocalInfo {
-                        name: name.clone(),
-                        kind: value_kind,
-                        func_id: None,
-                    });
-                    self.scopes[0].insert(name.clone(), id);
-                    block_stmts.push(HirStmt {
-                        kind: HirStmtKind::LocalInit { id, value },
-                        span,
-                    });
-                    continue;
-                }
-            };
-            block_stmts.push(HirStmt {
-                kind: HirStmtKind::Assign { id: dst_id, value },
-                span,
-            });
+            block_stmts.push(self.lower_assign_target(name, value, span)?);
         }
         Ok(HirStmt {
             kind: HirStmtKind::Block { stmts: block_stmts },
