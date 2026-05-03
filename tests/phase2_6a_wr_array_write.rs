@@ -70,14 +70,18 @@ t[5] = 99";
 }
 
 #[test]
-fn grow_write_at_length_plus_one_traps() {
-    // Lua spec: t[#t+1]=v grows the array. We don't yet track
-    // capacity, so this also traps. (LIC-2.6a-wr-2 — reverts
-    // when capacity tracking lands.)
+fn grow_write_at_length_plus_one_now_works_after_2_6a_grow() {
+    // Phase 2.6a-grow (ADR 0057) resolved LIC-2.6a-wr-2. The
+    // one-past-end push slot is now a valid write target — it
+    // grows the array and updates length. Coverage of the grow
+    // path itself lives in `tests/phase2_6a_grow_array_push.rs`.
     let src = "local t = {1, 2, 3}
-t[4] = 99";
+t[4] = 99
+print(t[4])
+print(#t)";
     let out = compile_and_run(src, "lumelir_26a_wr_grow");
-    assert!(!out.status.success(), "grow write must trap (for now)");
+    assert!(out.status.success(), "grow write must succeed now");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).into_owned(), "99\n4\n",);
 }
 
 #[test]

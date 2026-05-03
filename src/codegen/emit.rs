@@ -452,6 +452,22 @@ fn emit_string_runtime_decls<'c>(
         .build();
     module.body().append_operation(memcpy_op.into());
 
+    // Phase 2.6a-grow (ADR 0057): free(ptr) -> void. Used to
+    // release the old `array_buf` after a doubling realloc; safe
+    // on the null pointer (C99 §7.20.3.2) so callers can free
+    // unconditionally if cap was 0.
+    let free_ty = llvm::r#type::function(llvm::r#type::void(context), &[types.ptr], false);
+    let free_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "free"))
+        .function_type(TypeAttribute::new(free_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(free_op.into());
+
     let strcmp_ty = llvm::r#type::function(types.i32, &[types.ptr, types.ptr], false);
     let strcmp_op = LLVMFuncOperationBuilder::new(context, loc)
         .body(Region::new())
@@ -907,10 +923,15 @@ fn emit_stmt<'a, 'c>(
                 params_len, loc,
             )?;
         }
-        // Phase 2.6a-wr (ADR 0055) / 2.6a-norm (ADR 0056):
-        // `target[key] = value` — mirror of the read path. Load
-        // length from header, bounds-check, fetch array_buf from
-        // header, GEP to element offset, store.
+        // Phase 2.6a-wr (ADR 0055) / 2.6a-norm (ADR 0056) /
+        // 2.6a-grow (ADR 0057): `target[key] = value` —
+        // - bounds-check: key in [1, length+1] (write allows the
+        //   one-past-end push slot)
+        // - if key > cap: realloc array_buf (memcpy + free old),
+        //   update header.cap and header.array_buf
+        // - if key > length: update header.length to key
+        // - reload array_buf (might have been just swapped) and
+        //   store the value at offset (key-1)*8
         HirStmtKind::IndexAssign { target, key, value } => {
             let target_ptr = emit_expr(
                 context, block, target, slots, locals, functions, types, params_len, loc,
@@ -923,8 +944,7 @@ fn emit_stmt<'a, 'c>(
             )?;
             let key_i = emit_f2i(block, key_f, types, loc);
             let length_i = emit_load(block, target_ptr, types.i64, loc);
-            emit_table_bounds_check(context, block, key_i, length_i, types, loc);
-            let array_buf = emit_table_array_buf(context, block, target_ptr, types, loc);
+            // Write bounds: upper = length + 1 (allow one-past-end).
             let one = block
                 .append_operation(arith::constant(
                     context,
@@ -934,6 +954,55 @@ fn emit_stmt<'a, 'c>(
                 .result(0)
                 .unwrap()
                 .into();
+            let len_plus_one: Value<'c, 'a> = block
+                .append_operation(arith::addi(length_i, one, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            emit_table_bounds_check(context, block, key_i, len_plus_one, types, loc);
+            // Grow array_buf if capacity is insufficient.
+            emit_table_grow_if_needed(context, block, target_ptr, key_i, length_i, types, loc);
+            // Update length when pushing past current end.
+            let push_grew_len: Value<'c, 'a> = block
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Sgt,
+                    key_i,
+                    length_i,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let len_then_region = Region::new();
+            let len_then_blk = Block::new(&[]);
+            {
+                let len_slot_inner = emit_byte_offset_ptr(
+                    context,
+                    &len_then_blk,
+                    target_ptr,
+                    TABLE_OFF_LEN,
+                    types,
+                    loc,
+                );
+                emit_store(&len_then_blk, key_i, len_slot_inner, loc);
+                len_then_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            len_then_region.append_block(len_then_blk);
+            let len_else_region = Region::new();
+            let len_else_blk = Block::new(&[]);
+            len_else_blk.append_operation(scf::r#yield(&[], loc));
+            len_else_region.append_block(len_else_blk);
+            block.append_operation(scf::r#if(
+                push_grew_len,
+                &[],
+                len_then_region,
+                len_else_region,
+                loc,
+            ));
+            // Reload array_buf (grow may have just swapped it) and
+            // store the value at (key-1)*8.
+            let array_buf = emit_table_array_buf(context, block, target_ptr, types, loc);
             let zero_idx: Value<'c, 'a> = block
                 .append_operation(arith::subi(key_i, one, loc))
                 .result(0)
@@ -1098,9 +1167,8 @@ fn emit_null_ptr<'a, 'c>(
 }
 
 /// Phase 2.6a-norm (ADR 0056): load the `array_buf` ptr from a
-/// table header. Both index-read and index-write call this; future
-/// grow phase additionally *stores* through the same offset (rule
-/// of three pre-paid).
+/// table header. Used by index read, index write, and 2.6a-grow's
+/// post-realloc reload. Three call sites — rule of three paid.
 fn emit_table_array_buf<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
@@ -1110,6 +1178,153 @@ fn emit_table_array_buf<'a, 'c>(
 ) -> Value<'c, 'a> {
     let slot = emit_byte_offset_ptr(context, block, table_ptr, TABLE_OFF_ARRAY_BUF, types, loc);
     emit_load(block, slot, types.ptr, loc)
+}
+
+/// Phase 2.6a-grow (ADR 0057): if `key_i > capacity`, allocate a
+/// new array_buf with `max(cap*2, key_i)` slots, memcpy the
+/// existing `length_i` elements (only when cap > 0; gates against
+/// null source UB), free the old buffer, and update the header's
+/// capacity (offset 8) and array_buf (offset 16) fields. Must be
+/// called *after* the bounds check so we know `key_i ≥ 1` and we
+/// won't grow unboundedly.
+fn emit_table_grow_if_needed<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    table_ptr: Value<'c, 'a>,
+    key_i: Value<'c, 'a>,
+    length_i: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    // cap = load i64, header + 8
+    let cap_slot = emit_byte_offset_ptr(context, block, table_ptr, TABLE_OFF_CAP, types, loc);
+    let cap = emit_load(block, cap_slot, types.i64, loc);
+    // need_grow = key_i > cap
+    let need_grow: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Sgt,
+            key_i,
+            cap,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        let two = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 2).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let cap_doubled: Value<'c, '_> = then_blk
+            .append_operation(arith::muli(cap, two, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let new_cap: Value<'c, '_> = then_blk
+            .append_operation(arith::maxsi(cap_doubled, key_i, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let eight = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 8).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let new_size: Value<'c, '_> = then_blk
+            .append_operation(arith::muli(new_cap, eight, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let new_buf = emit_libc_call_ptr(context, &then_blk, "malloc", &[new_size], types, loc);
+        // Conditional copy + free: only when cap > 0 (i.e. there
+        // was a previous non-null array_buf).
+        let zero_i64 = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let had_old: Value<'c, '_> = then_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Sgt,
+                cap,
+                zero_i64,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let copy_then = Region::new();
+        let copy_blk = Block::new(&[]);
+        {
+            let array_buf_slot = emit_byte_offset_ptr(
+                context,
+                &copy_blk,
+                table_ptr,
+                TABLE_OFF_ARRAY_BUF,
+                types,
+                loc,
+            );
+            let old_buf = emit_load(&copy_blk, array_buf_slot, types.ptr, loc);
+            let copy_size: Value<'c, '_> = copy_blk
+                .append_operation(arith::muli(length_i, eight, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let _ = emit_libc_call_ptr(
+                context,
+                &copy_blk,
+                "memcpy",
+                &[new_buf, old_buf, copy_size],
+                types,
+                loc,
+            );
+            emit_libc_call_void(context, &copy_blk, "free", &[old_buf], loc);
+            copy_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        copy_then.append_block(copy_blk);
+        let copy_else = Region::new();
+        let copy_else_blk = Block::new(&[]);
+        copy_else_blk.append_operation(scf::r#yield(&[], loc));
+        copy_else.append_block(copy_else_blk);
+        then_blk.append_operation(scf::r#if(had_old, &[], copy_then, copy_else, loc));
+        // Update header.capacity and header.array_buf.
+        let cap_slot_inner =
+            emit_byte_offset_ptr(context, &then_blk, table_ptr, TABLE_OFF_CAP, types, loc);
+        emit_store(&then_blk, new_cap, cap_slot_inner, loc);
+        let array_buf_slot_inner = emit_byte_offset_ptr(
+            context,
+            &then_blk,
+            table_ptr,
+            TABLE_OFF_ARRAY_BUF,
+            types,
+            loc,
+        );
+        emit_store(&then_blk, new_buf, array_buf_slot_inner, loc);
+        then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(need_grow, &[], then_region, else_region, loc));
 }
 
 /// Phase 2.6a-arr (ADR 0054): produce a `!llvm.ptr` pointing at
@@ -2291,6 +2506,38 @@ fn emit_libc_call_ptr<'a, 'c>(
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
     emit_libc_call_with_result(context, block, name, args, types.ptr, loc)
+}
+
+/// Phase 2.6a-grow (ADR 0057): void-returning libc helper. Used for
+/// `free(ptr)`. Mirrors `emit_libc_call_with_result` but skips
+/// `add_results` since the callee returns nothing.
+fn emit_libc_call_void<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    name: &str,
+    args: &[Value<'c, 'a>],
+    loc: Location<'c>,
+) {
+    let n = i32::try_from(args.len()).expect("call arity fits in i32");
+    let call_op = OperationBuilder::new("llvm.call", loc)
+        .add_operands(args)
+        .add_attributes(&[
+            (
+                Identifier::new(context, "callee"),
+                FlatSymbolRefAttribute::new(context, name).into(),
+            ),
+            (
+                Identifier::new(context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(context, &[n, 0]).into(),
+            ),
+            (
+                Identifier::new(context, "op_bundle_sizes"),
+                DenseI32ArrayAttribute::new(context, &[]).into(),
+            ),
+        ])
+        .build()
+        .unwrap_or_else(|_| panic!("llvm.call @{name}"));
+    block.append_operation(call_op);
 }
 
 fn emit_libc_call_with_result<'a, 'c>(

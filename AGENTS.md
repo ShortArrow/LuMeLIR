@@ -74,7 +74,8 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.6a-arr Number array constructor + `t[i]` read | **Done** | `{e1,e2,…}` populated form, integer indexing, runtime OOB trap (ADR 0054) |
 | ‣ 2.6a-wr Number array element write `t[i] = v` | **Done** | parse-then-equals fallthrough, `IndexAssign` AST/HIR, codegen mirrors read path (ADR 0055) |
 | ‣ 2.6a-norm stable table header (Tidy First) | **Done** | 32-byte header + separate array_buf; frozen offsets at 0 (length) / 16 (array_buf); alias-safe under grow (ADR 0056) |
-| ‣ 2.6+ tables / metatables | In progress | grow (alias-safe via 2.6a-norm), hash part, methods, metatables — multiple sub-phases |
+| ‣ 2.6a-grow array push `t[#t+1] = v` | **Done** | doubling capacity + realloc inside stable header; alias-safe under grow; LIC-2.6a-wr-2 resolved (ADR 0057) |
+| ‣ 2.6+ tables / metatables | In progress | hash part, methods, metatables, tagged values — multiple sub-phases |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |
 
 **How to read TBD markers:** sections marked `TBD: Phase N, ADR XXXX` indicate the rule is undecided until that ADR lands. Do not invent answers — surface the question instead.
