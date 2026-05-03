@@ -1419,6 +1419,68 @@ impl LowerCtx {
         }
     }
 
+    /// Phase 2.1b (ADR 0050): resolve each target name in a
+    /// multi-target reassignment. Existing locals must match the
+    /// expected kind at their position; unresolved names auto-
+    /// declare at chunk scope per ADR 0048 (and reject inside
+    /// function bodies). Returns the destination LocalIds in the
+    /// same order as `names`.
+    fn resolve_or_declare_multi_targets(
+        &mut self,
+        names: &[String],
+        kinds: &[ValueKind],
+        span: Span,
+    ) -> Result<Vec<LocalId>, HirError> {
+        let mut dst_ids: Vec<LocalId> = Vec::with_capacity(names.len());
+        for (n, k) in names.iter().zip(kinds.iter()) {
+            let id = match self.resolve(n) {
+                Some(id) => {
+                    if self.readonly_locals.contains(&id) {
+                        return Err(HirError::ReadOnlyAssign {
+                            name: n.clone(),
+                            offset: span.start,
+                        });
+                    }
+                    if self.locals[id.0].kind != *k {
+                        return Err(HirError::TypeMismatch {
+                            op: "=".to_owned(),
+                            lhs_kind: self.locals[id.0].kind.name().to_owned(),
+                            rhs_kind: k.name().to_owned(),
+                            offset: span.start,
+                        });
+                    }
+                    id
+                }
+                None => {
+                    if self.in_function.is_some() {
+                        return Err(HirError::UndefinedName {
+                            name: n.clone(),
+                            offset: span.start,
+                        });
+                    }
+                    if self.function_names.contains_key(n) {
+                        return Err(HirError::TypeMismatch {
+                            op: "=".to_owned(),
+                            lhs_kind: "function".to_owned(),
+                            rhs_kind: "value".to_owned(),
+                            offset: span.start,
+                        });
+                    }
+                    let id = LocalId(self.locals.len());
+                    self.locals.push(LocalInfo {
+                        name: n.clone(),
+                        kind: *k,
+                        func_id: None,
+                    });
+                    self.scopes[0].insert(n.clone(), id);
+                    id
+                }
+            };
+            dst_ids.push(id);
+        }
+        Ok(dst_ids)
+    }
+
     /// Phase 2.1a (ADR 0049): lower a multi-target reassignment
     /// `a, b = e1, e2`. Per Lua semantics, evaluate every RHS into
     /// a temporary first so a swap (`a, b = b, a`) reads the
@@ -1432,6 +1494,45 @@ impl LowerCtx {
         values: &[Expr],
         span: Span,
     ) -> Result<HirStmt, HirError> {
+        // Phase 2.1b (ADR 0050): `a, b = call()` — a single Call
+        // RHS expanding across N targets. Mirror `lower_local_multi`'s
+        // shape but resolve / auto-declare each target instead of
+        // declaring fresh.
+        if values.len() == 1 && names.len() > 1 {
+            let lowered = self.lower_expr(&values[0])?;
+            if let HirExprKind::Call { callee, args } = lowered.kind {
+                let ret_kinds: Vec<ValueKind> = match callee {
+                    Callee::User(FuncId(fid)) => self.functions[fid].ret_kinds.clone(),
+                    _ => {
+                        return Err(HirError::ArityMismatch {
+                            builtin: "multi-assign".to_owned(),
+                            expected: names.len(),
+                            actual: 1,
+                            offset: span.start,
+                        });
+                    }
+                };
+                if ret_kinds.len() != names.len() {
+                    return Err(HirError::ArityMismatch {
+                        builtin: "multi-assign".to_owned(),
+                        expected: ret_kinds.len(),
+                        actual: names.len(),
+                        offset: span.start,
+                    });
+                }
+                let dst_ids = self.resolve_or_declare_multi_targets(names, &ret_kinds, span)?;
+                return Ok(HirStmt {
+                    kind: HirStmtKind::MultiAssignFromCall {
+                        dst_ids,
+                        callee,
+                        args,
+                    },
+                    span,
+                });
+            }
+            // Single non-Call RHS with multiple targets — fall
+            // through to the arity-mismatch error path.
+        }
         if names.len() != values.len() {
             return Err(HirError::ArityMismatch {
                 builtin: "multi-assign".to_owned(),
