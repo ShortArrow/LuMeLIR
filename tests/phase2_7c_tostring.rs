@@ -101,11 +101,14 @@ print(show(42))";
 }
 
 #[test]
-fn tostring_of_function_value_is_static_error() {
+fn tostring_of_function_value_now_succeeds_after_2_7n() {
+    // Phase 2.7c rejected Function-kind tostring; Phase 2.7n
+    // (ADR 0052) lifts that — `tostring(f)` returns "function".
+    // See `tests/phase2_7n_tostring_function.rs` for full coverage.
     let chunk = lumelir::parser::parse(
         "local f = function() return 1 end
 print(tostring(f))",
     )
     .unwrap();
-    assert!(lumelir::hir::lower(&chunk).is_err());
+    assert!(lumelir::hir::lower(&chunk).is_ok());
 }

@@ -1700,10 +1700,11 @@ fn emit_tostring<'a, 'c>(
             block.append_operation(call_op);
             buf
         }
-        ValueKind::Function(_) => unreachable!(
-            "Function-kind tostring is rejected at HIR-time \
-             (FunctionUsedAsValue) — should not reach codegen"
-        ),
+        // Phase 2.7n (ADR 0052): `tostring(f)` returns the literal
+        // "function". Reuses the global `s_typename_function`
+        // already registered for `type(f)` so we don't bloat the
+        // module with a near-duplicate string.
+        ValueKind::Function(_) => emit_addressof(context, block, "s_typename_function", types, loc),
     }
 }
 

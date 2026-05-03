@@ -2164,11 +2164,14 @@ impl LowerCtx {
         // observed as values yet). Reject explicitly.
         for arg in &lowered_args {
             let k = infer_kind(arg, &self.locals, &self.functions);
-            // Phase 2.7f (ADR 0029): `type(f)` is the one builtin
-            // that legitimately accepts a Function value — every
-            // other call site keeps treating it as a hard error.
+            // Phase 2.7f (ADR 0029) / 2.7n (ADR 0052): `type(f)`
+            // and `tostring(f)` both legitimately accept a Function
+            // value — `type` returns the typename string,
+            // `tostring` returns the literal "function". Every
+            // other call site keeps treating Function-as-value
+            // as a hard error.
             if let ValueKind::Function(_) = k
-                && !matches!(builtin, Builtin::Type)
+                && !matches!(builtin, Builtin::Type | Builtin::ToString)
             {
                 let arg_name = match &arg.kind {
                     HirExprKind::Local(LocalId(idx)) => self.locals[*idx].name.clone(),
