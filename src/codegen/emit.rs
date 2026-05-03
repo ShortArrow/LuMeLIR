@@ -33,6 +33,41 @@ use crate::parser::{BinOp, UnaryOp};
 
 use super::error::CodegenError;
 
+// =============================================================
+// Phase 2.6a-norm (ADR 0056): stable table header layout.
+//
+// `ValueKind::Table` is `!llvm.ptr` pointing at a heap-allocated
+// header. The header is 32 bytes and **never moves** for the
+// lifetime of the table value — `local b = a` aliases stay valid
+// even when the inner buffers are reallocated by future grow /
+// hash sub-phases. The contract:
+//
+// ```text
+// table value (!llvm.ptr)
+//   → header [32 bytes, malloc'd, stable]
+//        offset 0  : i64 length          ← `#t` reads here (frozen)
+//        offset 8  : i64 capacity        ← grow updates (2.6a-grow)
+//        offset 16 : !llvm.ptr array_buf ← f64 elem buffer (frozen offset)
+//        offset 24 : !llvm.ptr hash_buf  ← null today; 2.6b lights it up
+//
+//   array_buf (!llvm.ptr) → [f64 elem₀][f64 elem₁]…[f64 elem_{cap-1}]
+// ```
+//
+// **Frozen offsets** (will never move; depend on these):
+//   - 0  (length)
+//   - 16 (array_buf)
+//
+// **Mutable offsets** (may relocate as the layout grows):
+//   - 8  (capacity)
+//   - 24 (hash_buf)
+//
+// =============================================================
+const TABLE_OFF_LEN: i64 = 0;
+const TABLE_OFF_CAP: i64 = 8;
+const TABLE_OFF_ARRAY_BUF: i64 = 16;
+const TABLE_OFF_HASH_BUF: i64 = 24;
+const TABLE_HEADER_SIZE: i64 = 32;
+
 struct Types<'c> {
     i1: Type<'c>,
     /// Phase 2.6a-arr (ADR 0054): i8 used as the GEP element type
@@ -872,9 +907,10 @@ fn emit_stmt<'a, 'c>(
                 params_len, loc,
             )?;
         }
-        // Phase 2.6a-wr (ADR 0055): `target[key] = value` —
-        // mirror of the read path. Same bounds-check + GEP, but
-        // ends in a store instead of a load.
+        // Phase 2.6a-wr (ADR 0055) / 2.6a-norm (ADR 0056):
+        // `target[key] = value` — mirror of the read path. Load
+        // length from header, bounds-check, fetch array_buf from
+        // header, GEP to element offset, store.
         HirStmtKind::IndexAssign { target, key, value } => {
             let target_ptr = emit_expr(
                 context, block, target, slots, locals, functions, types, params_len, loc,
@@ -888,6 +924,7 @@ fn emit_stmt<'a, 'c>(
             let key_i = emit_f2i(block, key_f, types, loc);
             let length_i = emit_load(block, target_ptr, types.i64, loc);
             emit_table_bounds_check(context, block, key_i, length_i, types, loc);
+            let array_buf = emit_table_array_buf(context, block, target_ptr, types, loc);
             let one = block
                 .append_operation(arith::constant(
                     context,
@@ -916,13 +953,8 @@ fn emit_stmt<'a, 'c>(
                 .result(0)
                 .unwrap()
                 .into();
-            let header_offset: Value<'c, 'a> = block
-                .append_operation(arith::addi(body_offset, eight, loc))
-                .result(0)
-                .unwrap()
-                .into();
             let elem_ptr =
-                emit_byte_offset_ptr_dynamic(context, block, target_ptr, header_offset, types, loc);
+                emit_byte_offset_ptr_dynamic(context, block, array_buf, body_offset, types, loc);
             emit_store(block, value_v, elem_ptr, loc);
         }
     }
@@ -1045,6 +1077,39 @@ fn emit_load<'a, 'c>(
         .build()
         .expect("llvm.load");
     block.append_operation(load).result(0).unwrap().into()
+}
+
+/// Phase 2.6a-norm (ADR 0056): emit a null `!llvm.ptr` constant
+/// via `llvm.mlir.zero`. Used to initialise the `array_buf` field
+/// for empty tables and the `hash_buf` field (always null until
+/// 2.6b lights it up).
+fn emit_null_ptr<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let _ = context;
+    let zero_op = OperationBuilder::new("llvm.mlir.zero", loc)
+        .add_results(&[types.ptr])
+        .build()
+        .expect("llvm.mlir.zero");
+    block.append_operation(zero_op).result(0).unwrap().into()
+}
+
+/// Phase 2.6a-norm (ADR 0056): load the `array_buf` ptr from a
+/// table header. Both index-read and index-write call this; future
+/// grow phase additionally *stores* through the same offset (rule
+/// of three pre-paid).
+fn emit_table_array_buf<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    table_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let slot = emit_byte_offset_ptr(context, block, table_ptr, TABLE_OFF_ARRAY_BUF, types, loc);
+    emit_load(block, slot, types.ptr, loc)
 }
 
 /// Phase 2.6a-arr (ADR 0054): produce a `!llvm.ptr` pointing at
@@ -1209,28 +1274,29 @@ fn emit_expr<'a, 'c>(
                 .expect("collect_string_pool seeds every literal before codegen");
             Ok(emit_addressof(context, block, global_name, types, loc))
         }
-        // Phase 2.6a-min (ADR 0053): table constructor. Allocate
-        // `8 + N*8` bytes via `malloc`, store the length at offset
-        // 0. For the empty form (`elems.is_empty()`) that's just an
-        // `[i64 length=0]` 8-byte block. Element stores arrive in
-        // 2.6a.1.
+        // Phase 2.6a-norm (ADR 0056): stable header layout.
+        // Allocate the 32-byte header first (header ptr is the
+        // table value and never moves), then a separate buffer for
+        // the f64 elements. Empty tables get a null array_buf —
+        // bounds check excludes any read/write before it touches
+        // the null. Future grow / hash phases swap the inner
+        // buffers without disturbing the header.
         HirExprKind::Table(elems) => {
             let elem_count = elems.len();
-            // 8 bytes for the length header, plus 8 per Number
-            // element. Phase 2.6a-arr (ADR 0054): elements are
-            // now stored at offset `8 + i*8`.
-            let total_bytes = 8i64 + (elem_count as i64) * 8;
-            let size_const = block
+            // Step 1: header malloc (fixed 32 bytes).
+            let header_size = block
                 .append_operation(arith::constant(
                     context,
-                    IntegerAttribute::new(types.i64, total_bytes).into(),
+                    IntegerAttribute::new(types.i64, TABLE_HEADER_SIZE).into(),
                     loc,
                 ))
                 .result(0)
                 .unwrap()
                 .into();
-            let table_ptr = emit_libc_call_ptr(context, block, "malloc", &[size_const], types, loc);
-            // Store length at offset 0.
+            let header_ptr =
+                emit_libc_call_ptr(context, block, "malloc", &[header_size], types, loc);
+            // length + capacity (both = elem_count for a freshly-
+            // constructed array; capacity tracking lands in 2.6a-grow).
             let len_const = block
                 .append_operation(arith::constant(
                     context,
@@ -1240,21 +1306,52 @@ fn emit_expr<'a, 'c>(
                 .result(0)
                 .unwrap()
                 .into();
-            emit_store(block, len_const, table_ptr, loc);
-            // Store each element at offset `8 + i*8`.
+            let len_slot =
+                emit_byte_offset_ptr(context, block, header_ptr, TABLE_OFF_LEN, types, loc);
+            emit_store(block, len_const, len_slot, loc);
+            let cap_slot =
+                emit_byte_offset_ptr(context, block, header_ptr, TABLE_OFF_CAP, types, loc);
+            emit_store(block, len_const, cap_slot, loc);
+            // Step 2: array_buf malloc (or null for empty).
+            let array_buf: Value<'c, '_> = if elem_count == 0 {
+                emit_null_ptr(context, block, types, loc)
+            } else {
+                let buf_bytes = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, (elem_count as i64) * 8).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                emit_libc_call_ptr(context, block, "malloc", &[buf_bytes], types, loc)
+            };
+            let array_buf_slot =
+                emit_byte_offset_ptr(context, block, header_ptr, TABLE_OFF_ARRAY_BUF, types, loc);
+            emit_store(block, array_buf, array_buf_slot, loc);
+            // Step 3: hash_buf = null (2.6b will populate).
+            let null_hash = emit_null_ptr(context, block, types, loc);
+            let hash_buf_slot =
+                emit_byte_offset_ptr(context, block, header_ptr, TABLE_OFF_HASH_BUF, types, loc);
+            emit_store(block, null_hash, hash_buf_slot, loc);
+            // Step 4: store each element at array_buf + i*8.
             for (i, elem) in elems.iter().enumerate() {
                 let v = emit_expr(
                     context, block, elem, slots, locals, functions, types, params_len, loc,
                 )?;
-                let offset_bytes = 8i64 + (i as i64) * 8;
+                let offset_bytes = (i as i64) * 8;
                 let elem_ptr =
-                    emit_byte_offset_ptr(context, block, table_ptr, offset_bytes, types, loc);
+                    emit_byte_offset_ptr(context, block, array_buf, offset_bytes, types, loc);
                 emit_store(block, v, elem_ptr, loc);
             }
-            Ok(table_ptr)
+            Ok(header_ptr)
         }
-        // Phase 2.6a-arr (ADR 0054): `t[i]` — load f64 from offset
-        // `8 + (key-1)*8`. Bounds-check first; trap on OOB.
+        // Phase 2.6a-arr (ADR 0054) / 2.6a-norm (ADR 0056): `t[i]`
+        // — load length from header (offset 0, frozen contract),
+        // bounds-check, fetch array_buf from header (offset 16,
+        // frozen contract), then GEP `(key-1)*8` bytes into
+        // array_buf and load f64.
         HirExprKind::Index { target, key } => {
             let target_ptr = emit_expr(
                 context, block, target, slots, locals, functions, types, params_len, loc,
@@ -1265,6 +1362,7 @@ fn emit_expr<'a, 'c>(
             let key_i = emit_f2i(block, key_f, types, loc);
             let length_i = emit_load(block, target_ptr, types.i64, loc);
             emit_table_bounds_check(context, block, key_i, length_i, types, loc);
+            let array_buf = emit_table_array_buf(context, block, target_ptr, types, loc);
             let one = block
                 .append_operation(arith::constant(
                     context,
@@ -1293,13 +1391,8 @@ fn emit_expr<'a, 'c>(
                 .result(0)
                 .unwrap()
                 .into();
-            let header_offset: Value<'c, 'a> = block
-                .append_operation(arith::addi(body_offset, eight, loc))
-                .result(0)
-                .unwrap()
-                .into();
             let elem_ptr =
-                emit_byte_offset_ptr_dynamic(context, block, target_ptr, header_offset, types, loc);
+                emit_byte_offset_ptr_dynamic(context, block, array_buf, body_offset, types, loc);
             Ok(emit_load(block, elem_ptr, types.f64, loc))
         }
         HirExprKind::Local(LocalId(idx)) => {
