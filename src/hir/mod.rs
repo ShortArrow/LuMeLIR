@@ -2131,9 +2131,20 @@ impl LowerCtx {
             }
         };
         // Phase 2.8b (ADR 0032): `print` is the one variadic builtin
-        // — accepts any arity ≥ 0. Every other builtin keeps its
-        // fixed arity from `Builtin::arity()`.
-        if !matches!(builtin, Builtin::Print) {
+        // — accepts any arity ≥ 0. Phase 2.7m (ADR 0051): `assert`
+        // takes 1 *or* 2 args (the optional second is a String
+        // failure-message). Every other builtin keeps its fixed
+        // arity from `Builtin::arity()`.
+        if matches!(builtin, Builtin::Assert) {
+            if args.is_empty() || args.len() > 2 {
+                return Err(HirError::ArityMismatch {
+                    builtin: name.clone(),
+                    expected: 1,
+                    actual: args.len(),
+                    offset: whole.span.start,
+                });
+            }
+        } else if !matches!(builtin, Builtin::Print) {
             let arity = builtin.arity();
             if args.len() != arity {
                 return Err(HirError::ArityMismatch {
@@ -2181,16 +2192,28 @@ impl LowerCtx {
                     offset: arg.span.start,
                 });
             }
-            // Phase 2.7g (ADR 0030): `assert(cond)` requires a Bool
-            // operand. The broader "any kind, return same kind"
-            // signature needs heterogeneous return support; defer.
-            if matches!(builtin, Builtin::Assert) && k != ValueKind::Bool {
-                return Err(HirError::TypeMismatch {
-                    op: "assert".to_owned(),
-                    lhs_kind: "bool".to_owned(),
-                    rhs_kind: k.name().to_owned(),
-                    offset: arg.span.start,
-                });
+            // Phase 2.7g (ADR 0030): `assert(cond, [msg])` — first
+            // arg must be Bool. Phase 2.7m (ADR 0051): the optional
+            // second arg, when present, must be String. Use the
+            // arg's index in `lowered_args` to dispatch.
+            if matches!(builtin, Builtin::Assert) {
+                let arg_idx = lowered_args
+                    .iter()
+                    .position(|a| std::ptr::eq(a as *const _, arg as *const _))
+                    .unwrap_or(0);
+                let expected = if arg_idx == 0 {
+                    ValueKind::Bool
+                } else {
+                    ValueKind::String
+                };
+                if k != expected {
+                    return Err(HirError::TypeMismatch {
+                        op: "assert".to_owned(),
+                        lhs_kind: expected.name().to_owned(),
+                        rhs_kind: k.name().to_owned(),
+                        offset: arg.span.start,
+                    });
+                }
             }
             // Phase 2.7h (ADR 0033): `error(msg)` requires a String
             // operand. Lua's table-as-message form is deferred

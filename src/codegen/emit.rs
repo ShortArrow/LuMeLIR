@@ -1161,13 +1161,24 @@ fn emit_expr<'a, 'c>(
                 )?;
                 Ok(emit_tonumber(context, block, arg_val, kind, types, loc))
             }
-            // Phase 2.7g (ADR 0030): `assert(cond)` — pass through
-            // when truthy, otherwise emit the diagnostic and `exit(1)`.
+            // Phase 2.7g (ADR 0030) / 2.7m (ADR 0051): `assert(cond,
+            // [msg])` — pass through when truthy; otherwise print
+            // the (custom or default) message and `exit(1)`. The
+            // second arg, when present, is evaluated unconditionally
+            // (it's a regular call argument); the conditional fork
+            // only chooses which message ptr feeds the failure path.
             Callee::Builtin(Builtin::Assert) => {
                 let cond_val = emit_expr(
                     context, block, &args[0], slots, locals, functions, types, params_len, loc,
                 )?;
-                emit_assert(context, block, cond_val, types, loc);
+                let custom_msg = if args.len() == 2 {
+                    Some(emit_expr(
+                        context, block, &args[1], slots, locals, functions, types, params_len, loc,
+                    )?)
+                } else {
+                    None
+                };
+                emit_assert(context, block, cond_val, custom_msg, types, loc);
                 Ok(cond_val)
             }
             // Phase 2.7h (ADR 0033): `error(msg)` — unconditional
@@ -2108,6 +2119,7 @@ fn emit_assert<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     cond: Value<'c, 'a>,
+    custom_msg: Option<Value<'c, 'a>>,
     types: &Types<'c>,
     loc: Location<'c>,
 ) {
@@ -2128,10 +2140,16 @@ fn emit_assert<'a, 'c>(
 
     // Then-region: emit the failure path via the shared helper,
     // then a structurally-required (but unreachable) yield. exit()
-    // is noreturn so control never falls through.
+    // is noreturn so control never falls through. Phase 2.7m
+    // (ADR 0051): if the user supplied a 2nd-arg message, it's
+    // already in scope as `custom_msg` from the outer block — feed
+    // that ptr into the failure path instead of the default global.
     let then_region = Region::new();
     let then_blk = Block::new(&[]);
-    let msg_ptr = emit_addressof(context, &then_blk, "s_assert_failed", types, loc);
+    let msg_ptr = match custom_msg {
+        Some(v) => v,
+        None => emit_addressof(context, &then_blk, "s_assert_failed", types, loc),
+    };
     emit_exit_with_message(context, &then_blk, msg_ptr, types, loc);
     then_blk.append_operation(scf::r#yield(&[], loc));
     then_region.append_block(then_blk);
