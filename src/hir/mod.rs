@@ -426,6 +426,11 @@ fn infer_user_function_param_kinds(
                     visit_expr(v, names, kinds, seen);
                 }
             }
+            StmtKind::IndexAssign { target, key, value } => {
+                visit_expr(target, names, kinds, seen);
+                visit_expr(key, names, kinds, seen);
+                visit_expr(value, names, kinds, seen);
+            }
             StmtKind::Break => {}
         }
     }
@@ -564,6 +569,11 @@ fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
                 for v in values {
                     visit_expr(v, name_to_idx, kinds);
                 }
+            }
+            StmtKind::IndexAssign { target, key, value } => {
+                visit_expr(target, name_to_idx, kinds);
+                visit_expr(key, name_to_idx, kinds);
+                visit_expr(value, name_to_idx, kinds);
             }
         }
     }
@@ -1365,6 +1375,50 @@ impl LowerCtx {
             }
             StmtKind::AssignMulti { names, values } => {
                 self.lower_assign_multi(names, values, stmt.span)
+            }
+            // Phase 2.6a-wr (ADR 0055): `target[key] = value` table
+            // element write. Mirror of `ExprKind::Index` on the read
+            // side — same kind constraints (target Table, key Number,
+            // value Number); codegen emits the same bounds check.
+            StmtKind::IndexAssign { target, key, value } => {
+                let target_hir = self.lower_expr(target)?;
+                let key_hir = self.lower_expr(key)?;
+                let value_hir = self.lower_expr(value)?;
+                let target_kind = infer_kind(&target_hir, &self.locals, &self.functions);
+                if target_kind != ValueKind::Table {
+                    return Err(HirError::TypeMismatch {
+                        op: "[]=".to_owned(),
+                        lhs_kind: "table".to_owned(),
+                        rhs_kind: target_kind.name().to_owned(),
+                        offset: target.span.start,
+                    });
+                }
+                let key_kind = infer_kind(&key_hir, &self.locals, &self.functions);
+                if key_kind != ValueKind::Number {
+                    return Err(HirError::TypeMismatch {
+                        op: "[]=".to_owned(),
+                        lhs_kind: "number".to_owned(),
+                        rhs_kind: key_kind.name().to_owned(),
+                        offset: key.span.start,
+                    });
+                }
+                let value_kind = infer_kind(&value_hir, &self.locals, &self.functions);
+                if value_kind != ValueKind::Number {
+                    return Err(HirError::TypeMismatch {
+                        op: "[]=".to_owned(),
+                        lhs_kind: "number".to_owned(),
+                        rhs_kind: value_kind.name().to_owned(),
+                        offset: value.span.start,
+                    });
+                }
+                Ok(HirStmt {
+                    kind: HirStmtKind::IndexAssign {
+                        target: target_hir,
+                        key: key_hir,
+                        value: value_hir,
+                    },
+                    span: stmt.span,
+                })
             }
         }
     }

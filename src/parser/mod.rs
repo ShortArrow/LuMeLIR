@@ -105,7 +105,34 @@ impl<'t> Parser<'t> {
                 self.parse_multi_assign()
             }
             _ => {
+                // Phase 2.6a-wr (ADR 0055): the fallthrough now also
+                // handles `target[key] = value` table element write.
+                // Parse the prefix expression first; if `=` follows
+                // and the prefix is a valid lvalue (currently only
+                // `ExprKind::Index`), build an `IndexAssign`. A bare
+                // expression-statement still wraps in `ExprStmt`.
                 let expr = self.parse_expr(0)?;
+                if matches!(self.peek().kind, TokenKind::Equals) {
+                    let eq_tok = self.bump().clone();
+                    let value = self.parse_expr(0)?;
+                    return match expr.kind {
+                        ExprKind::Index { target, key } => {
+                            let span = Span::new(target.span.start, value.span.end);
+                            Ok(Stmt::new(
+                                StmtKind::IndexAssign {
+                                    target: *target,
+                                    key: *key,
+                                    value,
+                                },
+                                span,
+                            ))
+                        }
+                        _ => Err(ParseError::UnexpectedToken {
+                            actual: TokenKind::Equals,
+                            offset: eq_tok.span.start,
+                        }),
+                    };
+                }
                 let span = expr.span;
                 Ok(Stmt::new(StmtKind::ExprStmt(expr), span))
             }
@@ -1016,6 +1043,11 @@ mod tests {
             StmtKind::AssignMulti { names, values } => StmtKind::AssignMulti {
                 names,
                 values: values.into_iter().map(strip_span_expr).collect(),
+            },
+            StmtKind::IndexAssign { target, key, value } => StmtKind::IndexAssign {
+                target: strip_span_expr(target),
+                key: strip_span_expr(key),
+                value: strip_span_expr(value),
             },
             StmtKind::ReturnMulti { values } => StmtKind::ReturnMulti {
                 values: values.into_iter().map(strip_span_expr).collect(),

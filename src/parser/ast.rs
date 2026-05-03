@@ -142,6 +142,17 @@ pub enum StmtKind {
         name: String,
         value: Expr,
     },
+    /// `target[key] = value` table element write (Phase 2.6a-wr,
+    /// ADR 0055). `target` must lower to a Table-kind expression,
+    /// `key` and `value` to Number-kind. Codegen emits a runtime
+    /// bounds check (mirror of the read path); out-of-bounds traps
+    /// rather than growing — Lua compatibility deferred until
+    /// capacity tracking arrives.
+    IndexAssign {
+        target: Expr,
+        key: Expr,
+        value: Expr,
+    },
     /// `NAME (, NAME)+ = EXPR (, EXPR)*` (Phase 2.1a, ADR 0049).
     /// Per Lua semantics every RHS is evaluated before any LHS
     /// is written, so `a, b = b, a` is a real swap. Lower layers

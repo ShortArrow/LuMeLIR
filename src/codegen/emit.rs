@@ -322,6 +322,11 @@ fn collect_string_pool(chunk: &HirChunk) -> std::collections::HashMap<String, St
                     visit_expr(a, set);
                 }
             }
+            HirStmtKind::IndexAssign { target, key, value } => {
+                visit_expr(target, set);
+                visit_expr(key, set);
+                visit_expr(value, set);
+            }
         }
     }
     let mut set: BTreeSet<String> = BTreeSet::new();
@@ -866,6 +871,59 @@ fn emit_stmt<'a, 'c>(
                 context, block, dst_ids, *callee, args, slots, locals, functions, types,
                 params_len, loc,
             )?;
+        }
+        // Phase 2.6a-wr (ADR 0055): `target[key] = value` —
+        // mirror of the read path. Same bounds-check + GEP, but
+        // ends in a store instead of a load.
+        HirStmtKind::IndexAssign { target, key, value } => {
+            let target_ptr = emit_expr(
+                context, block, target, slots, locals, functions, types, params_len, loc,
+            )?;
+            let key_f = emit_expr(
+                context, block, key, slots, locals, functions, types, params_len, loc,
+            )?;
+            let value_v = emit_expr(
+                context, block, value, slots, locals, functions, types, params_len, loc,
+            )?;
+            let key_i = emit_f2i(block, key_f, types, loc);
+            let length_i = emit_load(block, target_ptr, types.i64, loc);
+            emit_table_bounds_check(context, block, key_i, length_i, types, loc);
+            let one = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let zero_idx: Value<'c, 'a> = block
+                .append_operation(arith::subi(key_i, one, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let eight = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 8).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let body_offset: Value<'c, 'a> = block
+                .append_operation(arith::muli(zero_idx, eight, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let header_offset: Value<'c, 'a> = block
+                .append_operation(arith::addi(body_offset, eight, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let elem_ptr =
+                emit_byte_offset_ptr_dynamic(context, block, target_ptr, header_offset, types, loc);
+            emit_store(block, value_v, elem_ptr, loc);
         }
     }
     Ok(())

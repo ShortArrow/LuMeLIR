@@ -161,6 +161,15 @@ pub enum HirStmtKind {
         callee: Callee,
         args: Vec<HirExpr>,
     },
+    /// `target[key] = value` table element write (Phase 2.6a-wr,
+    /// ADR 0055). Mirror of `HirExprKind::Index` on the read side —
+    /// codegen emits the same bounds-check + GEP, but stores
+    /// `value` instead of loading.
+    IndexAssign {
+        target: HirExpr,
+        key: HirExpr,
+        value: HirExpr,
+    },
     ExprStmt(HirExpr),
 }
 
