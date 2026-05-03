@@ -26,6 +26,7 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.0 `local` + multi-stmt | **Done** | HIR layer introduced; `local x = 1; print(x + 2)` (ADR 0007) |
 | ‣ 2.0a auto-declare globals (top-level only) | **Done** | bare `x = 1` at chunk scope auto-declares as chunk-level local; type-stable; no cross-function leak (ADR 0048) |
 | ‣ 2.1 reassignment / scopes | **Done** | `x = 2`, `do ... end` blocks, scope stack, shadowing (ADR 0008) |
+| ‣ 2.1a multi-target reassignment | **Done** | `a, b = b, a` parallel evaluation via temp-then-assign; auto-declare via ADR 0048 (ADR 0049) |
 | ‣ 2.2a arithmetic operators | **Done** | `-` `*` `/` `%` `^` + unary `-`; libm pow/floor (ADR 0009) |
 | ‣ 2.2b comparisons + bool literals | **Done** | `<` `<=` `==` `~=` `>` `>=`, `true`/`false`; ordered cmpf, print(bool) (ADR 0010) |
 | ‣ 2.2c floor div + bitwise ops | **Done** | `//`, `&`/`\|`/`~`/`<<`/`>>`, unary `~`; f64↔i64 via fptosi/sitofp (ADR 0022) |

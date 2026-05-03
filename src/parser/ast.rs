@@ -131,6 +131,16 @@ pub enum StmtKind {
         name: String,
         value: Expr,
     },
+    /// `NAME (, NAME)+ = EXPR (, EXPR)*` (Phase 2.1a, ADR 0049).
+    /// Per Lua semantics every RHS is evaluated before any LHS
+    /// is written, so `a, b = b, a` is a real swap. Lower layers
+    /// require `values.len() == names.len()` (parallel binding) —
+    /// multi-result Call expansion is the LocalMulti / 2.5d
+    /// territory and is out of scope here.
+    AssignMulti {
+        names: Vec<String>,
+        values: Vec<Expr>,
+    },
     Block(Chunk),
     /// `if cond then ... [elseif cond then ...]* [else ...]? end`.
     /// `elifs` keeps the chain explicit (one entry per `elseif` arm).

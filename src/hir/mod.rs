@@ -399,7 +399,7 @@ fn infer_user_function_param_kinds(
                     visit_stmt(st, names, kinds, seen);
                 }
             }
-            StmtKind::LocalMulti { values, .. } => {
+            StmtKind::LocalMulti { values, .. } | StmtKind::AssignMulti { values, .. } => {
                 for v in values {
                     visit_expr(v, names, kinds, seen);
                 }
@@ -538,7 +538,7 @@ fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
             }
             StmtKind::Break => {}
             StmtKind::FunctionDef { .. } => {} // nested fn defs not in 2.5b.2
-            StmtKind::LocalMulti { values, .. } => {
+            StmtKind::LocalMulti { values, .. } | StmtKind::AssignMulti { values, .. } => {
                 for v in values {
                     visit_expr(v, name_to_idx, kinds);
                 }
@@ -1413,7 +1413,121 @@ impl LowerCtx {
             StmtKind::LocalMulti { names, values } => {
                 self.lower_local_multi(names, values, stmt.span)
             }
+            StmtKind::AssignMulti { names, values } => {
+                self.lower_assign_multi(names, values, stmt.span)
+            }
         }
+    }
+
+    /// Phase 2.1a (ADR 0049): lower a multi-target reassignment
+    /// `a, b = e1, e2`. Per Lua semantics, evaluate every RHS into
+    /// a temporary first so a swap (`a, b = b, a`) reads the
+    /// pre-assignment values. Then store each temporary into the
+    /// matching target. Targets must already exist (or be auto-
+    /// declared at chunk scope per ADR 0048's rule); each target's
+    /// kind must match the value at its position.
+    fn lower_assign_multi(
+        &mut self,
+        names: &[String],
+        values: &[Expr],
+        span: Span,
+    ) -> Result<HirStmt, HirError> {
+        if names.len() != values.len() {
+            return Err(HirError::ArityMismatch {
+                builtin: "multi-assign".to_owned(),
+                expected: names.len(),
+                actual: values.len(),
+                offset: span.start,
+            });
+        }
+        let lowered: Vec<HirExpr> = values
+            .iter()
+            .map(|v| self.lower_expr(v))
+            .collect::<Result<_, _>>()?;
+        // Stage 1: snapshot each RHS into a fresh temp local. The
+        // temp's kind comes from the lowered expr — same as how
+        // single Assign infers it.
+        let mut tmp_ids: Vec<LocalId> = Vec::with_capacity(lowered.len());
+        let mut block_stmts: Vec<HirStmt> = Vec::with_capacity(lowered.len() * 2);
+        for v in &lowered {
+            let kind = infer_kind(v, &self.locals, &self.functions);
+            let id = self.declare_local(format!("_multi_tmp_{}", self.locals.len()), kind);
+            tmp_ids.push(id);
+            block_stmts.push(HirStmt {
+                kind: HirStmtKind::LocalInit {
+                    id,
+                    value: v.clone(),
+                },
+                span,
+            });
+        }
+        // Stage 2: write each temp to its target. The target may
+        // already exist as a local, or — at chunk scope — auto-
+        // declare per ADR 0048.
+        for (name, tmp_id) in names.iter().zip(tmp_ids.iter()) {
+            let value = HirExpr {
+                kind: HirExprKind::Local(*tmp_id),
+                span,
+            };
+            let value_kind = self.locals[tmp_id.0].kind;
+            let dst_id = match self.resolve(name) {
+                Some(id) => {
+                    if self.readonly_locals.contains(&id) {
+                        return Err(HirError::ReadOnlyAssign {
+                            name: name.clone(),
+                            offset: span.start,
+                        });
+                    }
+                    let slot_kind = self.locals[id.0].kind;
+                    if slot_kind != value_kind {
+                        return Err(HirError::TypeMismatch {
+                            op: "=".to_owned(),
+                            lhs_kind: slot_kind.name().to_owned(),
+                            rhs_kind: value_kind.name().to_owned(),
+                            offset: span.start,
+                        });
+                    }
+                    id
+                }
+                None => {
+                    if self.in_function.is_some() {
+                        return Err(HirError::UndefinedName {
+                            name: name.clone(),
+                            offset: span.start,
+                        });
+                    }
+                    if self.function_names.contains_key(name) {
+                        return Err(HirError::TypeMismatch {
+                            op: "=".to_owned(),
+                            lhs_kind: "function".to_owned(),
+                            rhs_kind: "value".to_owned(),
+                            offset: span.start,
+                        });
+                    }
+                    // Auto-declare at chunk scope (ADR 0048).
+                    let id = LocalId(self.locals.len());
+                    self.locals.push(LocalInfo {
+                        name: name.clone(),
+                        kind: value_kind,
+                        func_id: None,
+                    });
+                    self.scopes[0].insert(name.clone(), id);
+                    block_stmts.push(HirStmt {
+                        kind: HirStmtKind::LocalInit { id, value },
+                        span,
+                    });
+                    continue;
+                }
+            };
+            block_stmts.push(HirStmt {
+                kind: HirStmtKind::Assign { id: dst_id, value },
+                span,
+            });
+        }
+        Ok(HirStmt {
+            kind: HirStmtKind::Block { stmts: block_stmts },
+            span,
+        })
     }
 
     /// Phase 2.5d (ADR 0021): shared implementation for both

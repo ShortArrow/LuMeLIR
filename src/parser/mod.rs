@@ -92,6 +92,18 @@ impl<'t> Parser<'t> {
             TokenKind::Ident(_) if matches!(self.peek_kind_at(1), Some(TokenKind::Equals)) => {
                 self.parse_assign()
             }
+            // Phase 2.1a (ADR 0049): `NAME, NAME ... = ...` is a
+            // multi-target reassignment. The lookahead at offset 1
+            // is `,`; we then walk forward to confirm an `=` lives
+            // before any non-comma/non-ident token, otherwise this
+            // isn't a multi-assign and we let the expression parser
+            // take over (which will error with a clear diagnostic).
+            TokenKind::Ident(_)
+                if matches!(self.peek_kind_at(1), Some(TokenKind::Comma))
+                    && self.is_multi_assign_lookahead() =>
+            {
+                self.parse_multi_assign()
+            }
             _ => {
                 let expr = self.parse_expr(0)?;
                 let span = expr.span;
@@ -257,6 +269,78 @@ impl<'t> Parser<'t> {
         let value = self.parse_expr(0)?;
         let span = Span::new(name_tok.span.start, value.span.end);
         Ok(Stmt::new(StmtKind::Assign { name, value }, span))
+    }
+
+    /// Phase 2.1a (ADR 0049): peek ahead to decide whether
+    /// `Ident, Ident, …` is the start of a multi-target assignment
+    /// (rather than e.g. an expression statement that starts with
+    /// a comma-something later). The pattern we accept is
+    /// `Ident (, Ident)+ =`. If the trailing `=` isn't there, the
+    /// dispatcher falls back to expression parsing.
+    fn is_multi_assign_lookahead(&self) -> bool {
+        let mut idx = 0usize;
+        loop {
+            // Position 2*idx must be an Ident.
+            match self.peek_kind_at(idx * 2) {
+                Some(TokenKind::Ident(_)) => {}
+                _ => return false,
+            }
+            // Position 2*idx + 1 is either `,` (continue) or `=` (done).
+            match self.peek_kind_at(idx * 2 + 1) {
+                Some(TokenKind::Comma) => {
+                    idx += 1;
+                    if idx > 32 {
+                        // sanity bound
+                        return false;
+                    }
+                }
+                Some(TokenKind::Equals) => return idx >= 1,
+                _ => return false,
+            }
+        }
+    }
+
+    fn parse_multi_assign(&mut self) -> Result<Stmt, ParseError> {
+        let start_offset = self.peek().span.start;
+        let mut names: Vec<String> = Vec::new();
+        loop {
+            let tok = self.peek().clone();
+            let TokenKind::Ident(name) = tok.kind else {
+                return Err(ParseError::UnexpectedToken {
+                    actual: tok.kind,
+                    offset: tok.span.start,
+                });
+            };
+            self.bump(); // ident
+            names.push(name);
+            match self.peek().kind {
+                TokenKind::Comma => {
+                    self.bump();
+                }
+                TokenKind::Equals => {
+                    self.bump();
+                    break;
+                }
+                _ => {
+                    let t = self.peek().clone();
+                    return Err(ParseError::UnexpectedToken {
+                        actual: t.kind,
+                        offset: t.span.start,
+                    });
+                }
+            }
+        }
+        let mut values: Vec<Expr> = Vec::new();
+        values.push(self.parse_expr(0)?);
+        while matches!(self.peek().kind, TokenKind::Comma) {
+            self.bump();
+            values.push(self.parse_expr(0)?);
+        }
+        let end_offset = values.last().map(|v| v.span.end).unwrap_or(start_offset);
+        Ok(Stmt::new(
+            StmtKind::AssignMulti { names, values },
+            Span::new(start_offset, end_offset),
+        ))
     }
 
     fn parse_block(&mut self) -> Result<Stmt, ParseError> {
@@ -837,6 +921,10 @@ mod tests {
                 value: value.map(strip_span_expr),
             },
             StmtKind::LocalMulti { names, values } => StmtKind::LocalMulti {
+                names,
+                values: values.into_iter().map(strip_span_expr).collect(),
+            },
+            StmtKind::AssignMulti { names, values } => StmtKind::AssignMulti {
                 names,
                 values: values.into_iter().map(strip_span_expr).collect(),
             },
