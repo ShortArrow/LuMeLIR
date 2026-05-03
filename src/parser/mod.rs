@@ -642,6 +642,27 @@ impl<'t> Parser<'t> {
                     }),
                 }
             }
+            // Phase 2.6a-min (ADR 0053): table constructor. Only the
+            // empty form `{}` is accepted in this sub-phase; non-empty
+            // forms land in 2.6a.1.
+            TokenKind::LBrace => {
+                self.bump();
+                let closing = self.peek().clone();
+                match closing.kind {
+                    TokenKind::RBrace => {
+                        self.bump();
+                        let span = Span::new(tok.span.start, closing.span.end);
+                        Ok(Expr::new(ExprKind::Table(Vec::new()), span))
+                    }
+                    TokenKind::Eof => Err(ParseError::UnexpectedEof {
+                        offset: closing.span.start,
+                    }),
+                    other => Err(ParseError::UnexpectedToken {
+                        actual: other,
+                        offset: closing.span.start,
+                    }),
+                }
+            }
             TokenKind::Eof => Err(ParseError::UnexpectedEof {
                 offset: tok.span.start,
             }),
@@ -854,6 +875,9 @@ mod tests {
                 params,
                 body: body.into_iter().map(strip_span_stmt).collect(),
             },
+            ExprKind::Table(elems) => {
+                ExprKind::Table(elems.into_iter().map(strip_span_expr).collect())
+            }
         };
         Expr::new(kind, Span::new(0, 0))
     }

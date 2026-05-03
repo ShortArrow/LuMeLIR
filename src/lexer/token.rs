@@ -74,6 +74,11 @@ pub enum TokenKind {
     GtEq,
     Comma,
     Semicolon,
+    /// `{` opening brace, used for table constructors
+    /// (Phase 2.6a-min, ADR 0053).
+    LBrace,
+    /// `}` closing brace.
+    RBrace,
     /// End-of-source sentinel. Always present as the last element of a
     /// successful [`super::lex`] result.
     Eof,

@@ -70,7 +70,8 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.7k extended string escapes | **Done** | `\a \b \f \v \xHH \ddd` (ASCII range) via `read_hex_escape` / `read_decimal_escape` (ADR 0039) |
 | ‣ 2.7l `\u{XXXX}` + `\z` | **Done** | Unicode codepoint → UTF-8 via `read_unicode_escape`; `\z` skips whitespace run (ADR 0040) |
 | ‣ 2.5c closures | Not started | upvalue capture, heap-allocated environments |
-| ‣ 2.6+ tables / metatables | Not started | tables, metatables, generic for, GC |
+| ‣ 2.6a-min empty tables `{}` + `#t` | **Done** | `ValueKind::Table` (`!llvm.ptr`), `[i64 length]` heap header, malloc on construct (ADR 0053) |
+| ‣ 2.6+ tables / metatables | In progress | non-empty constructors, indexing, methods, metatables — multiple sub-phases |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |
 
 **How to read TBD markers:** sections marked `TBD: Phase N, ADR XXXX` indicate the rule is undecided until that ADR lands. Do not invent answers — surface the question instead.

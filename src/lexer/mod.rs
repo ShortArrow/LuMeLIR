@@ -152,6 +152,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
             '#' => Some(TokenKind::Hash),
             ',' => Some(TokenKind::Comma),
             ';' => Some(TokenKind::Semicolon),
+            // Phase 2.6a-min (ADR 0053): table constructor delimiters.
+            '{' => Some(TokenKind::LBrace),
+            '}' => Some(TokenKind::RBrace),
             _ => None,
         };
 

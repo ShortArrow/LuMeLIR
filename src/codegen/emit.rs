@@ -164,6 +164,8 @@ fn emit_fmt_global<'c>(
         "function\0",
         loc,
     );
+    // Phase 2.6a-min (ADR 0053): typename for `type(t)` on tables.
+    emit_string_global(context, module, i8_type, "s_typename_table", "table\0", loc);
     // Phase 2.7g (ADR 0030): diagnostic for the `assert` failure
     // path. The `printf("%s\n", _)` caller already adds the line
     // terminator, so the payload itself ends with NUL only.
@@ -497,6 +499,9 @@ fn param_mlir_type<'c>(context: &'c Context, kind: ValueKind, types: &Types<'c>)
         // Phase 2.7a (ADR 0024): a String value is a `!llvm.ptr`
         // into the static C-string pool.
         ValueKind::String => types.ptr,
+        // Phase 2.6a-min (ADR 0053): a Table value is a `!llvm.ptr`
+        // to a heap-allocated `[length: i64]`-prefixed region.
+        ValueKind::Table => types.ptr,
     }
 }
 
@@ -518,7 +523,7 @@ fn ret_mlir_types<'c>(
                 let p_types: Vec<Type<'c>> = (0..*arity).map(|_| types.f64).collect();
                 FunctionType::new(context, &p_types, &[types.f64]).into()
             }
-            ValueKind::String => types.ptr,
+            ValueKind::String | ValueKind::Table => types.ptr,
         })
         .collect()
 }
@@ -645,10 +650,13 @@ fn emit_function<'c>(
                 let fn_ty: Type<'c> = FunctionType::new(context, &p_types, &[types.f64]).into();
                 emit_unrealized_cast(&block, ptr_val, fn_ty, loc)
             }
-            // Phase 2.7a: String returns surface the slot's `ptr`
-            // value directly — no cast is needed since the slot type
-            // already matches the function signature.
-            ValueKind::String => emit_load(&block, slots[ret_value_idx], types.ptr, loc),
+            // Phase 2.7a / 2.6a-min: String and Table returns
+            // surface the slot's `ptr` value directly — no cast is
+            // needed since the slot type already matches the
+            // function signature.
+            ValueKind::String | ValueKind::Table => {
+                emit_load(&block, slots[ret_value_idx], types.ptr, loc)
+            }
         };
         ret_values.push(v);
     }
@@ -922,6 +930,8 @@ fn emit_alloca_slot_for_kind<'a, 'c>(
         // pointers — `!func.func<...>` values are bridged via
         // `unrealized_conversion_cast` at store/load.
         ValueKind::Function(_) => types.ptr,
+        // Phase 2.6a-min (ADR 0053): Table slot stores a heap ptr.
+        ValueKind::Table => types.ptr,
     };
 
     let one = arith::constant(context, IntegerAttribute::new(types.i32, 1).into(), loc);
@@ -1010,6 +1020,40 @@ fn emit_expr<'a, 'c>(
                 .expect("collect_string_pool seeds every literal before codegen");
             Ok(emit_addressof(context, block, global_name, types, loc))
         }
+        // Phase 2.6a-min (ADR 0053): table constructor. Allocate
+        // `8 + N*8` bytes via `malloc`, store the length at offset
+        // 0. For the empty form (`elems.is_empty()`) that's just an
+        // `[i64 length=0]` 8-byte block. Element stores arrive in
+        // 2.6a.1.
+        HirExprKind::Table(elems) => {
+            let elem_count = elems.len();
+            // 8 bytes for the length header, plus 8 per Number
+            // element (this is enough for 2.6a-min since elems is
+            // always empty here, but the layout pre-figures 2.6a.1).
+            let total_bytes = 8i64 + (elem_count as i64) * 8;
+            let size_const = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, total_bytes).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let table_ptr = emit_libc_call_ptr(context, block, "malloc", &[size_const], types, loc);
+            // Store length at offset 0.
+            let len_const = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, elem_count as i64).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            emit_store(block, len_const, table_ptr, loc);
+            Ok(table_ptr)
+        }
         HirExprKind::Local(LocalId(idx)) => {
             let info = &locals[*idx];
             match info.kind {
@@ -1018,6 +1062,7 @@ fn emit_expr<'a, 'c>(
                     Ok(emit_load(block, slots[*idx], types.i1, loc))
                 }
                 ValueKind::String => Ok(emit_load(block, slots[*idx], types.ptr, loc)),
+                ValueKind::Table => Ok(emit_load(block, slots[*idx], types.ptr, loc)),
                 ValueKind::Function(arity) => {
                     // Three buckets (Phase 2.5b.3, ADR 0019):
                     //   - Function param: slots[idx] is the block arg.
@@ -1090,8 +1135,10 @@ fn emit_expr<'a, 'c>(
         }
         HirExprKind::UnaryOp { op, operand } => {
             // `not` accepts any kind: convert operand to truthiness i1
-            // first, then flip with xori. Other unaries (currently `-`)
-            // pass through emit_unary unchanged.
+            // first, then flip with xori. `Len` dispatches on operand
+            // kind (String → strlen; Table → load i64 from header).
+            // Other unaries (currently `-`, `~`) pass through
+            // emit_unary unchanged.
             if matches!(op, UnaryOp::Not) {
                 let kind = infer_kind(operand, locals, functions);
                 let v = emit_expr(
@@ -1105,6 +1152,20 @@ fn emit_expr<'a, 'c>(
                     .result(0)
                     .unwrap()
                     .into());
+            }
+            if matches!(op, UnaryOp::Len) {
+                let kind = infer_kind(operand, locals, functions);
+                let v = emit_expr(
+                    context, block, operand, slots, locals, functions, types, params_len, loc,
+                )?;
+                let len_i64 = match kind {
+                    ValueKind::String => {
+                        emit_libc_call_i64(context, block, "strlen", &[v], types, loc)
+                    }
+                    ValueKind::Table => emit_load(block, v, types.i64, loc),
+                    _ => unreachable!("HIR rejects #x for non-String/Table kinds"),
+                };
+                return Ok(emit_i2f(block, len_i64, types, loc));
             }
             let v = emit_expr(
                 context, block, operand, slots, locals, functions, types, params_len, loc,
@@ -1219,6 +1280,7 @@ fn emit_expr<'a, 'c>(
                     ValueKind::Bool => "s_typename_boolean",
                     ValueKind::Nil => "s_typename_nil",
                     ValueKind::Function(_) => "s_typename_function",
+                    ValueKind::Table => "s_typename_table",
                 };
                 Ok(emit_addressof(context, block, global, types, loc))
             }
@@ -1486,33 +1548,15 @@ fn emit_unary<'a, 'c>(
                 .into();
             Ok(emit_i2f(block, r_i, types, loc))
         }
-        // Phase 2.7a (ADR 0024): `#s` calls libc strlen on the
-        // string ptr, then promotes the i64 byte count to f64 to
-        // match our Number-typed expression world.
-        UnaryOp::Len => {
-            let n = i32::try_from(1usize).unwrap();
-            let call_op = OperationBuilder::new("llvm.call", loc)
-                .add_operands(&[operand])
-                .add_attributes(&[
-                    (
-                        Identifier::new(context, "callee"),
-                        FlatSymbolRefAttribute::new(context, "strlen").into(),
-                    ),
-                    (
-                        Identifier::new(context, "operandSegmentSizes"),
-                        DenseI32ArrayAttribute::new(context, &[n, 0]).into(),
-                    ),
-                    (
-                        Identifier::new(context, "op_bundle_sizes"),
-                        DenseI32ArrayAttribute::new(context, &[]).into(),
-                    ),
-                ])
-                .add_results(&[types.i64])
-                .build()
-                .expect("llvm.call @strlen");
-            let len_i64: Value<'c, 'a> = block.append_operation(call_op).result(0).unwrap().into();
-            Ok(emit_i2f(block, len_i64, types, loc))
-        }
+        // Phase 2.7a (ADR 0024) / 2.6a-min (ADR 0053): `#x` is now
+        // dispatched in emit_expr where the operand kind is
+        // available — String → strlen; Table → load header. This
+        // arm is unreachable.
+        UnaryOp::Len => unreachable!(
+            "UnaryOp::Len is dispatched in emit_expr where the \
+             operand kind is available (String → strlen, Table → \
+             header load)"
+        ),
     }
 }
 
@@ -1705,6 +1749,13 @@ fn emit_tostring<'a, 'c>(
         // already registered for `type(f)` so we don't bloat the
         // module with a near-duplicate string.
         ValueKind::Function(_) => emit_addressof(context, block, "s_typename_function", types, loc),
+        // Phase 2.6a-min (ADR 0053): tables don't yet flow through
+        // `tostring` — HIR rejects this path. The arm exists only
+        // for exhaustiveness.
+        ValueKind::Table => unreachable!(
+            "Table-kind tostring is rejected at HIR-time \
+             (FunctionUsedAsValue analogue) — should not reach codegen"
+        ),
     }
 }
 
@@ -1816,10 +1867,12 @@ fn emit_tonumber<'a, 'c>(
                 .unwrap()
                 .into()
         }
-        ValueKind::Bool | ValueKind::Nil | ValueKind::Function(_) => unreachable!(
-            "tonumber on Bool/Nil/Function is rejected at HIR-time \
-             (TypeMismatch / FunctionUsedAsValue) — should not reach codegen"
-        ),
+        ValueKind::Bool | ValueKind::Nil | ValueKind::Function(_) | ValueKind::Table => {
+            unreachable!(
+                "tonumber on Bool/Nil/Function/Table is rejected at HIR-time \
+                 (TypeMismatch / FunctionUsedAsValue) — should not reach codegen"
+            )
+        }
     }
 }
 
@@ -2046,9 +2099,9 @@ fn emit_print_value_raw<'a, 'c>(
             let fmt_ptr = emit_addressof(context, block, "fmt_str_raw", types, loc);
             emit_printf(context, block, fmt_ptr, value, types, loc);
         }
-        ValueKind::Function(_) => unreachable!(
-            "Function-kind args are rejected at HIR-time \
-             (HirError::FunctionUsedAsValue) — should not reach codegen"
+        ValueKind::Function(_) | ValueKind::Table => unreachable!(
+            "Function/Table args are rejected at HIR-time \
+             (FunctionUsedAsValue) — should not reach codegen"
         ),
     }
 }
@@ -2249,8 +2302,10 @@ fn emit_truthiness<'a, 'c>(
                 .into()
         }
         // Phase 2.7a (ADR 0024): every string is truthy in Lua,
-        // including the empty string. Same fold as Number.
-        ValueKind::String => {
+        // including the empty string. Same fold as Number. Phase
+        // 2.6a-min: every table is truthy too (Lua's truthy/falsy
+        // rule: only `nil` and `false` are falsy).
+        ValueKind::String | ValueKind::Table => {
             let attr = IntegerAttribute::new(types.i1, 1);
             block
                 .append_operation(arith::constant(context, attr.into(), loc))
@@ -2272,7 +2327,7 @@ fn kind_to_mlir_type<'c>(kind: ValueKind, types: &Types<'c>) -> Type<'c> {
     match kind {
         ValueKind::Number => types.f64,
         ValueKind::Bool | ValueKind::Nil | ValueKind::Function(_) => types.i1,
-        ValueKind::String => types.ptr,
+        ValueKind::String | ValueKind::Table => types.ptr,
     }
 }
 

@@ -37,6 +37,12 @@ pub enum ValueKind {
     /// to a static C-string global; length is recovered via libc
     /// `strlen` at the `#` use site rather than tracked statically.
     String,
+    /// Table value (Phase 2.6a-min, ADR 0053). Reference type —
+    /// represented as `!llvm.ptr` pointing at a heap-allocated
+    /// `[length: i64]`-prefixed region. Phase 2.6a-min only
+    /// supports the empty form; populated arrays / hashes /
+    /// metatables are out-of-scope until later sub-phases.
+    Table,
 }
 
 impl ValueKind {
@@ -47,6 +53,7 @@ impl ValueKind {
             ValueKind::Nil => "nil",
             ValueKind::Function(_) => "function",
             ValueKind::String => "string",
+            ValueKind::Table => "table",
         }
     }
 }
@@ -57,6 +64,7 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
         HirExprKind::Bool(_) => ValueKind::Bool,
         HirExprKind::Nil => ValueKind::Nil,
         HirExprKind::Str(_) => ValueKind::String,
+        HirExprKind::Table(_) => ValueKind::Table,
         HirExprKind::Local(LocalId(idx)) => locals[*idx].kind,
         HirExprKind::UnaryOp { op, .. } => match op {
             crate::parser::UnaryOp::Neg => ValueKind::Number,
@@ -210,7 +218,10 @@ fn wrap_with_broken_guard(stmt: HirStmt, broken_id: LocalId) -> HirStmt {
 fn coerce_to_string(expr: HirExpr, kind: ValueKind, offset: usize) -> Result<HirExpr, HirError> {
     match kind {
         ValueKind::String => Ok(expr),
-        ValueKind::Function(_) => Err(HirError::TypeMismatch {
+        // Phase 2.6a-min (ADR 0053): table concat needs `__tostring`
+        // metatable resolution which doesn't exist yet — reject for
+        // symmetry with Function-kind concat rejection.
+        ValueKind::Function(_) | ValueKind::Table => Err(HirError::TypeMismatch {
             op: "..".to_owned(),
             lhs_kind: "string".to_owned(),
             rhs_kind: kind.name().to_owned(),
@@ -297,6 +308,9 @@ fn ast_arg_kind(expr: &Expr) -> ValueKind {
         // refines that parameter to ValueKind::String, so functions
         // like `greet(name)` lower with a String-kind `name`.
         ExprKind::Str(_) => ValueKind::String,
+        // Phase 2.6a-min (ADR 0053): a table constructor literal at
+        // a call site refines the param to ValueKind::Table.
+        ExprKind::Table(_) => ValueKind::Table,
         ExprKind::UnaryOp { op, operand }
             if matches!(op, UnaryOp::Neg) && matches!(operand.kind, ExprKind::Number(_)) =>
         {
@@ -978,12 +992,10 @@ impl LowerCtx {
                 ValueKind::Number => Some(HirExprKind::Number(0.0)),
                 ValueKind::Bool => Some(HirExprKind::Bool(false)),
                 ValueKind::Nil => Some(HirExprKind::Nil),
-                // Function: no sensible default (ptr alloca, body-
-                // guard guarantees a real value before load).
-                // String: same — no empty-string sentinel needed since
-                // every non-trivial body assigns before the trailing
-                // load fires.
-                ValueKind::Function(_) | ValueKind::String => None,
+                // Function / String / Table: no sensible default
+                // (ptr alloca, body-guard guarantees a real value
+                // before load fires).
+                ValueKind::Function(_) | ValueKind::String | ValueKind::Table => None,
             };
             if let Some(kind) = init_value {
                 out.push(HirStmt {
@@ -1885,13 +1897,16 @@ impl LowerCtx {
             }
             ExprKind::UnaryOp { op, operand } => {
                 let operand_hir = self.lower_expr(operand)?;
-                // Phase 2.7a (ADR 0024): `#x` requires a String operand.
+                // Phase 2.7a (ADR 0024) / 2.6a-min (ADR 0053): `#x`
+                // accepts either a String (length via libc strlen)
+                // or a Table (length read from the heap header's
+                // first i64 slot).
                 if matches!(op, UnaryOp::Len) {
                     let k = infer_kind(&operand_hir, &self.locals, &self.functions);
-                    if k != ValueKind::String {
+                    if !matches!(k, ValueKind::String | ValueKind::Table) {
                         return Err(HirError::TypeMismatch {
                             op: "#".to_owned(),
-                            lhs_kind: "string".to_owned(),
+                            lhs_kind: "string or table".to_owned(),
                             rhs_kind: k.name().to_owned(),
                             offset: expr.span.start,
                         });
@@ -1951,6 +1966,20 @@ impl LowerCtx {
                 HirExprKind::FunctionRef(id)
             }
             ExprKind::Call { callee, args } => self.lower_call(callee, args, expr)?,
+            // Phase 2.6a-min (ADR 0053): table constructor. Empty
+            // form only — non-empty forms reject for now to keep
+            // the codegen surface minimal until 2.6a.1.
+            ExprKind::Table(elems) => {
+                if !elems.is_empty() {
+                    return Err(HirError::TypeMismatch {
+                        op: "table constructor".to_owned(),
+                        lhs_kind: "empty".to_owned(),
+                        rhs_kind: "non-empty (defer to 2.6a.1)".to_owned(),
+                        offset: expr.span.start,
+                    });
+                }
+                HirExprKind::Table(Vec::new())
+            }
         };
         Ok(HirExpr {
             kind,
@@ -2076,6 +2105,7 @@ impl LowerCtx {
                     (ValueKind::Bool, ValueKind::Bool) => true,
                     (ValueKind::Nil, ValueKind::Nil) => true,
                     (ValueKind::String, ValueKind::String) => true,
+                    (ValueKind::Table, ValueKind::Table) => true,
                     (ValueKind::Function(a), ValueKind::Function(b)) => a == b,
                     _ => false,
                 };

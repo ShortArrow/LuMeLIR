@@ -43,6 +43,10 @@ pub enum ExprKind {
         params: Vec<String>,
         body: Chunk,
     },
+    /// `{ e1, e2, … }` table constructor (Phase 2.6a-min, ADR 0053).
+    /// Phase 2.6a-min only accepts the empty form `{}`; non-empty
+    /// constructors land in 2.6a.1.
+    Table(Vec<Expr>),
 }
 
 /// Binary operators. Phase 2.2a covers all arithmetic operators
