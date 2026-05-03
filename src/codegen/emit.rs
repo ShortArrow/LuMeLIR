@@ -68,6 +68,32 @@ const TABLE_OFF_ARRAY_BUF: i64 = 16;
 const TABLE_OFF_HASH_BUF: i64 = 24;
 const TABLE_HEADER_SIZE: i64 = 32;
 
+// =============================================================
+// Phase 2.6b-hash (ADR 0058): hash_buf layout for string-keyed
+// fields. Lazy-allocated on first `t.k = v`. Open addressing
+// with linear probing.
+//
+// ```text
+// hash_buf (!llvm.ptr)
+//   [0..8)   : i64 hash_cap     # bucket count (always power of two)
+//   [8..16)  : i64 hash_count   # occupied buckets
+//   [16..)   : entry array      # hash_cap × 16-byte entries
+//      entry layout (16 bytes):
+//        [0..8)  : !llvm.ptr key_str   (null = empty bucket)
+//        [8..16) : f64 value
+// ```
+//
+// Initial capacity 8 (= 128 bytes for entries + 16 for header).
+// Resize at load factor 0.75 (`count * 4 ≥ cap * 3`).
+// =============================================================
+const HASH_OFF_CAP: i64 = 0;
+const HASH_OFF_COUNT: i64 = 8;
+const HASH_OFF_ENTRIES: i64 = 16;
+const HASH_ENTRY_SIZE: i64 = 16;
+const HASH_ENTRY_OFF_KEY: i64 = 0;
+const HASH_ENTRY_OFF_VALUE: i64 = 8;
+const HASH_INITIAL_CAP: i64 = 8;
+
 struct Types<'c> {
     i1: Type<'c>,
     /// Phase 2.6a-arr (ADR 0054): i8 used as the GEP element type
@@ -225,6 +251,16 @@ fn emit_fmt_global<'c>(
         "table index out of bounds\0",
         loc,
     );
+    // Phase 2.6b-hash (ADR 0058): missing-key diagnostic for
+    // `t.k` / `t["k"]` reads.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_table_missing_key",
+        "table missing key\0",
+        loc,
+    );
 }
 
 fn emit_string_global<'c>(
@@ -289,6 +325,19 @@ fn collect_string_pool(chunk: &HirChunk) -> std::collections::HashMap<String, St
                 for a in args {
                     visit_expr(a, set);
                 }
+            }
+            // Phase 2.6a-arr (ADR 0054) / 2.6b-hash (ADR 0058):
+            // recurse into table constructors and index expressions
+            // so any string literal used as a table element or hash
+            // key is seeded into the global pool.
+            HirExprKind::Table(elems) => {
+                for elem in elems {
+                    visit_expr(elem, set);
+                }
+            }
+            HirExprKind::Index { target, key } => {
+                visit_expr(target, set);
+                visit_expr(key, set);
             }
             _ => {}
         }
@@ -936,95 +985,259 @@ fn emit_stmt<'a, 'c>(
             let target_ptr = emit_expr(
                 context, block, target, slots, locals, functions, types, params_len, loc,
             )?;
-            let key_f = emit_expr(
-                context, block, key, slots, locals, functions, types, params_len, loc,
-            )?;
+            let key_kind = infer_kind(key, locals, functions);
             let value_v = emit_expr(
                 context, block, value, slots, locals, functions, types, params_len, loc,
             )?;
-            let key_i = emit_f2i(block, key_f, types, loc);
-            let length_i = emit_load(block, target_ptr, types.i64, loc);
-            // Write bounds: upper = length + 1 (allow one-past-end).
-            let one = block
-                .append_operation(arith::constant(
-                    context,
-                    IntegerAttribute::new(types.i64, 1).into(),
-                    loc,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            let len_plus_one: Value<'c, 'a> = block
-                .append_operation(arith::addi(length_i, one, loc))
-                .result(0)
-                .unwrap()
-                .into();
-            emit_table_bounds_check(context, block, key_i, len_plus_one, types, loc);
-            // Grow array_buf if capacity is insufficient.
-            emit_table_grow_if_needed(context, block, target_ptr, key_i, length_i, types, loc);
-            // Update length when pushing past current end.
-            let push_grew_len: Value<'c, 'a> = block
-                .append_operation(arith::cmpi(
-                    context,
-                    arith::CmpiPredicate::Sgt,
-                    key_i,
-                    length_i,
-                    loc,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            let len_then_region = Region::new();
-            let len_then_blk = Block::new(&[]);
-            {
-                let len_slot_inner = emit_byte_offset_ptr(
-                    context,
-                    &len_then_blk,
-                    target_ptr,
-                    TABLE_OFF_LEN,
-                    types,
-                    loc,
-                );
-                emit_store(&len_then_blk, key_i, len_slot_inner, loc);
-                len_then_blk.append_operation(scf::r#yield(&[], loc));
+            match key_kind {
+                ValueKind::Number => {
+                    let key_f = emit_expr(
+                        context, block, key, slots, locals, functions, types, params_len, loc,
+                    )?;
+                    let key_i = emit_f2i(block, key_f, types, loc);
+                    let length_i = emit_load(block, target_ptr, types.i64, loc);
+                    // Write bounds: upper = length + 1 (allow one-past-end).
+                    let one = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 1).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let len_plus_one: Value<'c, 'a> = block
+                        .append_operation(arith::addi(length_i, one, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    emit_table_bounds_check(context, block, key_i, len_plus_one, types, loc);
+                    emit_table_grow_if_needed(
+                        context, block, target_ptr, key_i, length_i, types, loc,
+                    );
+                    let push_grew_len: Value<'c, 'a> = block
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Sgt,
+                            key_i,
+                            length_i,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let len_then_region = Region::new();
+                    let len_then_blk = Block::new(&[]);
+                    {
+                        let len_slot_inner = emit_byte_offset_ptr(
+                            context,
+                            &len_then_blk,
+                            target_ptr,
+                            TABLE_OFF_LEN,
+                            types,
+                            loc,
+                        );
+                        emit_store(&len_then_blk, key_i, len_slot_inner, loc);
+                        len_then_blk.append_operation(scf::r#yield(&[], loc));
+                    }
+                    len_then_region.append_block(len_then_blk);
+                    let len_else_region = Region::new();
+                    let len_else_blk = Block::new(&[]);
+                    len_else_blk.append_operation(scf::r#yield(&[], loc));
+                    len_else_region.append_block(len_else_blk);
+                    block.append_operation(scf::r#if(
+                        push_grew_len,
+                        &[],
+                        len_then_region,
+                        len_else_region,
+                        loc,
+                    ));
+                    let array_buf = emit_table_array_buf(context, block, target_ptr, types, loc);
+                    let zero_idx: Value<'c, 'a> = block
+                        .append_operation(arith::subi(key_i, one, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let eight = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 8).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let body_offset: Value<'c, 'a> = block
+                        .append_operation(arith::muli(zero_idx, eight, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let elem_ptr = emit_byte_offset_ptr_dynamic(
+                        context,
+                        block,
+                        array_buf,
+                        body_offset,
+                        types,
+                        loc,
+                    );
+                    emit_store(block, value_v, elem_ptr, loc);
+                }
+                ValueKind::String => {
+                    // Phase 2.6b-hash (ADR 0058): hash insert.
+                    // ensure_buf → grow_if_needed → probe → store
+                    // (handle both "new key" → count++ and
+                    // "existing key" → just overwrite value).
+                    let key_str = emit_expr(
+                        context, block, key, slots, locals, functions, types, params_len, loc,
+                    )?;
+                    emit_hash_ensure_buf(context, block, target_ptr, types, loc);
+                    emit_hash_grow_if_needed(context, block, target_ptr, types, loc);
+                    let hash_buf_slot = emit_byte_offset_ptr(
+                        context,
+                        block,
+                        target_ptr,
+                        TABLE_OFF_HASH_BUF,
+                        types,
+                        loc,
+                    );
+                    let hash_buf = emit_load(block, hash_buf_slot, types.ptr, loc);
+                    let cap_slot =
+                        emit_byte_offset_ptr(context, block, hash_buf, HASH_OFF_CAP, types, loc);
+                    let cap = emit_load(block, cap_slot, types.i64, loc);
+                    let bucket = emit_hash_probe_for_insert(
+                        context, block, hash_buf, cap, key_str, types, loc,
+                    );
+                    let entry_size = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let entries_off = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let bucket_off: Value<'c, 'a> = block
+                        .append_operation(arith::muli(bucket, entry_size, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let entry_off: Value<'c, 'a> = block
+                        .append_operation(arith::addi(bucket_off, entries_off, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let entry_ptr = emit_byte_offset_ptr_dynamic(
+                        context, block, hash_buf, entry_off, types, loc,
+                    );
+                    // Check whether the bucket was empty (= new key)
+                    // — if so, increment count and store the key.
+                    let cur_key = emit_load(block, entry_ptr, types.ptr, loc);
+                    let cur_key_i = block
+                        .append_operation(
+                            OperationBuilder::new("llvm.ptrtoint", loc)
+                                .add_operands(&[cur_key])
+                                .add_results(&[types.i64])
+                                .build()
+                                .expect("llvm.ptrtoint"),
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let zero_i64 = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 0).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let was_empty: Value<'c, 'a> = block
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Eq,
+                            cur_key_i,
+                            zero_i64,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let new_key_then = Region::new();
+                    let new_key_blk = Block::new(&[]);
+                    {
+                        // store the key
+                        emit_store(&new_key_blk, key_str, entry_ptr, loc);
+                        // count++
+                        let count_slot = emit_byte_offset_ptr(
+                            context,
+                            &new_key_blk,
+                            hash_buf,
+                            HASH_OFF_COUNT,
+                            types,
+                            loc,
+                        );
+                        let count = emit_load(&new_key_blk, count_slot, types.i64, loc);
+                        let one_inner = new_key_blk
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(types.i64, 1).into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let new_count: Value<'c, '_> = new_key_blk
+                            .append_operation(arith::addi(count, one_inner, loc))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        emit_store(&new_key_blk, new_count, count_slot, loc);
+                        new_key_blk.append_operation(scf::r#yield(&[], loc));
+                    }
+                    new_key_then.append_block(new_key_blk);
+                    let new_key_else = Region::new();
+                    let new_key_else_blk = Block::new(&[]);
+                    new_key_else_blk.append_operation(scf::r#yield(&[], loc));
+                    new_key_else.append_block(new_key_else_blk);
+                    block.append_operation(scf::r#if(
+                        was_empty,
+                        &[],
+                        new_key_then,
+                        new_key_else,
+                        loc,
+                    ));
+                    // Always store the value (overwrite or fresh).
+                    let value_off_const = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, HASH_ENTRY_OFF_VALUE).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let value_ptr = emit_byte_offset_ptr_dynamic(
+                        context,
+                        block,
+                        entry_ptr,
+                        value_off_const,
+                        types,
+                        loc,
+                    );
+                    emit_store(block, value_v, value_ptr, loc);
+                }
+                _ => unreachable!("HIR rejects non-Number/String key kinds"),
             }
-            len_then_region.append_block(len_then_blk);
-            let len_else_region = Region::new();
-            let len_else_blk = Block::new(&[]);
-            len_else_blk.append_operation(scf::r#yield(&[], loc));
-            len_else_region.append_block(len_else_blk);
-            block.append_operation(scf::r#if(
-                push_grew_len,
-                &[],
-                len_then_region,
-                len_else_region,
-                loc,
-            ));
-            // Reload array_buf (grow may have just swapped it) and
-            // store the value at (key-1)*8.
-            let array_buf = emit_table_array_buf(context, block, target_ptr, types, loc);
-            let zero_idx: Value<'c, 'a> = block
-                .append_operation(arith::subi(key_i, one, loc))
-                .result(0)
-                .unwrap()
-                .into();
-            let eight = block
-                .append_operation(arith::constant(
-                    context,
-                    IntegerAttribute::new(types.i64, 8).into(),
-                    loc,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            let body_offset: Value<'c, 'a> = block
-                .append_operation(arith::muli(zero_idx, eight, loc))
-                .result(0)
-                .unwrap()
-                .into();
-            let elem_ptr =
-                emit_byte_offset_ptr_dynamic(context, block, array_buf, body_offset, types, loc);
-            emit_store(block, value_v, elem_ptr, loc);
         }
     }
     Ok(())
@@ -1327,10 +1540,1086 @@ fn emit_table_grow_if_needed<'a, 'c>(
     block.append_operation(scf::r#if(need_grow, &[], then_region, else_region, loc));
 }
 
+/// Phase 2.6b-hash (ADR 0058): FNV-1a 64-bit hash of a NUL-
+/// terminated C string. `strlen` gives the byte count, then a
+/// `scf.while` loop folds each byte into the running hash.
+/// Returns the i64 hash value (bit pattern interpreted as
+/// unsigned for bucket masking).
+fn emit_string_hash<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    str_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    // FNV-1a 64-bit constants: offset basis and prime. The offset
+    // basis 14695981039346656037 doesn't fit in i64 as positive,
+    // but as bit pattern it equals -3750763034362895579 i64 —
+    // store via the wrapping reinterpretation.
+    const FNV_OFFSET_BASIS: i64 = -3750763034362895579;
+    const FNV_PRIME: i64 = 1099511628211;
+    let len_i64 = emit_libc_call_i64(context, block, "strlen", &[str_ptr], types, loc);
+    let init_hash = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, FNV_OFFSET_BASIS).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let init_idx = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    // scf.while [hash, idx] -> hash:
+    //   before: yield (idx < len) carrying hash, idx
+    //   after : load byte, hash = (hash xor byte) * prime; idx++; yield hash, idx
+    let before_region = Region::new();
+    let before_blk = Block::new(&[(types.i64, loc), (types.i64, loc)]);
+    {
+        let hash_arg: Value<'c, '_> = before_blk.argument(0).unwrap().into();
+        let idx_arg: Value<'c, '_> = before_blk.argument(1).unwrap().into();
+        let cond: Value<'c, '_> = before_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Slt,
+                idx_arg,
+                len_i64,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        before_blk.append_operation(scf::condition(cond, &[hash_arg, idx_arg], loc));
+    }
+    before_region.append_block(before_blk);
+    let after_region = Region::new();
+    let after_blk = Block::new(&[(types.i64, loc), (types.i64, loc)]);
+    {
+        let hash_arg: Value<'c, '_> = after_blk.argument(0).unwrap().into();
+        let idx_arg: Value<'c, '_> = after_blk.argument(1).unwrap().into();
+        // byte_ptr = str_ptr + idx (gep i8)
+        let byte_ptr =
+            emit_byte_offset_ptr_dynamic(context, &after_blk, str_ptr, idx_arg, types, loc);
+        // i8 byte → i64 zero-extended
+        let byte_i8 = emit_load(&after_blk, byte_ptr, types.i8, loc);
+        let byte_i64: Value<'c, '_> = after_blk
+            .append_operation(
+                OperationBuilder::new("arith.extui", loc)
+                    .add_operands(&[byte_i8])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("arith.extui i8 -> i64"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let xored: Value<'c, '_> = after_blk
+            .append_operation(arith::xori(hash_arg, byte_i64, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let prime = after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, FNV_PRIME).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let new_hash: Value<'c, '_> = after_blk
+            .append_operation(arith::muli(xored, prime, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let one = after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let new_idx: Value<'c, '_> = after_blk
+            .append_operation(arith::addi(idx_arg, one, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        after_blk.append_operation(scf::r#yield(&[new_hash, new_idx], loc));
+    }
+    after_region.append_block(after_blk);
+    let while_op = scf::r#while(
+        &[init_hash, init_idx],
+        &[types.i64, types.i64],
+        before_region,
+        after_region,
+        loc,
+    );
+    block.append_operation(while_op).result(0).unwrap().into()
+}
+
+/// Phase 2.6b-hash (ADR 0058): if `header.hash_buf` is null,
+/// allocate the initial hash region (header for cap+count, then
+/// `cap` zeroed entries), and store the buffer pointer in the
+/// table header. After this returns, `header.hash_buf` is
+/// guaranteed non-null with cap=HASH_INITIAL_CAP and count=0.
+fn emit_hash_ensure_buf<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    table_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let hash_buf_slot =
+        emit_byte_offset_ptr(context, block, table_ptr, TABLE_OFF_HASH_BUF, types, loc);
+    let hash_buf = emit_load(block, hash_buf_slot, types.ptr, loc);
+    // is_null = ptrtoint(hash_buf) == 0
+    let hash_buf_i = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[hash_buf])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let is_null: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            hash_buf_i,
+            zero,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        let total_size = HASH_OFF_ENTRIES + HASH_INITIAL_CAP * HASH_ENTRY_SIZE;
+        let size_const = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, total_size).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let new_buf = emit_libc_call_ptr(context, &then_blk, "malloc", &[size_const], types, loc);
+        // Initialize header.cap and header.count
+        let cap_const = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, HASH_INITIAL_CAP).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let cap_slot = emit_byte_offset_ptr(context, &then_blk, new_buf, HASH_OFF_CAP, types, loc);
+        emit_store(&then_blk, cap_const, cap_slot, loc);
+        let zero_const = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let count_slot =
+            emit_byte_offset_ptr(context, &then_blk, new_buf, HASH_OFF_COUNT, types, loc);
+        emit_store(&then_blk, zero_const, count_slot, loc);
+        // Zero-init each entry's key field (value field will be
+        // written on first occupancy; only key=null marks empty).
+        let null_key = emit_null_ptr(context, &then_blk, types, loc);
+        for i in 0..HASH_INITIAL_CAP {
+            let entry_off = HASH_OFF_ENTRIES + i * HASH_ENTRY_SIZE + HASH_ENTRY_OFF_KEY;
+            let key_slot = emit_byte_offset_ptr(context, &then_blk, new_buf, entry_off, types, loc);
+            emit_store(&then_blk, null_key, key_slot, loc);
+        }
+        // Store buf into header.
+        let hash_buf_slot_inner = emit_byte_offset_ptr(
+            context,
+            &then_blk,
+            table_ptr,
+            TABLE_OFF_HASH_BUF,
+            types,
+            loc,
+        );
+        emit_store(&then_blk, new_buf, hash_buf_slot_inner, loc);
+        then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(is_null, &[], then_region, else_region, loc));
+}
+
+/// Phase 2.6b-hash (ADR 0058): probe `hash_buf` for the bucket
+/// matching `key_str`. Returns the i64 bucket index on success
+/// or traps with `s_table_missing_key` if the probe walks into
+/// an empty bucket (= key not present).
+///
+/// Caller must guarantee the buffer is non-null; for lookup that
+/// means `header.hash_buf != null` (else trap before calling).
+fn emit_hash_probe_lookup<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    hash_buf: Value<'c, 'a>,
+    cap: Value<'c, 'a>,
+    key_str: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let one = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mask: Value<'c, 'a> = block
+        .append_operation(arith::subi(cap, one, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let hash = emit_string_hash(context, block, key_str, types, loc);
+    let initial_bucket: Value<'c, 'a> = block
+        .append_operation(arith::andi(hash, mask, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    // scf.while [bucket]:
+    //   before: load key, trap if null, compare with key_str,
+    //           condition = !eq, yield bucket
+    //   after [bucket]: bucket = (bucket + 1) & mask, yield
+    let before_region = Region::new();
+    let before_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let bucket_arg: Value<'c, '_> = before_blk.argument(0).unwrap().into();
+        let entry_off_const = before_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let entries_base_off = before_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let bucket_offset: Value<'c, '_> = before_blk
+            .append_operation(arith::muli(bucket_arg, entry_off_const, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let entry_off: Value<'c, '_> = before_blk
+            .append_operation(arith::addi(bucket_offset, entries_base_off, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let entry_ptr =
+            emit_byte_offset_ptr_dynamic(context, &before_blk, hash_buf, entry_off, types, loc);
+        // Key is at offset 0 within the entry — entry_ptr itself.
+        let key_at_slot = emit_load(&before_blk, entry_ptr, types.ptr, loc);
+        let key_at_slot_i = before_blk
+            .append_operation(
+                OperationBuilder::new("llvm.ptrtoint", loc)
+                    .add_operands(&[key_at_slot])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.ptrtoint"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let zero_i64 = before_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_null: Value<'c, '_> = before_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                key_at_slot_i,
+                zero_i64,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        // Trap if null — key not found.
+        let null_trap_then = Region::new();
+        let null_trap_blk = Block::new(&[]);
+        let msg_ptr = emit_addressof(context, &null_trap_blk, "s_table_missing_key", types, loc);
+        emit_exit_with_message(context, &null_trap_blk, msg_ptr, types, loc);
+        null_trap_blk.append_operation(scf::r#yield(&[], loc));
+        null_trap_then.append_block(null_trap_blk);
+        let null_trap_else = Region::new();
+        let null_trap_else_blk = Block::new(&[]);
+        null_trap_else_blk.append_operation(scf::r#yield(&[], loc));
+        null_trap_else.append_block(null_trap_else_blk);
+        before_blk.append_operation(scf::r#if(is_null, &[], null_trap_then, null_trap_else, loc));
+        // strcmp(key_at_slot, key_str)
+        let cmp = emit_libc_call_i32(
+            context,
+            &before_blk,
+            "strcmp",
+            &[key_at_slot, key_str],
+            types,
+            loc,
+        );
+        let zero_i32 = before_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i32, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let eq: Value<'c, '_> = before_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                cmp,
+                zero_i32,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let i1_one = before_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i1, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let not_eq: Value<'c, '_> = before_blk
+            .append_operation(arith::xori(eq, i1_one, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        before_blk.append_operation(scf::condition(not_eq, &[bucket_arg], loc));
+    }
+    before_region.append_block(before_blk);
+    let after_region = Region::new();
+    let after_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let bucket_arg: Value<'c, '_> = after_blk.argument(0).unwrap().into();
+        let one_inner = after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let plus1: Value<'c, '_> = after_blk
+            .append_operation(arith::addi(bucket_arg, one_inner, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let next: Value<'c, '_> = after_blk
+            .append_operation(arith::andi(plus1, mask, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        after_blk.append_operation(scf::r#yield(&[next], loc));
+    }
+    after_region.append_block(after_blk);
+    let while_op = scf::r#while(
+        &[initial_bucket],
+        &[types.i64],
+        before_region,
+        after_region,
+        loc,
+    );
+    block.append_operation(while_op).result(0).unwrap().into()
+}
+
+/// Phase 2.6b-hash (ADR 0058): walk `hash_buf` from a starting
+/// bucket until either an empty slot OR a slot whose key equals
+/// `key_str` is found, and return that bucket. Used by both the
+/// insert path and the rehash path.
+fn emit_hash_probe_for_insert<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    hash_buf: Value<'c, 'a>,
+    cap: Value<'c, 'a>,
+    key_str: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let one = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mask: Value<'c, 'a> = block
+        .append_operation(arith::subi(cap, one, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let hash = emit_string_hash(context, block, key_str, types, loc);
+    let initial_bucket: Value<'c, 'a> = block
+        .append_operation(arith::andi(hash, mask, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let before_region = Region::new();
+    let before_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let bucket_arg: Value<'c, '_> = before_blk.argument(0).unwrap().into();
+        let entry_size = before_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let entries_base = before_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let bucket_off: Value<'c, '_> = before_blk
+            .append_operation(arith::muli(bucket_arg, entry_size, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let entry_off: Value<'c, '_> = before_blk
+            .append_operation(arith::addi(bucket_off, entries_base, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let entry_ptr =
+            emit_byte_offset_ptr_dynamic(context, &before_blk, hash_buf, entry_off, types, loc);
+        let key_at_slot = emit_load(&before_blk, entry_ptr, types.ptr, loc);
+        let key_at_slot_i = before_blk
+            .append_operation(
+                OperationBuilder::new("llvm.ptrtoint", loc)
+                    .add_operands(&[key_at_slot])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.ptrtoint"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let zero_i64 = before_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_null: Value<'c, '_> = before_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                key_at_slot_i,
+                zero_i64,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        // eq must only be evaluated when key is non-null; gate
+        // strcmp behind scf.if returning i1.
+        let eq_then = Region::new();
+        let eq_then_blk = Block::new(&[]);
+        {
+            let i1_zero = eq_then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i1, 0).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            eq_then_blk.append_operation(scf::r#yield(&[i1_zero], loc));
+        }
+        eq_then.append_block(eq_then_blk);
+        let eq_else = Region::new();
+        let eq_else_blk = Block::new(&[]);
+        {
+            let cmp = emit_libc_call_i32(
+                context,
+                &eq_else_blk,
+                "strcmp",
+                &[key_at_slot, key_str],
+                types,
+                loc,
+            );
+            let zero_i32 = eq_else_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i32, 0).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let eq_inner: Value<'c, '_> = eq_else_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    cmp,
+                    zero_i32,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            eq_else_blk.append_operation(scf::r#yield(&[eq_inner], loc));
+        }
+        eq_else.append_block(eq_else_blk);
+        let eq_op = scf::r#if(is_null, &[types.i1], eq_then, eq_else, loc);
+        let eq: Value<'c, '_> = before_blk.append_operation(eq_op).result(0).unwrap().into();
+        // Found if is_null OR eq. Loop continues otherwise.
+        let found: Value<'c, '_> = before_blk
+            .append_operation(arith::ori(is_null, eq, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let i1_one = before_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i1, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let not_found: Value<'c, '_> = before_blk
+            .append_operation(arith::xori(found, i1_one, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        before_blk.append_operation(scf::condition(not_found, &[bucket_arg], loc));
+    }
+    before_region.append_block(before_blk);
+    let after_region = Region::new();
+    let after_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let bucket_arg: Value<'c, '_> = after_blk.argument(0).unwrap().into();
+        let one_inner = after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let plus1: Value<'c, '_> = after_blk
+            .append_operation(arith::addi(bucket_arg, one_inner, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let next: Value<'c, '_> = after_blk
+            .append_operation(arith::andi(plus1, mask, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        after_blk.append_operation(scf::r#yield(&[next], loc));
+    }
+    after_region.append_block(after_blk);
+    let while_op = scf::r#while(
+        &[initial_bucket],
+        &[types.i64],
+        before_region,
+        after_region,
+        loc,
+    );
+    block.append_operation(while_op).result(0).unwrap().into()
+}
+
+/// Phase 2.6b-hash (ADR 0058): if load factor ≥ 0.75, double the
+/// `hash_cap` and rehash all existing entries into a fresh
+/// buffer. Old buffer is freed; header.hash_buf is updated.
+/// Caller must have already ensured `hash_buf` is non-null.
+fn emit_hash_grow_if_needed<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    table_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let hash_buf_slot =
+        emit_byte_offset_ptr(context, block, table_ptr, TABLE_OFF_HASH_BUF, types, loc);
+    let hash_buf = emit_load(block, hash_buf_slot, types.ptr, loc);
+    let cap_slot = emit_byte_offset_ptr(context, block, hash_buf, HASH_OFF_CAP, types, loc);
+    let cap = emit_load(block, cap_slot, types.i64, loc);
+    let count_slot = emit_byte_offset_ptr(context, block, hash_buf, HASH_OFF_COUNT, types, loc);
+    let count = emit_load(block, count_slot, types.i64, loc);
+    // Need rehash if count*4 >= cap*3.
+    let four = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 4).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let three = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 3).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let count4: Value<'c, 'a> = block
+        .append_operation(arith::muli(count, four, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let cap3: Value<'c, 'a> = block
+        .append_operation(arith::muli(cap, three, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let need_grow: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Sge,
+            count4,
+            cap3,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        let two = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 2).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let new_cap: Value<'c, '_> = then_blk
+            .append_operation(arith::muli(cap, two, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let entry_size = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let entries_size: Value<'c, '_> = then_blk
+            .append_operation(arith::muli(new_cap, entry_size, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let header_off = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let total_size: Value<'c, '_> = then_blk
+            .append_operation(arith::addi(entries_size, header_off, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let new_buf = emit_libc_call_ptr(context, &then_blk, "malloc", &[total_size], types, loc);
+        // header init (cap and count=count; count stays since
+        // every old entry will be reinserted)
+        let new_cap_slot =
+            emit_byte_offset_ptr(context, &then_blk, new_buf, HASH_OFF_CAP, types, loc);
+        emit_store(&then_blk, new_cap, new_cap_slot, loc);
+        let new_count_slot =
+            emit_byte_offset_ptr(context, &then_blk, new_buf, HASH_OFF_COUNT, types, loc);
+        emit_store(&then_blk, count, new_count_slot, loc);
+        // Null-init each entry's key in new_buf via scf.while [i].
+        let null_key = emit_null_ptr(context, &then_blk, types, loc);
+        let zero_idx = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let init_before = Region::new();
+        let init_before_blk = Block::new(&[(types.i64, loc)]);
+        {
+            let i_arg: Value<'c, '_> = init_before_blk.argument(0).unwrap().into();
+            let cond: Value<'c, '_> = init_before_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Slt,
+                    i_arg,
+                    new_cap,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            init_before_blk.append_operation(scf::condition(cond, &[i_arg], loc));
+        }
+        init_before.append_block(init_before_blk);
+        let init_after = Region::new();
+        let init_after_blk = Block::new(&[(types.i64, loc)]);
+        {
+            let i_arg: Value<'c, '_> = init_after_blk.argument(0).unwrap().into();
+            let entry_size_inner = init_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let entries_off_inner = init_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let off_part: Value<'c, '_> = init_after_blk
+                .append_operation(arith::muli(i_arg, entry_size_inner, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let off: Value<'c, '_> = init_after_blk
+                .append_operation(arith::addi(off_part, entries_off_inner, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let key_slot =
+                emit_byte_offset_ptr_dynamic(context, &init_after_blk, new_buf, off, types, loc);
+            emit_store(&init_after_blk, null_key, key_slot, loc);
+            let one_i = init_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let next_i: Value<'c, '_> = init_after_blk
+                .append_operation(arith::addi(i_arg, one_i, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            init_after_blk.append_operation(scf::r#yield(&[next_i], loc));
+        }
+        init_after.append_block(init_after_blk);
+        let init_while = scf::r#while(&[zero_idx], &[types.i64], init_before, init_after, loc);
+        then_blk.append_operation(init_while);
+        // Rehash: walk old buf, for each non-null key probe in
+        // new_buf and store. scf.while [i].
+        let rehash_zero = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let rehash_before = Region::new();
+        let rehash_before_blk = Block::new(&[(types.i64, loc)]);
+        {
+            let i_arg: Value<'c, '_> = rehash_before_blk.argument(0).unwrap().into();
+            let cond: Value<'c, '_> = rehash_before_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Slt,
+                    i_arg,
+                    cap,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            rehash_before_blk.append_operation(scf::condition(cond, &[i_arg], loc));
+        }
+        rehash_before.append_block(rehash_before_blk);
+        let rehash_after = Region::new();
+        let rehash_after_blk = Block::new(&[(types.i64, loc)]);
+        {
+            let i_arg: Value<'c, '_> = rehash_after_blk.argument(0).unwrap().into();
+            let entry_size_inner = rehash_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let entries_off_inner = rehash_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let off_part: Value<'c, '_> = rehash_after_blk
+                .append_operation(arith::muli(i_arg, entry_size_inner, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let off: Value<'c, '_> = rehash_after_blk
+                .append_operation(arith::addi(off_part, entries_off_inner, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let old_entry_ptr =
+                emit_byte_offset_ptr_dynamic(context, &rehash_after_blk, hash_buf, off, types, loc);
+            let old_key = emit_load(&rehash_after_blk, old_entry_ptr, types.ptr, loc);
+            let old_key_i = rehash_after_blk
+                .append_operation(
+                    OperationBuilder::new("llvm.ptrtoint", loc)
+                        .add_operands(&[old_key])
+                        .add_results(&[types.i64])
+                        .build()
+                        .expect("llvm.ptrtoint"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let zero_i64_inner = rehash_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 0).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let occupied: Value<'c, '_> = rehash_after_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Ne,
+                    old_key_i,
+                    zero_i64_inner,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let migrate_then = Region::new();
+            let migrate_blk = Block::new(&[]);
+            {
+                // Probe new_buf for empty slot using old_key.
+                let new_bucket = emit_hash_probe_for_insert(
+                    context,
+                    &migrate_blk,
+                    new_buf,
+                    new_cap,
+                    old_key,
+                    types,
+                    loc,
+                );
+                let entry_size_m = migrate_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let entries_off_m = migrate_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let new_off_part: Value<'c, '_> = migrate_blk
+                    .append_operation(arith::muli(new_bucket, entry_size_m, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let new_off: Value<'c, '_> = migrate_blk
+                    .append_operation(arith::addi(new_off_part, entries_off_m, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let new_entry_ptr = emit_byte_offset_ptr_dynamic(
+                    context,
+                    &migrate_blk,
+                    new_buf,
+                    new_off,
+                    types,
+                    loc,
+                );
+                emit_store(&migrate_blk, old_key, new_entry_ptr, loc);
+                // Read old value, store in new value slot.
+                let old_value_off_const = migrate_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, HASH_ENTRY_OFF_VALUE).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let old_value_ptr = emit_byte_offset_ptr_dynamic(
+                    context,
+                    &migrate_blk,
+                    old_entry_ptr,
+                    old_value_off_const,
+                    types,
+                    loc,
+                );
+                let old_value = emit_load(&migrate_blk, old_value_ptr, types.f64, loc);
+                let new_value_ptr = emit_byte_offset_ptr_dynamic(
+                    context,
+                    &migrate_blk,
+                    new_entry_ptr,
+                    old_value_off_const,
+                    types,
+                    loc,
+                );
+                emit_store(&migrate_blk, old_value, new_value_ptr, loc);
+                migrate_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            migrate_then.append_block(migrate_blk);
+            let migrate_else = Region::new();
+            let migrate_else_blk = Block::new(&[]);
+            migrate_else_blk.append_operation(scf::r#yield(&[], loc));
+            migrate_else.append_block(migrate_else_blk);
+            rehash_after_blk.append_operation(scf::r#if(
+                occupied,
+                &[],
+                migrate_then,
+                migrate_else,
+                loc,
+            ));
+            let one_i = rehash_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let next_i: Value<'c, '_> = rehash_after_blk
+                .append_operation(arith::addi(i_arg, one_i, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            rehash_after_blk.append_operation(scf::r#yield(&[next_i], loc));
+        }
+        rehash_after.append_block(rehash_after_blk);
+        let rehash_while = scf::r#while(
+            &[rehash_zero],
+            &[types.i64],
+            rehash_before,
+            rehash_after,
+            loc,
+        );
+        then_blk.append_operation(rehash_while);
+        // Free old buf, install new buf in header.
+        emit_libc_call_void(context, &then_blk, "free", &[hash_buf], loc);
+        let header_hash_slot = emit_byte_offset_ptr(
+            context,
+            &then_blk,
+            table_ptr,
+            TABLE_OFF_HASH_BUF,
+            types,
+            loc,
+        );
+        emit_store(&then_blk, new_buf, header_hash_slot, loc);
+        then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(need_grow, &[], then_region, else_region, loc));
+}
+
 /// Phase 2.6a-arr (ADR 0054): produce a `!llvm.ptr` pointing at
-/// `base + const_offset` bytes, via `llvm.getelementptr` over an
-/// `i8` element type. Used for table element stores at known
-/// constant offsets.
 fn emit_byte_offset_ptr<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
@@ -1571,44 +2860,167 @@ fn emit_expr<'a, 'c>(
             let target_ptr = emit_expr(
                 context, block, target, slots, locals, functions, types, params_len, loc,
             )?;
-            let key_f = emit_expr(
-                context, block, key, slots, locals, functions, types, params_len, loc,
-            )?;
-            let key_i = emit_f2i(block, key_f, types, loc);
-            let length_i = emit_load(block, target_ptr, types.i64, loc);
-            emit_table_bounds_check(context, block, key_i, length_i, types, loc);
-            let array_buf = emit_table_array_buf(context, block, target_ptr, types, loc);
-            let one = block
-                .append_operation(arith::constant(
-                    context,
-                    IntegerAttribute::new(types.i64, 1).into(),
-                    loc,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            let zero_idx: Value<'c, 'a> = block
-                .append_operation(arith::subi(key_i, one, loc))
-                .result(0)
-                .unwrap()
-                .into();
-            let eight = block
-                .append_operation(arith::constant(
-                    context,
-                    IntegerAttribute::new(types.i64, 8).into(),
-                    loc,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            let body_offset: Value<'c, 'a> = block
-                .append_operation(arith::muli(zero_idx, eight, loc))
-                .result(0)
-                .unwrap()
-                .into();
-            let elem_ptr =
-                emit_byte_offset_ptr_dynamic(context, block, array_buf, body_offset, types, loc);
-            Ok(emit_load(block, elem_ptr, types.f64, loc))
+            let key_kind = infer_kind(key, locals, functions);
+            match key_kind {
+                ValueKind::Number => {
+                    let key_f = emit_expr(
+                        context, block, key, slots, locals, functions, types, params_len, loc,
+                    )?;
+                    let key_i = emit_f2i(block, key_f, types, loc);
+                    let length_i = emit_load(block, target_ptr, types.i64, loc);
+                    emit_table_bounds_check(context, block, key_i, length_i, types, loc);
+                    let array_buf = emit_table_array_buf(context, block, target_ptr, types, loc);
+                    let one = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 1).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let zero_idx: Value<'c, 'a> = block
+                        .append_operation(arith::subi(key_i, one, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let eight = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 8).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let body_offset: Value<'c, 'a> = block
+                        .append_operation(arith::muli(zero_idx, eight, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let elem_ptr = emit_byte_offset_ptr_dynamic(
+                        context,
+                        block,
+                        array_buf,
+                        body_offset,
+                        types,
+                        loc,
+                    );
+                    Ok(emit_load(block, elem_ptr, types.f64, loc))
+                }
+                ValueKind::String => {
+                    // Phase 2.6b-hash (ADR 0058): hash-keyed lookup.
+                    // header.hash_buf null → trap (no entries). Else
+                    // probe to find the bucket and load value.
+                    let key_str = emit_expr(
+                        context, block, key, slots, locals, functions, types, params_len, loc,
+                    )?;
+                    let hash_buf_slot = emit_byte_offset_ptr(
+                        context,
+                        block,
+                        target_ptr,
+                        TABLE_OFF_HASH_BUF,
+                        types,
+                        loc,
+                    );
+                    let hash_buf = emit_load(block, hash_buf_slot, types.ptr, loc);
+                    // Trap if hash_buf is null (no string keys ever
+                    // inserted).
+                    let hash_buf_i = block
+                        .append_operation(
+                            OperationBuilder::new("llvm.ptrtoint", loc)
+                                .add_operands(&[hash_buf])
+                                .add_results(&[types.i64])
+                                .build()
+                                .expect("llvm.ptrtoint"),
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let zero_i64 = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 0).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let null_buf: Value<'c, 'a> = block
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Eq,
+                            hash_buf_i,
+                            zero_i64,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let null_then = Region::new();
+                    let null_then_blk = Block::new(&[]);
+                    {
+                        let msg = emit_addressof(
+                            context,
+                            &null_then_blk,
+                            "s_table_missing_key",
+                            types,
+                            loc,
+                        );
+                        emit_exit_with_message(context, &null_then_blk, msg, types, loc);
+                        null_then_blk.append_operation(scf::r#yield(&[], loc));
+                    }
+                    null_then.append_block(null_then_blk);
+                    let null_else = Region::new();
+                    let null_else_blk = Block::new(&[]);
+                    null_else_blk.append_operation(scf::r#yield(&[], loc));
+                    null_else.append_block(null_else_blk);
+                    block.append_operation(scf::r#if(null_buf, &[], null_then, null_else, loc));
+                    let cap_slot =
+                        emit_byte_offset_ptr(context, block, hash_buf, HASH_OFF_CAP, types, loc);
+                    let cap = emit_load(block, cap_slot, types.i64, loc);
+                    let bucket =
+                        emit_hash_probe_lookup(context, block, hash_buf, cap, key_str, types, loc);
+                    // value at offset HASH_OFF_ENTRIES + bucket*16 + 8
+                    let entry_size = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let bucket_off: Value<'c, 'a> = block
+                        .append_operation(arith::muli(bucket, entry_size, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let value_total_off_const = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(
+                                types.i64,
+                                HASH_OFF_ENTRIES + HASH_ENTRY_OFF_VALUE,
+                            )
+                            .into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let total_off: Value<'c, 'a> = block
+                        .append_operation(arith::addi(bucket_off, value_total_off_const, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let value_ptr = emit_byte_offset_ptr_dynamic(
+                        context, block, hash_buf, total_off, types, loc,
+                    );
+                    Ok(emit_load(block, value_ptr, types.f64, loc))
+                }
+                _ => unreachable!("HIR rejects non-Number/String key kinds"),
+            }
         }
         HirExprKind::Local(LocalId(idx)) => {
             let info = &locals[*idx];

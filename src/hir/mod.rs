@@ -1394,10 +1394,10 @@ impl LowerCtx {
                     });
                 }
                 let key_kind = infer_kind(&key_hir, &self.locals, &self.functions);
-                if key_kind != ValueKind::Number {
+                if !matches!(key_kind, ValueKind::Number | ValueKind::String) {
                     return Err(HirError::TypeMismatch {
                         op: "[]=".to_owned(),
-                        lhs_kind: "number".to_owned(),
+                        lhs_kind: "number or string".to_owned(),
                         rhs_kind: key_kind.name().to_owned(),
                         offset: key.span.start,
                     });
@@ -2046,10 +2046,10 @@ impl LowerCtx {
                 }
                 HirExprKind::Table(lowered)
             }
-            // Phase 2.6a-arr (ADR 0054): `target[key]` array index
-            // read. `target` must be Table-kind, `key` Number-kind.
-            // The result is Number (Number-only arrays). Codegen
-            // emits the bounds-check trap.
+            // Phase 2.6a-arr (ADR 0054) / 2.6b-hash (ADR 0058):
+            // `target[key]` index read. Number key → array path,
+            // String key → hash path. Codegen dispatches on the
+            // key's static kind.
             ExprKind::Index { target, key } => {
                 let target_hir = self.lower_expr(target)?;
                 let key_hir = self.lower_expr(key)?;
@@ -2063,10 +2063,10 @@ impl LowerCtx {
                     });
                 }
                 let key_kind = infer_kind(&key_hir, &self.locals, &self.functions);
-                if key_kind != ValueKind::Number {
+                if !matches!(key_kind, ValueKind::Number | ValueKind::String) {
                     return Err(HirError::TypeMismatch {
                         op: "[]".to_owned(),
-                        lhs_kind: "number".to_owned(),
+                        lhs_kind: "number or string".to_owned(),
                         rhs_kind: key_kind.name().to_owned(),
                         offset: key.span.start,
                     });

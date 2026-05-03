@@ -117,10 +117,14 @@ t[1] = \"x\"",
 }
 
 #[test]
-fn write_key_must_be_number() {
+fn write_key_must_be_arithmetic_or_string_after_2_6b() {
+    // Phase 2.6b-hash (ADR 0058) opened String keys via the hash
+    // path. Bool/Nil/Function/Table keys still reject. See
+    // `tests/phase2_6b_hash_keys.rs` for the string-key write
+    // path coverage.
     let chunk = lumelir::parser::parse(
         "local t = {1, 2, 3}
-t[\"k\"] = 99",
+t[true] = 99",
     )
     .unwrap();
     assert!(lumelir::hir::lower(&chunk).is_err());

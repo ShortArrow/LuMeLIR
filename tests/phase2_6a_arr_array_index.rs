@@ -135,11 +135,15 @@ fn non_number_element_is_static_error() {
 }
 
 #[test]
-fn non_number_key_is_static_error() {
-    // String keys belong to the hash part (2.6b); Number keys only.
+fn non_arithmetic_key_kind_is_static_error_after_2_6b() {
+    // Phase 2.6b-hash (ADR 0058) opened String keys as a valid
+    // index kind via the hash path. Other kinds (Bool / Nil /
+    // Function / Table) still reject — the only kinds we accept
+    // are Number (array path) and String (hash path). See
+    // `tests/phase2_6b_hash_keys.rs` for the string-key path.
     let chunk = lumelir::parser::parse(
         "local t = {1, 2, 3}
-print(t[\"one\"])",
+print(t[true])",
     )
     .unwrap();
     assert!(lumelir::hir::lower(&chunk).is_err());

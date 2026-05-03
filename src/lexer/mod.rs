@@ -126,7 +126,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                 ('/', Some('/')) => (TokenKind::SlashSlash, true),
                 ('/', _) => (TokenKind::Slash, false),
                 ('.', Some('.')) => (TokenKind::DotDot, true),
-                ('.', _) => return Err(LexError::Unexpected { ch, offset }),
+                // Phase 2.6b-hash (ADR 0058): lone `.` is now a real
+                // token for field access. `.NUMBER` (`.5` etc.) is
+                // already protected — `scan_number` only consumes
+                // a fractional `.` when it has trailing digits, so
+                // the lexer reaches this dispatch only for genuine
+                // field-access-or-error contexts.
+                ('.', _) => (TokenKind::Dot, false),
                 _ => unreachable!(),
             };
             let end = if two_char {

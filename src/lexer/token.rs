@@ -63,6 +63,9 @@ pub enum TokenKind {
     GtGt,
     /// `..` string concatenation (Phase 2.7b, ADR 0025).
     DotDot,
+    /// `.` field-access separator (Phase 2.6b-hash, ADR 0058).
+    /// Lone `.` was a lex error until field access landed.
+    Dot,
     /// `#` length operator (Phase 2.7a, ADR 0024).
     Hash,
     Equals,

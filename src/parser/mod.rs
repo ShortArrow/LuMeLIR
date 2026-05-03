@@ -795,6 +795,41 @@ impl<'t> Parser<'t> {
                         }
                     }
                 }
+                // Phase 2.6b-hash (ADR 0058): `.IDENT` field
+                // access. Sugar to `Index { target, key: Str("k") }`
+                // so AST/HIR/codegen reuse the index path with
+                // `key_kind == String` driving the hash branch.
+                TokenKind::Dot => {
+                    self.bump();
+                    let name_tok = self.peek().clone();
+                    let name = match name_tok.kind {
+                        TokenKind::Ident(ref n) => {
+                            let s = n.clone();
+                            self.bump();
+                            s
+                        }
+                        TokenKind::Eof => {
+                            return Err(ParseError::UnexpectedEof {
+                                offset: name_tok.span.start,
+                            });
+                        }
+                        other => {
+                            return Err(ParseError::UnexpectedToken {
+                                actual: other,
+                                offset: name_tok.span.start,
+                            });
+                        }
+                    };
+                    let key_expr = Expr::new(ExprKind::Str(name), name_tok.span);
+                    let span = Span::new(callee.span.start, name_tok.span.end);
+                    callee = Expr::new(
+                        ExprKind::Index {
+                            target: Box::new(callee),
+                            key: Box::new(key_expr),
+                        },
+                        span,
+                    );
+                }
                 _ => break,
             }
         }
