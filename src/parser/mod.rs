@@ -642,25 +642,48 @@ impl<'t> Parser<'t> {
                     }),
                 }
             }
-            // Phase 2.6a-min (ADR 0053): table constructor. Only the
-            // empty form `{}` is accepted in this sub-phase; non-empty
-            // forms land in 2.6a.1.
+            // Phase 2.6a-min (ADR 0053) / 2.6a-arr (ADR 0054):
+            // table constructor `{e1, e2, …}` — comma-separated,
+            // trailing comma allowed (Lua 5.4 spec).
             TokenKind::LBrace => {
                 self.bump();
-                let closing = self.peek().clone();
-                match closing.kind {
-                    TokenKind::RBrace => {
-                        self.bump();
+                let mut elems: Vec<Expr> = Vec::new();
+                loop {
+                    if matches!(self.peek().kind, TokenKind::RBrace) {
+                        let closing = self.bump().clone();
                         let span = Span::new(tok.span.start, closing.span.end);
-                        Ok(Expr::new(ExprKind::Table(Vec::new()), span))
+                        return Ok(Expr::new(ExprKind::Table(elems), span));
                     }
-                    TokenKind::Eof => Err(ParseError::UnexpectedEof {
-                        offset: closing.span.start,
-                    }),
-                    other => Err(ParseError::UnexpectedToken {
-                        actual: other,
-                        offset: closing.span.start,
-                    }),
+                    if matches!(self.peek().kind, TokenKind::Eof) {
+                        return Err(ParseError::UnexpectedEof {
+                            offset: self.peek().span.start,
+                        });
+                    }
+                    elems.push(self.parse_expr(0)?);
+                    match self.peek().kind {
+                        TokenKind::Comma => {
+                            self.bump();
+                            // Trailing comma is fine — next iteration
+                            // will see `RBrace` and exit cleanly.
+                        }
+                        TokenKind::RBrace => {
+                            let closing = self.bump().clone();
+                            let span = Span::new(tok.span.start, closing.span.end);
+                            return Ok(Expr::new(ExprKind::Table(elems), span));
+                        }
+                        TokenKind::Eof => {
+                            return Err(ParseError::UnexpectedEof {
+                                offset: self.peek().span.start,
+                            });
+                        }
+                        _ => {
+                            let t = self.peek().clone();
+                            return Err(ParseError::UnexpectedToken {
+                                actual: t.kind,
+                                offset: t.span.start,
+                            });
+                        }
+                    }
                 }
             }
             TokenKind::Eof => Err(ParseError::UnexpectedEof {
@@ -674,40 +697,78 @@ impl<'t> Parser<'t> {
     }
 
     fn parse_call_suffix(&mut self, mut callee: Expr) -> Result<Expr, ParseError> {
-        while matches!(self.peek().kind, TokenKind::LParen) {
-            self.bump();
-            let mut args = Vec::new();
-            if !matches!(self.peek().kind, TokenKind::RParen) {
-                args.push(self.parse_expr(0)?);
-                while matches!(self.peek().kind, TokenKind::Comma) {
+        // Phase 2.6a-arr (ADR 0054): a primary expression can chain
+        // any of:  `(args)`  call  /  `[expr]`  index suffix. Lua's
+        // prefix-expression rule allows `f()[i]`, `t[i][j]`, and
+        // `({1,2})[1]` to all parse here.
+        loop {
+            match self.peek().kind {
+                TokenKind::LParen => {
                     self.bump();
-                    args.push(self.parse_expr(0)?);
+                    let mut args = Vec::new();
+                    if !matches!(self.peek().kind, TokenKind::RParen) {
+                        args.push(self.parse_expr(0)?);
+                        while matches!(self.peek().kind, TokenKind::Comma) {
+                            self.bump();
+                            args.push(self.parse_expr(0)?);
+                        }
+                    }
+                    let closing = self.peek().clone();
+                    match closing.kind {
+                        TokenKind::RParen => {
+                            self.bump();
+                            let span = Span::new(callee.span.start, closing.span.end);
+                            callee = Expr::new(
+                                ExprKind::Call {
+                                    callee: Box::new(callee),
+                                    args,
+                                },
+                                span,
+                            );
+                        }
+                        TokenKind::Eof => {
+                            return Err(ParseError::UnexpectedEof {
+                                offset: closing.span.start,
+                            });
+                        }
+                        other => {
+                            return Err(ParseError::UnexpectedToken {
+                                actual: other,
+                                offset: closing.span.start,
+                            });
+                        }
+                    }
                 }
-            }
-            let closing = self.peek().clone();
-            match closing.kind {
-                TokenKind::RParen => {
+                TokenKind::LBracket => {
                     self.bump();
-                    let span = Span::new(callee.span.start, closing.span.end);
-                    callee = Expr::new(
-                        ExprKind::Call {
-                            callee: Box::new(callee),
-                            args,
-                        },
-                        span,
-                    );
+                    let key = self.parse_expr(0)?;
+                    let closing = self.peek().clone();
+                    match closing.kind {
+                        TokenKind::RBracket => {
+                            self.bump();
+                            let span = Span::new(callee.span.start, closing.span.end);
+                            callee = Expr::new(
+                                ExprKind::Index {
+                                    target: Box::new(callee),
+                                    key: Box::new(key),
+                                },
+                                span,
+                            );
+                        }
+                        TokenKind::Eof => {
+                            return Err(ParseError::UnexpectedEof {
+                                offset: closing.span.start,
+                            });
+                        }
+                        other => {
+                            return Err(ParseError::UnexpectedToken {
+                                actual: other,
+                                offset: closing.span.start,
+                            });
+                        }
+                    }
                 }
-                TokenKind::Eof => {
-                    return Err(ParseError::UnexpectedEof {
-                        offset: closing.span.start,
-                    });
-                }
-                other => {
-                    return Err(ParseError::UnexpectedToken {
-                        actual: other,
-                        offset: closing.span.start,
-                    });
-                }
+                _ => break,
             }
         }
         Ok(callee)
@@ -878,6 +939,10 @@ mod tests {
             ExprKind::Table(elems) => {
                 ExprKind::Table(elems.into_iter().map(strip_span_expr).collect())
             }
+            ExprKind::Index { target, key } => ExprKind::Index {
+                target: Box::new(strip_span_expr(*target)),
+                key: Box::new(strip_span_expr(*key)),
+            },
         };
         Expr::new(kind, Span::new(0, 0))
     }

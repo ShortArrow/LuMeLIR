@@ -74,9 +74,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
         }
 
         // Phase 2.7j (ADR 0038): `[==[ ... ]==]` long-bracket
-        // string. A bare `[` (no matching opener) keeps its
-        // historical "unexpected" status until table indexing
-        // arrives — the long-string match must be exact.
+        // string takes priority over `[` indexing. Phase 2.6a-arr
+        // (ADR 0054): when the long-bracket match fails, fall
+        // through to emit a `LBracket` token for array indexing.
         if ch == '[' {
             if let Some(level) = try_match_long_open(bytes, offset) {
                 for _ in 0..(level + 2) {
@@ -91,7 +91,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                 tokens.push(Token::new(TokenKind::Str(body), Span::new(offset, end)));
                 continue;
             }
-            // Bare `[` — fall through to the unexpected-character path.
+            // Bare `[` — fall through to single-token dispatch.
         }
 
         if is_ident_start(ch) {
@@ -155,6 +155,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
             // Phase 2.6a-min (ADR 0053): table constructor delimiters.
             '{' => Some(TokenKind::LBrace),
             '}' => Some(TokenKind::RBrace),
+            // Phase 2.6a-arr (ADR 0054): array index delimiters.
+            // `[` reaches here only when the preceding long-bracket
+            // string scan failed.
+            '[' => Some(TokenKind::LBracket),
+            ']' => Some(TokenKind::RBracket),
             _ => None,
         };
 
@@ -1174,12 +1179,19 @@ mod tests {
     }
 
     #[test]
-    fn lex_open_bracket_without_long_form_is_unexpected() {
-        // `[` alone is not yet a token (no table indexing yet).
-        // It must surface as a lex error rather than silently
-        // start a long-bracket scan.
-        let err = lex("[ x]").expect_err("bare `[` should be unexpected");
-        assert!(matches!(err, LexError::Unexpected { ch: '[', .. }));
+    fn lex_open_bracket_without_long_form_emits_lbracket_after_2_6a_arr() {
+        // Phase 2.6a-arr (ADR 0054): `[` is now a real token —
+        // long-bracket scan still has priority, but a bare `[`
+        // emits LBracket for array indexing.
+        assert_eq!(
+            kinds("[ x]"),
+            vec![
+                TokenKind::LBracket,
+                TokenKind::Ident("x".into()),
+                TokenKind::RBracket,
+                TokenKind::Eof,
+            ]
+        );
     }
 
     // -----------------------------------------------------------

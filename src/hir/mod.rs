@@ -65,6 +65,9 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
         HirExprKind::Nil => ValueKind::Nil,
         HirExprKind::Str(_) => ValueKind::String,
         HirExprKind::Table(_) => ValueKind::Table,
+        // Phase 2.6a-arr (ADR 0054): Number-only arrays mean
+        // every read returns a Number.
+        HirExprKind::Index { .. } => ValueKind::Number,
         HirExprKind::Local(LocalId(idx)) => locals[*idx].kind,
         HirExprKind::UnaryOp { op, .. } => match op {
             crate::parser::UnaryOp::Neg => ValueKind::Number,
@@ -1966,19 +1969,58 @@ impl LowerCtx {
                 HirExprKind::FunctionRef(id)
             }
             ExprKind::Call { callee, args } => self.lower_call(callee, args, expr)?,
-            // Phase 2.6a-min (ADR 0053): table constructor. Empty
-            // form only — non-empty forms reject for now to keep
-            // the codegen surface minimal until 2.6a.1.
+            // Phase 2.6a-min (ADR 0053) / 2.6a-arr (ADR 0054):
+            // table constructor. Empty form lands as `Table([])`;
+            // populated form lowers each element and enforces
+            // Number-only kind. Heterogeneous arrays defer to a
+            // future phase that introduces tagged values.
             ExprKind::Table(elems) => {
-                if !elems.is_empty() {
+                let lowered: Vec<HirExpr> = elems
+                    .iter()
+                    .map(|e| self.lower_expr(e))
+                    .collect::<Result<_, _>>()?;
+                for elem in &lowered {
+                    let k = infer_kind(elem, &self.locals, &self.functions);
+                    if k != ValueKind::Number {
+                        return Err(HirError::TypeMismatch {
+                            op: "table element".to_owned(),
+                            lhs_kind: "number".to_owned(),
+                            rhs_kind: k.name().to_owned(),
+                            offset: elem.span.start,
+                        });
+                    }
+                }
+                HirExprKind::Table(lowered)
+            }
+            // Phase 2.6a-arr (ADR 0054): `target[key]` array index
+            // read. `target` must be Table-kind, `key` Number-kind.
+            // The result is Number (Number-only arrays). Codegen
+            // emits the bounds-check trap.
+            ExprKind::Index { target, key } => {
+                let target_hir = self.lower_expr(target)?;
+                let key_hir = self.lower_expr(key)?;
+                let target_kind = infer_kind(&target_hir, &self.locals, &self.functions);
+                if target_kind != ValueKind::Table {
                     return Err(HirError::TypeMismatch {
-                        op: "table constructor".to_owned(),
-                        lhs_kind: "empty".to_owned(),
-                        rhs_kind: "non-empty (defer to 2.6a.1)".to_owned(),
-                        offset: expr.span.start,
+                        op: "[]".to_owned(),
+                        lhs_kind: "table".to_owned(),
+                        rhs_kind: target_kind.name().to_owned(),
+                        offset: target.span.start,
                     });
                 }
-                HirExprKind::Table(Vec::new())
+                let key_kind = infer_kind(&key_hir, &self.locals, &self.functions);
+                if key_kind != ValueKind::Number {
+                    return Err(HirError::TypeMismatch {
+                        op: "[]".to_owned(),
+                        lhs_kind: "number".to_owned(),
+                        rhs_kind: key_kind.name().to_owned(),
+                        offset: key.span.start,
+                    });
+                }
+                HirExprKind::Index {
+                    target: Box::new(target_hir),
+                    key: Box::new(key_hir),
+                }
             }
         };
         Ok(HirExpr {

@@ -35,6 +35,9 @@ use super::error::CodegenError;
 
 struct Types<'c> {
     i1: Type<'c>,
+    /// Phase 2.6a-arr (ADR 0054): i8 used as the GEP element type
+    /// for byte-offset pointer arithmetic on table heap regions.
+    i8: Type<'c>,
     i32: Type<'c>,
     i64: Type<'c>,
     f64: Type<'c>,
@@ -72,6 +75,7 @@ pub(crate) fn emit_module_unverified<'c>(
     let string_pool = collect_string_pool(chunk);
     let types = Types {
         i1: IntegerType::new(context, 1).into(),
+        i8: i8_type,
         i32: IntegerType::new(context, 32).into(),
         i64: IntegerType::new(context, 64).into(),
         f64: Type::float64(context),
@@ -175,6 +179,15 @@ fn emit_fmt_global<'c>(
         i8_type,
         "s_assert_failed",
         "assertion failed!\0",
+        loc,
+    );
+    // Phase 2.6a-arr (ADR 0054): out-of-bounds diagnostic.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_table_oob",
+        "table index out of bounds\0",
         loc,
     );
 }
@@ -976,6 +989,124 @@ fn emit_load<'a, 'c>(
     block.append_operation(load).result(0).unwrap().into()
 }
 
+/// Phase 2.6a-arr (ADR 0054): produce a `!llvm.ptr` pointing at
+/// `base + const_offset` bytes, via `llvm.getelementptr` over an
+/// `i8` element type. Used for table element stores at known
+/// constant offsets.
+fn emit_byte_offset_ptr<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    base: Value<'c, 'a>,
+    offset_bytes: i64,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let offset_const = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, offset_bytes).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_byte_offset_ptr_dynamic(context, block, base, offset_const, types, loc)
+}
+
+/// Phase 2.6a-arr (ADR 0054): same as `emit_byte_offset_ptr` but
+/// the offset is a runtime `i64` value (used for variable-key
+/// indexing). `llvm.getelementptr` with `elem_type = i8` so the
+/// offset is interpreted in raw bytes.
+fn emit_byte_offset_ptr_dynamic<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    base: Value<'c, 'a>,
+    offset_i64: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let gep = OperationBuilder::new("llvm.getelementptr", loc)
+        .add_operands(&[base, offset_i64])
+        .add_attributes(&[
+            (
+                Identifier::new(context, "rawConstantIndices"),
+                DenseI32ArrayAttribute::new(context, &[i32::MIN]).into(),
+            ),
+            (
+                Identifier::new(context, "elem_type"),
+                TypeAttribute::new(types.i8).into(),
+            ),
+        ])
+        .add_results(&[types.ptr])
+        .build()
+        .expect("llvm.getelementptr (i8 byte offset)");
+    block.append_operation(gep).result(0).unwrap().into()
+}
+
+/// Phase 2.6a-arr (ADR 0054): runtime bounds check for `t[i]`.
+/// `key_i < 1 || key_i > length` triggers `exit(1)` with the
+/// "table index out of bounds" diagnostic. Lua spec returns nil
+/// for OOB; until tagged values arrive we trap to keep the
+/// failure observable (security over compatibility).
+fn emit_table_bounds_check<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    key_i: Value<'c, 'a>,
+    length_i: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let one = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    // key_i < 1
+    let too_small: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Slt,
+            key_i,
+            one,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    // key_i > length
+    let too_big: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Sgt,
+            key_i,
+            length_i,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let oob: Value<'c, 'a> = block
+        .append_operation(arith::ori(too_small, too_big, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    let msg_ptr = emit_addressof(context, &then_blk, "s_table_oob", types, loc);
+    emit_exit_with_message(context, &then_blk, msg_ptr, types, loc);
+    then_blk.append_operation(scf::r#yield(&[], loc));
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(oob, &[], then_region, else_region, loc));
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_expr<'a, 'c>(
     context: &'c Context,
@@ -1028,8 +1159,8 @@ fn emit_expr<'a, 'c>(
         HirExprKind::Table(elems) => {
             let elem_count = elems.len();
             // 8 bytes for the length header, plus 8 per Number
-            // element (this is enough for 2.6a-min since elems is
-            // always empty here, but the layout pre-figures 2.6a.1).
+            // element. Phase 2.6a-arr (ADR 0054): elements are
+            // now stored at offset `8 + i*8`.
             let total_bytes = 8i64 + (elem_count as i64) * 8;
             let size_const = block
                 .append_operation(arith::constant(
@@ -1052,7 +1183,66 @@ fn emit_expr<'a, 'c>(
                 .unwrap()
                 .into();
             emit_store(block, len_const, table_ptr, loc);
+            // Store each element at offset `8 + i*8`.
+            for (i, elem) in elems.iter().enumerate() {
+                let v = emit_expr(
+                    context, block, elem, slots, locals, functions, types, params_len, loc,
+                )?;
+                let offset_bytes = 8i64 + (i as i64) * 8;
+                let elem_ptr =
+                    emit_byte_offset_ptr(context, block, table_ptr, offset_bytes, types, loc);
+                emit_store(block, v, elem_ptr, loc);
+            }
             Ok(table_ptr)
+        }
+        // Phase 2.6a-arr (ADR 0054): `t[i]` — load f64 from offset
+        // `8 + (key-1)*8`. Bounds-check first; trap on OOB.
+        HirExprKind::Index { target, key } => {
+            let target_ptr = emit_expr(
+                context, block, target, slots, locals, functions, types, params_len, loc,
+            )?;
+            let key_f = emit_expr(
+                context, block, key, slots, locals, functions, types, params_len, loc,
+            )?;
+            let key_i = emit_f2i(block, key_f, types, loc);
+            let length_i = emit_load(block, target_ptr, types.i64, loc);
+            emit_table_bounds_check(context, block, key_i, length_i, types, loc);
+            let one = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let zero_idx: Value<'c, 'a> = block
+                .append_operation(arith::subi(key_i, one, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let eight = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 8).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let body_offset: Value<'c, 'a> = block
+                .append_operation(arith::muli(zero_idx, eight, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let header_offset: Value<'c, 'a> = block
+                .append_operation(arith::addi(body_offset, eight, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let elem_ptr =
+                emit_byte_offset_ptr_dynamic(context, block, target_ptr, header_offset, types, loc);
+            Ok(emit_load(block, elem_ptr, types.f64, loc))
         }
         HirExprKind::Local(LocalId(idx)) => {
             let info = &locals[*idx];

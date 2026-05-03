@@ -79,6 +79,13 @@ pub enum TokenKind {
     LBrace,
     /// `}` closing brace.
     RBrace,
+    /// `[` opening bracket, used for array indexing
+    /// (Phase 2.6a-arr, ADR 0054). Long-bracket strings still
+    /// shadow this — the lexer falls through here only when
+    /// `try_match_long_open` returns None.
+    LBracket,
+    /// `]` closing bracket (Phase 2.6a-arr, ADR 0054).
+    RBracket,
     /// End-of-source sentinel. Always present as the last element of a
     /// successful [`super::lex`] result.
     Eof,

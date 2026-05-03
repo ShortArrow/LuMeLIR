@@ -43,10 +43,17 @@ pub enum ExprKind {
         params: Vec<String>,
         body: Chunk,
     },
-    /// `{ e1, e2, … }` table constructor (Phase 2.6a-min, ADR 0053).
-    /// Phase 2.6a-min only accepts the empty form `{}`; non-empty
-    /// constructors land in 2.6a.1.
+    /// `{ e1, e2, … }` table constructor (Phase 2.6a-min, ADR 0053
+    /// for the empty form; ADR 0054 for the populated array form).
+    /// Trailing comma allowed.
     Table(Vec<Expr>),
+    /// `target[key]` array indexing (Phase 2.6a-arr, ADR 0054).
+    /// `target` must be Table-kind, `key` Number-kind. Out-of-
+    /// bounds reads trap at runtime.
+    Index {
+        target: Box<Expr>,
+        key: Box<Expr>,
+    },
 }
 
 /// Binary operators. Phase 2.2a covers all arithmetic operators

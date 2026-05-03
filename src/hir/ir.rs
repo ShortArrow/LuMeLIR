@@ -199,11 +199,19 @@ pub enum HirExprKind {
     /// local; codegen treats it as an `i1 0` placeholder because the
     /// actual function is resolved by name at every call site.
     FunctionRef(FuncId),
-    /// Table constructor (Phase 2.6a-min, ADR 0053). The vec is
-    /// empty for `{}`; non-empty constructors arrive in 2.6a.1.
-    /// Codegen mallocs `[length: i64]`-prefixed memory (length
-    /// equal to the vec's len) and stores the elements.
+    /// Table constructor (Phase 2.6a-min, ADR 0053; populated form
+    /// in Phase 2.6a-arr, ADR 0054). Codegen mallocs
+    /// `[length: i64][elem₀]...[elem_{N-1}]` (each elem 8 bytes
+    /// for Number-only) and stores each element at offset
+    /// `8 + i*8`.
     Table(Vec<HirExpr>),
+    /// `target[key]` array indexing read (Phase 2.6a-arr, ADR 0054).
+    /// `target` must be Table-kind, `key` Number-kind. Codegen
+    /// emits a runtime bounds check that traps on out-of-bounds.
+    Index {
+        target: Box<HirExpr>,
+        key: Box<HirExpr>,
+    },
 }
 
 /// Discriminates whether a [`HirExprKind::Call`] hits a built-in
