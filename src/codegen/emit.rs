@@ -89,9 +89,14 @@ const TABLE_HEADER_SIZE: i64 = 32;
 const HASH_OFF_CAP: i64 = 0;
 const HASH_OFF_COUNT: i64 = 8;
 const HASH_OFF_ENTRIES: i64 = 16;
-const HASH_ENTRY_SIZE: i64 = 16;
+// Phase 2.6c-tag-hash (ADR 0060): hash entry layout is now
+// `{ptr key, 16-byte tagged value slot}` = 24 bytes. The value
+// slot starts at offset 8 inside the entry; its internal
+// `{tag, value}` layout matches array_buf's element slot exactly,
+// so `emit_value_slot_*` helpers work unchanged on it.
+const HASH_ENTRY_SIZE: i64 = 24;
 const HASH_ENTRY_OFF_KEY: i64 = 0;
-const HASH_ENTRY_OFF_VALUE: i64 = 8;
+const HASH_ENTRY_OFF_VALUE_SLOT: i64 = 8;
 const HASH_INITIAL_CAP: i64 = 8;
 
 // =============================================================
@@ -1267,25 +1272,34 @@ fn emit_stmt<'a, 'c>(
                         new_key_else,
                         loc,
                     ));
-                    // Always store the value (overwrite or fresh).
-                    let value_off_const = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(types.i64, HASH_ENTRY_OFF_VALUE).into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let value_ptr = emit_byte_offset_ptr_dynamic(
+                    // Phase 2.6c-tag-hash (ADR 0060): store the
+                    // tagged value at slot offset 8 within the
+                    // entry. Number → tag=Number + value; Nil →
+                    // tag=Nil (soft delete; key remains for
+                    // probing).
+                    let value_slot_ptr = emit_byte_offset_ptr(
                         context,
                         block,
                         entry_ptr,
-                        value_off_const,
+                        HASH_ENTRY_OFF_VALUE_SLOT,
                         types,
                         loc,
                     );
-                    emit_store(block, value_v, value_ptr, loc);
+                    let value_kind = infer_kind(value, locals, functions);
+                    match value_kind {
+                        ValueKind::Number => emit_value_slot_store_number(
+                            context,
+                            block,
+                            value_slot_ptr,
+                            value_v,
+                            types,
+                            loc,
+                        ),
+                        ValueKind::Nil => {
+                            emit_value_slot_store_nil(context, block, value_slot_ptr, types, loc)
+                        }
+                        _ => unreachable!("HIR rejects non-Number/Nil values for hash insert"),
+                    }
                 }
                 _ => unreachable!("HIR rejects non-Number/String key kinds"),
             }
@@ -2804,34 +2818,57 @@ fn emit_hash_grow_if_needed<'a, 'c>(
                     loc,
                 );
                 emit_store(&migrate_blk, old_key, new_entry_ptr, loc);
-                // Read old value, store in new value slot.
-                let old_value_off_const = migrate_blk
+                // Phase 2.6c-tag-hash (ADR 0060): migrate the
+                // entire 16-byte tagged value slot (tag at +0,
+                // value at +8) so Nil-tagged entries (`t.k = nil`
+                // soft-deletes) re-rehash with their tag intact.
+                let value_slot_off_const = migrate_blk
                     .append_operation(arith::constant(
                         context,
-                        IntegerAttribute::new(types.i64, HASH_ENTRY_OFF_VALUE).into(),
+                        IntegerAttribute::new(types.i64, HASH_ENTRY_OFF_VALUE_SLOT).into(),
                         loc,
                     ))
                     .result(0)
                     .unwrap()
                     .into();
-                let old_value_ptr = emit_byte_offset_ptr_dynamic(
+                let old_value_slot_ptr = emit_byte_offset_ptr_dynamic(
                     context,
                     &migrate_blk,
                     old_entry_ptr,
-                    old_value_off_const,
+                    value_slot_off_const,
                     types,
                     loc,
                 );
-                let old_value = emit_load(&migrate_blk, old_value_ptr, types.f64, loc);
-                let new_value_ptr = emit_byte_offset_ptr_dynamic(
+                let new_value_slot_ptr = emit_byte_offset_ptr_dynamic(
                     context,
                     &migrate_blk,
                     new_entry_ptr,
-                    old_value_off_const,
+                    value_slot_off_const,
                     types,
                     loc,
                 );
-                emit_store(&migrate_blk, old_value, new_value_ptr, loc);
+                // tag at slot+0
+                let old_tag = emit_load(&migrate_blk, old_value_slot_ptr, types.i64, loc);
+                emit_store(&migrate_blk, old_tag, new_value_slot_ptr, loc);
+                // value at slot+8
+                let old_value_inner_ptr = emit_byte_offset_ptr(
+                    context,
+                    &migrate_blk,
+                    old_value_slot_ptr,
+                    ARRAY_ELEM_OFF_VALUE,
+                    types,
+                    loc,
+                );
+                let old_value = emit_load(&migrate_blk, old_value_inner_ptr, types.f64, loc);
+                let new_value_inner_ptr = emit_byte_offset_ptr(
+                    context,
+                    &migrate_blk,
+                    new_value_slot_ptr,
+                    ARRAY_ELEM_OFF_VALUE,
+                    types,
+                    loc,
+                );
+                emit_store(&migrate_blk, old_value, new_value_inner_ptr, loc);
                 migrate_blk.append_operation(scf::r#yield(&[], loc));
             }
             migrate_then.append_block(migrate_blk);
@@ -3237,7 +3274,10 @@ fn emit_expr<'a, 'c>(
                     let cap = emit_load(block, cap_slot, types.i64, loc);
                     let bucket =
                         emit_hash_probe_lookup(context, block, hash_buf, cap, key_str, types, loc);
-                    // value at offset HASH_OFF_ENTRIES + bucket*16 + 8
+                    // Phase 2.6c-tag-hash (ADR 0060): tag-checked
+                    // value load. value slot starts at
+                    // HASH_OFF_ENTRIES + bucket*HASH_ENTRY_SIZE +
+                    // HASH_ENTRY_OFF_VALUE_SLOT.
                     let entry_size = block
                         .append_operation(arith::constant(
                             context,
@@ -3252,12 +3292,12 @@ fn emit_expr<'a, 'c>(
                         .result(0)
                         .unwrap()
                         .into();
-                    let value_total_off_const = block
+                    let value_slot_total_off = block
                         .append_operation(arith::constant(
                             context,
                             IntegerAttribute::new(
                                 types.i64,
-                                HASH_OFF_ENTRIES + HASH_ENTRY_OFF_VALUE,
+                                HASH_OFF_ENTRIES + HASH_ENTRY_OFF_VALUE_SLOT,
                             )
                             .into(),
                             loc,
@@ -3266,12 +3306,21 @@ fn emit_expr<'a, 'c>(
                         .unwrap()
                         .into();
                     let total_off: Value<'c, 'a> = block
-                        .append_operation(arith::addi(bucket_off, value_total_off_const, loc))
+                        .append_operation(arith::addi(bucket_off, value_slot_total_off, loc))
                         .result(0)
                         .unwrap()
                         .into();
-                    let value_ptr = emit_byte_offset_ptr_dynamic(
+                    let value_slot_ptr = emit_byte_offset_ptr_dynamic(
                         context, block, hash_buf, total_off, types, loc,
+                    );
+                    emit_value_slot_check_number(context, block, value_slot_ptr, types, loc);
+                    let value_ptr = emit_byte_offset_ptr(
+                        context,
+                        block,
+                        value_slot_ptr,
+                        ARRAY_ELEM_OFF_VALUE,
+                        types,
+                        loc,
                     );
                     Ok(emit_load(block, value_ptr, types.f64, loc))
                 }

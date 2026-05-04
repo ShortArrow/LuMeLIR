@@ -1402,8 +1402,20 @@ impl LowerCtx {
                         offset: key.span.start,
                     });
                 }
+                // Phase 2.6c-tag-hash (ADR 0060): String-keyed
+                // assignment additionally accepts Nil values as a
+                // soft-delete signal (`t.k = nil`). Number-keyed
+                // (array) writes still reject Nil because there's
+                // no observable use for it — array hole creation
+                // happens implicitly via the upper-bound lift.
                 let value_kind = infer_kind(&value_hir, &self.locals, &self.functions);
-                if value_kind != ValueKind::Number {
+                let value_ok = matches!(
+                    (key_kind, value_kind),
+                    (ValueKind::Number, ValueKind::Number)
+                        | (ValueKind::String, ValueKind::Number)
+                        | (ValueKind::String, ValueKind::Nil)
+                );
+                if !value_ok {
                     return Err(HirError::TypeMismatch {
                         op: "[]=".to_owned(),
                         lhs_kind: "number".to_owned(),
