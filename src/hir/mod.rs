@@ -51,7 +51,7 @@ pub enum ValueKind {
     /// when the value is `HirExprKind::Index` (or its rewritten
     /// `IndexTagged`); future sub-phases will extend to
     /// MaybeNilBool / MaybeNilString etc.
-    MaybeNilNumber,
+    TaggedValue,
 }
 
 impl ValueKind {
@@ -63,24 +63,24 @@ impl ValueKind {
             ValueKind::Function(_) => "function",
             ValueKind::String => "string",
             ValueKind::Table => "table",
-            ValueKind::MaybeNilNumber => "number?",
+            ValueKind::TaggedValue => "number?",
         }
     }
 }
 
 /// Number-compatible kinds: a plain `Number` or a
-/// `MaybeNilNumber` (the latter traps at the Local read site if
+/// `TaggedValue` (the latter traps at the Local read site if
 /// the tag is Nil; in HIR the kinds are interchangeable for
 /// arithmetic / comparison / print). Phase 2.6c-tag-locals
 /// (ADR 0063).
 fn is_number_compatible(k: ValueKind) -> bool {
-    matches!(k, ValueKind::Number | ValueKind::MaybeNilNumber)
+    matches!(k, ValueKind::Number | ValueKind::TaggedValue)
 }
 
 /// Phase 2.6c-tag-locals (ADR 0063): when a `LocalInit` /
 /// `Assign`'s RHS is a plain `HirExprKind::Index`, rewrite it
 /// into `HirExprKind::IndexTagged` so the local widens to
-/// `MaybeNilNumber`. Idempotent on every other shape.
+/// `TaggedValue`. Idempotent on every other shape.
 fn widen_index_for_local_init(value: HirExpr) -> HirExpr {
     match value.kind {
         HirExprKind::Index { target, key } => HirExpr {
@@ -105,7 +105,7 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
         // probe returns Bool.
         HirExprKind::IsNilQuery { .. } => ValueKind::Bool,
         // Phase 2.6c-tag-locals (ADR 0063).
-        HirExprKind::IndexTagged { .. } => ValueKind::MaybeNilNumber,
+        HirExprKind::IndexTagged { .. } => ValueKind::TaggedValue,
         HirExprKind::IsNilLocal { .. } => ValueKind::Bool,
         HirExprKind::Local(LocalId(idx)) => locals[*idx].kind,
         HirExprKind::UnaryOp { op, .. } => match op {
@@ -269,7 +269,7 @@ fn coerce_to_string(expr: HirExpr, kind: ValueKind, offset: usize) -> Result<Hir
             rhs_kind: kind.name().to_owned(),
             offset,
         }),
-        ValueKind::Number | ValueKind::Bool | ValueKind::Nil | ValueKind::MaybeNilNumber => {
+        ValueKind::Number | ValueKind::Bool | ValueKind::Nil | ValueKind::TaggedValue => {
             let span = expr.span;
             Ok(HirExpr {
                 kind: HirExprKind::Call {
@@ -1048,12 +1048,12 @@ impl LowerCtx {
                 // (ptr alloca, body-guard guarantees a real value
                 // before load fires).
                 ValueKind::Function(_) | ValueKind::String | ValueKind::Table => None,
-                // Phase 2.6c-tag-locals (ADR 0063): MaybeNilNumber
+                // Phase 2.6c-tag-locals (ADR 0063): TaggedValue
                 // is only ever produced by `lower_stmt` rewriting a
                 // table read into `IndexTagged`; ret-value slots
                 // never carry it (function returns are still
                 // Number-only at this sub-phase).
-                ValueKind::MaybeNilNumber => None,
+                ValueKind::TaggedValue => None,
             };
             if let Some(kind) = init_value {
                 out.push(HirStmt {
@@ -1153,7 +1153,7 @@ impl LowerCtx {
                 let value = self.lower_expr(value)?;
                 // Phase 2.6c-tag-locals (ADR 0063): a plain table
                 // read in LocalInit position widens the local to
-                // MaybeNilNumber. Rewriting the value into
+                // TaggedValue. Rewriting the value into
                 // `IndexTagged` lets `infer_kind` pick the wider
                 // kind and lets codegen take the non-trapping
                 // path inside `emit_stmt(LocalInit)`.
@@ -1931,7 +1931,7 @@ impl LowerCtx {
                     | BinOp::Shl
                     | BinOp::Shr => {
                         // Phase 2.6c-tag-locals (ADR 0063):
-                        // MaybeNilNumber is interchangeable with
+                        // TaggedValue is interchangeable with
                         // Number at the HIR layer. The Local
                         // read site emits a tag check that traps
                         // when the actual value is Nil.
@@ -1985,7 +1985,7 @@ impl LowerCtx {
                     BinOp::Eq | BinOp::Ne => {
                         // Phase 2.6c-isnil-query (ADR 0061): Index == Nil.
                         // Phase 2.6c-tag-locals (ADR 0063): also detect
-                        // `Local(MaybeNilNumber) == Nil`, which lowers
+                        // `Local(TaggedValue) == Nil`, which lowers
                         // into `IsNilLocal { local_id }` and reads only
                         // the slot's tag — never traps.
                         let nil_query_index = match (&lhs_hir.kind, &rhs_hir.kind) {
@@ -1999,12 +1999,12 @@ impl LowerCtx {
                         };
                         let nil_query_local = match (&lhs_hir.kind, &rhs_hir.kind) {
                             (HirExprKind::Local(LocalId(idx)), HirExprKind::Nil)
-                                if matches!(self.locals[*idx].kind, ValueKind::MaybeNilNumber) =>
+                                if matches!(self.locals[*idx].kind, ValueKind::TaggedValue) =>
                             {
                                 Some(LocalId(*idx))
                             }
                             (HirExprKind::Nil, HirExprKind::Local(LocalId(idx)))
-                                if matches!(self.locals[*idx].kind, ValueKind::MaybeNilNumber) =>
+                                if matches!(self.locals[*idx].kind, ValueKind::TaggedValue) =>
                             {
                                 Some(LocalId(*idx))
                             }

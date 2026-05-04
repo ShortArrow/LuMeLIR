@@ -669,13 +669,13 @@ fn param_mlir_type<'c>(context: &'c Context, kind: ValueKind, types: &Types<'c>)
         // Phase 2.6a-min (ADR 0053): a Table value is a `!llvm.ptr`
         // to a heap-allocated `[length: i64]`-prefixed region.
         ValueKind::Table => types.ptr,
-        // Phase 2.6c-tag-locals (ADR 0063): a MaybeNilNumber slot
+        // Phase 2.6c-tag-locals (ADR 0063): a TaggedValue slot
         // is a 16-byte tagged region. Function params and returns
-        // do not currently carry MaybeNilNumber (function-return
+        // do not currently carry TaggedValue (function-return
         // widening is a follow-up sub-phase) — `unreachable!`
         // guards against that until the next phase relaxes it.
-        ValueKind::MaybeNilNumber => {
-            unreachable!("MaybeNilNumber is not yet a function param/return kind")
+        ValueKind::TaggedValue => {
+            unreachable!("TaggedValue is not yet a function param/return kind")
         }
     }
 }
@@ -699,8 +699,8 @@ fn ret_mlir_types<'c>(
                 FunctionType::new(context, &p_types, &[types.f64]).into()
             }
             ValueKind::String | ValueKind::Table => types.ptr,
-            ValueKind::MaybeNilNumber => {
-                unreachable!("MaybeNilNumber is not yet a function return kind")
+            ValueKind::TaggedValue => {
+                unreachable!("TaggedValue is not yet a function return kind")
             }
         })
         .collect()
@@ -835,8 +835,8 @@ fn emit_function<'c>(
             ValueKind::String | ValueKind::Table => {
                 emit_load(&block, slots[ret_value_idx], types.ptr, loc)
             }
-            ValueKind::MaybeNilNumber => {
-                unreachable!("MaybeNilNumber is not yet a function return kind")
+            ValueKind::TaggedValue => {
+                unreachable!("TaggedValue is not yet a function return kind")
             }
         };
         ret_values.push(v);
@@ -963,12 +963,12 @@ fn emit_stmt<'a, 'c>(
                         emit_store(block, ptr_val, slots[id.0], loc);
                     }
                 }
-                ValueKind::MaybeNilNumber => {
+                ValueKind::TaggedValue => {
                     // Phase 2.6c-tag-locals (ADR 0063): the dst is
                     // a 16-byte tagged slot. Source dispatch:
                     //   - IndexTagged: non-trapping table read +
                     //     tagged store (emit_local_init_tagged).
-                    //   - Local(MaybeNilNumber): copy the 16-byte
+                    //   - Local(TaggedValue): copy the 16-byte
                     //     slot verbatim (preserves Nil tag).
                     //   - else (Number-kind expr): wrap in
                     //     `{TAG_NUMBER, value}`.
@@ -989,7 +989,7 @@ fn emit_stmt<'a, 'c>(
                             )?;
                         }
                         HirExprKind::Local(LocalId(src_idx))
-                            if matches!(locals[*src_idx].kind, ValueKind::MaybeNilNumber) =>
+                            if matches!(locals[*src_idx].kind, ValueKind::TaggedValue) =>
                         {
                             let src_slot = slots[*src_idx];
                             let dst_slot = slots[id.0];
@@ -1536,7 +1536,7 @@ fn emit_alloca_slot_for_kind<'a, 'c>(
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
     // (elem_type, count) — most kinds are a single-element slot.
-    // Phase 2.6c-tag-locals (ADR 0063): MaybeNilNumber needs a
+    // Phase 2.6c-tag-locals (ADR 0063): TaggedValue needs a
     // 16-byte slot laid out as `{i64 tag, f64 value}`. Allocating
     // 2 × i64 gives the required size and 8-byte alignment so the
     // f64 store/load at offset 8 is naturally aligned.
@@ -1555,7 +1555,7 @@ fn emit_alloca_slot_for_kind<'a, 'c>(
         ValueKind::Function(_) => (types.ptr, 1),
         // Phase 2.6a-min (ADR 0053): Table slot stores a heap ptr.
         ValueKind::Table => (types.ptr, 1),
-        ValueKind::MaybeNilNumber => (types.i64, 2),
+        ValueKind::TaggedValue => (types.i64, 2),
     };
 
     let count_op = arith::constant(
@@ -1788,7 +1788,7 @@ fn emit_value_slot_check_number<'a, 'c>(
 
 /// Phase 2.6c-tag-locals (ADR 0063): non-trapping `IndexTagged`
 /// read that writes the resulting `{tag, value}` directly to a
-/// `MaybeNilNumber` local slot. Mirror of the `IsNilQuery`
+/// `TaggedValue` local slot. Mirror of the `IsNilQuery`
 /// codegen — same bounds / probe / null-buf shape — but instead
 /// of yielding an i1 we write either `{TAG_NIL, 0.0}` or
 /// `{TAG_NUMBER, value}` to `dst_slot`.
@@ -4031,7 +4031,7 @@ fn emit_expr<'a, 'c>(
                 }
                 ValueKind::String => Ok(emit_load(block, slots[*idx], types.ptr, loc)),
                 ValueKind::Table => Ok(emit_load(block, slots[*idx], types.ptr, loc)),
-                ValueKind::MaybeNilNumber => {
+                ValueKind::TaggedValue => {
                     // Phase 2.6c-tag-locals (ADR 0063): tag-checked
                     // extract. Nil-tagged → trap. Number-tagged →
                     // load f64 at offset +8. Mirrors the array
@@ -4273,7 +4273,7 @@ fn emit_expr<'a, 'c>(
                     // is logged as a follow-up LIC since the
                     // widening tests in this sub-phase do not
                     // exercise it.
-                    ValueKind::MaybeNilNumber => "s_typename_number",
+                    ValueKind::TaggedValue => "s_typename_number",
                 };
                 Ok(emit_addressof(context, block, global, types, loc))
             }
@@ -4371,7 +4371,7 @@ fn emit_expr<'a, 'c>(
             unreachable!("IndexTagged is consumed by emit_stmt(LocalInit/Assign)")
         }
         // Phase 2.6c-tag-locals (ADR 0063): non-trapping nil probe
-        // on a MaybeNilNumber local — read the tag at slot+0 and
+        // on a TaggedValue local — read the tag at slot+0 and
         // compare against TAG_NIL. Returns i1.
         HirExprKind::IsNilLocal { local_id } => {
             let slot_ptr = slots[local_id.0];
@@ -4785,7 +4785,7 @@ fn emit_tostring<'a, 'c>(
         // Phase 2.6c-tag-locals (ADR 0063): the upstream Local
         // read already extracted f64 (trapping on Nil) before
         // tostring sees the value, so dispatch as Number.
-        ValueKind::MaybeNilNumber => {
+        ValueKind::TaggedValue => {
             emit_tostring(context, block, value, ValueKind::Number, types, loc)
         }
     }
@@ -4907,7 +4907,7 @@ fn emit_tonumber<'a, 'c>(
         }
         // Phase 2.6c-tag-locals (ADR 0063): Local read produced f64
         // (trapping on Nil) before tonumber sees it.
-        ValueKind::MaybeNilNumber => value,
+        ValueKind::TaggedValue => value,
     }
 }
 
@@ -5173,7 +5173,7 @@ fn emit_print_value_raw<'a, 'c>(
         // Phase 2.6c-tag-locals (ADR 0063): the upstream Local
         // read already produced the f64 (trapping on Nil). Print
         // it as Number.
-        ValueKind::MaybeNilNumber => {
+        ValueKind::TaggedValue => {
             let fmt_ptr = emit_addressof(context, block, "fmt_raw", types, loc);
             emit_printf(context, block, fmt_ptr, value, types, loc);
         }
@@ -5393,7 +5393,7 @@ fn emit_truthiness<'a, 'c>(
         ),
         // Phase 2.6c-tag-locals (ADR 0063): Local read produced
         // f64 (trapping on Nil). Truthy by Number rule.
-        ValueKind::MaybeNilNumber => {
+        ValueKind::TaggedValue => {
             let attr = IntegerAttribute::new(types.i1, 1);
             block
                 .append_operation(arith::constant(context, attr.into(), loc))
@@ -5415,7 +5415,7 @@ fn kind_to_mlir_type<'c>(kind: ValueKind, types: &Types<'c>) -> Type<'c> {
         // Phase 2.6c-tag-locals (ADR 0063): the slot is 16 bytes
         // but the *yielded* value once extracted is f64 (Local
         // read traps on Nil and unwraps the tagged payload).
-        ValueKind::MaybeNilNumber => types.f64,
+        ValueKind::TaggedValue => types.f64,
     }
 }
 

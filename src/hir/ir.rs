@@ -246,7 +246,7 @@ pub enum HirExprKind {
     },
     /// Local-side counterpart of IsNilQuery (Phase 2.6c-tag-
     /// locals, ADR 0063). Produced when HIR pattern-matches
-    /// `Local(MaybeNilNumber) == Nil` (or `~= nil`, wrapped in
+    /// `Local(TaggedValue) == Nil` (or `~= nil`, wrapped in
     /// `UnaryOp::Not`). Codegen reads only the tag at slot+0 and
     /// returns `tag == TAG_NIL` as i1 — never traps.
     IsNilLocal {
