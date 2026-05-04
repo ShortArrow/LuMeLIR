@@ -373,6 +373,10 @@ fn collect_string_pool(chunk: &HirChunk) -> std::collections::HashMap<String, St
                 visit_expr(target, set);
                 visit_expr(key, set);
             }
+            HirExprKind::IsNilQuery { target, key } => {
+                visit_expr(target, set);
+                visit_expr(key, set);
+            }
             _ => {}
         }
     }
@@ -3325,6 +3329,312 @@ fn emit_expr<'a, 'c>(
                     Ok(emit_load(block, value_ptr, types.f64, loc))
                 }
                 _ => unreachable!("HIR rejects non-Number/String key kinds"),
+            }
+        }
+        // Phase 2.6c-isnil-query (ADR 0061): non-trapping nil
+        // probe. OOB array reads, missing hash keys, and Nil-
+        // tagged slots all yield `true`; Number-tagged slots
+        // yield `false`. Mirrors the Index arm's two key-kind
+        // branches but never traps.
+        HirExprKind::IsNilQuery { target, key } => {
+            let target_ptr = emit_expr(
+                context, block, target, slots, locals, functions, types, params_len, loc,
+            )?;
+            let key_kind = infer_kind(key, locals, functions);
+            let i1_true = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i1, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            match key_kind {
+                ValueKind::Number => {
+                    let key_f = emit_expr(
+                        context, block, key, slots, locals, functions, types, params_len, loc,
+                    )?;
+                    let key_i = emit_f2i(block, key_f, types, loc);
+                    let length_i = emit_load(block, target_ptr, types.i64, loc);
+                    let one = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 1).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let too_small: Value<'c, 'a> = block
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Slt,
+                            key_i,
+                            one,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let too_big: Value<'c, 'a> = block
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Sgt,
+                            key_i,
+                            length_i,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let oob: Value<'c, 'a> = block
+                        .append_operation(arith::ori(too_small, too_big, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    // scf.if oob -> yield true; else load tag and
+                    // compare with TAG_NIL.
+                    let then_region = Region::new();
+                    let then_blk = Block::new(&[]);
+                    then_blk.append_operation(scf::r#yield(&[i1_true], loc));
+                    then_region.append_block(then_blk);
+                    let else_region = Region::new();
+                    let else_blk = Block::new(&[]);
+                    {
+                        let array_buf =
+                            emit_table_array_buf(context, &else_blk, target_ptr, types, loc);
+                        let elem_ptr =
+                            emit_array_elem_ptr(context, &else_blk, array_buf, key_i, types, loc);
+                        let tag = emit_load(&else_blk, elem_ptr, types.i64, loc);
+                        let tag_nil_const = else_blk
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let is_nil: Value<'c, '_> = else_blk
+                            .append_operation(arith::cmpi(
+                                context,
+                                arith::CmpiPredicate::Eq,
+                                tag,
+                                tag_nil_const,
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        else_blk.append_operation(scf::r#yield(&[is_nil], loc));
+                    }
+                    else_region.append_block(else_blk);
+                    let if_op = scf::r#if(oob, &[types.i1], then_region, else_region, loc);
+                    Ok(block.append_operation(if_op).result(0).unwrap().into())
+                }
+                ValueKind::String => {
+                    let key_str = emit_expr(
+                        context, block, key, slots, locals, functions, types, params_len, loc,
+                    )?;
+                    let hash_buf_slot = emit_byte_offset_ptr(
+                        context,
+                        block,
+                        target_ptr,
+                        TABLE_OFF_HASH_BUF,
+                        types,
+                        loc,
+                    );
+                    let hash_buf = emit_load(block, hash_buf_slot, types.ptr, loc);
+                    let hash_buf_i: Value<'c, 'a> = block
+                        .append_operation(
+                            OperationBuilder::new("llvm.ptrtoint", loc)
+                                .add_operands(&[hash_buf])
+                                .add_results(&[types.i64])
+                                .build()
+                                .expect("llvm.ptrtoint"),
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let zero_i64 = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 0).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let hash_buf_null: Value<'c, 'a> = block
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Eq,
+                            hash_buf_i,
+                            zero_i64,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    // scf.if hash_buf_null -> yield true; else
+                    // probe and inspect bucket.
+                    let then_region = Region::new();
+                    let then_blk = Block::new(&[]);
+                    then_blk.append_operation(scf::r#yield(&[i1_true], loc));
+                    then_region.append_block(then_blk);
+                    let else_region = Region::new();
+                    let else_blk = Block::new(&[]);
+                    {
+                        let cap_slot = emit_byte_offset_ptr(
+                            context,
+                            &else_blk,
+                            hash_buf,
+                            HASH_OFF_CAP,
+                            types,
+                            loc,
+                        );
+                        let cap = emit_load(&else_blk, cap_slot, types.i64, loc);
+                        // emit_hash_probe_for_insert returns a
+                        // bucket whose key is either null OR
+                        // matches `key_str` — exactly what we
+                        // need for non-trapping lookup.
+                        let bucket = emit_hash_probe_for_insert(
+                            context, &else_blk, hash_buf, cap, key_str, types, loc,
+                        );
+                        let entry_size = else_blk
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let bucket_off: Value<'c, '_> = else_blk
+                            .append_operation(arith::muli(bucket, entry_size, loc))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let entries_base = else_blk
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let entry_total_off: Value<'c, '_> = else_blk
+                            .append_operation(arith::addi(bucket_off, entries_base, loc))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let entry_ptr = emit_byte_offset_ptr_dynamic(
+                            context,
+                            &else_blk,
+                            hash_buf,
+                            entry_total_off,
+                            types,
+                            loc,
+                        );
+                        let key_at = emit_load(&else_blk, entry_ptr, types.ptr, loc);
+                        let key_at_i: Value<'c, '_> = else_blk
+                            .append_operation(
+                                OperationBuilder::new("llvm.ptrtoint", loc)
+                                    .add_operands(&[key_at])
+                                    .add_results(&[types.i64])
+                                    .build()
+                                    .expect("llvm.ptrtoint"),
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let zero_i64_inner = else_blk
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(types.i64, 0).into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let key_at_null: Value<'c, '_> = else_blk
+                            .append_operation(arith::cmpi(
+                                context,
+                                arith::CmpiPredicate::Eq,
+                                key_at_i,
+                                zero_i64_inner,
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        // Inner scf.if: missing key -> true; else
+                        // load value tag and check TAG_NIL.
+                        let inner_then = Region::new();
+                        let inner_then_blk = Block::new(&[]);
+                        let inner_true = inner_then_blk
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(types.i1, 1).into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        inner_then_blk.append_operation(scf::r#yield(&[inner_true], loc));
+                        inner_then.append_block(inner_then_blk);
+                        let inner_else = Region::new();
+                        let inner_else_blk = Block::new(&[]);
+                        {
+                            let value_slot_ptr = emit_byte_offset_ptr(
+                                context,
+                                &inner_else_blk,
+                                entry_ptr,
+                                HASH_ENTRY_OFF_VALUE_SLOT,
+                                types,
+                                loc,
+                            );
+                            let tag = emit_load(&inner_else_blk, value_slot_ptr, types.i64, loc);
+                            let tag_nil_const = inner_else_blk
+                                .append_operation(arith::constant(
+                                    context,
+                                    IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let is_nil: Value<'c, '_> = inner_else_blk
+                                .append_operation(arith::cmpi(
+                                    context,
+                                    arith::CmpiPredicate::Eq,
+                                    tag,
+                                    tag_nil_const,
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            inner_else_blk.append_operation(scf::r#yield(&[is_nil], loc));
+                        }
+                        inner_else.append_block(inner_else_blk);
+                        let inner_if =
+                            scf::r#if(key_at_null, &[types.i1], inner_then, inner_else, loc);
+                        let inner_result: Value<'c, '_> = else_blk
+                            .append_operation(inner_if)
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        else_blk.append_operation(scf::r#yield(&[inner_result], loc));
+                    }
+                    else_region.append_block(else_blk);
+                    let if_op =
+                        scf::r#if(hash_buf_null, &[types.i1], then_region, else_region, loc);
+                    Ok(block.append_operation(if_op).result(0).unwrap().into())
+                }
+                _ => unreachable!("IsNilQuery key must be Number or String"),
             }
         }
         HirExprKind::Local(LocalId(idx)) => {

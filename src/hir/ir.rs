@@ -221,6 +221,18 @@ pub enum HirExprKind {
         target: Box<HirExpr>,
         key: Box<HirExpr>,
     },
+    /// `t[i] == nil` / `t.k == nil` non-trapping nil query (Phase
+    /// 2.6c-isnil-query, ADR 0061). Produced when HIR lowering
+    /// detects `BinOp::Eq` (or `Ne`, wrapped in `UnaryOp::Not`) with
+    /// one side being `Index` and the other being `Nil`. Returns
+    /// `Bool` — `true` when the slot is missing/OOB/Nil-tagged,
+    /// `false` when a Number-tagged value is present. Bypasses the
+    /// trapping read path entirely, so OOB array reads and missing
+    /// hash keys report the Lua-spec answer.
+    IsNilQuery {
+        target: Box<HirExpr>,
+        key: Box<HirExpr>,
+    },
 }
 
 /// Discriminates whether a [`HirExprKind::Call`] hits a built-in

@@ -68,6 +68,9 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
         // Phase 2.6a-arr (ADR 0054): Number-only arrays mean
         // every read returns a Number.
         HirExprKind::Index { .. } => ValueKind::Number,
+        // Phase 2.6c-isnil-query (ADR 0061): non-trapping nil
+        // probe returns Bool.
+        HirExprKind::IsNilQuery { .. } => ValueKind::Bool,
         HirExprKind::Local(LocalId(idx)) => locals[*idx].kind,
         HirExprKind::UnaryOp { op, .. } => match op {
             crate::parser::UnaryOp::Neg => ValueKind::Number,
@@ -1911,21 +1914,54 @@ impl LowerCtx {
                     // Equality: heterogeneous kinds and both-Nil fold to a
                     // constant (Lua semantics: `1 == nil` ≡ false). Same-
                     // kind non-Nil drops through to runtime cmpf in codegen.
+                    //
+                    // Phase 2.6c-isnil-query (ADR 0061): `Index == nil` /
+                    // `nil == Index` (and `~=`) bypasses the fold to
+                    // produce a non-trapping `IsNilQuery`, so OOB array
+                    // reads and missing hash keys can answer the Lua-
+                    // spec true without triggering the trapping read
+                    // path. Detected before the fold; otherwise the
+                    // heterogeneous-kind rule would silently miscompile
+                    // them to `Bool(false)`.
                     BinOp::Eq | BinOp::Ne => {
-                        let fold = lk != rk || (lk == ValueKind::Nil && rk == ValueKind::Nil);
-                        if fold {
-                            let equal = lk == rk; // both-Nil → true; heterogeneous → false
-                            let folded = match op {
-                                BinOp::Eq => equal,
-                                BinOp::Ne => !equal,
-                                _ => unreachable!(),
+                        let nil_query = match (&lhs_hir.kind, &rhs_hir.kind) {
+                            (HirExprKind::Index { target, key }, HirExprKind::Nil) => {
+                                Some((target.clone(), key.clone()))
+                            }
+                            (HirExprKind::Nil, HirExprKind::Index { target, key }) => {
+                                Some((target.clone(), key.clone()))
+                            }
+                            _ => None,
+                        };
+                        if let Some((target, key)) = nil_query {
+                            let query = HirExpr {
+                                kind: HirExprKind::IsNilQuery { target, key },
+                                span: expr.span,
                             };
-                            HirExprKind::Bool(folded)
+                            match op {
+                                BinOp::Eq => query.kind,
+                                BinOp::Ne => HirExprKind::UnaryOp {
+                                    op: UnaryOp::Not,
+                                    operand: Box::new(query),
+                                },
+                                _ => unreachable!(),
+                            }
                         } else {
-                            HirExprKind::BinOp {
-                                op: *op,
-                                lhs: Box::new(lhs_hir),
-                                rhs: Box::new(rhs_hir),
+                            let fold = lk != rk || (lk == ValueKind::Nil && rk == ValueKind::Nil);
+                            if fold {
+                                let equal = lk == rk; // both-Nil → true; heterogeneous → false
+                                let folded = match op {
+                                    BinOp::Eq => equal,
+                                    BinOp::Ne => !equal,
+                                    _ => unreachable!(),
+                                };
+                                HirExprKind::Bool(folded)
+                            } else {
+                                HirExprKind::BinOp {
+                                    op: *op,
+                                    lhs: Box::new(lhs_hir),
+                                    rhs: Box::new(rhs_hir),
+                                }
                             }
                         }
                     }
