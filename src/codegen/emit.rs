@@ -98,6 +98,12 @@ const HASH_ENTRY_SIZE: i64 = 24;
 const HASH_ENTRY_OFF_KEY: i64 = 0;
 const HASH_ENTRY_OFF_VALUE_SLOT: i64 = 8;
 const HASH_INITIAL_CAP: i64 = 8;
+// Phase 2.6c-tag-hash-hard (ADR 0062): a deleted bucket has its
+// key replaced with this i64-comparable sentinel. Both `.data`-
+// section string globals and `malloc`'d buffers have alignment
+// well above 1, so the sentinel is unambiguously distinguishable
+// from any live key pointer (and from null = empty bucket).
+const HASH_DELETED_KEY: i64 = 1;
 
 // =============================================================
 // Phase 2.6c-tag-arr (ADR 0059): tagged array_buf slots.
@@ -1232,55 +1238,6 @@ fn emit_stmt<'a, 'c>(
                         .result(0)
                         .unwrap()
                         .into();
-                    let new_key_then = Region::new();
-                    let new_key_blk = Block::new(&[]);
-                    {
-                        // store the key
-                        emit_store(&new_key_blk, key_str, entry_ptr, loc);
-                        // count++
-                        let count_slot = emit_byte_offset_ptr(
-                            context,
-                            &new_key_blk,
-                            hash_buf,
-                            HASH_OFF_COUNT,
-                            types,
-                            loc,
-                        );
-                        let count = emit_load(&new_key_blk, count_slot, types.i64, loc);
-                        let one_inner = new_key_blk
-                            .append_operation(arith::constant(
-                                context,
-                                IntegerAttribute::new(types.i64, 1).into(),
-                                loc,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into();
-                        let new_count: Value<'c, '_> = new_key_blk
-                            .append_operation(arith::addi(count, one_inner, loc))
-                            .result(0)
-                            .unwrap()
-                            .into();
-                        emit_store(&new_key_blk, new_count, count_slot, loc);
-                        new_key_blk.append_operation(scf::r#yield(&[], loc));
-                    }
-                    new_key_then.append_block(new_key_blk);
-                    let new_key_else = Region::new();
-                    let new_key_else_blk = Block::new(&[]);
-                    new_key_else_blk.append_operation(scf::r#yield(&[], loc));
-                    new_key_else.append_block(new_key_else_blk);
-                    block.append_operation(scf::r#if(
-                        was_empty,
-                        &[],
-                        new_key_then,
-                        new_key_else,
-                        loc,
-                    ));
-                    // Phase 2.6c-tag-hash (ADR 0060): store the
-                    // tagged value at slot offset 8 within the
-                    // entry. Number → tag=Number + value; Nil →
-                    // tag=Nil (soft delete; key remains for
-                    // probing).
                     let value_slot_ptr = emit_byte_offset_ptr(
                         context,
                         block,
@@ -1291,16 +1248,134 @@ fn emit_stmt<'a, 'c>(
                     );
                     let value_kind = infer_kind(value, locals, functions);
                     match value_kind {
-                        ValueKind::Number => emit_value_slot_store_number(
-                            context,
-                            block,
-                            value_slot_ptr,
-                            value_v,
-                            types,
-                            loc,
-                        ),
+                        ValueKind::Number => {
+                            // Number write: when bucket was empty,
+                            // record the new key and bump the live
+                            // count; otherwise overwrite in place.
+                            let new_key_then = Region::new();
+                            let new_key_blk = Block::new(&[]);
+                            {
+                                emit_store(&new_key_blk, key_str, entry_ptr, loc);
+                                let count_slot = emit_byte_offset_ptr(
+                                    context,
+                                    &new_key_blk,
+                                    hash_buf,
+                                    HASH_OFF_COUNT,
+                                    types,
+                                    loc,
+                                );
+                                let count = emit_load(&new_key_blk, count_slot, types.i64, loc);
+                                let one_inner = new_key_blk
+                                    .append_operation(arith::constant(
+                                        context,
+                                        IntegerAttribute::new(types.i64, 1).into(),
+                                        loc,
+                                    ))
+                                    .result(0)
+                                    .unwrap()
+                                    .into();
+                                let new_count: Value<'c, '_> = new_key_blk
+                                    .append_operation(arith::addi(count, one_inner, loc))
+                                    .result(0)
+                                    .unwrap()
+                                    .into();
+                                emit_store(&new_key_blk, new_count, count_slot, loc);
+                                new_key_blk.append_operation(scf::r#yield(&[], loc));
+                            }
+                            new_key_then.append_block(new_key_blk);
+                            let new_key_else = Region::new();
+                            let new_key_else_blk = Block::new(&[]);
+                            new_key_else_blk.append_operation(scf::r#yield(&[], loc));
+                            new_key_else.append_block(new_key_else_blk);
+                            block.append_operation(scf::r#if(
+                                was_empty,
+                                &[],
+                                new_key_then,
+                                new_key_else,
+                                loc,
+                            ));
+                            emit_value_slot_store_number(
+                                context,
+                                block,
+                                value_slot_ptr,
+                                value_v,
+                                types,
+                                loc,
+                            );
+                        }
                         ValueKind::Nil => {
-                            emit_value_slot_store_nil(context, block, value_slot_ptr, types, loc)
+                            // Phase 2.6c-tag-hash-hard (ADR 0062):
+                            // hard delete. When the key is present
+                            // (was_empty == false), overwrite the
+                            // key slot with HASH_DELETED_KEY and
+                            // mark the value slot Nil. Probe will
+                            // skip past the sentinel and rehash
+                            // drops it physically. When the key is
+                            // absent (was_empty == true), this is a
+                            // no-op (Lua spec: deleting a missing
+                            // key is harmless). count is unchanged
+                            // either way — sentinel stays counted
+                            // against load factor until rehash.
+                            let del_then = Region::new();
+                            let del_then_blk = Block::new(&[]);
+                            {
+                                let sentinel_i = del_then_blk
+                                    .append_operation(arith::constant(
+                                        context,
+                                        IntegerAttribute::new(types.i64, HASH_DELETED_KEY).into(),
+                                        loc,
+                                    ))
+                                    .result(0)
+                                    .unwrap()
+                                    .into();
+                                let sentinel_ptr: Value<'c, '_> = del_then_blk
+                                    .append_operation(
+                                        OperationBuilder::new("llvm.inttoptr", loc)
+                                            .add_operands(&[sentinel_i])
+                                            .add_results(&[types.ptr])
+                                            .build()
+                                            .expect("llvm.inttoptr"),
+                                    )
+                                    .result(0)
+                                    .unwrap()
+                                    .into();
+                                emit_store(&del_then_blk, sentinel_ptr, entry_ptr, loc);
+                                emit_value_slot_store_nil(
+                                    context,
+                                    &del_then_blk,
+                                    value_slot_ptr,
+                                    types,
+                                    loc,
+                                );
+                                del_then_blk.append_operation(scf::r#yield(&[], loc));
+                            }
+                            del_then.append_block(del_then_blk);
+                            let del_else = Region::new();
+                            let del_else_blk = Block::new(&[]);
+                            del_else_blk.append_operation(scf::r#yield(&[], loc));
+                            del_else.append_block(del_else_blk);
+                            // del happens only when !was_empty.
+                            let i1_one = block
+                                .append_operation(arith::constant(
+                                    context,
+                                    IntegerAttribute::new(types.i1, 1).into(),
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let not_empty: Value<'c, 'a> = block
+                                .append_operation(arith::xori(was_empty, i1_one, loc))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            block.append_operation(scf::r#if(
+                                not_empty,
+                                &[],
+                                del_then,
+                                del_else,
+                                loc,
+                            ));
                         }
                         _ => unreachable!("HIR rejects non-Number/Nil values for hash insert"),
                     }
@@ -2177,6 +2252,29 @@ fn emit_hash_probe_lookup<'a, 'c>(
             .result(0)
             .unwrap()
             .into();
+        // Phase 2.6c-tag-hash-hard (ADR 0062): is_sentinel marks
+        // a deleted bucket. Probe must skip past it — strcmp on
+        // sentinel is UB.
+        let sentinel_const = before_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, HASH_DELETED_KEY).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_sentinel: Value<'c, '_> = before_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                key_at_slot_i,
+                sentinel_const,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
         // Trap if null — key not found.
         let null_trap_then = Region::new();
         let null_trap_blk = Block::new(&[]);
@@ -2189,35 +2287,59 @@ fn emit_hash_probe_lookup<'a, 'c>(
         null_trap_else_blk.append_operation(scf::r#yield(&[], loc));
         null_trap_else.append_block(null_trap_else_blk);
         before_blk.append_operation(scf::r#if(is_null, &[], null_trap_then, null_trap_else, loc));
-        // strcmp(key_at_slot, key_str)
-        let cmp = emit_libc_call_i32(
-            context,
-            &before_blk,
-            "strcmp",
-            &[key_at_slot, key_str],
-            types,
-            loc,
-        );
-        let zero_i32 = before_blk
-            .append_operation(arith::constant(
+        // strcmp gated on is_sentinel: yield false directly when
+        // the bucket is a deleted-tombstone, otherwise compare.
+        let eq_then = Region::new();
+        let eq_then_blk = Block::new(&[]);
+        {
+            let i1_zero = eq_then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i1, 0).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            eq_then_blk.append_operation(scf::r#yield(&[i1_zero], loc));
+        }
+        eq_then.append_block(eq_then_blk);
+        let eq_else = Region::new();
+        let eq_else_blk = Block::new(&[]);
+        {
+            let cmp = emit_libc_call_i32(
                 context,
-                IntegerAttribute::new(types.i32, 0).into(),
+                &eq_else_blk,
+                "strcmp",
+                &[key_at_slot, key_str],
+                types,
                 loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let eq: Value<'c, '_> = before_blk
-            .append_operation(arith::cmpi(
-                context,
-                arith::CmpiPredicate::Eq,
-                cmp,
-                zero_i32,
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
+            );
+            let zero_i32 = eq_else_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i32, 0).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let eq_inner: Value<'c, '_> = eq_else_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    cmp,
+                    zero_i32,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            eq_else_blk.append_operation(scf::r#yield(&[eq_inner], loc));
+        }
+        eq_else.append_block(eq_else_blk);
+        let eq_op = scf::r#if(is_sentinel, &[types.i1], eq_then, eq_else, loc);
+        let eq: Value<'c, '_> = before_blk.append_operation(eq_op).result(0).unwrap().into();
         let i1_one = before_blk
             .append_operation(arith::constant(
                 context,
@@ -2370,8 +2492,37 @@ fn emit_hash_probe_for_insert<'a, 'c>(
             .result(0)
             .unwrap()
             .into();
-        // eq must only be evaluated when key is non-null; gate
-        // strcmp behind scf.if returning i1.
+        // Phase 2.6c-tag-hash-hard (ADR 0062): a deleted bucket
+        // carries HASH_DELETED_KEY at the key slot. Insert probe
+        // skips past it (no reuse) — strcmp must not run on a
+        // sentinel.
+        let sentinel_const = before_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, HASH_DELETED_KEY).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_sentinel: Value<'c, '_> = before_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                key_at_slot_i,
+                sentinel_const,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_skip: Value<'c, '_> = before_blk
+            .append_operation(arith::ori(is_null, is_sentinel, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        // eq must only be evaluated when key is a live string ptr;
+        // gate strcmp behind scf.if returning i1.
         let eq_then = Region::new();
         let eq_then_blk = Block::new(&[]);
         {
@@ -2421,9 +2572,11 @@ fn emit_hash_probe_for_insert<'a, 'c>(
             eq_else_blk.append_operation(scf::r#yield(&[eq_inner], loc));
         }
         eq_else.append_block(eq_else_blk);
-        let eq_op = scf::r#if(is_null, &[types.i1], eq_then, eq_else, loc);
+        let eq_op = scf::r#if(is_skip, &[types.i1], eq_then, eq_else, loc);
         let eq: Value<'c, '_> = before_blk.append_operation(eq_op).result(0).unwrap().into();
-        // Found if is_null OR eq. Loop continues otherwise.
+        // Found if is_null OR eq. Sentinel is *not* found — the
+        // loop continues past it. is_null implies the loop has
+        // walked off the end of the probe chain (insert here).
         let found: Value<'c, '_> = before_blk
             .append_operation(arith::ori(is_null, eq, loc))
             .result(0)
@@ -2761,7 +2914,7 @@ fn emit_hash_grow_if_needed<'a, 'c>(
                 .result(0)
                 .unwrap()
                 .into();
-            let occupied: Value<'c, '_> = rehash_after_blk
+            let not_null: Value<'c, '_> = rehash_after_blk
                 .append_operation(arith::cmpi(
                     context,
                     arith::CmpiPredicate::Ne,
@@ -2769,6 +2922,34 @@ fn emit_hash_grow_if_needed<'a, 'c>(
                     zero_i64_inner,
                     loc,
                 ))
+                .result(0)
+                .unwrap()
+                .into();
+            // Phase 2.6c-tag-hash-hard (ADR 0062): treat sentinel
+            // entries as unoccupied so rehash physically drops
+            // them. Live = (key != null && key != sentinel).
+            let sentinel_const_inner = rehash_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, HASH_DELETED_KEY).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let not_sentinel: Value<'c, '_> = rehash_after_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Ne,
+                    old_key_i,
+                    sentinel_const_inner,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let occupied: Value<'c, '_> = rehash_after_blk
+                .append_operation(arith::andi(not_null, not_sentinel, loc))
                 .result(0)
                 .unwrap()
                 .into();

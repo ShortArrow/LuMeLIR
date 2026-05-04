@@ -79,7 +79,8 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.6c-tag-arr tagged array slots + holes | **Done** | 16-byte `{tag, value}` slots; `t[#t+2]=v` hole creation with Nil-tagged gap fill; LIC-2.6a-wr-1 resolved (ADR 0059) |
 | ‣ 2.6c-tag-hash tagged hash entries + `t.k = nil` | **Done** | 24-byte hash entries (`{ptr key, 16-byte value slot}`); soft-delete via Nil tag; LIC-2.6b-hash-2 partial (Nil accepted) (ADR 0060) |
 | ‣ 2.6c-isnil-query inline `t[i] == nil` / `t.k == nil` non-trapping | **Done** | HIR pattern detection before fold → `IsNilQuery`; non-trapping codegen (OOB / missing key / Nil tag → true); LIC-2.6a-arr-1 + LIC-2.6b-hash-1 partial (inline form only) (ADR 0061) |
-| ‣ 2.6+ tables / metatables | In progress | hetero values, locals widening, hard tombstone, methods, metatables — multiple sub-phases |
+| ‣ 2.6c-tag-hash-hard hash hard tombstone | **Done** | `t.k = nil` overwrites key with `HASH_DELETED_KEY=1` sentinel; probe helpers skip past it; rehash physically drops sentinel entries; LIC-2.6c-tag-hash-1 resolved (ADR 0062) |
+| ‣ 2.6+ tables / metatables | In progress | hetero values, locals widening, methods, metatables — multiple sub-phases |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |
 
 **How to read TBD markers:** sections marked `TBD: Phase N, ADR XXXX` indicate the rule is undecided until that ADR lands. Do not invent answers — surface the question instead.
