@@ -1131,7 +1131,7 @@ fn emit_stmt<'a, 'c>(
                     // Final tagged-Number store at slot[key].
                     let elem_ptr =
                         emit_array_elem_ptr(context, block, array_buf, key_i, types, loc);
-                    emit_array_elem_store_number(context, block, elem_ptr, value_v, types, loc);
+                    emit_value_slot_store_number(context, block, elem_ptr, value_v, types, loc);
                 }
                 ValueKind::String => {
                     // Phase 2.6b-hash (ADR 0058): hash insert.
@@ -1487,12 +1487,14 @@ fn emit_array_elem_ptr<'a, 'c>(
     emit_byte_offset_ptr_dynamic(context, block, array_buf, offset, types, loc)
 }
 
-/// Phase 2.6c-tag-arr (ADR 0059): write `{tag=Number, value}` to a
-/// 16-byte tagged slot.
-fn emit_array_elem_store_number<'a, 'c>(
+/// Phase 2.6c-tag-arr (ADR 0059) / 2.6c-tag-hash (ADR 0060):
+/// write `{tag=Number, value}` to a 16-byte tagged value slot.
+/// Used by both array element stores and hash entry value
+/// stores — the slot layout is identical in both contexts.
+fn emit_value_slot_store_number<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
-    elem_ptr: Value<'c, 'a>,
+    slot_ptr: Value<'c, 'a>,
     value: Value<'c, 'a>,
     types: &Types<'c>,
     loc: Location<'c>,
@@ -1506,24 +1508,59 @@ fn emit_array_elem_store_number<'a, 'c>(
         .result(0)
         .unwrap()
         .into();
-    // tag at offset 0 = elem_ptr itself
-    emit_store(block, tag_const, elem_ptr, loc);
+    // tag at offset 0 = slot_ptr itself
+    emit_store(block, tag_const, slot_ptr, loc);
     let value_slot =
-        emit_byte_offset_ptr(context, block, elem_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
+        emit_byte_offset_ptr(context, block, slot_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
     emit_store(block, value, value_slot, loc);
 }
 
-/// Phase 2.6c-tag-arr (ADR 0059): load the tag at offset 0 of an
-/// element slot and trap if it isn't `TAG_NUMBER`. After this
-/// returns, the caller can safely load the f64 value at offset 8.
-fn emit_array_elem_check_number<'a, 'c>(
+/// Phase 2.6c-tag-hash (ADR 0060): write `{tag=Nil, 0.0}` to a
+/// tagged value slot. Used for array hole-fill and for hash
+/// `t.k = nil` deletion (soft tombstone — the hash key remains).
+fn emit_value_slot_store_nil<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
-    elem_ptr: Value<'c, 'a>,
+    slot_ptr: Value<'c, 'a>,
     types: &Types<'c>,
     loc: Location<'c>,
 ) {
-    let tag = emit_load(block, elem_ptr, types.i64, loc);
+    let nil_tag = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, TAG_NIL).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_store(block, nil_tag, slot_ptr, loc);
+    let zero_f = block
+        .append_operation(arith::constant(
+            context,
+            FloatAttribute::new(context, types.f64, 0.0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let value_slot =
+        emit_byte_offset_ptr(context, block, slot_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
+    emit_store(block, zero_f, value_slot, loc);
+}
+
+/// Phase 2.6c-tag-arr (ADR 0059) / 2.6c-tag-hash (ADR 0060):
+/// load the tag at offset 0 of a tagged value slot and trap if
+/// it isn't `TAG_NUMBER`. After this returns, the caller can
+/// safely load the f64 value at offset 8.
+fn emit_value_slot_check_number<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let tag = emit_load(block, slot_ptr, types.i64, loc);
     let expected = block
         .append_operation(arith::constant(
             context,
@@ -1594,36 +1631,7 @@ fn emit_array_fill_nil<'a, 'c>(
     {
         let i_arg: Value<'c, '_> = after_blk.argument(0).unwrap().into();
         let elem_ptr = emit_array_elem_ptr(context, &after_blk, array_buf, i_arg, types, loc);
-        let nil_tag = after_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(types.i64, TAG_NIL).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        // tag at offset 0
-        emit_store(&after_blk, nil_tag, elem_ptr, loc);
-        // value: zero (irrelevant for Nil but deterministic)
-        let zero_f = after_blk
-            .append_operation(arith::constant(
-                context,
-                FloatAttribute::new(context, types.f64, 0.0).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let value_slot = emit_byte_offset_ptr(
-            context,
-            &after_blk,
-            elem_ptr,
-            ARRAY_ELEM_OFF_VALUE,
-            types,
-            loc,
-        );
-        emit_store(&after_blk, zero_f, value_slot, loc);
+        emit_value_slot_store_nil(context, &after_blk, elem_ptr, types, loc);
         let one = after_blk
             .append_operation(arith::constant(
                 context,
@@ -3116,7 +3124,7 @@ fn emit_expr<'a, 'c>(
                 let offset_bytes = (i as i64) * ARRAY_ELEM_SIZE;
                 let elem_ptr =
                     emit_byte_offset_ptr(context, block, array_buf, offset_bytes, types, loc);
-                emit_array_elem_store_number(context, block, elem_ptr, v, types, loc);
+                emit_value_slot_store_number(context, block, elem_ptr, v, types, loc);
             }
             Ok(header_ptr)
         }
@@ -3145,7 +3153,7 @@ fn emit_expr<'a, 'c>(
                     let array_buf = emit_table_array_buf(context, block, target_ptr, types, loc);
                     let elem_ptr =
                         emit_array_elem_ptr(context, block, array_buf, key_i, types, loc);
-                    emit_array_elem_check_number(context, block, elem_ptr, types, loc);
+                    emit_value_slot_check_number(context, block, elem_ptr, types, loc);
                     let value_slot = emit_byte_offset_ptr(
                         context,
                         block,
