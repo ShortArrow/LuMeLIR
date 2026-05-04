@@ -233,6 +233,25 @@ pub enum HirExprKind {
         target: Box<HirExpr>,
         key: Box<HirExpr>,
     },
+    /// Non-trapping tagged read of a table cell (Phase 2.6c-tag-
+    /// locals, ADR 0063). Produced *only* by `lower_stmt(LocalInit
+    /// | Assign)` when the source expression is
+    /// `HirExprKind::Index`; codegen consumes it inline by
+    /// `emit_local_init_tagged` to write `{tag, value}` into the
+    /// local's 16-byte slot. Calling `emit_expr` on this variant
+    /// is a programming error — use `Index` for value-context use.
+    IndexTagged {
+        target: Box<HirExpr>,
+        key: Box<HirExpr>,
+    },
+    /// Local-side counterpart of IsNilQuery (Phase 2.6c-tag-
+    /// locals, ADR 0063). Produced when HIR pattern-matches
+    /// `Local(MaybeNilNumber) == Nil` (or `~= nil`, wrapped in
+    /// `UnaryOp::Not`). Codegen reads only the tag at slot+0 and
+    /// returns `tag == TAG_NIL` as i1 — never traps.
+    IsNilLocal {
+        local_id: LocalId,
+    },
 }
 
 /// Discriminates whether a [`HirExprKind::Call`] hits a built-in

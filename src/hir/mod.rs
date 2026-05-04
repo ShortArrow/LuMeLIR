@@ -43,6 +43,15 @@ pub enum ValueKind {
     /// supports the empty form; populated arrays / hashes /
     /// metatables are out-of-scope until later sub-phases.
     Table,
+    /// Phase 2.6c-tag-locals (ADR 0063): a local slot that may
+    /// carry a Number value or Nil. Storage is the same 16-byte
+    /// tagged layout used by array elements / hash entries —
+    /// `{i64 tag, f64 value}` — so `emit_value_slot_*` helpers
+    /// transfer over. Produced by `lower_stmt(LocalInit | Assign)`
+    /// when the value is `HirExprKind::Index` (or its rewritten
+    /// `IndexTagged`); future sub-phases will extend to
+    /// MaybeNilBool / MaybeNilString etc.
+    MaybeNilNumber,
 }
 
 impl ValueKind {
@@ -54,7 +63,31 @@ impl ValueKind {
             ValueKind::Function(_) => "function",
             ValueKind::String => "string",
             ValueKind::Table => "table",
+            ValueKind::MaybeNilNumber => "number?",
         }
+    }
+}
+
+/// Number-compatible kinds: a plain `Number` or a
+/// `MaybeNilNumber` (the latter traps at the Local read site if
+/// the tag is Nil; in HIR the kinds are interchangeable for
+/// arithmetic / comparison / print). Phase 2.6c-tag-locals
+/// (ADR 0063).
+fn is_number_compatible(k: ValueKind) -> bool {
+    matches!(k, ValueKind::Number | ValueKind::MaybeNilNumber)
+}
+
+/// Phase 2.6c-tag-locals (ADR 0063): when a `LocalInit` /
+/// `Assign`'s RHS is a plain `HirExprKind::Index`, rewrite it
+/// into `HirExprKind::IndexTagged` so the local widens to
+/// `MaybeNilNumber`. Idempotent on every other shape.
+fn widen_index_for_local_init(value: HirExpr) -> HirExpr {
+    match value.kind {
+        HirExprKind::Index { target, key } => HirExpr {
+            kind: HirExprKind::IndexTagged { target, key },
+            span: value.span,
+        },
+        _ => value,
     }
 }
 
@@ -71,6 +104,9 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
         // Phase 2.6c-isnil-query (ADR 0061): non-trapping nil
         // probe returns Bool.
         HirExprKind::IsNilQuery { .. } => ValueKind::Bool,
+        // Phase 2.6c-tag-locals (ADR 0063).
+        HirExprKind::IndexTagged { .. } => ValueKind::MaybeNilNumber,
+        HirExprKind::IsNilLocal { .. } => ValueKind::Bool,
         HirExprKind::Local(LocalId(idx)) => locals[*idx].kind,
         HirExprKind::UnaryOp { op, .. } => match op {
             crate::parser::UnaryOp::Neg => ValueKind::Number,
@@ -233,7 +269,7 @@ fn coerce_to_string(expr: HirExpr, kind: ValueKind, offset: usize) -> Result<Hir
             rhs_kind: kind.name().to_owned(),
             offset,
         }),
-        ValueKind::Number | ValueKind::Bool | ValueKind::Nil => {
+        ValueKind::Number | ValueKind::Bool | ValueKind::Nil | ValueKind::MaybeNilNumber => {
             let span = expr.span;
             Ok(HirExpr {
                 kind: HirExprKind::Call {
@@ -1012,6 +1048,12 @@ impl LowerCtx {
                 // (ptr alloca, body-guard guarantees a real value
                 // before load fires).
                 ValueKind::Function(_) | ValueKind::String | ValueKind::Table => None,
+                // Phase 2.6c-tag-locals (ADR 0063): MaybeNilNumber
+                // is only ever produced by `lower_stmt` rewriting a
+                // table read into `IndexTagged`; ret-value slots
+                // never carry it (function returns are still
+                // Number-only at this sub-phase).
+                ValueKind::MaybeNilNumber => None,
             };
             if let Some(kind) = init_value {
                 out.push(HirStmt {
@@ -1109,6 +1151,13 @@ impl LowerCtx {
         match &stmt.kind {
             StmtKind::Local { name, value } => {
                 let value = self.lower_expr(value)?;
+                // Phase 2.6c-tag-locals (ADR 0063): a plain table
+                // read in LocalInit position widens the local to
+                // MaybeNilNumber. Rewriting the value into
+                // `IndexTagged` lets `infer_kind` pick the wider
+                // kind and lets codegen take the non-trapping
+                // path inside `emit_stmt(LocalInit)`.
+                let value = widen_index_for_local_init(value);
                 let kind = infer_kind(&value, &self.locals, &self.functions);
                 // Phase 2.5b.2: when the rhs is a function reference
                 // (literal `function() end` or alias of a Function-kind
@@ -1515,6 +1564,11 @@ impl LowerCtx {
         value: HirExpr,
         span: Span,
     ) -> Result<HirStmt, HirError> {
+        // Phase 2.6c-tag-locals (ADR 0063): same Index→IndexTagged
+        // widening as in `Local { ... }` lowering, applied to the
+        // `Assign` path (and the auto-declare-at-top-level path
+        // routed through here per ADR 0048).
+        let value = widen_index_for_local_init(value);
         let value_kind = infer_kind(&value, &self.locals, &self.functions);
         let func_id = match &value.kind {
             HirExprKind::FunctionRef(fid) => Some(*fid),
@@ -1876,7 +1930,12 @@ impl LowerCtx {
                     | BinOp::BitXor
                     | BinOp::Shl
                     | BinOp::Shr => {
-                        if !(lk == ValueKind::Number && rk == ValueKind::Number) {
+                        // Phase 2.6c-tag-locals (ADR 0063):
+                        // MaybeNilNumber is interchangeable with
+                        // Number at the HIR layer. The Local
+                        // read site emits a tag check that traps
+                        // when the actual value is Nil.
+                        if !(is_number_compatible(lk) && is_number_compatible(rk)) {
                             return Err(HirError::TypeMismatch {
                                 op: binop_symbol(*op).to_owned(),
                                 lhs_kind: lk.name().to_owned(),
@@ -1895,7 +1954,7 @@ impl LowerCtx {
                     // from "Number only" to "Number-Number or
                     // String-String"; cross-kind still rejects.
                     BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                        let ok = (lk == ValueKind::Number && rk == ValueKind::Number)
+                        let ok = (is_number_compatible(lk) && is_number_compatible(rk))
                             || (lk == ValueKind::String && rk == ValueKind::String);
                         if !ok {
                             return Err(HirError::TypeMismatch {
@@ -1924,7 +1983,12 @@ impl LowerCtx {
                     // heterogeneous-kind rule would silently miscompile
                     // them to `Bool(false)`.
                     BinOp::Eq | BinOp::Ne => {
-                        let nil_query = match (&lhs_hir.kind, &rhs_hir.kind) {
+                        // Phase 2.6c-isnil-query (ADR 0061): Index == Nil.
+                        // Phase 2.6c-tag-locals (ADR 0063): also detect
+                        // `Local(MaybeNilNumber) == Nil`, which lowers
+                        // into `IsNilLocal { local_id }` and reads only
+                        // the slot's tag — never traps.
+                        let nil_query_index = match (&lhs_hir.kind, &rhs_hir.kind) {
                             (HirExprKind::Index { target, key }, HirExprKind::Nil) => {
                                 Some((target.clone(), key.clone()))
                             }
@@ -1933,9 +1997,28 @@ impl LowerCtx {
                             }
                             _ => None,
                         };
-                        if let Some((target, key)) = nil_query {
+                        let nil_query_local = match (&lhs_hir.kind, &rhs_hir.kind) {
+                            (HirExprKind::Local(LocalId(idx)), HirExprKind::Nil)
+                                if matches!(self.locals[*idx].kind, ValueKind::MaybeNilNumber) =>
+                            {
+                                Some(LocalId(*idx))
+                            }
+                            (HirExprKind::Nil, HirExprKind::Local(LocalId(idx)))
+                                if matches!(self.locals[*idx].kind, ValueKind::MaybeNilNumber) =>
+                            {
+                                Some(LocalId(*idx))
+                            }
+                            _ => None,
+                        };
+                        let query_kind: Option<HirExprKind> =
+                            if let Some((target, key)) = nil_query_index {
+                                Some(HirExprKind::IsNilQuery { target, key })
+                            } else {
+                                nil_query_local.map(|id| HirExprKind::IsNilLocal { local_id: id })
+                            };
+                        if let Some(qk) = query_kind {
                             let query = HirExpr {
-                                kind: HirExprKind::IsNilQuery { target, key },
+                                kind: qk,
                                 span: expr.span,
                             };
                             match op {

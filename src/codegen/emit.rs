@@ -383,6 +383,11 @@ fn collect_string_pool(chunk: &HirChunk) -> std::collections::HashMap<String, St
                 visit_expr(target, set);
                 visit_expr(key, set);
             }
+            HirExprKind::IndexTagged { target, key } => {
+                visit_expr(target, set);
+                visit_expr(key, set);
+            }
+            HirExprKind::IsNilLocal { .. } => {}
             _ => {}
         }
     }
@@ -664,6 +669,14 @@ fn param_mlir_type<'c>(context: &'c Context, kind: ValueKind, types: &Types<'c>)
         // Phase 2.6a-min (ADR 0053): a Table value is a `!llvm.ptr`
         // to a heap-allocated `[length: i64]`-prefixed region.
         ValueKind::Table => types.ptr,
+        // Phase 2.6c-tag-locals (ADR 0063): a MaybeNilNumber slot
+        // is a 16-byte tagged region. Function params and returns
+        // do not currently carry MaybeNilNumber (function-return
+        // widening is a follow-up sub-phase) — `unreachable!`
+        // guards against that until the next phase relaxes it.
+        ValueKind::MaybeNilNumber => {
+            unreachable!("MaybeNilNumber is not yet a function param/return kind")
+        }
     }
 }
 
@@ -686,6 +699,9 @@ fn ret_mlir_types<'c>(
                 FunctionType::new(context, &p_types, &[types.f64]).into()
             }
             ValueKind::String | ValueKind::Table => types.ptr,
+            ValueKind::MaybeNilNumber => {
+                unreachable!("MaybeNilNumber is not yet a function return kind")
+            }
         })
         .collect()
 }
@@ -819,6 +835,9 @@ fn emit_function<'c>(
             ValueKind::String | ValueKind::Table => {
                 emit_load(&block, slots[ret_value_idx], types.ptr, loc)
             }
+            ValueKind::MaybeNilNumber => {
+                unreachable!("MaybeNilNumber is not yet a function return kind")
+            }
         };
         ret_values.push(v);
     }
@@ -942,6 +961,76 @@ fn emit_stmt<'a, 'c>(
                         )?;
                         let ptr_val = emit_unrealized_cast(block, v, types.ptr, loc);
                         emit_store(block, ptr_val, slots[id.0], loc);
+                    }
+                }
+                ValueKind::MaybeNilNumber => {
+                    // Phase 2.6c-tag-locals (ADR 0063): the dst is
+                    // a 16-byte tagged slot. Source dispatch:
+                    //   - IndexTagged: non-trapping table read +
+                    //     tagged store (emit_local_init_tagged).
+                    //   - Local(MaybeNilNumber): copy the 16-byte
+                    //     slot verbatim (preserves Nil tag).
+                    //   - else (Number-kind expr): wrap in
+                    //     `{TAG_NUMBER, value}`.
+                    match &value.kind {
+                        HirExprKind::IndexTagged { target, key } => {
+                            emit_local_init_tagged(
+                                context,
+                                block,
+                                slots[id.0],
+                                target,
+                                key,
+                                slots,
+                                locals,
+                                functions,
+                                types,
+                                params_len,
+                                loc,
+                            )?;
+                        }
+                        HirExprKind::Local(LocalId(src_idx))
+                            if matches!(locals[*src_idx].kind, ValueKind::MaybeNilNumber) =>
+                        {
+                            let src_slot = slots[*src_idx];
+                            let dst_slot = slots[id.0];
+                            // tag (i64 at offset 0)
+                            let tag = emit_load(block, src_slot, types.i64, loc);
+                            emit_store(block, tag, dst_slot, loc);
+                            // payload (f64 at offset 8)
+                            let src_value_ptr = emit_byte_offset_ptr(
+                                context,
+                                block,
+                                src_slot,
+                                ARRAY_ELEM_OFF_VALUE,
+                                types,
+                                loc,
+                            );
+                            let dst_value_ptr = emit_byte_offset_ptr(
+                                context,
+                                block,
+                                dst_slot,
+                                ARRAY_ELEM_OFF_VALUE,
+                                types,
+                                loc,
+                            );
+                            let payload = emit_load(block, src_value_ptr, types.f64, loc);
+                            emit_store(block, payload, dst_value_ptr, loc);
+                        }
+                        _ => {
+                            let v = emit_expr(
+                                context, block, value, slots, locals, functions, types, params_len,
+                                loc,
+                            )?;
+                            // Wrap as a Number-tagged slot.
+                            emit_value_slot_store_number(
+                                context,
+                                block,
+                                slots[id.0],
+                                v,
+                                types,
+                                loc,
+                            );
+                        }
                     }
                 }
                 _ => {
@@ -1446,28 +1535,38 @@ fn emit_alloca_slot_for_kind<'a, 'c>(
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
-    let elem = match kind {
-        ValueKind::Number => types.f64,
+    // (elem_type, count) — most kinds are a single-element slot.
+    // Phase 2.6c-tag-locals (ADR 0063): MaybeNilNumber needs a
+    // 16-byte slot laid out as `{i64 tag, f64 value}`. Allocating
+    // 2 × i64 gives the required size and 8-byte alignment so the
+    // f64 store/load at offset 8 is naturally aligned.
+    let (elem, count) = match kind {
+        ValueKind::Number => (types.f64, 1i32),
         // Bool: 1-bit. Nil: nominally 1-bit too — the value is never
         // observed (heterogeneous `==` and print(nil) both bypass
         // the slot via static dispatch), but storage is uniform.
-        ValueKind::Bool | ValueKind::Nil => types.i1,
+        ValueKind::Bool | ValueKind::Nil => (types.i1, 1),
         // Phase 2.7a (ADR 0024): a String slot stores a `ptr` to a
         // static C-string global.
-        ValueKind::String => types.ptr,
+        ValueKind::String => (types.ptr, 1),
         // Phase 2.5b.3 (ADR 0019): Function values stored as opaque
         // pointers — `!func.func<...>` values are bridged via
         // `unrealized_conversion_cast` at store/load.
-        ValueKind::Function(_) => types.ptr,
+        ValueKind::Function(_) => (types.ptr, 1),
         // Phase 2.6a-min (ADR 0053): Table slot stores a heap ptr.
-        ValueKind::Table => types.ptr,
+        ValueKind::Table => (types.ptr, 1),
+        ValueKind::MaybeNilNumber => (types.i64, 2),
     };
 
-    let one = arith::constant(context, IntegerAttribute::new(types.i32, 1).into(), loc);
-    let one_val: Value<'c, 'a> = block.append_operation(one).result(0).unwrap().into();
+    let count_op = arith::constant(
+        context,
+        IntegerAttribute::new(types.i32, count as i64).into(),
+        loc,
+    );
+    let count_val: Value<'c, 'a> = block.append_operation(count_op).result(0).unwrap().into();
 
     let alloca = OperationBuilder::new("llvm.alloca", loc)
-        .add_operands(&[one_val])
+        .add_operands(&[count_val])
         .add_attributes(&[(
             Identifier::new(context, "elem_type"),
             TypeAttribute::new(elem).into(),
@@ -1685,6 +1784,285 @@ fn emit_value_slot_check_number<'a, 'c>(
     else_blk.append_operation(scf::r#yield(&[], loc));
     else_region.append_block(else_blk);
     block.append_operation(scf::r#if(mismatch, &[], then_region, else_region, loc));
+}
+
+/// Phase 2.6c-tag-locals (ADR 0063): non-trapping `IndexTagged`
+/// read that writes the resulting `{tag, value}` directly to a
+/// `MaybeNilNumber` local slot. Mirror of the `IsNilQuery`
+/// codegen — same bounds / probe / null-buf shape — but instead
+/// of yielding an i1 we write either `{TAG_NIL, 0.0}` or
+/// `{TAG_NUMBER, value}` to `dst_slot`.
+#[allow(clippy::too_many_arguments)]
+fn emit_local_init_tagged<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    dst_slot: Value<'c, 'a>,
+    target: &HirExpr,
+    key: &HirExpr,
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    let target_ptr = emit_expr(
+        context, block, target, slots, locals, functions, types, params_len, loc,
+    )?;
+    let key_kind = infer_kind(key, locals, functions);
+    match key_kind {
+        ValueKind::Number => {
+            let key_f = emit_expr(
+                context, block, key, slots, locals, functions, types, params_len, loc,
+            )?;
+            let key_i = emit_f2i(block, key_f, types, loc);
+            let length_i = emit_load(block, target_ptr, types.i64, loc);
+            let one = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let too_small: Value<'c, 'a> = block
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Slt,
+                    key_i,
+                    one,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let too_big: Value<'c, 'a> = block
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Sgt,
+                    key_i,
+                    length_i,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let oob: Value<'c, 'a> = block
+                .append_operation(arith::ori(too_small, too_big, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let then_region = Region::new();
+            let then_blk = Block::new(&[]);
+            emit_value_slot_store_nil(context, &then_blk, dst_slot, types, loc);
+            then_blk.append_operation(scf::r#yield(&[], loc));
+            then_region.append_block(then_blk);
+            let else_region = Region::new();
+            let else_blk = Block::new(&[]);
+            {
+                let array_buf = emit_table_array_buf(context, &else_blk, target_ptr, types, loc);
+                let elem_ptr =
+                    emit_array_elem_ptr(context, &else_blk, array_buf, key_i, types, loc);
+                // Copy the 16-byte tagged slot verbatim — the
+                // source already lives as `{tag, value}` (ADR
+                // 0059), and Nil-tagged source maps to Nil-
+                // tagged local slot directly.
+                let tag = emit_load(&else_blk, elem_ptr, types.i64, loc);
+                emit_store(&else_blk, tag, dst_slot, loc);
+                let src_value_ptr = emit_byte_offset_ptr(
+                    context,
+                    &else_blk,
+                    elem_ptr,
+                    ARRAY_ELEM_OFF_VALUE,
+                    types,
+                    loc,
+                );
+                let dst_value_ptr = emit_byte_offset_ptr(
+                    context,
+                    &else_blk,
+                    dst_slot,
+                    ARRAY_ELEM_OFF_VALUE,
+                    types,
+                    loc,
+                );
+                let payload = emit_load(&else_blk, src_value_ptr, types.f64, loc);
+                emit_store(&else_blk, payload, dst_value_ptr, loc);
+                else_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            else_region.append_block(else_blk);
+            block.append_operation(scf::r#if(oob, &[], then_region, else_region, loc));
+        }
+        ValueKind::String => {
+            let key_str = emit_expr(
+                context, block, key, slots, locals, functions, types, params_len, loc,
+            )?;
+            let hash_buf_slot =
+                emit_byte_offset_ptr(context, block, target_ptr, TABLE_OFF_HASH_BUF, types, loc);
+            let hash_buf = emit_load(block, hash_buf_slot, types.ptr, loc);
+            let hash_buf_i: Value<'c, 'a> = block
+                .append_operation(
+                    OperationBuilder::new("llvm.ptrtoint", loc)
+                        .add_operands(&[hash_buf])
+                        .add_results(&[types.i64])
+                        .build()
+                        .expect("llvm.ptrtoint"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let zero_i64 = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 0).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let hash_buf_null: Value<'c, 'a> = block
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    hash_buf_i,
+                    zero_i64,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let then_region = Region::new();
+            let then_blk = Block::new(&[]);
+            emit_value_slot_store_nil(context, &then_blk, dst_slot, types, loc);
+            then_blk.append_operation(scf::r#yield(&[], loc));
+            then_region.append_block(then_blk);
+            let else_region = Region::new();
+            let else_blk = Block::new(&[]);
+            {
+                let cap_slot =
+                    emit_byte_offset_ptr(context, &else_blk, hash_buf, HASH_OFF_CAP, types, loc);
+                let cap = emit_load(&else_blk, cap_slot, types.i64, loc);
+                let bucket = emit_hash_probe_for_insert(
+                    context, &else_blk, hash_buf, cap, key_str, types, loc,
+                );
+                let entry_size = else_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let bucket_off: Value<'c, '_> = else_blk
+                    .append_operation(arith::muli(bucket, entry_size, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let entries_base = else_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let entry_total_off: Value<'c, '_> = else_blk
+                    .append_operation(arith::addi(bucket_off, entries_base, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let entry_ptr = emit_byte_offset_ptr_dynamic(
+                    context,
+                    &else_blk,
+                    hash_buf,
+                    entry_total_off,
+                    types,
+                    loc,
+                );
+                let key_at = emit_load(&else_blk, entry_ptr, types.ptr, loc);
+                let key_at_i: Value<'c, '_> = else_blk
+                    .append_operation(
+                        OperationBuilder::new("llvm.ptrtoint", loc)
+                            .add_operands(&[key_at])
+                            .add_results(&[types.i64])
+                            .build()
+                            .expect("llvm.ptrtoint"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let zero_inner = else_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let key_at_null: Value<'c, '_> = else_blk
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Eq,
+                        key_at_i,
+                        zero_inner,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                // Inner scf.if: missing key → store Nil; else
+                // copy the 16-byte tagged value slot.
+                let inner_then = Region::new();
+                let inner_then_blk = Block::new(&[]);
+                emit_value_slot_store_nil(context, &inner_then_blk, dst_slot, types, loc);
+                inner_then_blk.append_operation(scf::r#yield(&[], loc));
+                inner_then.append_block(inner_then_blk);
+                let inner_else = Region::new();
+                let inner_else_blk = Block::new(&[]);
+                {
+                    let value_slot_ptr = emit_byte_offset_ptr(
+                        context,
+                        &inner_else_blk,
+                        entry_ptr,
+                        HASH_ENTRY_OFF_VALUE_SLOT,
+                        types,
+                        loc,
+                    );
+                    let tag = emit_load(&inner_else_blk, value_slot_ptr, types.i64, loc);
+                    emit_store(&inner_else_blk, tag, dst_slot, loc);
+                    let src_value_ptr = emit_byte_offset_ptr(
+                        context,
+                        &inner_else_blk,
+                        value_slot_ptr,
+                        ARRAY_ELEM_OFF_VALUE,
+                        types,
+                        loc,
+                    );
+                    let dst_value_ptr = emit_byte_offset_ptr(
+                        context,
+                        &inner_else_blk,
+                        dst_slot,
+                        ARRAY_ELEM_OFF_VALUE,
+                        types,
+                        loc,
+                    );
+                    let payload = emit_load(&inner_else_blk, src_value_ptr, types.f64, loc);
+                    emit_store(&inner_else_blk, payload, dst_value_ptr, loc);
+                    inner_else_blk.append_operation(scf::r#yield(&[], loc));
+                }
+                inner_else.append_block(inner_else_blk);
+                else_blk.append_operation(scf::r#if(key_at_null, &[], inner_then, inner_else, loc));
+                else_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            else_region.append_block(else_blk);
+            block.append_operation(scf::r#if(hash_buf_null, &[], then_region, else_region, loc));
+        }
+        _ => unreachable!("IndexTagged key must be Number or String"),
+    }
+    Ok(())
 }
 
 /// Phase 2.6c-tag-arr (ADR 0059): fill slots `[from_idx, to_idx)`
@@ -3653,6 +4031,23 @@ fn emit_expr<'a, 'c>(
                 }
                 ValueKind::String => Ok(emit_load(block, slots[*idx], types.ptr, loc)),
                 ValueKind::Table => Ok(emit_load(block, slots[*idx], types.ptr, loc)),
+                ValueKind::MaybeNilNumber => {
+                    // Phase 2.6c-tag-locals (ADR 0063): tag-checked
+                    // extract. Nil-tagged → trap. Number-tagged →
+                    // load f64 at offset +8. Mirrors the array
+                    // element read in ADR 0059.
+                    let slot_ptr = slots[*idx];
+                    emit_value_slot_check_number(context, block, slot_ptr, types, loc);
+                    let value_ptr = emit_byte_offset_ptr(
+                        context,
+                        block,
+                        slot_ptr,
+                        ARRAY_ELEM_OFF_VALUE,
+                        types,
+                        loc,
+                    );
+                    Ok(emit_load(block, value_ptr, types.f64, loc))
+                }
                 ValueKind::Function(arity) => {
                     // Three buckets (Phase 2.5b.3, ADR 0019):
                     //   - Function param: slots[idx] is the block arg.
@@ -3871,6 +4266,14 @@ fn emit_expr<'a, 'c>(
                     ValueKind::Nil => "s_typename_nil",
                     ValueKind::Function(_) => "s_typename_function",
                     ValueKind::Table => "s_typename_table",
+                    // Phase 2.6c-tag-locals (ADR 0063): static
+                    // dispatch picks the inner kind's name. A
+                    // runtime nil-tagged read of `type(x)` will
+                    // mis-report "number" instead of "nil"; that
+                    // is logged as a follow-up LIC since the
+                    // widening tests in this sub-phase do not
+                    // exercise it.
+                    ValueKind::MaybeNilNumber => "s_typename_number",
                 };
                 Ok(emit_addressof(context, block, global, types, loc))
             }
@@ -3960,6 +4363,39 @@ fn emit_expr<'a, 'c>(
                 loc,
             );
             Ok(block.append_operation(constant).result(0).unwrap().into())
+        }
+        // Phase 2.6c-tag-locals (ADR 0063): IndexTagged is consumed
+        // inline by `emit_local_init_tagged` inside `emit_stmt` —
+        // it never surfaces in value-context emit.
+        HirExprKind::IndexTagged { .. } => {
+            unreachable!("IndexTagged is consumed by emit_stmt(LocalInit/Assign)")
+        }
+        // Phase 2.6c-tag-locals (ADR 0063): non-trapping nil probe
+        // on a MaybeNilNumber local — read the tag at slot+0 and
+        // compare against TAG_NIL. Returns i1.
+        HirExprKind::IsNilLocal { local_id } => {
+            let slot_ptr = slots[local_id.0];
+            let tag = emit_load(block, slot_ptr, types.i64, loc);
+            let tag_nil = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            Ok(block
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    tag,
+                    tag_nil,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into())
         }
     }
 }
@@ -4346,6 +4782,12 @@ fn emit_tostring<'a, 'c>(
             "Table-kind tostring is rejected at HIR-time \
              (FunctionUsedAsValue analogue) — should not reach codegen"
         ),
+        // Phase 2.6c-tag-locals (ADR 0063): the upstream Local
+        // read already extracted f64 (trapping on Nil) before
+        // tostring sees the value, so dispatch as Number.
+        ValueKind::MaybeNilNumber => {
+            emit_tostring(context, block, value, ValueKind::Number, types, loc)
+        }
     }
 }
 
@@ -4463,6 +4905,9 @@ fn emit_tonumber<'a, 'c>(
                  (TypeMismatch / FunctionUsedAsValue) — should not reach codegen"
             )
         }
+        // Phase 2.6c-tag-locals (ADR 0063): Local read produced f64
+        // (trapping on Nil) before tonumber sees it.
+        ValueKind::MaybeNilNumber => value,
     }
 }
 
@@ -4725,6 +5170,13 @@ fn emit_print_value_raw<'a, 'c>(
             "Function/Table args are rejected at HIR-time \
              (FunctionUsedAsValue) — should not reach codegen"
         ),
+        // Phase 2.6c-tag-locals (ADR 0063): the upstream Local
+        // read already produced the f64 (trapping on Nil). Print
+        // it as Number.
+        ValueKind::MaybeNilNumber => {
+            let fmt_ptr = emit_addressof(context, block, "fmt_raw", types, loc);
+            emit_printf(context, block, fmt_ptr, value, types, loc);
+        }
     }
 }
 
@@ -4939,6 +5391,16 @@ fn emit_truthiness<'a, 'c>(
             "Function-kind values do not flow through truthiness \
              (HIR rejects them at use sites) — ADR 0017"
         ),
+        // Phase 2.6c-tag-locals (ADR 0063): Local read produced
+        // f64 (trapping on Nil). Truthy by Number rule.
+        ValueKind::MaybeNilNumber => {
+            let attr = IntegerAttribute::new(types.i1, 1);
+            block
+                .append_operation(arith::constant(context, attr.into(), loc))
+                .result(0)
+                .unwrap()
+                .into()
+        }
     }
 }
 
@@ -4950,6 +5412,10 @@ fn kind_to_mlir_type<'c>(kind: ValueKind, types: &Types<'c>) -> Type<'c> {
         ValueKind::Number => types.f64,
         ValueKind::Bool | ValueKind::Nil | ValueKind::Function(_) => types.i1,
         ValueKind::String | ValueKind::Table => types.ptr,
+        // Phase 2.6c-tag-locals (ADR 0063): the slot is 16 bytes
+        // but the *yielded* value once extracted is f64 (Local
+        // read traps on Nil and unwraps the tagged payload).
+        ValueKind::MaybeNilNumber => types.f64,
     }
 }
 
