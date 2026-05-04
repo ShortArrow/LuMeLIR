@@ -76,7 +76,8 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.6a-norm stable table header (Tidy First) | **Done** | 32-byte header + separate array_buf; frozen offsets at 0 (length) / 16 (array_buf); alias-safe under grow (ADR 0056) |
 | ‣ 2.6a-grow array push `t[#t+1] = v` | **Done** | doubling capacity + realloc inside stable header; alias-safe under grow; LIC-2.6a-wr-2 resolved (ADR 0057) |
 | ‣ 2.6b-hash string-keyed `t.k` / `t["k"]` | **Done** | open addressing + linear probing on `hash_buf`; FNV-1a hash; doubling rehash; sugar parser-level (ADR 0058) |
-| ‣ 2.6+ tables / metatables | In progress | methods, metatables, tagged values, deletion — multiple sub-phases |
+| ‣ 2.6c-tag-arr tagged array slots + holes | **Done** | 16-byte `{tag, value}` slots; `t[#t+2]=v` hole creation with Nil-tagged gap fill; LIC-2.6a-wr-1 resolved (ADR 0059) |
+| ‣ 2.6+ tables / metatables | In progress | hash tagging, hetero values, methods, metatables, deletion — multiple sub-phases |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |
 
 **How to read TBD markers:** sections marked `TBD: Phase N, ADR XXXX` indicate the rule is undecided until that ADR lands. Do not invent answers — surface the question instead.

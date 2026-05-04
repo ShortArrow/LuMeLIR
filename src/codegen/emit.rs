@@ -94,6 +94,24 @@ const HASH_ENTRY_OFF_KEY: i64 = 0;
 const HASH_ENTRY_OFF_VALUE: i64 = 8;
 const HASH_INITIAL_CAP: i64 = 8;
 
+// =============================================================
+// Phase 2.6c-tag-arr (ADR 0059): tagged array_buf slots.
+//
+// Each array element is a 16-byte slot:
+//   offset 0  : i64 tag    (TAG_NIL=0, TAG_NUMBER=1; 2..=5 reserved)
+//   offset 8  : f64 value  (zero when tag is Nil)
+//
+// Holes (`t[i] = v` for `i > length+1`) fill intermediate slots
+// with TAG_NIL; reads check the tag and trap on mismatch.
+// =============================================================
+const ARRAY_ELEM_SIZE: i64 = 16;
+// `ARRAY_ELEM_OFF_TAG = 0`: tag at slot start. Implicit in the
+// `emit_load(elem_ptr, types.i64, …)` calls; not referenced by
+// name to avoid an unused-const warning.
+const ARRAY_ELEM_OFF_VALUE: i64 = 8;
+const TAG_NIL: i64 = 0;
+const TAG_NUMBER: i64 = 1;
+
 struct Types<'c> {
     i1: Type<'c>,
     /// Phase 2.6a-arr (ADR 0054): i8 used as the GEP element type
@@ -259,6 +277,17 @@ fn emit_fmt_global<'c>(
         i8_type,
         "s_table_missing_key",
         "table missing key\0",
+        loc,
+    );
+    // Phase 2.6c-tag-arr (ADR 0059): tag-mismatch diagnostic
+    // when reading a slot whose tag differs from the expected
+    // kind (currently always Number on the read API surface).
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_table_type_mismatch",
+        "table value type mismatch\0",
         loc,
     );
 }
@@ -991,12 +1020,17 @@ fn emit_stmt<'a, 'c>(
             )?;
             match key_kind {
                 ValueKind::Number => {
+                    // Phase 2.6c-tag-arr (ADR 0059): hole-write
+                    // enabled. Bound check is now `key >= 1`
+                    // only; grow handles capacity, gap-fill marks
+                    // intermediate slots as Nil-tagged.
                     let key_f = emit_expr(
                         context, block, key, slots, locals, functions, types, params_len, loc,
                     )?;
                     let key_i = emit_f2i(block, key_f, types, loc);
                     let length_i = emit_load(block, target_ptr, types.i64, loc);
-                    // Write bounds: upper = length + 1 (allow one-past-end).
+                    // Lower bound: key >= 1 (else trap; same
+                    // diagnostic as before via s_table_oob).
                     let one = block
                         .append_operation(arith::constant(
                             context,
@@ -1006,15 +1040,57 @@ fn emit_stmt<'a, 'c>(
                         .result(0)
                         .unwrap()
                         .into();
-                    let len_plus_one: Value<'c, 'a> = block
+                    let too_small: Value<'c, 'a> = block
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Slt,
+                            key_i,
+                            one,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let lower_then = Region::new();
+                    let lower_then_blk = Block::new(&[]);
+                    {
+                        let msg =
+                            emit_addressof(context, &lower_then_blk, "s_table_oob", types, loc);
+                        emit_exit_with_message(context, &lower_then_blk, msg, types, loc);
+                        lower_then_blk.append_operation(scf::r#yield(&[], loc));
+                    }
+                    lower_then.append_block(lower_then_blk);
+                    let lower_else = Region::new();
+                    let lower_else_blk = Block::new(&[]);
+                    lower_else_blk.append_operation(scf::r#yield(&[], loc));
+                    lower_else.append_block(lower_else_blk);
+                    block.append_operation(scf::r#if(too_small, &[], lower_then, lower_else, loc));
+                    // Grow array_buf to cover key (uses cap*16
+                    // sizing internally — 2.6a-grow updated below).
+                    emit_table_grow_if_needed(
+                        context, block, target_ptr, key_i, length_i, types, loc,
+                    );
+                    // Gap fill: emit_array_fill_nil iterates
+                    // `[length+1, key)` (1-based, half-open) marking
+                    // each slot Nil-tagged. No-op when key ≤ length+1
+                    // (the runtime cmpi inside its loop is the
+                    // base-case guard).
+                    let array_buf = emit_table_array_buf(context, block, target_ptr, types, loc);
+                    let length_plus_one: Value<'c, 'a> = block
                         .append_operation(arith::addi(length_i, one, loc))
                         .result(0)
                         .unwrap()
                         .into();
-                    emit_table_bounds_check(context, block, key_i, len_plus_one, types, loc);
-                    emit_table_grow_if_needed(
-                        context, block, target_ptr, key_i, length_i, types, loc,
+                    emit_array_fill_nil(
+                        context,
+                        block,
+                        array_buf,
+                        length_plus_one,
+                        key_i,
+                        types,
+                        loc,
                     );
+                    // Length update: if key > length, length = key.
                     let push_grew_len: Value<'c, 'a> = block
                         .append_operation(arith::cmpi(
                             context,
@@ -1052,35 +1128,10 @@ fn emit_stmt<'a, 'c>(
                         len_else_region,
                         loc,
                     ));
-                    let array_buf = emit_table_array_buf(context, block, target_ptr, types, loc);
-                    let zero_idx: Value<'c, 'a> = block
-                        .append_operation(arith::subi(key_i, one, loc))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let eight = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(types.i64, 8).into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let body_offset: Value<'c, 'a> = block
-                        .append_operation(arith::muli(zero_idx, eight, loc))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let elem_ptr = emit_byte_offset_ptr_dynamic(
-                        context,
-                        block,
-                        array_buf,
-                        body_offset,
-                        types,
-                        loc,
-                    );
-                    emit_store(block, value_v, elem_ptr, loc);
+                    // Final tagged-Number store at slot[key].
+                    let elem_ptr =
+                        emit_array_elem_ptr(context, block, array_buf, key_i, types, loc);
+                    emit_array_elem_store_number(context, block, elem_ptr, value_v, types, loc);
                 }
                 ValueKind::String => {
                     // Phase 2.6b-hash (ADR 0058): hash insert.
@@ -1393,6 +1444,207 @@ fn emit_table_array_buf<'a, 'c>(
     emit_load(block, slot, types.ptr, loc)
 }
 
+/// Phase 2.6c-tag-arr (ADR 0059): compute the byte address of the
+/// 16-byte slot at 1-based `key_i` inside `array_buf`. The slot
+/// holds `{i64 tag, f64 value}`; callers add `+0` for tag and
+/// `+8` for value via the offset constants.
+fn emit_array_elem_ptr<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    array_buf: Value<'c, 'a>,
+    key_i: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let one = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_idx: Value<'c, 'a> = block
+        .append_operation(arith::subi(key_i, one, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let elem_size = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, ARRAY_ELEM_SIZE).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let offset: Value<'c, 'a> = block
+        .append_operation(arith::muli(zero_idx, elem_size, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_byte_offset_ptr_dynamic(context, block, array_buf, offset, types, loc)
+}
+
+/// Phase 2.6c-tag-arr (ADR 0059): write `{tag=Number, value}` to a
+/// 16-byte tagged slot.
+fn emit_array_elem_store_number<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    elem_ptr: Value<'c, 'a>,
+    value: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let tag_const = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, TAG_NUMBER).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    // tag at offset 0 = elem_ptr itself
+    emit_store(block, tag_const, elem_ptr, loc);
+    let value_slot =
+        emit_byte_offset_ptr(context, block, elem_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
+    emit_store(block, value, value_slot, loc);
+}
+
+/// Phase 2.6c-tag-arr (ADR 0059): load the tag at offset 0 of an
+/// element slot and trap if it isn't `TAG_NUMBER`. After this
+/// returns, the caller can safely load the f64 value at offset 8.
+fn emit_array_elem_check_number<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    elem_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let tag = emit_load(block, elem_ptr, types.i64, loc);
+    let expected = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, TAG_NUMBER).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mismatch: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Ne,
+            tag,
+            expected,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    let msg_ptr = emit_addressof(context, &then_blk, "s_table_type_mismatch", types, loc);
+    emit_exit_with_message(context, &then_blk, msg_ptr, types, loc);
+    then_blk.append_operation(scf::r#yield(&[], loc));
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(mismatch, &[], then_region, else_region, loc));
+}
+
+/// Phase 2.6c-tag-arr (ADR 0059): fill slots `[from_idx, to_idx)`
+/// (1-based, half-open) with TAG_NIL. Used by hole-write to make
+/// gap slots deterministically Nil rather than UB. No-op when
+/// `from_idx >= to_idx` (covered by the runtime cmpi inside the
+/// while loop).
+fn emit_array_fill_nil<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    array_buf: Value<'c, 'a>,
+    from_idx: Value<'c, 'a>,
+    to_idx: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let before_region = Region::new();
+    let before_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let i_arg: Value<'c, '_> = before_blk.argument(0).unwrap().into();
+        let cond: Value<'c, '_> = before_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Slt,
+                i_arg,
+                to_idx,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        before_blk.append_operation(scf::condition(cond, &[i_arg], loc));
+    }
+    before_region.append_block(before_blk);
+    let after_region = Region::new();
+    let after_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let i_arg: Value<'c, '_> = after_blk.argument(0).unwrap().into();
+        let elem_ptr = emit_array_elem_ptr(context, &after_blk, array_buf, i_arg, types, loc);
+        let nil_tag = after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        // tag at offset 0
+        emit_store(&after_blk, nil_tag, elem_ptr, loc);
+        // value: zero (irrelevant for Nil but deterministic)
+        let zero_f = after_blk
+            .append_operation(arith::constant(
+                context,
+                FloatAttribute::new(context, types.f64, 0.0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let value_slot = emit_byte_offset_ptr(
+            context,
+            &after_blk,
+            elem_ptr,
+            ARRAY_ELEM_OFF_VALUE,
+            types,
+            loc,
+        );
+        emit_store(&after_blk, zero_f, value_slot, loc);
+        let one = after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let next: Value<'c, '_> = after_blk
+            .append_operation(arith::addi(i_arg, one, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        after_blk.append_operation(scf::r#yield(&[next], loc));
+    }
+    after_region.append_block(after_blk);
+    let while_op = scf::r#while(&[from_idx], &[types.i64], before_region, after_region, loc);
+    block.append_operation(while_op);
+}
+
 /// Phase 2.6a-grow (ADR 0057): if `key_i > capacity`, allocate a
 /// new array_buf with `max(cap*2, key_i)` slots, memcpy the
 /// existing `length_i` elements (only when cap > 0; gates against
@@ -1446,17 +1698,19 @@ fn emit_table_grow_if_needed<'a, 'c>(
             .result(0)
             .unwrap()
             .into();
-        let eight = then_blk
+        // Phase 2.6c-tag-arr (ADR 0059): each slot is now 16
+        // bytes (`{i64 tag, f64 value}`).
+        let elem_size = then_blk
             .append_operation(arith::constant(
                 context,
-                IntegerAttribute::new(types.i64, 8).into(),
+                IntegerAttribute::new(types.i64, ARRAY_ELEM_SIZE).into(),
                 loc,
             ))
             .result(0)
             .unwrap()
             .into();
         let new_size: Value<'c, '_> = then_blk
-            .append_operation(arith::muli(new_cap, eight, loc))
+            .append_operation(arith::muli(new_cap, elem_size, loc))
             .result(0)
             .unwrap()
             .into();
@@ -1495,8 +1749,19 @@ fn emit_table_grow_if_needed<'a, 'c>(
                 loc,
             );
             let old_buf = emit_load(&copy_blk, array_buf_slot, types.ptr, loc);
+            // Phase 2.6c-tag-arr (ADR 0059): copy 16 bytes per
+            // existing slot (was 8 bytes pre-tagging).
+            let elem_size_inner = copy_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, ARRAY_ELEM_SIZE).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
             let copy_size: Value<'c, '_> = copy_blk
-                .append_operation(arith::muli(length_i, eight, loc))
+                .append_operation(arith::muli(length_i, elem_size_inner, loc))
                 .result(0)
                 .unwrap()
                 .into();
@@ -2816,14 +3081,16 @@ fn emit_expr<'a, 'c>(
             let cap_slot =
                 emit_byte_offset_ptr(context, block, header_ptr, TABLE_OFF_CAP, types, loc);
             emit_store(block, len_const, cap_slot, loc);
-            // Step 2: array_buf malloc (or null for empty).
+            // Step 2: array_buf malloc (or null for empty). Each
+            // element is now a 16-byte tagged slot (ADR 0059).
             let array_buf: Value<'c, '_> = if elem_count == 0 {
                 emit_null_ptr(context, block, types, loc)
             } else {
                 let buf_bytes = block
                     .append_operation(arith::constant(
                         context,
-                        IntegerAttribute::new(types.i64, (elem_count as i64) * 8).into(),
+                        IntegerAttribute::new(types.i64, (elem_count as i64) * ARRAY_ELEM_SIZE)
+                            .into(),
                         loc,
                     ))
                     .result(0)
@@ -2839,15 +3106,17 @@ fn emit_expr<'a, 'c>(
             let hash_buf_slot =
                 emit_byte_offset_ptr(context, block, header_ptr, TABLE_OFF_HASH_BUF, types, loc);
             emit_store(block, null_hash, hash_buf_slot, loc);
-            // Step 4: store each element at array_buf + i*8.
+            // Step 4: store each element as a tagged Number slot
+            // at offset `i * ARRAY_ELEM_SIZE`. Phase 2.6c-tag-arr
+            // keeps construction Number-only — hetero defers.
             for (i, elem) in elems.iter().enumerate() {
                 let v = emit_expr(
                     context, block, elem, slots, locals, functions, types, params_len, loc,
                 )?;
-                let offset_bytes = (i as i64) * 8;
+                let offset_bytes = (i as i64) * ARRAY_ELEM_SIZE;
                 let elem_ptr =
                     emit_byte_offset_ptr(context, block, array_buf, offset_bytes, types, loc);
-                emit_store(block, v, elem_ptr, loc);
+                emit_array_elem_store_number(context, block, elem_ptr, v, types, loc);
             }
             Ok(header_ptr)
         }
@@ -2863,6 +3132,10 @@ fn emit_expr<'a, 'c>(
             let key_kind = infer_kind(key, locals, functions);
             match key_kind {
                 ValueKind::Number => {
+                    // Phase 2.6c-tag-arr (ADR 0059): each slot is
+                    // a tagged 16-byte struct. Bounds-check, then
+                    // load tag and trap on non-Number, then load
+                    // the f64 value at offset 8.
                     let key_f = emit_expr(
                         context, block, key, slots, locals, functions, types, params_len, loc,
                     )?;
@@ -2870,43 +3143,18 @@ fn emit_expr<'a, 'c>(
                     let length_i = emit_load(block, target_ptr, types.i64, loc);
                     emit_table_bounds_check(context, block, key_i, length_i, types, loc);
                     let array_buf = emit_table_array_buf(context, block, target_ptr, types, loc);
-                    let one = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(types.i64, 1).into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let zero_idx: Value<'c, 'a> = block
-                        .append_operation(arith::subi(key_i, one, loc))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let eight = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(types.i64, 8).into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let body_offset: Value<'c, 'a> = block
-                        .append_operation(arith::muli(zero_idx, eight, loc))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let elem_ptr = emit_byte_offset_ptr_dynamic(
+                    let elem_ptr =
+                        emit_array_elem_ptr(context, block, array_buf, key_i, types, loc);
+                    emit_array_elem_check_number(context, block, elem_ptr, types, loc);
+                    let value_slot = emit_byte_offset_ptr(
                         context,
                         block,
-                        array_buf,
-                        body_offset,
+                        elem_ptr,
+                        ARRAY_ELEM_OFF_VALUE,
                         types,
                         loc,
                     );
-                    Ok(emit_load(block, elem_ptr, types.f64, loc))
+                    Ok(emit_load(block, value_slot, types.f64, loc))
                 }
                 ValueKind::String => {
                     // Phase 2.6b-hash (ADR 0058): hash-keyed lookup.

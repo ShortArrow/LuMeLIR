@@ -49,24 +49,19 @@ print(t[2])";
 }
 
 #[test]
-fn out_of_bounds_write_traps() {
-    // OOB write traps via the same mechanism as 2.6a-arr's read.
-    // Lua spec: silently grow / create a hole. Our static type
-    // system can't represent that yet — security over Lua
-    // compatibility per ADR 0054's policy.
+fn out_of_bounds_write_now_creates_hole_after_2_6c_tag_arr() {
+    // Phase 2.6c-tag-arr (ADR 0059) lifted the upper-bound trap.
+    // `t[5] = 99` on a length-3 table now creates Nil-tagged
+    // holes at indices 4 and 5-1=4 (i.e. just slot 4), then sets
+    // t[5] and extends length to 5. The lower-bound (`key < 1`)
+    // trap is unchanged — see `zero_index_write_traps` below.
     let src = "local t = {1, 2, 3}
-t[5] = 99";
+t[5] = 99
+print(t[5])
+print(#t)";
     let out = compile_and_run(src, "lumelir_26a_wr_oob");
-    assert!(!out.status.success(), "OOB write must trap");
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    assert!(
-        combined.contains("table index out of bounds") || combined.contains("out of bounds"),
-        "expected OOB diagnostic, got: {combined}"
-    );
+    assert!(out.status.success(), "hole creation must succeed");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).into_owned(), "99\n5\n",);
 }
 
 #[test]

@@ -110,14 +110,20 @@ print(#b)";
 }
 
 #[test]
-fn hole_creation_still_traps() {
-    // `t[5] = 99` on a length-2 table tries to skip indices 3 and
-    // 4. Lua spec creates a hole; we still trap (LIC-2.6a-wr-1
-    // unchanged).
+fn hole_creation_now_works_after_2_6c_tag_arr() {
+    // Phase 2.6c-tag-arr (ADR 0059) resolved LIC-2.6a-wr-1.
+    // `t[5] = 99` on a length-2 table now fills indices 3 and 4
+    // with Nil-tagged slots and extends length to 5. Reading the
+    // hole indices still traps (tag mismatch). Coverage of the
+    // hole-write path itself lives in
+    // `tests/phase2_6c_tag_arr_holes.rs`.
     let src = "local t = {1, 2}
-t[5] = 99";
+t[5] = 99
+print(t[5])
+print(#t)";
     let out = compile_and_run(src, "lumelir_26a_grow_hole");
-    assert!(!out.status.success(), "hole creation must still trap");
+    assert!(out.status.success(), "hole creation must succeed now");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).into_owned(), "99\n5\n",);
 }
 
 #[test]
