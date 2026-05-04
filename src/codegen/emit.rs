@@ -2145,264 +2145,33 @@ fn emit_hash_ensure_buf<'a, 'c>(
     block.append_operation(scf::r#if(is_null, &[], then_region, else_region, loc));
 }
 
-/// Phase 2.6b-hash (ADR 0058): probe `hash_buf` for the bucket
-/// matching `key_str`. Returns the i64 bucket index on success
-/// or traps with `s_table_missing_key` if the probe walks into
-/// an empty bucket (= key not present).
+/// Phase 2.6c-tag-hash-tidy (Tidy First): the unified scf.while
+/// skeleton shared by `emit_hash_probe_lookup` and
+/// `emit_hash_probe_for_insert`. Walks `hash_buf` from
+/// `hash(key_str) & mask` forward, skipping deleted-tombstone
+/// buckets (`HASH_DELETED_KEY`), until a stop condition fires.
 ///
-/// Caller must guarantee the buffer is non-null; for lookup that
-/// means `header.hash_buf != null` (else trap before calling).
-fn emit_hash_probe_lookup<'a, 'c>(
+/// `trap_on_null = true` (lookup):
+///   - empty bucket (key == null) traps with `s_table_missing_key`
+///   - matching key terminates the loop and the bucket is returned
+///
+/// `trap_on_null = false` (insert / rehash placement):
+///   - empty bucket terminates the loop (caller treats as
+///     "insert here", `was_empty == true`)
+///   - matching key terminates the loop (caller overwrites)
+///
+/// Sentinel buckets are never the terminating answer in either
+/// mode; the probe walks past them. Insert with sentinel reuse
+/// is intentionally not implemented — sentinels are dropped at
+/// the next rehash (ADR 0062).
+#[allow(clippy::too_many_arguments)]
+fn emit_hash_probe_loop<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     hash_buf: Value<'c, 'a>,
     cap: Value<'c, 'a>,
     key_str: Value<'c, 'a>,
-    types: &Types<'c>,
-    loc: Location<'c>,
-) -> Value<'c, 'a> {
-    let one = block
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(types.i64, 1).into(),
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    let mask: Value<'c, 'a> = block
-        .append_operation(arith::subi(cap, one, loc))
-        .result(0)
-        .unwrap()
-        .into();
-    let hash = emit_string_hash(context, block, key_str, types, loc);
-    let initial_bucket: Value<'c, 'a> = block
-        .append_operation(arith::andi(hash, mask, loc))
-        .result(0)
-        .unwrap()
-        .into();
-    // scf.while [bucket]:
-    //   before: load key, trap if null, compare with key_str,
-    //           condition = !eq, yield bucket
-    //   after [bucket]: bucket = (bucket + 1) & mask, yield
-    let before_region = Region::new();
-    let before_blk = Block::new(&[(types.i64, loc)]);
-    {
-        let bucket_arg: Value<'c, '_> = before_blk.argument(0).unwrap().into();
-        let entry_off_const = before_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let entries_base_off = before_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let bucket_offset: Value<'c, '_> = before_blk
-            .append_operation(arith::muli(bucket_arg, entry_off_const, loc))
-            .result(0)
-            .unwrap()
-            .into();
-        let entry_off: Value<'c, '_> = before_blk
-            .append_operation(arith::addi(bucket_offset, entries_base_off, loc))
-            .result(0)
-            .unwrap()
-            .into();
-        let entry_ptr =
-            emit_byte_offset_ptr_dynamic(context, &before_blk, hash_buf, entry_off, types, loc);
-        // Key is at offset 0 within the entry — entry_ptr itself.
-        let key_at_slot = emit_load(&before_blk, entry_ptr, types.ptr, loc);
-        let key_at_slot_i = before_blk
-            .append_operation(
-                OperationBuilder::new("llvm.ptrtoint", loc)
-                    .add_operands(&[key_at_slot])
-                    .add_results(&[types.i64])
-                    .build()
-                    .expect("llvm.ptrtoint"),
-            )
-            .result(0)
-            .unwrap()
-            .into();
-        let zero_i64 = before_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(types.i64, 0).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let is_null: Value<'c, '_> = before_blk
-            .append_operation(arith::cmpi(
-                context,
-                arith::CmpiPredicate::Eq,
-                key_at_slot_i,
-                zero_i64,
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        // Phase 2.6c-tag-hash-hard (ADR 0062): is_sentinel marks
-        // a deleted bucket. Probe must skip past it — strcmp on
-        // sentinel is UB.
-        let sentinel_const = before_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(types.i64, HASH_DELETED_KEY).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let is_sentinel: Value<'c, '_> = before_blk
-            .append_operation(arith::cmpi(
-                context,
-                arith::CmpiPredicate::Eq,
-                key_at_slot_i,
-                sentinel_const,
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        // Trap if null — key not found.
-        let null_trap_then = Region::new();
-        let null_trap_blk = Block::new(&[]);
-        let msg_ptr = emit_addressof(context, &null_trap_blk, "s_table_missing_key", types, loc);
-        emit_exit_with_message(context, &null_trap_blk, msg_ptr, types, loc);
-        null_trap_blk.append_operation(scf::r#yield(&[], loc));
-        null_trap_then.append_block(null_trap_blk);
-        let null_trap_else = Region::new();
-        let null_trap_else_blk = Block::new(&[]);
-        null_trap_else_blk.append_operation(scf::r#yield(&[], loc));
-        null_trap_else.append_block(null_trap_else_blk);
-        before_blk.append_operation(scf::r#if(is_null, &[], null_trap_then, null_trap_else, loc));
-        // strcmp gated on is_sentinel: yield false directly when
-        // the bucket is a deleted-tombstone, otherwise compare.
-        let eq_then = Region::new();
-        let eq_then_blk = Block::new(&[]);
-        {
-            let i1_zero = eq_then_blk
-                .append_operation(arith::constant(
-                    context,
-                    IntegerAttribute::new(types.i1, 0).into(),
-                    loc,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            eq_then_blk.append_operation(scf::r#yield(&[i1_zero], loc));
-        }
-        eq_then.append_block(eq_then_blk);
-        let eq_else = Region::new();
-        let eq_else_blk = Block::new(&[]);
-        {
-            let cmp = emit_libc_call_i32(
-                context,
-                &eq_else_blk,
-                "strcmp",
-                &[key_at_slot, key_str],
-                types,
-                loc,
-            );
-            let zero_i32 = eq_else_blk
-                .append_operation(arith::constant(
-                    context,
-                    IntegerAttribute::new(types.i32, 0).into(),
-                    loc,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            let eq_inner: Value<'c, '_> = eq_else_blk
-                .append_operation(arith::cmpi(
-                    context,
-                    arith::CmpiPredicate::Eq,
-                    cmp,
-                    zero_i32,
-                    loc,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            eq_else_blk.append_operation(scf::r#yield(&[eq_inner], loc));
-        }
-        eq_else.append_block(eq_else_blk);
-        let eq_op = scf::r#if(is_sentinel, &[types.i1], eq_then, eq_else, loc);
-        let eq: Value<'c, '_> = before_blk.append_operation(eq_op).result(0).unwrap().into();
-        let i1_one = before_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(types.i1, 1).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let not_eq: Value<'c, '_> = before_blk
-            .append_operation(arith::xori(eq, i1_one, loc))
-            .result(0)
-            .unwrap()
-            .into();
-        before_blk.append_operation(scf::condition(not_eq, &[bucket_arg], loc));
-    }
-    before_region.append_block(before_blk);
-    let after_region = Region::new();
-    let after_blk = Block::new(&[(types.i64, loc)]);
-    {
-        let bucket_arg: Value<'c, '_> = after_blk.argument(0).unwrap().into();
-        let one_inner = after_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(types.i64, 1).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let plus1: Value<'c, '_> = after_blk
-            .append_operation(arith::addi(bucket_arg, one_inner, loc))
-            .result(0)
-            .unwrap()
-            .into();
-        let next: Value<'c, '_> = after_blk
-            .append_operation(arith::andi(plus1, mask, loc))
-            .result(0)
-            .unwrap()
-            .into();
-        after_blk.append_operation(scf::r#yield(&[next], loc));
-    }
-    after_region.append_block(after_blk);
-    let while_op = scf::r#while(
-        &[initial_bucket],
-        &[types.i64],
-        before_region,
-        after_region,
-        loc,
-    );
-    block.append_operation(while_op).result(0).unwrap().into()
-}
-
-/// Phase 2.6b-hash (ADR 0058): walk `hash_buf` from a starting
-/// bucket until either an empty slot OR a slot whose key equals
-/// `key_str` is found, and return that bucket. Used by both the
-/// insert path and the rehash path.
-fn emit_hash_probe_for_insert<'a, 'c>(
-    context: &'c Context,
-    block: &'a Block<'c>,
-    hash_buf: Value<'c, 'a>,
-    cap: Value<'c, 'a>,
-    key_str: Value<'c, 'a>,
+    trap_on_null: bool,
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
@@ -2492,10 +2261,6 @@ fn emit_hash_probe_for_insert<'a, 'c>(
             .result(0)
             .unwrap()
             .into();
-        // Phase 2.6c-tag-hash-hard (ADR 0062): a deleted bucket
-        // carries HASH_DELETED_KEY at the key slot. Insert probe
-        // skips past it (no reuse) — strcmp must not run on a
-        // sentinel.
         let sentinel_const = before_blk
             .append_operation(arith::constant(
                 context,
@@ -2521,8 +2286,30 @@ fn emit_hash_probe_for_insert<'a, 'c>(
             .result(0)
             .unwrap()
             .into();
-        // eq must only be evaluated when key is a live string ptr;
-        // gate strcmp behind scf.if returning i1.
+        // Lookup-only: trap on empty bucket before strcmp. Insert
+        // mode treats empty as a successful terminator instead.
+        if trap_on_null {
+            let null_trap_then = Region::new();
+            let null_trap_blk = Block::new(&[]);
+            let msg_ptr =
+                emit_addressof(context, &null_trap_blk, "s_table_missing_key", types, loc);
+            emit_exit_with_message(context, &null_trap_blk, msg_ptr, types, loc);
+            null_trap_blk.append_operation(scf::r#yield(&[], loc));
+            null_trap_then.append_block(null_trap_blk);
+            let null_trap_else = Region::new();
+            let null_trap_else_blk = Block::new(&[]);
+            null_trap_else_blk.append_operation(scf::r#yield(&[], loc));
+            null_trap_else.append_block(null_trap_else_blk);
+            before_blk.append_operation(scf::r#if(
+                is_null,
+                &[],
+                null_trap_then,
+                null_trap_else,
+                loc,
+            ));
+        }
+        // strcmp gated on is_skip (null OR sentinel): yield false
+        // directly when we cannot legally compare, otherwise call.
         let eq_then = Region::new();
         let eq_then_blk = Block::new(&[]);
         {
@@ -2574,14 +2361,16 @@ fn emit_hash_probe_for_insert<'a, 'c>(
         eq_else.append_block(eq_else_blk);
         let eq_op = scf::r#if(is_skip, &[types.i1], eq_then, eq_else, loc);
         let eq: Value<'c, '_> = before_blk.append_operation(eq_op).result(0).unwrap().into();
-        // Found if is_null OR eq. Sentinel is *not* found — the
-        // loop continues past it. is_null implies the loop has
-        // walked off the end of the probe chain (insert here).
-        let found: Value<'c, '_> = before_blk
-            .append_operation(arith::ori(is_null, eq, loc))
-            .result(0)
-            .unwrap()
-            .into();
+        // Lookup: terminate on eq. Insert: terminate on (is_null OR eq).
+        let terminate: Value<'c, '_> = if trap_on_null {
+            eq
+        } else {
+            before_blk
+                .append_operation(arith::ori(is_null, eq, loc))
+                .result(0)
+                .unwrap()
+                .into()
+        };
         let i1_one = before_blk
             .append_operation(arith::constant(
                 context,
@@ -2591,12 +2380,12 @@ fn emit_hash_probe_for_insert<'a, 'c>(
             .result(0)
             .unwrap()
             .into();
-        let not_found: Value<'c, '_> = before_blk
-            .append_operation(arith::xori(found, i1_one, loc))
+        let keep_going: Value<'c, '_> = before_blk
+            .append_operation(arith::xori(terminate, i1_one, loc))
             .result(0)
             .unwrap()
             .into();
-        before_blk.append_operation(scf::condition(not_found, &[bucket_arg], loc));
+        before_blk.append_operation(scf::condition(keep_going, &[bucket_arg], loc));
     }
     before_region.append_block(before_blk);
     let after_region = Region::new();
@@ -2633,6 +2422,43 @@ fn emit_hash_probe_for_insert<'a, 'c>(
         loc,
     );
     block.append_operation(while_op).result(0).unwrap().into()
+}
+
+/// Phase 2.6b-hash (ADR 0058): probe `hash_buf` for the bucket
+/// matching `key_str`. Returns the i64 bucket index on success
+/// or traps with `s_table_missing_key` if the probe walks into
+/// an empty bucket (= key not present). Sentinel buckets (ADR
+/// 0062) are skipped.
+///
+/// Caller must guarantee the buffer is non-null; for lookup that
+/// means `header.hash_buf != null` (else trap before calling).
+fn emit_hash_probe_lookup<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    hash_buf: Value<'c, 'a>,
+    cap: Value<'c, 'a>,
+    key_str: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    emit_hash_probe_loop(context, block, hash_buf, cap, key_str, true, types, loc)
+}
+
+/// Phase 2.6b-hash (ADR 0058): walk `hash_buf` from a starting
+/// bucket until either an empty slot OR a slot whose key equals
+/// `key_str` is found, and return that bucket. Sentinel buckets
+/// (ADR 0062) are skipped — no reuse. Used by the insert path,
+/// the rehash placement path, and the IsNilQuery hash arm.
+fn emit_hash_probe_for_insert<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    hash_buf: Value<'c, 'a>,
+    cap: Value<'c, 'a>,
+    key_str: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    emit_hash_probe_loop(context, block, hash_buf, cap, key_str, false, types, loc)
 }
 
 /// Phase 2.6b-hash (ADR 0058): if load factor ≥ 0.75, double the
