@@ -1460,11 +1460,19 @@ impl LowerCtx {
                 // (array) writes still reject Nil because there's
                 // no observable use for it — array hole creation
                 // happens implicitly via the upper-bound lift.
+                // Phase 2.6c-tag-hetero (ADR 0064): both array and
+                // hash writes additionally accept Bool / String
+                // values. Function / Table values stay rejected
+                // (separate sub-phase).
                 let value_kind = infer_kind(&value_hir, &self.locals, &self.functions);
                 let value_ok = matches!(
                     (key_kind, value_kind),
                     (ValueKind::Number, ValueKind::Number)
+                        | (ValueKind::Number, ValueKind::Bool)
+                        | (ValueKind::Number, ValueKind::String)
                         | (ValueKind::String, ValueKind::Number)
+                        | (ValueKind::String, ValueKind::Bool)
+                        | (ValueKind::String, ValueKind::String)
                         | (ValueKind::String, ValueKind::Nil)
                 );
                 if !value_ok {
@@ -2154,11 +2162,12 @@ impl LowerCtx {
                 HirExprKind::FunctionRef(id)
             }
             ExprKind::Call { callee, args } => self.lower_call(callee, args, expr)?,
-            // Phase 2.6a-min (ADR 0053) / 2.6a-arr (ADR 0054):
-            // table constructor. Empty form lands as `Table([])`;
-            // populated form lowers each element and enforces
-            // Number-only kind. Heterogeneous arrays defer to a
-            // future phase that introduces tagged values.
+            // Phase 2.6a-min (ADR 0053) / 2.6a-arr (ADR 0054) /
+            // 2.6c-tag-hetero (ADR 0064): table constructor.
+            // Number / Bool / String / Nil all land in a 16-byte
+            // tagged slot. Function / Table elements still
+            // reject — those payloads need a follow-up sub-phase
+            // (ucast / cycle handling).
             ExprKind::Table(elems) => {
                 let lowered: Vec<HirExpr> = elems
                     .iter()
@@ -2166,10 +2175,14 @@ impl LowerCtx {
                     .collect::<Result<_, _>>()?;
                 for elem in &lowered {
                     let k = infer_kind(elem, &self.locals, &self.functions);
-                    if k != ValueKind::Number {
+                    let elem_ok = matches!(
+                        k,
+                        ValueKind::Number | ValueKind::Bool | ValueKind::String | ValueKind::Nil
+                    );
+                    if !elem_ok {
                         return Err(HirError::TypeMismatch {
                             op: "table element".to_owned(),
-                            lhs_kind: "number".to_owned(),
+                            lhs_kind: "number/bool/string/nil".to_owned(),
                             rhs_kind: k.name().to_owned(),
                             offset: elem.span.start,
                         });

@@ -127,10 +127,12 @@ print(t[0])";
 }
 
 #[test]
-fn non_number_element_is_static_error() {
-    // 2.6a-arr restricts elements to Number — heterogeneous
-    // arrays land later (when tagged values arrive).
-    let chunk = lumelir::parser::parse("local t = {1, \"two\", 3}").unwrap();
+fn function_element_is_static_error_post_2_6c_hetero() {
+    // ADR 0064 (Phase 2.6c-tag-hetero) opened Bool / String /
+    // Nil as valid table elements alongside Number. Function
+    // elements still reject — the closure-escape / ucast path
+    // is left for a follow-up sub-phase.
+    let chunk = lumelir::parser::parse("local function f() return 1 end\nlocal t = {f}").unwrap();
     assert!(lumelir::hir::lower(&chunk).is_err());
 }
 

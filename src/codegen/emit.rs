@@ -122,6 +122,11 @@ const ARRAY_ELEM_SIZE: i64 = 16;
 const ARRAY_ELEM_OFF_VALUE: i64 = 8;
 const TAG_NIL: i64 = 0;
 const TAG_NUMBER: i64 = 1;
+// Phase 2.6c-tag-hetero (ADR 0064): widen the tagged slot to
+// carry Bool and String values. Function (4) and Table (5)
+// tags remain reserved for a follow-up sub-phase.
+const TAG_BOOL: i64 = 2;
+const TAG_STRING: i64 = 3;
 
 struct Types<'c> {
     i1: Type<'c>,
@@ -1013,7 +1018,10 @@ fn emit_stmt<'a, 'c>(
                                 types,
                                 loc,
                             );
-                            let payload = emit_load(block, src_value_ptr, types.f64, loc);
+                            // Phase 2.6c-tag-hetero (ADR 0064):
+                            // copy as raw i64 so any tag's payload
+                            // (f64 / i64-zext bool / ptr) survives.
+                            let payload = emit_load(block, src_value_ptr, types.i64, loc);
                             emit_store(block, payload, dst_value_ptr, loc);
                         }
                         _ => {
@@ -1232,10 +1240,15 @@ fn emit_stmt<'a, 'c>(
                         len_else_region,
                         loc,
                     ));
-                    // Final tagged-Number store at slot[key].
+                    // Phase 2.6c-tag-hetero (ADR 0064): tagged
+                    // store dispatched on value kind. Number /
+                    // Bool / String land in the same 16-byte slot.
+                    let value_kind = infer_kind(value, locals, functions);
                     let elem_ptr =
                         emit_array_elem_ptr(context, block, array_buf, key_i, types, loc);
-                    emit_value_slot_store_number(context, block, elem_ptr, value_v, types, loc);
+                    emit_value_slot_store_dispatched(
+                        context, block, elem_ptr, value_v, value_kind, types, loc,
+                    );
                 }
                 ValueKind::String => {
                     // Phase 2.6b-hash (ADR 0058): hash insert.
@@ -1337,10 +1350,12 @@ fn emit_stmt<'a, 'c>(
                     );
                     let value_kind = infer_kind(value, locals, functions);
                     match value_kind {
-                        ValueKind::Number => {
-                            // Number write: when bucket was empty,
-                            // record the new key and bump the live
-                            // count; otherwise overwrite in place.
+                        // Phase 2.6c-tag-hetero (ADR 0064): Number /
+                        // Bool / String all share the new-key + count++
+                        // path; only the final tagged store helper
+                        // differs. Dispatch via
+                        // `emit_value_slot_store_dispatched`.
+                        ValueKind::Number | ValueKind::Bool | ValueKind::String => {
                             let new_key_then = Region::new();
                             let new_key_blk = Block::new(&[]);
                             {
@@ -1383,11 +1398,12 @@ fn emit_stmt<'a, 'c>(
                                 new_key_else,
                                 loc,
                             ));
-                            emit_value_slot_store_number(
+                            emit_value_slot_store_dispatched(
                                 context,
                                 block,
                                 value_slot_ptr,
                                 value_v,
+                                value_kind,
                                 types,
                                 loc,
                             );
@@ -1466,7 +1482,9 @@ fn emit_stmt<'a, 'c>(
                                 loc,
                             ));
                         }
-                        _ => unreachable!("HIR rejects non-Number/Nil values for hash insert"),
+                        _ => unreachable!(
+                            "HIR rejects non-Number/Bool/String/Nil values for hash insert"
+                        ),
                     }
                 }
                 _ => unreachable!("HIR rejects non-Number/String key kinds"),
@@ -1741,6 +1759,97 @@ fn emit_value_slot_store_nil<'a, 'c>(
     emit_store(block, zero_f, value_slot, loc);
 }
 
+/// Phase 2.6c-tag-hetero (ADR 0064): write `{tag=Bool,
+/// payload=value zext-to-i64}` to a tagged value slot. The
+/// payload occupies the same 8-byte field as Number / String,
+/// just interpreted as i64 (with only the low bit meaningful).
+fn emit_value_slot_store_bool<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_ptr: Value<'c, 'a>,
+    value: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let tag = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, TAG_BOOL).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_store(block, tag, slot_ptr, loc);
+    // i1 → i64 zext via llvm.zext (arith::extui also works).
+    let value_i64: Value<'c, 'a> = block
+        .append_operation(
+            OperationBuilder::new("llvm.zext", loc)
+                .add_operands(&[value])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.zext bool→i64"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let value_slot =
+        emit_byte_offset_ptr(context, block, slot_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
+    emit_store(block, value_i64, value_slot, loc);
+}
+
+/// Phase 2.6c-tag-hetero (ADR 0064): write `{tag=String,
+/// payload=ptr}` to a tagged value slot. The payload field
+/// stores the string global pointer directly.
+fn emit_value_slot_store_string<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_ptr: Value<'c, 'a>,
+    value: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let tag = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, TAG_STRING).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_store(block, tag, slot_ptr, loc);
+    let value_slot =
+        emit_byte_offset_ptr(context, block, slot_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
+    emit_store(block, value, value_slot, loc);
+}
+
+/// Phase 2.6c-tag-hetero (ADR 0064): kind-dispatched store into a
+/// tagged value slot. Mirrors the value-side dispatch used by
+/// `Table` constructor / `IndexAssign` / `LocalInit` so each
+/// caller has a single entry point regardless of element kind.
+fn emit_value_slot_store_dispatched<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_ptr: Value<'c, 'a>,
+    value: Value<'c, 'a>,
+    kind: ValueKind,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    match kind {
+        ValueKind::Number => {
+            emit_value_slot_store_number(context, block, slot_ptr, value, types, loc)
+        }
+        ValueKind::Bool => emit_value_slot_store_bool(context, block, slot_ptr, value, types, loc),
+        ValueKind::String => {
+            emit_value_slot_store_string(context, block, slot_ptr, value, types, loc)
+        }
+        ValueKind::Nil => emit_value_slot_store_nil(context, block, slot_ptr, types, loc),
+        _ => unreachable!("unsupported value kind for tagged slot store: {:?}", kind),
+    }
+}
+
 /// Phase 2.6c-tag-arr (ADR 0059) / 2.6c-tag-hash (ADR 0060):
 /// load the tag at offset 0 of a tagged value slot and trap if
 /// it isn't `TAG_NUMBER`. After this returns, the caller can
@@ -1886,7 +1995,8 @@ fn emit_local_init_tagged<'a, 'c>(
                     types,
                     loc,
                 );
-                let payload = emit_load(&else_blk, src_value_ptr, types.f64, loc);
+                // Phase 2.6c-tag-hetero (ADR 0064): raw i64 copy.
+                let payload = emit_load(&else_blk, src_value_ptr, types.i64, loc);
                 emit_store(&else_blk, payload, dst_value_ptr, loc);
                 else_blk.append_operation(scf::r#yield(&[], loc));
             }
@@ -2049,7 +2159,8 @@ fn emit_local_init_tagged<'a, 'c>(
                         types,
                         loc,
                     );
-                    let payload = emit_load(&inner_else_blk, src_value_ptr, types.f64, loc);
+                    // Phase 2.6c-tag-hetero (ADR 0064): raw i64 copy.
+                    let payload = emit_load(&inner_else_blk, src_value_ptr, types.i64, loc);
                     emit_store(&inner_else_blk, payload, dst_value_ptr, loc);
                     inner_else_blk.append_operation(scf::r#yield(&[], loc));
                 }
@@ -3540,17 +3651,21 @@ fn emit_expr<'a, 'c>(
             let hash_buf_slot =
                 emit_byte_offset_ptr(context, block, header_ptr, TABLE_OFF_HASH_BUF, types, loc);
             emit_store(block, null_hash, hash_buf_slot, loc);
-            // Step 4: store each element as a tagged Number slot
-            // at offset `i * ARRAY_ELEM_SIZE`. Phase 2.6c-tag-arr
-            // keeps construction Number-only — hetero defers.
+            // Phase 2.6c-tag-hetero (ADR 0064): store each element
+            // as a tagged slot, dispatching on its static kind.
+            // Number → {Number, f64}, Bool → {Bool, i64-zext},
+            // String → {String, ptr}, Nil → {Nil, 0}.
             for (i, elem) in elems.iter().enumerate() {
                 let v = emit_expr(
                     context, block, elem, slots, locals, functions, types, params_len, loc,
                 )?;
+                let elem_kind = infer_kind(elem, locals, functions);
                 let offset_bytes = (i as i64) * ARRAY_ELEM_SIZE;
                 let elem_ptr =
                     emit_byte_offset_ptr(context, block, array_buf, offset_bytes, types, loc);
-                emit_value_slot_store_number(context, block, elem_ptr, v, types, loc);
+                emit_value_slot_store_dispatched(
+                    context, block, elem_ptr, v, elem_kind, types, loc,
+                );
             }
             Ok(header_ptr)
         }
@@ -4171,6 +4286,19 @@ fn emit_expr<'a, 'c>(
                             emit_print_literal(context, block, "s_tab", types, loc);
                         }
                         let kind = infer_kind(a, locals, functions);
+                        // Phase 2.6c-tag-hetero (ADR 0064):
+                        // `print(Local(TaggedValue))` dispatches at
+                        // runtime on the slot's tag — Number / Bool /
+                        // String / Nil all print the appropriate
+                        // representation. Bypass `emit_expr` (which
+                        // would force the trapping Number-only
+                        // extract) and read the slot directly.
+                        if kind == ValueKind::TaggedValue {
+                            if let HirExprKind::Local(LocalId(idx)) = &a.kind {
+                                emit_print_tagged_local(context, block, slots[*idx], types, loc);
+                                continue;
+                            }
+                        }
                         let v = emit_expr(
                             context, block, a, slots, locals, functions, types, params_len, loc,
                         )?;
@@ -5178,6 +5306,178 @@ fn emit_print_value_raw<'a, 'c>(
             emit_printf(context, block, fmt_ptr, value, types, loc);
         }
     }
+}
+
+/// Phase 2.6c-tag-hetero (ADR 0064): print a `TaggedValue` local
+/// by reading its slot's tag at offset 0 and dispatching on the
+/// runtime value: Number → `%g`, Bool → `s_true`/`s_false`,
+/// String → `%s`, Nil → `s_nil`. Implemented as a chain of
+/// nested scf.if so the codegen output is deterministic and the
+/// LLVM optimiser can fold any single-tag case if it ever sees
+/// one.
+fn emit_print_tagged_local<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let tag = emit_load(block, slot_ptr, types.i64, loc);
+    let value_ptr =
+        emit_byte_offset_ptr(context, block, slot_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
+    let tag_number = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, TAG_NUMBER).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let is_number: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            tag,
+            tag_number,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let number_then = Region::new();
+    let number_then_blk = Block::new(&[]);
+    {
+        let f = emit_load(&number_then_blk, value_ptr, types.f64, loc);
+        let fmt_ptr = emit_addressof(context, &number_then_blk, "fmt_raw", types, loc);
+        emit_printf(context, &number_then_blk, fmt_ptr, f, types, loc);
+        number_then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    number_then.append_block(number_then_blk);
+    let number_else = Region::new();
+    let number_else_blk = Block::new(&[]);
+    {
+        // Inner: Bool branch.
+        let tag_bool = number_else_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_BOOL).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_bool: Value<'c, '_> = number_else_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                tag,
+                tag_bool,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let bool_then = Region::new();
+        let bool_then_blk = Block::new(&[]);
+        {
+            let payload_i64 = emit_load(&bool_then_blk, value_ptr, types.i64, loc);
+            let zero_i64 = bool_then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 0).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let payload_i1: Value<'c, '_> = bool_then_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Ne,
+                    payload_i64,
+                    zero_i64,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let true_ptr = emit_addressof(context, &bool_then_blk, "s_true", types, loc);
+            let false_ptr = emit_addressof(context, &bool_then_blk, "s_false", types, loc);
+            let chosen: Value<'c, '_> = bool_then_blk
+                .append_operation(
+                    OperationBuilder::new("llvm.select", loc)
+                        .add_operands(&[payload_i1, true_ptr, false_ptr])
+                        .add_results(&[types.ptr])
+                        .build()
+                        .expect("llvm.select"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let fmt_ptr = emit_addressof(context, &bool_then_blk, "fmt_str_raw", types, loc);
+            emit_printf(context, &bool_then_blk, fmt_ptr, chosen, types, loc);
+            bool_then_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        bool_then.append_block(bool_then_blk);
+        let bool_else = Region::new();
+        let bool_else_blk = Block::new(&[]);
+        {
+            // Inner-inner: String branch vs Nil fallback.
+            let tag_string = bool_else_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, TAG_STRING).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let is_string: Value<'c, '_> = bool_else_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    tag,
+                    tag_string,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let string_then = Region::new();
+            let string_then_blk = Block::new(&[]);
+            {
+                let payload_ptr = emit_load(&string_then_blk, value_ptr, types.ptr, loc);
+                let fmt_ptr = emit_addressof(context, &string_then_blk, "fmt_str_raw", types, loc);
+                emit_printf(context, &string_then_blk, fmt_ptr, payload_ptr, types, loc);
+                string_then_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            string_then.append_block(string_then_blk);
+            let string_else = Region::new();
+            let string_else_blk = Block::new(&[]);
+            {
+                // Fallback: TAG_NIL (or any other tag — print "nil").
+                let nil_ptr = emit_addressof(context, &string_else_blk, "s_nil", types, loc);
+                let fmt_ptr = emit_addressof(context, &string_else_blk, "fmt_str_raw", types, loc);
+                emit_printf(context, &string_else_blk, fmt_ptr, nil_ptr, types, loc);
+                string_else_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            string_else.append_block(string_else_blk);
+            bool_else_blk.append_operation(scf::r#if(
+                is_string,
+                &[],
+                string_then,
+                string_else,
+                loc,
+            ));
+            bool_else_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        bool_else.append_block(bool_else_blk);
+        number_else_blk.append_operation(scf::r#if(is_bool, &[], bool_then, bool_else, loc));
+        number_else_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    number_else.append_block(number_else_blk);
+    block.append_operation(scf::r#if(is_number, &[], number_then, number_else, loc));
 }
 
 /// Phase 2.8b (ADR 0032): emit `printf("%s", @<global_name>)` for

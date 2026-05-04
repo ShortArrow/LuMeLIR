@@ -131,12 +131,15 @@ print(t[2])";
 }
 
 #[test]
-fn hash_value_must_be_number() {
-    // LIC-2.6b-hash-2: hash values are Number-only until tagged
-    // values arrive.
+fn hash_value_function_still_rejects_post_2_6c_hetero() {
+    // ADR 0064 (Phase 2.6c-tag-hetero) accepts Number / Bool /
+    // String / Nil-delete for hash values. Function values
+    // still reject — closure-escape / ucast handling is a
+    // follow-up sub-phase.
     let chunk = lumelir::parser::parse(
-        "local t = {}
-t.k = \"hello\"",
+        "local function f() return 1 end
+local t = {}
+t.k = f",
     )
     .unwrap();
     assert!(lumelir::hir::lower(&chunk).is_err());

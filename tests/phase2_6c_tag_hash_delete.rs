@@ -106,15 +106,15 @@ print(b.k)";
 }
 
 #[test]
-fn hash_value_string_still_rejects() {
-    // LIC-2.6b-hash-2 still pending: hash values are Number-only
-    // at the API surface. Nil is allowed only as a delete signal.
+fn hash_value_string_now_accepted_post_2_6c_hetero() {
+    // ADR 0064 (Phase 2.6c-tag-hetero) now accepts String hash
+    // values. The parse + lower pipeline must succeed.
     let chunk = lumelir::parser::parse(
         "local t = {}
 t.k = \"hello\"",
     )
     .unwrap();
-    assert!(lumelir::hir::lower(&chunk).is_err());
+    assert!(lumelir::hir::lower(&chunk).is_ok());
 }
 
 #[test]

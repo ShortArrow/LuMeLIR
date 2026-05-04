@@ -100,12 +100,14 @@ print(a[1])";
 }
 
 #[test]
-fn write_value_must_be_number() {
-    // Heterogeneous element kinds defer until tagged values
-    // arrive (LIC-2.6a-wr-3).
+fn write_function_value_still_rejects_post_2_6c_hetero() {
+    // ADR 0064 (Phase 2.6c-tag-hetero) accepts Number / Bool /
+    // String values for `t[i] = v`. Function values still
+    // reject — separate sub-phase.
     let chunk = lumelir::parser::parse(
-        "local t = {1, 2, 3}
-t[1] = \"x\"",
+        "local function f() return 1 end
+local t = {1, 2, 3}
+t[1] = f",
     )
     .unwrap();
     assert!(lumelir::hir::lower(&chunk).is_err());
