@@ -85,6 +85,7 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.6c-tag-hetero-fix inline print + Eq dispatch | **Done** | codex-review-flagged P1: `print(t[k])` materialises through tmp tagged slot for runtime tag dispatch; `TaggedValue == literal` lowers to runtime tag-check + per-kind compare instead of fold; supersedes ADR 0061/0063 plain-read-trap claims; LIC-2.6c-tag-hetero-inline-1 resolved (ADR 0065) |
 | ‣ 2.6c-tag-hetero-eq IsNil unification + Local-Local `==` | **Done** | Tidy First: `IsNilQuery` + `IsNilLocal` collapse into `IsNil(Box<HirExpr>)`. Feature: `Local(TaggedValue) == Local(TaggedValue)` runtime tag-vs-tag dispatch + per-kind compare (cmpf / cmpi / strcmp). LIC-2.6c-tag-hetero-eq-1 resolved (ADR 0066) |
 | ‣ 2.6c-tag-consumers `type` / `tostring` runtime dispatch | **Done** | `type(Local(TaggedValue))` and `tostring(Local(TaggedValue))` route through new helpers that read the slot tag at runtime; concat (`..`) auto-coerce reuses the new tostring path; matrix-test scaffold introduced; LIC-2.6c-tag-locals-1 resolved (ADR 0067) |
+| ‣ 2.6c-tag-doc-consolidate tagged-semantics SoT | **Done** | `docs/design/tagged-semantics.md` introduced as the SoT for TaggedValue slot layout, producer/source taxonomy, consumer coverage matrix, runtime invariants, consolidated LIC table; future ADRs delegate LIC tracking to the doc instead of duplicating tables (ADR 0068) |
 | ‣ 2.6+ tables / metatables | In progress | function/table values in tables, function-return widening, tagged module split (Tidy First), arith coerce, methods, metatables — multiple sub-phases |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |
 
@@ -97,6 +98,11 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 3. `docs/design/NNNN-*.md` — any ADRs relevant to your task
 4. This file
 5. Existing tests of the module you're touching
+
+**Phase 2.6c (TaggedValue) work:** also read
+[`docs/design/tagged-semantics.md`](docs/design/tagged-semantics.md)
+— the Single Source of Truth for slot layout, producer / consumer
+matrix, runtime invariants, and the consolidated LIC table (ADR 0068).
 
 ## 4. Coding Principles
 
