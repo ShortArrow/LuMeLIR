@@ -35,6 +35,22 @@ Each rejected option + the reason it was rejected.
 ## Consequences
 
 What becomes easier, harder, or locked-in as a result.
+
+## Documentation updates
+
+`docs/design/tagged-semantics.md` is the SoT for the
+TaggedValue runtime model (ADR 0068). Any ADR that touches a
+TaggedValue producer, consumer, dispatch site, or runtime
+invariant **must** record updates as a checklist below:
+
+- [ ] §1 slot layout
+- [ ] §2 producer / source taxonomy
+- [ ] §3 consumer coverage matrix
+- [ ] §4 LIC consolidation
+- [ ] §5 runtime tag invariants
+- [ ] §7 open questions
+- [ ] §8 ADR index
+- [ ] No `tagged-semantics.md` change required (briefly justify why)
 ```
 
 ## Index

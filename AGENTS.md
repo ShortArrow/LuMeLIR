@@ -208,6 +208,26 @@ Conventions live in [`docs/design/README.md`](docs/design/README.md). Recap:
 - [`README.md`](README.md) (English) is primary; [`docs/README.jp.md`](docs/README.jp.md) is the translation.
 - **When you change a policy in this file, update it in the same commit as the code/ADR change.** Stale AGENTS.md is the worst failure mode.
 
+### 9.1 TaggedValue SoT update checklist
+
+[`docs/design/tagged-semantics.md`](docs/design/tagged-semantics.md) is the
+SoT for the Phase 2.6c TaggedValue runtime model (ADR 0068). When a PR
+touches:
+
+- `src/codegen/emit.rs` TaggedValue dispatch helpers
+  (`emit_value_slot_*`, `emit_local_init_tagged`, `emit_isnil_index`,
+  `emit_print_tagged_local`, `emit_type_tagged_local`,
+  `emit_tostring_tagged_local`, `emit_tagged_eq_*`,
+  `emit_tagged_unknown_tag_trap`)
+- `src/hir/mod.rs` HIR variants for tagged values
+  (`HirExprKind::IndexTagged`, `IsNil`, `ValueKind::TaggedValue`)
+- Any test under `tests/phase2_6c_tag_*`
+
+… confirm the SoT doc is up to date. The ADR's *Documentation updates*
+checklist (per `docs/design/README.md` template) records which sections
+were touched, or justifies "no change required". Stale `tagged-semantics.md`
+is the second-worst failure mode after stale `AGENTS.md`.
+
 ## 10. LLM-Agent-Specific Rules
 
 ### 10.1 Destructive Operations Require Explicit Human Approval
