@@ -1896,6 +1896,25 @@ fn emit_value_slot_check_number<'a, 'c>(
     block.append_operation(scf::r#if(mismatch, &[], then_region, else_region, loc));
 }
 
+/// Phase 2.6c-tag-defensive-trap (ADR 0069): trap when a tagged
+/// slot exposes a runtime tag the current implementation does
+/// not handle (Function = 4 / Table = 5 reserved). Reuses the
+/// existing `s_table_type_mismatch` global so the diagnostic is
+/// consistent with the array/hash trap surface (ADR 0059 / 0060).
+/// All call sites currently sit in defensive `else` arms that are
+/// unreachable in practice (HIR rejects Function/Table values in
+/// tables — LIC-2.6c-tag-hetero-fn-tbl-1); the trap turns "future
+/// regression" from silent miscompile into runtime fail-fast.
+fn emit_tagged_unknown_tag_trap<'c>(
+    context: &'c Context,
+    block: &Block<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let msg_ptr = emit_addressof(context, block, "s_table_type_mismatch", types, loc);
+    emit_exit_with_message(context, block, msg_ptr, types, loc);
+}
+
 /// Phase 2.6c-tag-locals (ADR 0063): non-trapping `IndexTagged`
 /// read that writes the resulting `{tag, value}` directly to a
 /// `TaggedValue` local slot. Mirror of the `IsNilQuery`
@@ -5523,10 +5542,49 @@ fn emit_print_tagged_local<'a, 'c>(
             let string_else = Region::new();
             let string_else_blk = Block::new(&[]);
             {
-                // Fallback: TAG_NIL (or any other tag — print "nil").
-                let nil_ptr = emit_addressof(context, &string_else_blk, "s_nil", types, loc);
-                let fmt_ptr = emit_addressof(context, &string_else_blk, "fmt_str_raw", types, loc);
-                emit_printf(context, &string_else_blk, fmt_ptr, nil_ptr, types, loc);
+                // Phase 2.6c-tag-defensive-trap (ADR 0069): the
+                // previous arm collapsed "any tag not in
+                // {Number, Bool, String}" into "print nil" — fine
+                // for TAG_NIL, but silently masks a future
+                // Function/Table tag. Distinguish them: if the
+                // tag is TAG_NIL, print "nil"; otherwise trap.
+                let tag_nil = string_else_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let is_nil: Value<'c, '_> = string_else_blk
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Eq,
+                        tag,
+                        tag_nil,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let nil_then = Region::new();
+                let nil_then_blk = Block::new(&[]);
+                {
+                    let nil_ptr = emit_addressof(context, &nil_then_blk, "s_nil", types, loc);
+                    let fmt_ptr = emit_addressof(context, &nil_then_blk, "fmt_str_raw", types, loc);
+                    emit_printf(context, &nil_then_blk, fmt_ptr, nil_ptr, types, loc);
+                    nil_then_blk.append_operation(scf::r#yield(&[], loc));
+                }
+                nil_then.append_block(nil_then_blk);
+                let nil_else = Region::new();
+                let nil_else_blk = Block::new(&[]);
+                {
+                    emit_tagged_unknown_tag_trap(context, &nil_else_blk, types, loc);
+                    nil_else_blk.append_operation(scf::r#yield(&[], loc));
+                }
+                nil_else.append_block(nil_else_blk);
+                string_else_blk.append_operation(scf::r#if(is_nil, &[], nil_then, nil_else, loc));
                 string_else_blk.append_operation(scf::r#yield(&[], loc));
             }
             string_else.append_block(string_else_blk);
@@ -5734,9 +5792,15 @@ fn emit_tagged_eq_local_local<'a, 'c>(
                     let str_else = Region::new();
                     let str_else_blk = Block::new(&[]);
                     {
-                        // Defensive fallback for Function / Table
-                        // tags (4 / 5) — yet to be lowered.
-                        let i1_false = str_else_blk
+                        // Phase 2.6c-tag-defensive-trap (ADR 0069):
+                        // unknown tag (Function/Table reserved) →
+                        // fail-fast trap. Lifts the previous silent
+                        // `false` fallback that masked a future bug
+                        // when tag space expands. Yield placeholder
+                        // i1 to satisfy scf.if's type contract; the
+                        // trap exits before the placeholder lands.
+                        emit_tagged_unknown_tag_trap(context, &str_else_blk, types, loc);
+                        let placeholder = str_else_blk
                             .append_operation(arith::constant(
                                 context,
                                 IntegerAttribute::new(types.i1, 0).into(),
@@ -5745,7 +5809,7 @@ fn emit_tagged_eq_local_local<'a, 'c>(
                             .result(0)
                             .unwrap()
                             .into();
-                        str_else_blk.append_operation(scf::r#yield(&[i1_false], loc));
+                        str_else_blk.append_operation(scf::r#yield(&[placeholder], loc));
                     }
                     str_else.append_block(str_else_blk);
                     let str_op = scf::r#if(is_string, &[types.i1], str_then, str_else, loc);
@@ -6148,9 +6212,18 @@ fn emit_type_tagged_local<'a, 'c>(
                 str_then.append_block(str_then_blk);
                 let str_else = Region::new();
                 let str_else_blk = Block::new(&[]);
-                let fallback =
-                    emit_addressof(context, &str_else_blk, "s_typename_number", types, loc);
-                str_else_blk.append_operation(scf::r#yield(&[fallback], loc));
+                {
+                    // Phase 2.6c-tag-defensive-trap (ADR 0069):
+                    // unknown tag (Function/Table reserved) →
+                    // fail-fast trap. Lifts the previous silent
+                    // "number" fallback that mis-identified
+                    // future tag values. Yield placeholder ptr
+                    // to satisfy scf.if's type contract.
+                    emit_tagged_unknown_tag_trap(context, &str_else_blk, types, loc);
+                    let placeholder =
+                        emit_addressof(context, &str_else_blk, "s_typename_number", types, loc);
+                    str_else_blk.append_operation(scf::r#yield(&[placeholder], loc));
+                }
                 str_else.append_block(str_else_blk);
                 let str_op = scf::r#if(is_string, &[types.ptr], str_then, str_else, loc);
                 let str_result: Value<'c, '_> = bool_else_blk
@@ -6322,10 +6395,16 @@ fn emit_tostring_tagged_local<'a, 'c>(
                 let str_else = Region::new();
                 let str_else_blk = Block::new(&[]);
                 {
-                    // Defensive fallback for Function / Table.
-                    let fallback =
+                    // Phase 2.6c-tag-defensive-trap (ADR 0069):
+                    // unknown tag (Function/Table reserved) →
+                    // fail-fast trap. Lifts the previous silent
+                    // "function" fallback that mis-identified
+                    // future tag values. Yield placeholder ptr
+                    // to satisfy scf.if's type contract.
+                    emit_tagged_unknown_tag_trap(context, &str_else_blk, types, loc);
+                    let placeholder =
                         emit_addressof(context, &str_else_blk, "s_typename_function", types, loc);
-                    str_else_blk.append_operation(scf::r#yield(&[fallback], loc));
+                    str_else_blk.append_operation(scf::r#yield(&[placeholder], loc));
                 }
                 str_else.append_block(str_else_blk);
                 let str_op = scf::r#if(is_string, &[types.ptr], str_then, str_else, loc);

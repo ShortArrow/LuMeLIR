@@ -6,7 +6,7 @@
 > consumer / tag semantics. ADRs continue to record *decisions*;
 > this page records *current state*.
 
-**Last updated:** 2026-05-05 (after ADR 0067)
+**Last updated:** 2026-05-05 (after ADR 0069)
 
 ---
 
@@ -136,6 +136,15 @@ tag. Open LIC.
 inherits the runtime dispatch for free (matrix tests cover
 this).
 
+**Reserved tags (TAG_FUNCTION = 4 / TAG_TABLE = 5)**: every
+runtime-dispatch consumer (`print`, `type`, `tostring`,
+Local-Local `==`) traps via `emit_tagged_unknown_tag_trap` (ADR
+0069) when an unsupported tag reaches the dispatch chain.
+Currently unreachable — HIR rejects Function / Table values in
+tables (LIC-2.6c-tag-hetero-fn-tbl-1) — but the trap is the
+fail-fast guard rail for the day a sub-phase begins lowering
+those tags.
+
 ### `==` / `~=` (tagged operand)
 
 | Source LHS                          | Source RHS              | Behaviour                                | ADR  |
@@ -219,10 +228,18 @@ Hold across all sub-phases unless an ADR explicitly amends them.
    a tagged slot. Tagged-slot payload semantics are independent
    of the hash sentinel layer.
 5. **Defensive `else:` fallback** in any `scf.if` chain over
-   tags either:
-   - represents a tag value not yet implemented (LIC-tracked), or
-   - is genuinely unreachable given current HIR (commented).
-   A bare fallback that does not match either is a bug.
+   tags **traps** via `emit_tagged_unknown_tag_trap` (ADR 0069)
+   when the runtime tag is reserved (Function = 4 / Table = 5)
+   and the consumer has no implementation for it. Yielding a
+   silent value (e.g. `s_typename_function`, `false`, `s_nil`)
+   is a bug — it would mis-identify a future tag value as a
+   currently-supported one. The trap reuses
+   `s_table_type_mismatch` so the diagnostic is consistent with
+   the array/hash trap surface (ADR 0059 / 0060). Backed by
+   `tests/phase2_6c_tag_defensive_trap.rs` — HIR rejects
+   Function / Table values into tables today, so the trap is
+   currently unreachable; it stays as a fail-fast guard rail
+   for the day a sub-phase starts populating reserved tags.
 6. **Slot copy** between two tagged slots reads the payload as
    raw `i64` (ADR 0064) so any tag value round-trips.
 
@@ -313,3 +330,4 @@ Listed in Codex review priority order (post-ADR-0067):
 | 0066 | 2.6c-tag-hetero-eq           | IsNil unification (Tidy First) + Local-Local Eq runtime dispatch   |
 | 0067 | 2.6c-tag-consumers           | `type` / `tostring` runtime dispatch + consumer matrix scaffold    |
 | 0068 | 2.6c-tag-doc-consolidate     | This SoT doc + LIC consolidation                                   |
+| 0069 | 2.6c-tag-defensive-trap      | Trap on unknown tagged-slot tag (replaces silent fallbacks)        |
