@@ -243,6 +243,17 @@ pub enum HirExprKind {
     /// or `Local(LocalId)` with kind `TaggedValue` (slot tag
     /// check). Other operand shapes are unreachable.
     IsNil(Box<HirExpr>),
+    /// Phase 2.7p-arith-string-coerce (ADR 0077): wraps a String
+    /// operand of an arithmetic / bitwise BinOp with runtime
+    /// numeric coercion. Codegen lowers via
+    /// `emit_tonumber_for_arith` which traps on parse failure
+    /// (Lua spec §3.4.1: `"abc" + 1` is a runtime error, not a
+    /// silent NaN). The wrapped expression must have static kind
+    /// `String`. Distinct from `Builtin::ToNumber` so the failure
+    /// semantics differ: `tonumber("abc")` returns the NaN
+    /// sentinel; arith coercion traps via
+    /// `s_arith_coerce_failed`.
+    ArithStringCoerce(Box<HirExpr>),
 }
 
 /// Discriminates whether a [`HirExprKind::Call`] hits a built-in

@@ -279,6 +279,19 @@ fn emit_fmt_global<'c>(
         "table value type mismatch\0",
         loc,
     );
+    // Phase 2.7p-arith-string-coerce (ADR 0077): runtime trap
+    // diagnostic when a String operand of an arithmetic /
+    // bitwise BinOp fails to parse as a number. Lua spec
+    // §3.4.1: `"abc" + 1` is a runtime error, not a silent
+    // NaN propagation.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_arith_coerce_failed",
+        "attempt to perform arithmetic on a string value\0",
+        loc,
+    );
 }
 
 fn emit_string_global<'c>(
@@ -367,6 +380,10 @@ fn collect_string_pool(chunk: &HirChunk) -> std::collections::HashMap<String, St
             // its own string-pool entries) and the Local source
             // (which has none, but recursing is harmless).
             HirExprKind::IsNil(operand) => visit_expr(operand, set),
+            // Phase 2.7p-arith-string-coerce (ADR 0077): the
+            // wrapper holds a String operand; recurse so its pool
+            // entry is registered.
+            HirExprKind::ArithStringCoerce(operand) => visit_expr(operand, set),
             _ => {}
         }
     }
@@ -4268,6 +4285,18 @@ fn emit_expr<'a, 'c>(
         HirExprKind::IndexTagged { .. } => {
             unreachable!("IndexTagged is consumed by emit_stmt(LocalInit/Assign)")
         }
+        // Phase 2.7p-arith-string-coerce (ADR 0077): String operand
+        // of an arithmetic / bitwise BinOp materialises a Number
+        // at runtime. The wrapped expression is the original String
+        // operand; we evaluate it (yielding a `!llvm.ptr` to the
+        // string pool global), then call the trapping coerce
+        // helper which runs `sscanf("%lf")` and exits on failure.
+        HirExprKind::ArithStringCoerce(operand) => {
+            let str_ptr = emit_expr(
+                context, block, operand, slots, locals, functions, types, params_len, loc,
+            )?;
+            Ok(emit_tonumber_for_arith(context, block, str_ptr, types, loc))
+        }
     }
 }
 
@@ -4780,6 +4809,50 @@ fn emit_tonumber<'a, 'c>(
         // (trapping on Nil) before tonumber sees it.
         ValueKind::TaggedValue => value,
     }
+}
+
+/// Phase 2.7p-arith-string-coerce (ADR 0077): `emit_tonumber`
+/// for arithmetic context. Calls the same `sscanf` path as
+/// `emit_tonumber(String)` then promotes the NaN-on-failure
+/// sentinel into a runtime trap via `s_arith_coerce_failed`.
+/// Lua spec §3.4.1: `"abc" + 1` is a runtime error, not silent
+/// NaN propagation. The `tonumber` builtin path is unchanged
+/// — its NaN sentinel is part of its public contract (ADR
+/// 0028) and observable via `x == x` flips.
+fn emit_tonumber_for_arith<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    str_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let parsed = emit_tonumber(context, block, str_ptr, ValueKind::String, types, loc);
+    // arith.cmpf(uno) is true iff either operand is NaN. Comparing
+    // a value to itself with `Une` (unordered or not equal) yields
+    // true exactly when the value is NaN.
+    let is_nan: Value<'c, 'a> = block
+        .append_operation(arith::cmpf(
+            context,
+            CmpfPredicate::Une,
+            parsed,
+            parsed,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    let msg_ptr = emit_addressof(context, &then_blk, "s_arith_coerce_failed", types, loc);
+    emit_exit_with_message(context, &then_blk, msg_ptr, types, loc);
+    then_blk.append_operation(scf::r#yield(&[], loc));
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(is_nan, &[], then_region, else_region, loc));
+    parsed
 }
 
 /// Phase 2.7b/d (ADRs 0025, 0027): String equality and ordering via

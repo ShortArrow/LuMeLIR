@@ -6,7 +6,7 @@
 > consumer / tag semantics. ADRs continue to record *decisions*;
 > this page records *current state*.
 
-**Last updated:** 2026-05-04 (after ADR 0076)
+**Last updated:** 2026-05-04 (after ADR 0077)
 
 ---
 
@@ -191,8 +191,18 @@ phase.
 | `< <= > >=`                         | extract f64; cmpf | trap     | trap        | trap       | mixed kinds error    |
 
 These traps are **Lua-spec correct** for the current tag set —
-no LIC entry. (`"5" + 1` coercion is a separate Lua-spec
-feature; see Open Questions.)
+no LIC entry.
+
+**String operand coercion (ADR 0077):** when a static-`String`
+expression appears as an arithmetic / bitwise BinOp operand,
+HIR wraps it in `HirExprKind::ArithStringCoerce` and codegen
+runs `sscanf("%lf")` at runtime. Successful parse → arith
+proceeds; failed parse → exit with
+`s_arith_coerce_failed` (Lua-spec runtime error). Distinct
+from the `Builtin::ToNumber` builtin path (ADR 0028) whose
+failure returns the NaN sentinel — the arith path needs the
+trap because Lua spec §3.4.1 disallows silent NaN
+propagation from a non-numeric string.
 
 ---
 
@@ -224,6 +234,7 @@ the introduction, when still open).
 | LIC-2.6c-tag-callee-arity-1       | Tagged-callee arity / signature reconstruction soundness — resolved by HIR-rejecting all TaggedValue indirect calls | 0075       |
 | LIC-2.6c-tag-locals-fn-indirect-1 | Calling a TaggedValue-returning function through `Callee::Indirect` — subsumed by ADR 0075's broader rejection | 0074 / 0075 |
 | LIC-2.6c-tag-locals-fn-multi-1    | Multi-position TaggedValue interleaving (`return 1, nil` vs `return nil, 1`) — caller-side result-index walker generalised | 0076       |
+| LIC-2.7p-arith-coerce-1           | String → Number arithmetic coercion (`"5" + 1`); failure traps via `s_arith_coerce_failed` | 0077      |
 
 ### Partial
 
@@ -236,8 +247,9 @@ the introduction, when still open).
 | ID                                          | Behaviour                                                             | Notes                          |
 |---------------------------------------------|-----------------------------------------------------------------------|--------------------------------|
 | LIC-2.6c-tag-hetero-closure-escape-1        | Closure with upvalues stored in tables                                | HIR-rejects today (ADR 0044 + ADR 0071); needs escape-analysis relaxation |
+| LIC-2.7p-arith-coerce-tagged-1              | TaggedValue operand arith coerce (`local x = t[1]; print(x + 1)` when x is runtime String) | HIR can't statically resolve the kind; current TaggedValue-arith path traps on non-Number tag (ADR 0063). Unlocking needs runtime tag dispatch in arith codegen |
 
-**Total:** 18 LIC entries — 17 resolved, 1 partial, 1 pending.
+**Total:** 19 LIC entries — 18 resolved, 1 partial, 2 pending.
 
 ---
 
@@ -395,12 +407,12 @@ supported kind contributes 1.
 
 ## 7. Open Questions / Known Gaps
 
-Listed in Codex review priority order (post-ADR-0076):
+Listed in Codex review priority order (post-ADR-0077):
 
-1. **String → Number arith coerce** (`"5" + 1`). Lua-spec
-   feature, orthogonal to the tagged-value model.
-2. **Iteration `pairs(t)` / `ipairs(t)`.** Table runtime
+1. **Iteration `pairs(t)` / `ipairs(t)`.** Table runtime
    completeness; depends on the widened source set.
+2. **Hash key kinds expansion** (LIC-2.6a-arr-3). Bool /
+   Function / Table keys.
 3. **Future indirect-call re-enablement** (signature side
    table, ADR 0075 superseder candidate). Reopens
    `local g = t[k]; g()` once a runtime descriptor exists.
@@ -451,3 +463,4 @@ Listed in Codex review priority order (post-ADR-0076):
 | 0074 | 2.6c-tag-locals-fn           | Function-return TaggedValue widening — heterogeneous return paths widen `_ret_value_N` slot to TaggedValue; `ret_mlir_types` maps TaggedValue → `(i64 tag, i64 payload_raw)`; new helpers `emit_call_user_into_tagged_slot` / `_tmp` for caller-side result packing; HIR rejects storing tagged-return functions in tables |
 | 0075 | 2.6c-tag-callee-arity        | TaggedValue indirect call HIR-rejected (Strict Plan C, supersedes ADR 0072 in part) — `args.len()` arity reconstruction was unsound; LIC-callee-arity-1 + locals-fn-indirect-1 resolved by removal; `emit_value_slot_check_function` deleted |
 | 0076 | 2.6c-tag-locals-fn-multi     | Multi-position TaggedValue caller-side walker — new `ret_kind_result_width` / `flat_result_index` / `emit_pack_tagged_result_at_pos` helpers generalise `emit_multi_assign_from_call` to handle multi-position TaggedValue ABI (`(i64, i64, i64, i64)` for two TaggedValue positions); LIC-locals-fn-multi-1 resolved |
+| 0077 | 2.7p-arith-string-coerce     | String → Number arith coercion — HIR `ArithStringCoerce` wraps String operands of arith / bitwise BinOps; codegen `emit_tonumber_for_arith` reuses `emit_tonumber`'s sscanf path then promotes NaN sentinel to runtime trap (`s_arith_coerce_failed`); 12 arith / bitwise ops accept String operands; hex floats work via glibc's sscanf%lf; LIC-arith-coerce-1 resolved |

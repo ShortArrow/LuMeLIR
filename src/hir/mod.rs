@@ -77,6 +77,30 @@ fn is_number_compatible(k: ValueKind) -> bool {
     matches!(k, ValueKind::Number | ValueKind::TaggedValue)
 }
 
+/// Phase 2.7p-arith-string-coerce (ADR 0077, Codex Tidy First):
+/// if `expr` has static kind `String`, wrap it in
+/// `HirExprKind::ArithStringCoerce` so codegen runs `tonumber`
+/// at runtime and traps on parse failure (Lua spec §3.4.1).
+/// Otherwise pass `expr` through unchanged. Applied to both
+/// operands of every arithmetic / bitwise BinOp before kind
+/// validation so the wrapper's `Number` kind satisfies
+/// `is_number_compatible` downstream.
+fn coerce_arith_operand_if_string(
+    expr: HirExpr,
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+) -> HirExpr {
+    if matches!(infer_kind(&expr, locals, functions), ValueKind::String) {
+        let span = expr.span;
+        HirExpr {
+            kind: HirExprKind::ArithStringCoerce(Box::new(expr)),
+            span,
+        }
+    } else {
+        expr
+    }
+}
+
 /// Phase 2.6c-tag-locals (ADR 0063): when a `LocalInit` /
 /// `Assign`'s RHS is a plain `HirExprKind::Index`, rewrite it
 /// into `HirExprKind::IndexTagged` so the local widens to
@@ -120,6 +144,10 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
         // 0066) unifies the previous IsNilQuery / IsNilLocal
         // pair into IsNil(operand).
         HirExprKind::IsNil(_) => ValueKind::Bool,
+        // Phase 2.7p-arith-string-coerce (ADR 0077): the
+        // wrapper materialises a Number from a String operand at
+        // runtime; trap on parse failure (Lua spec §3.4.1).
+        HirExprKind::ArithStringCoerce(_) => ValueKind::Number,
         // Phase 2.6c-tag-locals (ADR 0063).
         HirExprKind::IndexTagged { .. } => ValueKind::TaggedValue,
         HirExprKind::Local(LocalId(idx)) => locals[*idx].kind,
@@ -2008,6 +2036,17 @@ impl LowerCtx {
                     | BinOp::BitXor
                     | BinOp::Shl
                     | BinOp::Shr => {
+                        // Phase 2.7p-arith-string-coerce (ADR 0077):
+                        // String operands wrap in
+                        // `ArithStringCoerce` so kind validation
+                        // sees them as Number; the wrapper traps
+                        // at runtime on parse failure.
+                        let lhs_hir =
+                            coerce_arith_operand_if_string(lhs_hir, &self.locals, &self.functions);
+                        let rhs_hir =
+                            coerce_arith_operand_if_string(rhs_hir, &self.locals, &self.functions);
+                        let lk = infer_kind(&lhs_hir, &self.locals, &self.functions);
+                        let rk = infer_kind(&rhs_hir, &self.locals, &self.functions);
                         // Phase 2.6c-tag-locals (ADR 0063):
                         // TaggedValue is interchangeable with
                         // Number at the HIR layer. The Local
