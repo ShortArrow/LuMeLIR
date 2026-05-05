@@ -381,6 +381,33 @@ pub(crate) fn emit_tagged_unknown_tag_trap<'c>(
     emit_exit_with_message(context, block, msg_ptr, types, loc);
 }
 
+/// Phase 2.6c-tag-dispatch-preamble (post-ADR-0074 Tidy First):
+/// load the i64 tag at slot+0 and compute the payload pointer at
+/// slot+8 for a 16-byte tagged value slot. Used by the consumer
+/// dispatchers (`emit_print_tagged_local`,
+/// `emit_tagged_eq_local_local`, `emit_tostring_tagged_local`)
+/// which all read both the tag and a per-arm payload. The
+/// `emit_type_tagged_local` helper only consults the tag and
+/// uses [`emit_load`] directly.
+///
+/// Codex review (post-ADR-0074) confirmed that a fuller
+/// callback-based skeleton extraction is blocked by Rust's
+/// borrow-checker against melior's eager region-building.
+/// Extracting the preamble alone is the safe, behaviour-
+/// preserving win.
+pub(crate) fn emit_tag_and_payload_ptr<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> (Value<'c, 'a>, Value<'c, 'a>) {
+    let tag = emit_load(block, slot_ptr, types.i64, loc);
+    let payload_ptr =
+        emit_byte_offset_ptr(context, block, slot_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
+    (tag, payload_ptr)
+}
+
 /// Phase 2.6c-tag-fn-tbl-call (ADR 0072): assert a tagged-value
 /// slot's tag is `TAG_FUNCTION`, exiting with the standard
 /// type-mismatch diagnostic otherwise. Mirrors
@@ -442,9 +469,7 @@ pub(crate) fn emit_print_tagged_local<'a, 'c>(
     types: &Types<'c>,
     loc: Location<'c>,
 ) {
-    let tag = emit_load(block, slot_ptr, types.i64, loc);
-    let value_ptr =
-        emit_byte_offset_ptr(context, block, slot_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
+    let (tag, value_ptr) = emit_tag_and_payload_ptr(context, block, slot_ptr, types, loc);
     let tag_number = block
         .append_operation(arith::constant(
             context,
@@ -758,8 +783,8 @@ pub(crate) fn emit_tagged_eq_local_local<'a, 'c>(
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
-    let lhs_tag = emit_load(block, slot_lhs, types.i64, loc);
-    let rhs_tag = emit_load(block, slot_rhs, types.i64, loc);
+    let (lhs_tag, lhs_payload) = emit_tag_and_payload_ptr(context, block, slot_lhs, types, loc);
+    let (rhs_tag, rhs_payload) = emit_tag_and_payload_ptr(context, block, slot_rhs, types, loc);
     let tag_eq: Value<'c, 'a> = block
         .append_operation(arith::cmpi(
             context,
@@ -771,10 +796,6 @@ pub(crate) fn emit_tagged_eq_local_local<'a, 'c>(
         .result(0)
         .unwrap()
         .into();
-    let lhs_payload =
-        emit_byte_offset_ptr(context, block, slot_lhs, ARRAY_ELEM_OFF_VALUE, types, loc);
-    let rhs_payload =
-        emit_byte_offset_ptr(context, block, slot_rhs, ARRAY_ELEM_OFF_VALUE, types, loc);
     // Outer scf.if tag_eq → kind-specific compare, else → false.
     let then_region = Region::new();
     let then_blk = Block::new(&[]);

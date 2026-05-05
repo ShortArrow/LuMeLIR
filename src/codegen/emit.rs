@@ -39,9 +39,10 @@ use super::primitive::{
 };
 use super::tagged::{
     ARRAY_ELEM_OFF_VALUE, ARRAY_ELEM_SIZE, TAG_BOOL, TAG_FUNCTION, TAG_NIL, TAG_NUMBER, TAG_STRING,
-    TAG_TABLE, emit_alloca_slot_for_kind, emit_print_tagged_local, emit_tagged_eq_local_local,
-    emit_tagged_unknown_tag_trap, emit_type_tagged_local, emit_value_slot_check_function,
-    emit_value_slot_check_number, emit_value_slot_store_dispatched, emit_value_slot_store_nil,
+    TAG_TABLE, emit_alloca_slot_for_kind, emit_print_tagged_local, emit_tag_and_payload_ptr,
+    emit_tagged_eq_local_local, emit_tagged_unknown_tag_trap, emit_type_tagged_local,
+    emit_value_slot_check_function, emit_value_slot_check_number, emit_value_slot_store_dispatched,
+    emit_value_slot_store_nil,
 };
 
 // =============================================================
@@ -5427,9 +5428,7 @@ fn emit_tostring_tagged_local<'a, 'c>(
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
-    let tag = emit_load(block, slot_ptr, types.i64, loc);
-    let value_ptr =
-        emit_byte_offset_ptr(context, block, slot_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
+    let (tag, value_ptr) = emit_tag_and_payload_ptr(context, block, slot_ptr, types, loc);
     let make_const_i64 = |b: &Block<'c>, v: i64| -> Value<'c, '_> {
         b.append_operation(arith::constant(
             context,
