@@ -5517,17 +5517,266 @@ fn emit_print_tagged_local<'a, 'c>(
     block.append_operation(scf::r#if(is_number, &[], number_then, number_else, loc));
 }
 
-/// Phase 2.6c-tag-hetero-fix (ADR 0065): `TaggedValue` operand
-/// `==` / `~=` runtime tag dispatch. When at least one side is
-/// `Local(TaggedValue)` and the other side is a Number / Bool /
-/// String typed operand, emit a tag check + per-kind compare
-/// instead of folding the heterogeneous-kind result. Returns
-/// `Some(i1)` when the dispatch fires, `None` to fall through
-/// to the existing BinOp path.
-///
-/// The TaggedValue ↔ TaggedValue case is intentionally left to
-/// the fall-through path — it lands as a Number-only extract and
-/// traps for non-Number operands (LIC-2.6c-tag-hetero-eq-1).
+/// Phase 2.6c-tag-hetero-eq (ADR 0066): `Local(TaggedValue) ==
+/// Local(TaggedValue)` runtime dispatch. Loads both slot tags
+/// at offset 0 and: if the tags differ, yields `false` (Lua:
+/// heterogeneous compare). If the tags match, switches on the
+/// shared tag and compares the 8-byte payloads with the kind-
+/// appropriate predicate — cmpf for Number, cmpi i64 for Bool's
+/// zext payload, strcmp for String, and `true` for both Nil.
+/// Function / Table tags fall through to a defensive `false`,
+/// reserving room for the follow-up sub-phase that introduces
+/// those payloads.
+fn emit_tagged_eq_local_local<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_lhs: Value<'c, 'a>,
+    slot_rhs: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let lhs_tag = emit_load(block, slot_lhs, types.i64, loc);
+    let rhs_tag = emit_load(block, slot_rhs, types.i64, loc);
+    let tag_eq: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            lhs_tag,
+            rhs_tag,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let lhs_payload =
+        emit_byte_offset_ptr(context, block, slot_lhs, ARRAY_ELEM_OFF_VALUE, types, loc);
+    let rhs_payload =
+        emit_byte_offset_ptr(context, block, slot_rhs, ARRAY_ELEM_OFF_VALUE, types, loc);
+    // Outer scf.if tag_eq → kind-specific compare, else → false.
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        // Nested chain: TAG_NIL → true; TAG_NUMBER → cmpf;
+        // TAG_BOOL → cmpi i64 (zext payload); TAG_STRING →
+        // strcmp == 0; else → false (Function/Table reserved).
+        let make_const_i64 = |b: &Block<'c>, v: i64| -> Value<'c, '_> {
+            b.append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, v).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into()
+        };
+        let tag_nil = make_const_i64(&then_blk, TAG_NIL);
+        let is_nil: Value<'c, '_> = then_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                lhs_tag,
+                tag_nil,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let nil_then = Region::new();
+        let nil_then_blk = Block::new(&[]);
+        let i1_true = nil_then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i1, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        nil_then_blk.append_operation(scf::r#yield(&[i1_true], loc));
+        nil_then.append_block(nil_then_blk);
+        let nil_else = Region::new();
+        let nil_else_blk = Block::new(&[]);
+        {
+            let tag_number = make_const_i64(&nil_else_blk, TAG_NUMBER);
+            let is_number: Value<'c, '_> = nil_else_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    lhs_tag,
+                    tag_number,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let num_then = Region::new();
+            let num_then_blk = Block::new(&[]);
+            {
+                let l = emit_load(&num_then_blk, lhs_payload, types.f64, loc);
+                let r = emit_load(&num_then_blk, rhs_payload, types.f64, loc);
+                let eq: Value<'c, '_> = num_then_blk
+                    .append_operation(arith::cmpf(context, arith::CmpfPredicate::Oeq, l, r, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                num_then_blk.append_operation(scf::r#yield(&[eq], loc));
+            }
+            num_then.append_block(num_then_blk);
+            let num_else = Region::new();
+            let num_else_blk = Block::new(&[]);
+            {
+                let tag_bool = make_const_i64(&num_else_blk, TAG_BOOL);
+                let is_bool: Value<'c, '_> = num_else_blk
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Eq,
+                        lhs_tag,
+                        tag_bool,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let bool_then = Region::new();
+                let bool_then_blk = Block::new(&[]);
+                {
+                    let l = emit_load(&bool_then_blk, lhs_payload, types.i64, loc);
+                    let r = emit_load(&bool_then_blk, rhs_payload, types.i64, loc);
+                    let eq: Value<'c, '_> = bool_then_blk
+                        .append_operation(arith::cmpi(context, arith::CmpiPredicate::Eq, l, r, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    bool_then_blk.append_operation(scf::r#yield(&[eq], loc));
+                }
+                bool_then.append_block(bool_then_blk);
+                let bool_else = Region::new();
+                let bool_else_blk = Block::new(&[]);
+                {
+                    let tag_string = make_const_i64(&bool_else_blk, TAG_STRING);
+                    let is_string: Value<'c, '_> = bool_else_blk
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Eq,
+                            lhs_tag,
+                            tag_string,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let str_then = Region::new();
+                    let str_then_blk = Block::new(&[]);
+                    {
+                        let lp = emit_load(&str_then_blk, lhs_payload, types.ptr, loc);
+                        let rp = emit_load(&str_then_blk, rhs_payload, types.ptr, loc);
+                        let cmp = emit_libc_call_i32(
+                            context,
+                            &str_then_blk,
+                            "strcmp",
+                            &[lp, rp],
+                            types,
+                            loc,
+                        );
+                        let zero_i32 = str_then_blk
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(types.i32, 0).into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let eq: Value<'c, '_> = str_then_blk
+                            .append_operation(arith::cmpi(
+                                context,
+                                arith::CmpiPredicate::Eq,
+                                cmp,
+                                zero_i32,
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        str_then_blk.append_operation(scf::r#yield(&[eq], loc));
+                    }
+                    str_then.append_block(str_then_blk);
+                    let str_else = Region::new();
+                    let str_else_blk = Block::new(&[]);
+                    {
+                        // Defensive fallback for Function / Table
+                        // tags (4 / 5) — yet to be lowered.
+                        let i1_false = str_else_blk
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(types.i1, 0).into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        str_else_blk.append_operation(scf::r#yield(&[i1_false], loc));
+                    }
+                    str_else.append_block(str_else_blk);
+                    let str_op = scf::r#if(is_string, &[types.i1], str_then, str_else, loc);
+                    let str_result: Value<'c, '_> = bool_else_blk
+                        .append_operation(str_op)
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    bool_else_blk.append_operation(scf::r#yield(&[str_result], loc));
+                }
+                bool_else.append_block(bool_else_blk);
+                let bool_op = scf::r#if(is_bool, &[types.i1], bool_then, bool_else, loc);
+                let bool_result: Value<'c, '_> = num_else_blk
+                    .append_operation(bool_op)
+                    .result(0)
+                    .unwrap()
+                    .into();
+                num_else_blk.append_operation(scf::r#yield(&[bool_result], loc));
+            }
+            num_else.append_block(num_else_blk);
+            let num_op = scf::r#if(is_number, &[types.i1], num_then, num_else, loc);
+            let num_result: Value<'c, '_> = nil_else_blk
+                .append_operation(num_op)
+                .result(0)
+                .unwrap()
+                .into();
+            nil_else_blk.append_operation(scf::r#yield(&[num_result], loc));
+        }
+        nil_else.append_block(nil_else_blk);
+        let nil_op = scf::r#if(is_nil, &[types.i1], nil_then, nil_else, loc);
+        let nil_result: Value<'c, '_> = then_blk.append_operation(nil_op).result(0).unwrap().into();
+        then_blk.append_operation(scf::r#yield(&[nil_result], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    {
+        let i1_false = else_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i1, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        else_blk.append_operation(scf::r#yield(&[i1_false], loc));
+    }
+    else_region.append_block(else_blk);
+    let if_op = scf::r#if(tag_eq, &[types.i1], then_region, else_region, loc);
+    block.append_operation(if_op).result(0).unwrap().into()
+}
+
+/// Phase 2.6c-tag-hetero-fix (ADR 0065) + ADR 0066:
+/// `TaggedValue` operand `==` / `~=` runtime tag dispatch. When
+/// at least one side is `Local(TaggedValue)`, both-tagged routes
+/// to `emit_tagged_eq_local_local` (ADR 0066) and one-tagged-
+/// plus-Number/Bool/String typed operand emits a tag check +
+/// per-kind compare (ADR 0065). Returns `Some(i1)` when the
+/// dispatch fires, `None` to fall through to the existing
+/// BinOp path.
 #[allow(clippy::too_many_arguments)]
 fn emit_tagged_eq_runtime_dispatch<'a, 'c>(
     context: &'c Context,
@@ -5550,11 +5799,43 @@ fn emit_tagged_eq_runtime_dispatch<'a, 'c>(
         }
         None
     }
-    // Identify which side carries the tagged local. Skip when
-    // both sides or neither side are TaggedValue locals.
+    // Identify which side(s) carry the tagged local.
     let (tagged_id, typed_expr, typed_kind) =
         match (tagged_local_idx(lhs, locals), tagged_local_idx(rhs, locals)) {
-            (Some(_), Some(_)) => return Ok(None), // both tagged — fall through
+            (Some(lhs_id), Some(rhs_id)) => {
+                // Phase 2.6c-tag-hetero-eq (ADR 0066): both sides
+                // are TaggedValue locals — runtime tag-vs-tag
+                // dispatch.
+                let eq = emit_tagged_eq_local_local(
+                    context,
+                    block,
+                    slots[lhs_id.0],
+                    slots[rhs_id.0],
+                    types,
+                    loc,
+                );
+                let final_val = match op {
+                    BinOp::Eq => eq,
+                    BinOp::Ne => {
+                        let i1_one = block
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(types.i1, 1).into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        block
+                            .append_operation(arith::xori(eq, i1_one, loc))
+                            .result(0)
+                            .unwrap()
+                            .into()
+                    }
+                    _ => unreachable!(),
+                };
+                return Ok(Some(final_val));
+            }
             (Some(id), None) => {
                 let k = infer_kind(rhs, locals, functions);
                 (id, rhs, k)

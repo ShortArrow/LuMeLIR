@@ -83,7 +83,8 @@ Full product requirements: [`docs/PRD.jp.md`](docs/PRD.jp.md) (Source of Truth, 
 | ‣ 2.6c-tag-locals Number-MaybeNil locals widening | **Done** | `local x = t[i]` widens x into a 16-byte tagged slot (`{tag, f64}`); `if x == nil` lowers to non-trapping `IsNilLocal`; LIC-2.6a-arr-1 + LIC-2.6b-hash-1 resolved for the locals form (ADR 0063) |
 | ‣ 2.6c-tag-hetero heterogeneous Bool/String table values | **Done** | TAG_BOOL/STRING extend the tagged slot; `{1, "hello", true}` and `t.k = "world"` accepted; `print(Local(TaggedValue))` runtime tag dispatch; LIC-2.6a-arr-2 / LIC-2.6a-wr-3 / LIC-2.6b-hash-2 resolved for Bool/String (ADR 0064) |
 | ‣ 2.6c-tag-hetero-fix inline print + Eq dispatch | **Done** | codex-review-flagged P1: `print(t[k])` materialises through tmp tagged slot for runtime tag dispatch; `TaggedValue == literal` lowers to runtime tag-check + per-kind compare instead of fold; supersedes ADR 0061/0063 plain-read-trap claims; LIC-2.6c-tag-hetero-inline-1 resolved (ADR 0065) |
-| ‣ 2.6+ tables / metatables | In progress | function/table values in tables, function-return widening, hetero Local-Local `==`, methods, metatables — multiple sub-phases |
+| ‣ 2.6c-tag-hetero-eq IsNil unification + Local-Local `==` | **Done** | Tidy First: `IsNilQuery` + `IsNilLocal` collapse into `IsNil(Box<HirExpr>)`. Feature: `Local(TaggedValue) == Local(TaggedValue)` runtime tag-vs-tag dispatch + per-kind compare (cmpf / cmpi / strcmp). LIC-2.6c-tag-hetero-eq-1 resolved (ADR 0066) |
+| ‣ 2.6+ tables / metatables | In progress | function/table values in tables, function-return widening, inline read consumers (`type`, `tostring`, arith), methods, metatables — multiple sub-phases |
 | Phase 3 — Domain Features | Not started | Rust-Lua inline bridge, embedded register dialect |
 
 **How to read TBD markers:** sections marked `TBD: Phase N, ADR XXXX` indicate the rule is undecided until that ADR lands. Do not invent answers — surface the question instead.
