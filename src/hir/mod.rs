@@ -102,11 +102,12 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
         // every read returns a Number.
         HirExprKind::Index { .. } => ValueKind::Number,
         // Phase 2.6c-isnil-query (ADR 0061): non-trapping nil
-        // probe returns Bool.
-        HirExprKind::IsNilQuery { .. } => ValueKind::Bool,
+        // probe returns Bool. Phase 2.6c-tag-hetero-eq (ADR
+        // 0066) unifies the previous IsNilQuery / IsNilLocal
+        // pair into IsNil(operand).
+        HirExprKind::IsNil(_) => ValueKind::Bool,
         // Phase 2.6c-tag-locals (ADR 0063).
         HirExprKind::IndexTagged { .. } => ValueKind::TaggedValue,
-        HirExprKind::IsNilLocal { .. } => ValueKind::Bool,
         HirExprKind::Local(LocalId(idx)) => locals[*idx].kind,
         HirExprKind::UnaryOp { op, .. } => match op {
             crate::parser::UnaryOp::Neg => ValueKind::Number,
@@ -1991,42 +1992,37 @@ impl LowerCtx {
                     // heterogeneous-kind rule would silently miscompile
                     // them to `Bool(false)`.
                     BinOp::Eq | BinOp::Ne => {
-                        // Phase 2.6c-isnil-query (ADR 0061): Index == Nil.
-                        // Phase 2.6c-tag-locals (ADR 0063): also detect
-                        // `Local(TaggedValue) == Nil`, which lowers
-                        // into `IsNilLocal { local_id }` and reads only
-                        // the slot's tag — never traps.
-                        let nil_query_index = match (&lhs_hir.kind, &rhs_hir.kind) {
-                            (HirExprKind::Index { target, key }, HirExprKind::Nil) => {
-                                Some((target.clone(), key.clone()))
-                            }
-                            (HirExprKind::Nil, HirExprKind::Index { target, key }) => {
-                                Some((target.clone(), key.clone()))
-                            }
-                            _ => None,
-                        };
-                        let nil_query_local = match (&lhs_hir.kind, &rhs_hir.kind) {
+                        // Phase 2.6c-tag-hetero-eq (ADR 0066): one
+                        // unified `IsNil` variant for any tagged-
+                        // value source. Two operand shapes lower
+                        // through here:
+                        //   - `Index { target, key }` (ADR 0061,
+                        //     non-trapping table read)
+                        //   - `Local(TaggedValue)` (ADR 0063, slot
+                        //     tag check)
+                        // Detect the `<source> == nil` (or the
+                        // reverse) pattern and lower to
+                        // `IsNil(<source>)`. Other Eq/Ne patterns
+                        // fall through to the fold or runtime
+                        // dispatch path below.
+                        let nil_operand: Option<HirExpr> = match (&lhs_hir.kind, &rhs_hir.kind) {
+                            (HirExprKind::Index { .. }, HirExprKind::Nil) => Some(lhs_hir.clone()),
+                            (HirExprKind::Nil, HirExprKind::Index { .. }) => Some(rhs_hir.clone()),
                             (HirExprKind::Local(LocalId(idx)), HirExprKind::Nil)
                                 if matches!(self.locals[*idx].kind, ValueKind::TaggedValue) =>
                             {
-                                Some(LocalId(*idx))
+                                Some(lhs_hir.clone())
                             }
                             (HirExprKind::Nil, HirExprKind::Local(LocalId(idx)))
                                 if matches!(self.locals[*idx].kind, ValueKind::TaggedValue) =>
                             {
-                                Some(LocalId(*idx))
+                                Some(rhs_hir.clone())
                             }
                             _ => None,
                         };
-                        let query_kind: Option<HirExprKind> =
-                            if let Some((target, key)) = nil_query_index {
-                                Some(HirExprKind::IsNilQuery { target, key })
-                            } else {
-                                nil_query_local.map(|id| HirExprKind::IsNilLocal { local_id: id })
-                            };
-                        if let Some(qk) = query_kind {
+                        if let Some(operand) = nil_operand {
                             let query = HirExpr {
-                                kind: qk,
+                                kind: HirExprKind::IsNil(Box::new(operand)),
                                 span: expr.span,
                             };
                             match op {

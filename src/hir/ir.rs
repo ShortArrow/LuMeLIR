@@ -221,18 +221,6 @@ pub enum HirExprKind {
         target: Box<HirExpr>,
         key: Box<HirExpr>,
     },
-    /// `t[i] == nil` / `t.k == nil` non-trapping nil query (Phase
-    /// 2.6c-isnil-query, ADR 0061). Produced when HIR lowering
-    /// detects `BinOp::Eq` (or `Ne`, wrapped in `UnaryOp::Not`) with
-    /// one side being `Index` and the other being `Nil`. Returns
-    /// `Bool` — `true` when the slot is missing/OOB/Nil-tagged,
-    /// `false` when a Number-tagged value is present. Bypasses the
-    /// trapping read path entirely, so OOB array reads and missing
-    /// hash keys report the Lua-spec answer.
-    IsNilQuery {
-        target: Box<HirExpr>,
-        key: Box<HirExpr>,
-    },
     /// Non-trapping tagged read of a table cell (Phase 2.6c-tag-
     /// locals, ADR 0063). Produced *only* by `lower_stmt(LocalInit
     /// | Assign)` when the source expression is
@@ -244,14 +232,17 @@ pub enum HirExprKind {
         target: Box<HirExpr>,
         key: Box<HirExpr>,
     },
-    /// Local-side counterpart of IsNilQuery (Phase 2.6c-tag-
-    /// locals, ADR 0063). Produced when HIR pattern-matches
-    /// `Local(TaggedValue) == Nil` (or `~= nil`, wrapped in
-    /// `UnaryOp::Not`). Codegen reads only the tag at slot+0 and
-    /// returns `tag == TAG_NIL` as i1 — never traps.
-    IsNilLocal {
-        local_id: LocalId,
-    },
+    /// Non-trapping nil probe of a tagged-value source (Phase
+    /// 2.6c-tag-hetero-eq, ADR 0066). Unifies the previous
+    /// `IsNilQuery` (ADR 0061, `Index` operand) and `IsNilLocal`
+    /// (ADR 0063, `Local(TaggedValue)` operand). Returns `Bool`
+    /// — `true` when the source's runtime tag is Nil, `false`
+    /// otherwise. The HIR pattern detection in
+    /// `lower_expr::BinOp Eq/Ne` only generates two operand
+    /// shapes: `Index { target, key }` (non-trapping table read)
+    /// or `Local(LocalId)` with kind `TaggedValue` (slot tag
+    /// check). Other operand shapes are unreachable.
+    IsNil(Box<HirExpr>),
 }
 
 /// Discriminates whether a [`HirExprKind::Call`] hits a built-in
