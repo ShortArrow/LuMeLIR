@@ -6158,6 +6158,18 @@ mod tests {
         hir::lower(&chunk).expect("lower")
     }
 
+    /// Phase 2.6c-tag-locals-fn (ADR 0074 prep, Tidy First):
+    /// shape-level assertion that an MLIR dump contains a given
+    /// substring. Use this for ABI-shape checks (function
+    /// signatures, call_indirect signatures, return tuples) so
+    /// the failure message labels the missing shape clearly.
+    fn assert_mlir_has(mlir: &str, expected: &str) {
+        assert!(
+            mlir.contains(expected),
+            "expected MLIR to contain `{expected}`, got:\n{mlir}",
+        );
+    }
+
     #[test]
     fn emit_number_constant_produces_arith_constant() {
         let ctx = new_context();
@@ -6377,10 +6389,7 @@ mod tests {
         let mlir = module.as_operation().to_string();
         // Pretty-printer prints `(f64) -> f64` rather than the
         // longer `!func.func<(f64) -> f64>` form for params.
-        assert!(
-            mlir.contains("%arg0: (f64) -> f64"),
-            "expected an `(f64) -> f64` param, got:\n{mlir}"
-        );
+        assert_mlir_has(&mlir, "%arg0: (f64) -> f64");
     }
 
     #[test]
@@ -6394,10 +6403,7 @@ mod tests {
         )
         .unwrap();
         let mlir = module.as_operation().to_string();
-        assert!(
-            mlir.contains("call_indirect"),
-            "expected `call_indirect`, got:\n{mlir}"
-        );
+        assert_mlir_has(&mlir, "call_indirect");
     }
 
     #[test]
