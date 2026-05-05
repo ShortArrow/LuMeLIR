@@ -1063,12 +1063,13 @@ impl LowerCtx {
                 // (ptr alloca, body-guard guarantees a real value
                 // before load fires).
                 ValueKind::Function(_) | ValueKind::String | ValueKind::Table => None,
-                // Phase 2.6c-tag-locals (ADR 0063): TaggedValue
-                // is only ever produced by `lower_stmt` rewriting a
-                // table read into `IndexTagged`; ret-value slots
-                // never carry it (function returns are still
-                // Number-only at this sub-phase).
-                ValueKind::TaggedValue => None,
+                // Phase 2.6c-tag-locals-fn (ADR 0074): a
+                // `_ret_value_N` slot widens to TaggedValue when
+                // the function has heterogeneous return paths.
+                // The default is Nil-tagged so an early implicit
+                // exit (no `return` reached) yields nil — matches
+                // Lua's "missing return = nil" rule.
+                ValueKind::TaggedValue => Some(HirExprKind::Nil),
             };
             if let Some(kind) = init_value {
                 out.push(HirStmt {
@@ -1511,10 +1512,30 @@ impl LowerCtx {
                 // / return escape. Plain `function() ... end`
                 // (no upvalues) and top-level `local function f`
                 // references pass through.
+                //
+                // Phase 2.6c-tag-locals-fn (ADR 0074): also
+                // reject functions whose ret_kinds widen to
+                // TaggedValue — the tagged-slot Function payload
+                // is a bare ptr with no signature info, and the
+                // call-site arity reconstruction (ADR 0072)
+                // cannot rebuild the `(...)→(i64,i64)` shape.
+                // LIC-2.6c-tag-locals-fn-indirect-1.
                 if let Some(fid) = function_ref_id(&value_hir, &self.locals) {
                     if !self.functions[fid.0].upvalues.is_empty() {
                         return Err(HirError::ClosureEscapes {
                             position: "table value".to_owned(),
+                            offset: value.span.start,
+                        });
+                    }
+                    if self.functions[fid.0]
+                        .ret_kinds
+                        .iter()
+                        .any(|k| matches!(k, ValueKind::TaggedValue))
+                    {
+                        return Err(HirError::TypeMismatch {
+                            op: "table value (function with tagged return)".to_owned(),
+                            lhs_kind: "function with non-tagged return".to_owned(),
+                            rhs_kind: "function returning TaggedValue".to_owned(),
                             offset: value.span.start,
                         });
                     }
@@ -1777,7 +1798,7 @@ impl LowerCtx {
             .iter()
             .map(|e| infer_kind(e, &self.locals, &self.functions))
             .collect();
-        if let Some(prev) = &self.in_function_ret_kinds {
+        if let Some(prev) = self.in_function_ret_kinds.clone() {
             if prev.len() != kinds.len() {
                 return Err(HirError::ArityMismatch {
                     builtin: "return".to_owned(),
@@ -1786,15 +1807,28 @@ impl LowerCtx {
                     offset: span.start,
                 });
             }
+            // Phase 2.6c-tag-locals-fn (ADR 0074): heterogeneous
+            // return kinds at the same position widen the slot
+            // (and thus the function's ret_kinds entry) to
+            // TaggedValue instead of being rejected. Once a
+            // position is TaggedValue, it stays TaggedValue
+            // (idempotent — every subsequent return path stores
+            // through the dispatched-store helper).
+            //
+            // Multi-return × TaggedValue position interleaving
+            // (`return 1, nil` vs `return nil, 1`) is still
+            // allowed by this pure widening logic, but the
+            // codegen ABI is not yet ready for it; the gating
+            // happens at the codegen layer
+            // (LIC-2.6c-tag-locals-fn-multi-1).
             for (i, (p, k)) in prev.iter().zip(kinds.iter()).enumerate() {
-                if p != k {
-                    return Err(HirError::TypeMismatch {
-                        op: format!("return position {i}"),
-                        lhs_kind: p.name().to_owned(),
-                        rhs_kind: k.name().to_owned(),
-                        offset: span.start,
-                    });
+                if *p == *k || *p == ValueKind::TaggedValue {
+                    continue;
                 }
+                let widened = self.in_function_ret_kinds.as_mut().unwrap();
+                widened[i] = ValueKind::TaggedValue;
+                let slot_id = ret_value_ids[i];
+                self.locals[slot_id.0].kind = ValueKind::TaggedValue;
             }
         } else {
             // First return seen — upgrade each `_ret_value_N` slot kind.
@@ -2237,10 +2271,25 @@ impl LowerCtx {
                     }
                     // Phase 2.6c-tag-fn-tbl (ADR 0071): closure
                     // with upvalues escapes through the table.
+                    // Phase 2.6c-tag-locals-fn (ADR 0074): same
+                    // rejection for tagged-return functions
+                    // (LIC-2.6c-tag-locals-fn-indirect-1).
                     if let Some(fid) = function_ref_id(elem, &self.locals) {
                         if !self.functions[fid.0].upvalues.is_empty() {
                             return Err(HirError::ClosureEscapes {
                                 position: "table element".to_owned(),
+                                offset: elem.span.start,
+                            });
+                        }
+                        if self.functions[fid.0]
+                            .ret_kinds
+                            .iter()
+                            .any(|k| matches!(k, ValueKind::TaggedValue))
+                        {
+                            return Err(HirError::TypeMismatch {
+                                op: "table element (function with tagged return)".to_owned(),
+                                lhs_kind: "function with non-tagged return".to_owned(),
+                                rhs_kind: "function returning TaggedValue".to_owned(),
                                 offset: elem.span.start,
                             });
                         }
@@ -3645,19 +3694,21 @@ local f = function() return b end";
     }
 
     #[test]
-    fn lower_inconsistent_bool_number_returns_error() {
-        // Body returns Bool in one branch, Number in another.
+    fn lower_inconsistent_bool_number_returns_widens_to_tagged() {
+        // Phase 2.6c-tag-locals-fn (ADR 0074): inconsistent kinds
+        // at the same return position used to reject; now they
+        // widen to TaggedValue so the function value can flow
+        // into a heterogeneous local at the call site.
         let src = concat!(
-            "local function bad(x)\n",
+            "local function widened(x)\n",
             "  if x > 0 then return true end\n",
             "  return 42\n",
             "end\n",
         );
-        let result = lower_src(src);
-        assert!(
-            result.is_err(),
-            "inconsistent Bool/Number returns must reject"
-        );
+        let hir =
+            lower_src(src).expect("Phase 2.6c-tag-locals-fn: heterogeneous returns must widen");
+        let f = &hir.functions[0];
+        assert_eq!(f.ret_kinds, vec![ValueKind::TaggedValue]);
     }
 
     #[test]

@@ -42,7 +42,6 @@ use super::tagged::{
     TAG_TABLE, emit_alloca_slot_for_kind, emit_print_tagged_local, emit_tagged_eq_local_local,
     emit_tagged_unknown_tag_trap, emit_type_tagged_local, emit_value_slot_check_function,
     emit_value_slot_check_number, emit_value_slot_store_dispatched, emit_value_slot_store_nil,
-    emit_value_slot_store_number,
 };
 
 // =============================================================
@@ -671,17 +670,21 @@ fn ret_mlir_types<'c>(
 ) -> Vec<Type<'c>> {
     ret_kinds
         .iter()
-        .map(|k| match k {
-            ValueKind::Number => types.f64,
-            ValueKind::Bool | ValueKind::Nil => types.i1,
+        .flat_map(|k| match k {
+            ValueKind::Number => vec![types.f64],
+            ValueKind::Bool | ValueKind::Nil => vec![types.i1],
             ValueKind::Function(arity) => {
                 let p_types: Vec<Type<'c>> = (0..*arity).map(|_| types.f64).collect();
-                FunctionType::new(context, &p_types, &[types.f64]).into()
+                vec![FunctionType::new(context, &p_types, &[types.f64]).into()]
             }
-            ValueKind::String | ValueKind::Table => types.ptr,
-            ValueKind::TaggedValue => {
-                unreachable!("TaggedValue is not yet a function return kind")
-            }
+            ValueKind::String | ValueKind::Table => vec![types.ptr],
+            // Phase 2.6c-tag-locals-fn (ADR 0074): a TaggedValue
+            // return becomes 2 MLIR i64 results: (tag, payload_raw).
+            // The caller reassembles them into a 16-byte tagged
+            // slot. payload_raw is i64 because slot copies (ADR
+            // 0064) already round-trip any payload kind through
+            // raw i64.
+            ValueKind::TaggedValue => vec![types.i64, types.i64],
         })
         .collect()
 }
@@ -778,29 +781,45 @@ fn emit_function<'c>(
     let mut ret_values: Vec<Value<'c, '_>> = Vec::with_capacity(hir_fn.ret_kinds.len());
     for (i, k) in hir_fn.ret_kinds.iter().enumerate() {
         let ret_value_idx = hir_fn.params.len() + 1 + i;
-        let v = match k {
-            ValueKind::Number => emit_load(&block, slots[ret_value_idx], types.f64, loc),
+        match k {
+            ValueKind::Number => {
+                ret_values.push(emit_load(&block, slots[ret_value_idx], types.f64, loc))
+            }
             ValueKind::Bool | ValueKind::Nil => {
-                emit_load(&block, slots[ret_value_idx], types.i1, loc)
+                ret_values.push(emit_load(&block, slots[ret_value_idx], types.i1, loc))
             }
             ValueKind::Function(arity) => {
                 let ptr_val = emit_load(&block, slots[ret_value_idx], types.ptr, loc);
                 let p_types: Vec<Type<'c>> = (0..*arity).map(|_| types.f64).collect();
                 let fn_ty: Type<'c> = FunctionType::new(context, &p_types, &[types.f64]).into();
-                emit_unrealized_cast(&block, ptr_val, fn_ty, loc)
+                ret_values.push(emit_unrealized_cast(&block, ptr_val, fn_ty, loc));
             }
             // Phase 2.7a / 2.6a-min: String and Table returns
             // surface the slot's `ptr` value directly — no cast is
             // needed since the slot type already matches the
             // function signature.
             ValueKind::String | ValueKind::Table => {
-                emit_load(&block, slots[ret_value_idx], types.ptr, loc)
+                ret_values.push(emit_load(&block, slots[ret_value_idx], types.ptr, loc));
             }
+            // Phase 2.6c-tag-locals-fn (ADR 0074): a TaggedValue
+            // return position emits 2 MLIR results — the i64 tag
+            // at slot+0 and the raw i64 payload at slot+8.
             ValueKind::TaggedValue => {
-                unreachable!("TaggedValue is not yet a function return kind")
+                let slot_ptr = slots[ret_value_idx];
+                let tag = emit_load(&block, slot_ptr, types.i64, loc);
+                let payload_ptr = emit_byte_offset_ptr(
+                    context,
+                    &block,
+                    slot_ptr,
+                    ARRAY_ELEM_OFF_VALUE,
+                    types,
+                    loc,
+                );
+                let payload = emit_load(&block, payload_ptr, types.i64, loc);
+                ret_values.push(tag);
+                ret_values.push(payload);
             }
         };
-        ret_values.push(v);
     }
     block.append_operation(func::r#return(&ret_values, loc));
     region.append_block(block);
@@ -925,15 +944,41 @@ fn emit_stmt<'a, 'c>(
                     }
                 }
                 ValueKind::TaggedValue => {
-                    // Phase 2.6c-tag-locals (ADR 0063): the dst is
-                    // a 16-byte tagged slot. Source dispatch:
+                    // Phase 2.6c-tag-locals (ADR 0063) / 2.6c-tag-
+                    // locals-fn (ADR 0074): the dst is a 16-byte
+                    // tagged slot. Source dispatch:
                     //   - IndexTagged: non-trapping table read +
                     //     tagged store (emit_local_init_tagged).
                     //   - Local(TaggedValue): copy the 16-byte
                     //     slot verbatim (preserves Nil tag).
-                    //   - else (Number-kind expr): wrap in
-                    //     `{TAG_NUMBER, value}`.
+                    //   - Call(User) returning TaggedValue: emit
+                    //     the call and pack 2 i64 results
+                    //     (tag, payload) into the slot.
+                    //   - else: dispatch on source kind via
+                    //     emit_value_slot_store_dispatched.
                     match &value.kind {
+                        HirExprKind::Call {
+                            callee: Callee::User(FuncId(fid)),
+                            args: call_args,
+                        } if matches!(
+                            functions[*fid].ret_kinds.first(),
+                            Some(ValueKind::TaggedValue)
+                        ) =>
+                        {
+                            emit_call_user_into_tagged_slot(
+                                context,
+                                block,
+                                slots[id.0],
+                                *fid,
+                                call_args,
+                                slots,
+                                locals,
+                                functions,
+                                types,
+                                params_len,
+                                loc,
+                            )?;
+                        }
                         HirExprKind::IndexTagged { target, key } => {
                             emit_local_init_tagged(
                                 context,
@@ -981,16 +1026,40 @@ fn emit_stmt<'a, 'c>(
                             emit_store(block, payload, dst_value_ptr, loc);
                         }
                         _ => {
-                            let v = emit_expr(
-                                context, block, value, slots, locals, functions, types, params_len,
-                                loc,
-                            )?;
-                            // Wrap as a Number-tagged slot.
-                            emit_value_slot_store_number(
+                            // Phase 2.6c-tag-locals-fn (ADR 0074):
+                            // a TaggedValue slot can be widened
+                            // from any concrete kind via `Assign`
+                            // (e.g. `_ret_value_N := nil` after the
+                            // function-return widening upgrades the
+                            // slot from Number to TaggedValue).
+                            // Dispatch on the source expression's
+                            // kind so Nil / Bool / String / Function
+                            // / Table sources all wrap correctly,
+                            // not just Number.
+                            let value_kind = infer_kind(value, locals, functions);
+                            let v = if matches!(value_kind, ValueKind::Nil) {
+                                // Nil sources don't materialise an
+                                // SSA value; the store helper
+                                // ignores the value arg for Nil.
+                                // Use a placeholder f64 0.0.
+                                let zero_op = arith::constant(
+                                    context,
+                                    FloatAttribute::new(context, types.f64, 0.0).into(),
+                                    loc,
+                                );
+                                block.append_operation(zero_op).result(0).unwrap().into()
+                            } else {
+                                emit_expr(
+                                    context, block, value, slots, locals, functions, types,
+                                    params_len, loc,
+                                )?
+                            };
+                            emit_value_slot_store_dispatched(
                                 context,
                                 block,
                                 slots[id.0],
                                 v,
+                                value_kind,
                                 types,
                                 loc,
                             );
@@ -1888,6 +1957,76 @@ fn emit_inline_index_into_tagged_tmp<'a, 'c>(
     let tmp = emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
     emit_local_init_tagged(
         context, block, tmp, target, key, slots, locals, functions, types, params_len, loc,
+    )?;
+    Ok(tmp)
+}
+
+/// Phase 2.6c-tag-locals-fn (ADR 0074): emit a `Callee::User`
+/// call whose `ret_kinds[0]` is `TaggedValue` and pack the two
+/// MLIR results (i64 tag, i64 payload_raw) into the tagged
+/// `dst_slot`. Single-position TaggedValue return only — multi-
+/// return × TaggedValue interleaving is rejected upstream
+/// (LIC-2.6c-tag-locals-fn-multi-1).
+#[allow(clippy::too_many_arguments)]
+fn emit_call_user_into_tagged_slot<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    dst_slot: Value<'c, 'a>,
+    fid: usize,
+    call_args: &[HirExpr],
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    let target = &functions[fid];
+    let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(call_args.len());
+    for a in call_args {
+        arg_vals.push(emit_expr(
+            context, block, a, slots, locals, functions, types, params_len, loc,
+        )?);
+    }
+    let ret_types = ret_mlir_types(context, &target.ret_kinds, types);
+    let call_op = func::call(
+        context,
+        FlatSymbolRefAttribute::new(context, &target.mangled_name),
+        &arg_vals,
+        &ret_types,
+        loc,
+    );
+    let op_ref = block.append_operation(call_op);
+    let tag: Value<'c, 'a> = op_ref.result(0).unwrap().into();
+    let payload: Value<'c, 'a> = op_ref.result(1).unwrap().into();
+    emit_store(block, tag, dst_slot, loc);
+    let payload_ptr =
+        emit_byte_offset_ptr(context, block, dst_slot, ARRAY_ELEM_OFF_VALUE, types, loc);
+    emit_store(block, payload, payload_ptr, loc);
+    Ok(())
+}
+
+/// Phase 2.6c-tag-locals-fn (ADR 0074): allocate a tmp 16-byte
+/// tagged slot, evaluate a `Callee::User` call with TaggedValue
+/// return, store the two results into the tmp, and return the
+/// slot pointer. Mirror of [`emit_inline_index_into_tagged_tmp`]
+/// (ADR 0071) for the function-call source.
+#[allow(clippy::too_many_arguments)]
+fn emit_call_user_into_tagged_tmp<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    fid: usize,
+    call_args: &[HirExpr],
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    loc: Location<'c>,
+) -> Result<Value<'c, 'a>, CodegenError> {
+    let tmp = emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
+    emit_call_user_into_tagged_slot(
+        context, block, tmp, fid, call_args, slots, locals, functions, types, params_len, loc,
     )?;
     Ok(tmp)
 }
@@ -3724,6 +3863,26 @@ fn emit_expr<'a, 'c>(
                             emit_print_tagged_local(context, block, tmp, types, loc);
                             continue;
                         }
+                        // Phase 2.6c-tag-locals-fn (ADR 0074):
+                        // inline `print(f())` where `f` returns
+                        // TaggedValue — materialise into a tmp
+                        // tagged slot and dispatch.
+                        if let HirExprKind::Call {
+                            callee: Callee::User(FuncId(fid)),
+                            args: call_args,
+                        } = &a.kind
+                            && matches!(
+                                functions[*fid].ret_kinds.first(),
+                                Some(ValueKind::TaggedValue)
+                            )
+                        {
+                            let tmp = emit_call_user_into_tagged_tmp(
+                                context, block, *fid, call_args, slots, locals, functions, types,
+                                params_len, loc,
+                            )?;
+                            emit_print_tagged_local(context, block, tmp, types, loc);
+                            continue;
+                        }
                         let v = emit_expr(
                             context, block, a, slots, locals, functions, types, params_len, loc,
                         )?;
@@ -3772,6 +3931,23 @@ fn emit_expr<'a, 'c>(
                     let tmp = emit_inline_index_into_tagged_tmp(
                         context, block, target, key, slots, locals, functions, types, params_len,
                         loc,
+                    )?;
+                    return Ok(emit_tostring_tagged_local(context, block, tmp, types, loc));
+                }
+                // Phase 2.6c-tag-locals-fn (ADR 0074): inline
+                // `tostring(f())` where `f` returns TaggedValue.
+                if let HirExprKind::Call {
+                    callee: Callee::User(FuncId(fid)),
+                    args: call_args,
+                } = &args[0].kind
+                    && matches!(
+                        functions[*fid].ret_kinds.first(),
+                        Some(ValueKind::TaggedValue)
+                    )
+                {
+                    let tmp = emit_call_user_into_tagged_tmp(
+                        context, block, *fid, call_args, slots, locals, functions, types,
+                        params_len, loc,
                     )?;
                     return Ok(emit_tostring_tagged_local(context, block, tmp, types, loc));
                 }
@@ -3859,6 +4035,23 @@ fn emit_expr<'a, 'c>(
                     let tmp = emit_inline_index_into_tagged_tmp(
                         context, block, target, key, slots, locals, functions, types, params_len,
                         loc,
+                    )?;
+                    return Ok(emit_type_tagged_local(context, block, tmp, types, loc));
+                }
+                // Phase 2.6c-tag-locals-fn (ADR 0074): inline
+                // `type(f())` where `f` returns TaggedValue.
+                if let HirExprKind::Call {
+                    callee: Callee::User(FuncId(fid)),
+                    args: call_args,
+                } = &args[0].kind
+                    && matches!(
+                        functions[*fid].ret_kinds.first(),
+                        Some(ValueKind::TaggedValue)
+                    )
+                {
+                    let tmp = emit_call_user_into_tagged_tmp(
+                        context, block, *fid, call_args, slots, locals, functions, types,
+                        params_len, loc,
                     )?;
                     return Ok(emit_type_tagged_local(context, block, tmp, types, loc));
                 }

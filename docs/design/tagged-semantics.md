@@ -6,7 +6,7 @@
 > consumer / tag semantics. ADRs continue to record *decisions*;
 > this page records *current state*.
 
-**Last updated:** 2026-05-04 (after ADR 0073)
+**Last updated:** 2026-05-04 (after ADR 0074)
 
 ---
 
@@ -79,7 +79,7 @@ a tagged slot, or whose result **carries** a tagged value.
 | `HirExprKind::IndexTagged { target, key }`  | LocalInit / Assign **only** — populates a `TaggedValue` slot via `emit_local_init_tagged` | ADR 0063 |
 | `HirExprKind::Local(id)` with `info.kind == TaggedValue` | Existing 16-byte alloca holds the tagged value | ADR 0063 |
 | Hard-tombstone delete (`t.k = nil`)         | `hash_buf` entry: key→sentinel + value tag→Nil       | ADR 0062 |
-| **(future)** function-return widening       | Pending — LIC-2.6c-tag-locals-fn                     | —          |
+| Function-return widening (`Callee::User`)   | `_ret_value_N` slot widens to TaggedValue when same return position sees mixed kinds; ABI returns 2 MLIR results `(i64 tag, i64 payload_raw)` per TaggedValue position | ADR 0074 |
 | **(future)** iterator (`pairs` / `ipairs`)  | Pending — depends on widening                        | —          |
 | **(future)** closure with upvalues          | HIR-rejects today — LIC-2.6c-tag-hetero-closure-escape-1 | —      |
 
@@ -113,6 +113,7 @@ Legend:
 |-------------------------------------|---------|-----------|---------|--------|----------|-------|------|
 | inline `Index { … }`                | `%g`    | s_true/false | `%s` | s_nil  | `s_typename_function` | `s_typename_table` | 0065 + 0071 |
 | `Local(TaggedValue)`                | `%g`    | s_true/false | `%s` | s_nil  | `s_typename_function` | `s_typename_table` | 0064 + 0071 |
+| inline `Call(User)` returning TaggedValue | `%g` | s_true/false | `%s` | s_nil  | `s_typename_function` | `s_typename_table` | 0074 |
 | `IndexTagged` (statement-only)      | n/a — never reaches expression context                                  |||||| 0063 |
 
 Implementation path: `Builtin::Print` arg loop special-cases
@@ -125,6 +126,7 @@ slot via `emit_local_init_tagged` + `emit_print_tagged_local`.
 |-------------------------------------|-------------|-------------|-------------|-----------|----------------|-------------|------|
 | `Local(TaggedValue)`                | `"number"`  | `"boolean"` | `"string"`  | `"nil"`   | `"function"`   | `"table"`   | 0067 + 0071 |
 | inline `Index`                      | `"number"`  | `"boolean"` | `"string"`  | `"nil"`   | `"function"`   | `"table"`   | 0070 + 0071 |
+| inline `Call(User)` returning TaggedValue | `"number"` | `"boolean"` | `"string"` | `"nil"` | `"function"` | `"table"` | 0074 |
 
 ### `tostring(x)`
 
@@ -132,6 +134,7 @@ slot via `emit_local_init_tagged` + `emit_print_tagged_local`.
 |-------------------------------------|-----------|---------------|----------------|----------|--------------|-----------|------|
 | `Local(TaggedValue)`                | `%g` snprintf | `s_true`/`s_false` | payload ptr | `s_nil` | `"function"` | `"table"` | 0067 + 0071 |
 | inline `Index`                      | `%g` snprintf | `s_true`/`s_false` | payload ptr | `s_nil` | `"function"` | `"table"` | 0070 + 0071 |
+| inline `Call(User)` returning TaggedValue | `%g` snprintf | `s_true`/`s_false` | payload ptr | `s_nil` | `"function"` | `"table"` | 0074 |
 
 Both inline rows use the ADR 0065 print pattern, factored into
 `emit_inline_index_into_tagged_tmp` (Tidy First, ADR 0071):
@@ -218,6 +221,7 @@ the introduction, when still open).
 | LIC-2.6a-wr-3                     | All six tag kinds supported as IndexAssign values       | 0064 + 0071   |
 | LIC-2.6b-hash-2                   | All six tag kinds supported as hash values + Nil-delete | 0064 + 0071   |
 | LIC-2.6c-tag-hetero-fn-tbl-call-1 | Calling a Function value retrieved through a tagged slot | 0072         |
+| LIC-2.6c-tag-locals-fn-1          | Heterogeneous direct-call return widening (`Callee::User`) | 0074        |
 
 ### Partial
 
@@ -230,8 +234,11 @@ the introduction, when still open).
 | ID                                          | Behaviour                                                             | Notes                          |
 |---------------------------------------------|-----------------------------------------------------------------------|--------------------------------|
 | LIC-2.6c-tag-hetero-closure-escape-1        | Closure with upvalues stored in tables                                | HIR-rejects today (ADR 0044 + ADR 0071); needs escape-analysis relaxation |
+| LIC-2.6c-tag-locals-fn-indirect-1           | Calling a TaggedValue-returning function through `Callee::Indirect`   | HIR-rejects storing such functions in tables (ADR 0074); call-site arity reconstruction has no static signature |
+| LIC-2.6c-tag-locals-fn-multi-1              | Multi-return × TaggedValue interleaving (e.g. `return 1, nil` vs `return nil, 1`) | Single-position TaggedValue return only today (ADR 0074); caller-side result-index walker needs per-position width awareness |
+| LIC-2.6c-tag-callee-arity-1                 | Tagged Function callee arity / signature contract                     | ADR 0072 reconstructs `(f64,…) → f64` from `args.len()`; widening (ADR 0074) makes mismatches more reachable. Hardening needs payload expansion or a side table |
 
-**Total:** 14 LIC entries — 13 resolved, 1 partial, 1 pending.
+**Total:** 18 LIC entries — 14 resolved, 1 partial, 4 pending.
 
 ---
 
@@ -319,26 +326,62 @@ through `emit_expr` (lowers a `HirExpr`) belongs to `emit.rs`.
 A helper that wraps a single MLIR / LLVM op without touching
 Lua semantics belongs to `primitive.rs`.
 
+### Function-return ABI (ADR 0074)
+
+A `HirFunction::ret_kinds[i] = ValueKind::TaggedValue` lowers
+to **two** MLIR results at position `i`:
+
+```text
+func.func @user_fn_NN(...) -> (i64, i64)
+                              ^^^   ^^^
+                              tag   payload_raw
+```
+
+`payload_raw` is **i64**, the universal representation used
+by slot-to-slot copies (ADR 0064). The caller reads
+`op_ref.result(0)` as the tag and `op_ref.result(1)` as the
+raw payload, then stores both into a 16-byte tagged slot via
+direct `emit_store` calls (no kind dispatch needed —
+the data is already in slot-compatible form). Helpers
+[`emit_call_user_into_tagged_slot`] and
+[`emit_call_user_into_tagged_tmp`] in `emit.rs` encapsulate
+this pattern for the LocalInit/Assign destination and the
+inline-consumer (Print / Type / ToString) tmp-slot
+materialization respectively.
+
+**Today (ADR 0074):** single-position TaggedValue return only.
+Multi-return × TaggedValue interleaving (`ret_kinds = [Number,
+TaggedValue]` etc.) is allowed by the ABI but rejected upstream
+(LIC-2.6c-tag-locals-fn-multi-1 — caller-side result-index
+walker needs per-position width awareness).
+
 ---
 
 ## 7. Open Questions / Known Gaps
 
-Listed in Codex review priority order (post-ADR-0073):
+Listed in Codex review priority order (post-ADR-0074):
 
-1. **Function-return TaggedValue widening.** `local x = f()`
-   where `f` returns nil/heterogeneous should widen `x`.
-   Requires function ABI updates (return a 16-byte tagged
-   payload, or pass a pointer). Most natural follow-up to the
-   matrix scaffold (extends the source axis); ADR 0073's
-   split makes the cross-cutting edits cheaper to land.
-2. **Tag-dispatch skeleton extraction.** Five tag-dispatch
+1. **Tag-dispatch skeleton extraction.** Five tag-dispatch
    sites (`emit_print_tagged_local`, `emit_type_tagged_local`,
    `emit_tostring_tagged_local`, `emit_tagged_eq_local_local`,
    `Callee::Indirect` TaggedValue arm) share a tag-load + nested
    `scf.if` chain + truly-unknown trap pattern. Worth a
    callback-based helper now that they live (mostly) in
-   `tagged.rs`. Codex flagged this in the ADR 0073 review.
-3. **Closure-with-upvalues in tables**
+   `tagged.rs`. Codex flagged this in the ADR 0073 review and
+   reconfirmed post-ADR-0074.
+2. **Tagged-callee arity hardening (LIC-2.6c-tag-callee-arity-1).**
+   ADR 0072 reconstructs `(f64,…) → f64` from `args.len()`.
+   ADR 0074's widening makes mismatches more reachable —
+   tagged-return functions can no longer enter the indirect
+   path safely. Needs payload expansion or a side table.
+3. **Multi-return × TaggedValue interleaving
+   (LIC-2.6c-tag-locals-fn-multi-1).** `return 1, nil` vs
+   `return nil, 1` cross-position mixing. Caller-side result-
+   index walker needs per-position width awareness.
+4. **Indirect call returning TaggedValue
+   (LIC-2.6c-tag-locals-fn-indirect-1).** Requires the runtime
+   arity/kind descriptor that #2 designs.
+5. **Closure-with-upvalues in tables**
    (LIC-2.6c-tag-hetero-closure-escape-1). HIR rejects today
    via the existing escape analysis (ADR 0044 + ADR 0071);
    relaxing requires escape semantics + GC strategy.
@@ -382,3 +425,4 @@ Listed in Codex review priority order (post-ADR-0073):
 | 0071 | 2.6c-tag-fn-tbl              | Closure-less Function and Table values in tables (TAG_FUNCTION/TABLE) + 4 consumer dispatch chains extended; `emit_inline_index_into_tagged_tmp` Tidy First; closure-with-upvalues HIR-rejected |
 | 0072 | 2.6c-tag-fn-tbl-call         | Call a Function value retrieved through a tagged slot (`local g = t[k]; g()`) — TaggedValue arm in `Callee::Indirect` + `emit_value_slot_check_function` trap helper |
 | 0073 | 2.6c-tag-rs-split            | 2-layer codegen module split — `primitive.rs` (pure MLIR helpers + `Types`) + `tagged.rs` (tag constants, store/check helpers, pure-tag consumer dispatchers); `emit.rs` 8464 → 6856 LOC |
+| 0074 | 2.6c-tag-locals-fn           | Function-return TaggedValue widening — heterogeneous return paths widen `_ret_value_N` slot to TaggedValue; `ret_mlir_types` maps TaggedValue → `(i64 tag, i64 payload_raw)`; new helpers `emit_call_user_into_tagged_slot` / `_tmp` for caller-side result packing; HIR rejects storing tagged-return functions in tables |
