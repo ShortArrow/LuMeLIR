@@ -6,7 +6,7 @@
 > consumer / tag semantics. ADRs continue to record *decisions*;
 > this page records *current state*.
 
-**Last updated:** 2026-05-04 (after ADR 0072)
+**Last updated:** 2026-05-04 (after ADR 0073)
 
 ---
 
@@ -302,21 +302,42 @@ When **adding a new producer** (e.g. function-return widening):
 4. Verify all consumer rows in §3 cover the new source.
 5. Add ADR with the design decision; update this doc.
 
+### Module layout (ADR 0073)
+
+`src/codegen/` is split three ways. Use the table to decide
+where a new helper belongs:
+
+| Module          | Responsibility                                                 |
+|-----------------|----------------------------------------------------------------|
+| `primitive.rs`  | Pure MLIR / LLVM-dialect wrappers. No Lua semantics. `Types`, libc-call shells (`emit_libc_call_*`), `emit_load`/`emit_store`/`emit_byte_offset_ptr*`, `emit_unrealized_cast`, `emit_addressof`, `emit_printf`, `emit_exit_with_message`. Used by both `emit.rs` and `tagged.rs`. |
+| `tagged.rs`     | TaggedValue runtime model. Tag space + slot-layout constants, `emit_alloca_slot_for_kind`, all `emit_value_slot_store_*` / `_check_*` helpers, `emit_tagged_unknown_tag_trap`, and the pure-tag consumer dispatchers (`emit_print_tagged_local`, `emit_tagged_eq_local_local`, `emit_type_tagged_local`). Depends only on `primitive.rs` and `crate::hir::ValueKind`. |
+| `emit.rs`       | HIR lowering driver, table/hash/array/string codegen, builtin dispatch, control flow, function emission, plus the **statement-context** tagged materializers (`emit_local_init_tagged`, `emit_inline_index_into_tagged_tmp`, `emit_isnil_index`, `emit_tagged_eq_runtime_dispatch`, `emit_tostring_tagged_local`) that recurse through `emit_expr` / call `emit_tostring`. |
+
+A new helper that takes a `slot_ptr` and dispatches purely off
+the runtime tag belongs to `tagged.rs`. A helper that recurses
+through `emit_expr` (lowers a `HirExpr`) belongs to `emit.rs`.
+A helper that wraps a single MLIR / LLVM op without touching
+Lua semantics belongs to `primitive.rs`.
+
 ---
 
 ## 7. Open Questions / Known Gaps
 
-Listed in Codex review priority order (post-ADR-0072):
+Listed in Codex review priority order (post-ADR-0073):
 
 1. **Function-return TaggedValue widening.** `local x = f()`
    where `f` returns nil/heterogeneous should widen `x`.
    Requires function ABI updates (return a 16-byte tagged
    payload, or pass a pointer). Most natural follow-up to the
-   matrix scaffold (extends the source axis).
-2. **`tagged.rs` module split (Tidy First).** `emit.rs` is
-   ~8300 LOC after ADR 0072; tagged-related helpers total
-   ~2300 LOC. Clean split needs careful visibility / re-export
-   design; previously deferred (ADR 0067 / 0069 / 0070 / 0071).
+   matrix scaffold (extends the source axis); ADR 0073's
+   split makes the cross-cutting edits cheaper to land.
+2. **Tag-dispatch skeleton extraction.** Five tag-dispatch
+   sites (`emit_print_tagged_local`, `emit_type_tagged_local`,
+   `emit_tostring_tagged_local`, `emit_tagged_eq_local_local`,
+   `Callee::Indirect` TaggedValue arm) share a tag-load + nested
+   `scf.if` chain + truly-unknown trap pattern. Worth a
+   callback-based helper now that they live (mostly) in
+   `tagged.rs`. Codex flagged this in the ADR 0073 review.
 3. **Closure-with-upvalues in tables**
    (LIC-2.6c-tag-hetero-closure-escape-1). HIR rejects today
    via the existing escape analysis (ADR 0044 + ADR 0071);
@@ -360,3 +381,4 @@ Listed in Codex review priority order (post-ADR-0072):
 | 0070 | 2.6c-tag-consumers-inline    | Inline `type(t[k])` / `tostring(t[k])` runtime tag dispatch        |
 | 0071 | 2.6c-tag-fn-tbl              | Closure-less Function and Table values in tables (TAG_FUNCTION/TABLE) + 4 consumer dispatch chains extended; `emit_inline_index_into_tagged_tmp` Tidy First; closure-with-upvalues HIR-rejected |
 | 0072 | 2.6c-tag-fn-tbl-call         | Call a Function value retrieved through a tagged slot (`local g = t[k]; g()`) — TaggedValue arm in `Callee::Indirect` + `emit_value_slot_check_function` trap helper |
+| 0073 | 2.6c-tag-rs-split            | 2-layer codegen module split — `primitive.rs` (pure MLIR helpers + `Types`) + `tagged.rs` (tag constants, store/check helpers, pure-tag consumer dispatchers); `emit.rs` 8464 → 6856 LOC |

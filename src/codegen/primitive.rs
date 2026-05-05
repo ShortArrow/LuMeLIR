@@ -242,3 +242,103 @@ pub(crate) fn emit_exit_with_message<'a, 'c>(
         .expect("llvm.call @exit");
     block.append_operation(exit_call);
 }
+
+/// Generic single-result libc helper — `i64` return type.
+pub(crate) fn emit_libc_call_i64<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    name: &str,
+    args: &[Value<'c, 'a>],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    emit_libc_call_with_result(context, block, name, args, types.i64, loc)
+}
+
+/// Generic single-result libc helper — `i32` return type.
+pub(crate) fn emit_libc_call_i32<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    name: &str,
+    args: &[Value<'c, 'a>],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    emit_libc_call_with_result(context, block, name, args, types.i32, loc)
+}
+
+/// Generic single-result libc helper — `ptr` return type.
+pub(crate) fn emit_libc_call_ptr<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    name: &str,
+    args: &[Value<'c, 'a>],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    emit_libc_call_with_result(context, block, name, args, types.ptr, loc)
+}
+
+/// Phase 2.6a-grow (ADR 0057): void-returning libc helper. Used for
+/// `free(ptr)`. Mirrors `emit_libc_call_with_result` but skips
+/// `add_results` since the callee returns nothing.
+pub(crate) fn emit_libc_call_void<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    name: &str,
+    args: &[Value<'c, 'a>],
+    loc: Location<'c>,
+) {
+    let n = i32::try_from(args.len()).expect("call arity fits in i32");
+    let call_op = OperationBuilder::new("llvm.call", loc)
+        .add_operands(args)
+        .add_attributes(&[
+            (
+                Identifier::new(context, "callee"),
+                FlatSymbolRefAttribute::new(context, name).into(),
+            ),
+            (
+                Identifier::new(context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(context, &[n, 0]).into(),
+            ),
+            (
+                Identifier::new(context, "op_bundle_sizes"),
+                DenseI32ArrayAttribute::new(context, &[]).into(),
+            ),
+        ])
+        .build()
+        .unwrap_or_else(|_| panic!("llvm.call @{name}"));
+    block.append_operation(call_op);
+}
+
+/// Generic single-result libc helper — base implementation.
+pub(crate) fn emit_libc_call_with_result<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    name: &str,
+    args: &[Value<'c, 'a>],
+    result_ty: Type<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let n = i32::try_from(args.len()).expect("call arity fits in i32");
+    let call_op = OperationBuilder::new("llvm.call", loc)
+        .add_operands(args)
+        .add_attributes(&[
+            (
+                Identifier::new(context, "callee"),
+                FlatSymbolRefAttribute::new(context, name).into(),
+            ),
+            (
+                Identifier::new(context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(context, &[n, 0]).into(),
+            ),
+            (
+                Identifier::new(context, "op_bundle_sizes"),
+                DenseI32ArrayAttribute::new(context, &[]).into(),
+            ),
+        ])
+        .add_results(&[result_ty])
+        .build()
+        .unwrap_or_else(|_| panic!("llvm.call @{name}"));
+    block.append_operation(call_op).result(0).unwrap().into()
+}
