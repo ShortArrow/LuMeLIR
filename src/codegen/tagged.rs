@@ -408,53 +408,6 @@ pub(crate) fn emit_tag_and_payload_ptr<'a, 'c>(
     (tag, payload_ptr)
 }
 
-/// Phase 2.6c-tag-fn-tbl-call (ADR 0072): assert a tagged-value
-/// slot's tag is `TAG_FUNCTION`, exiting with the standard
-/// type-mismatch diagnostic otherwise. Mirrors
-/// [`emit_value_slot_check_number`] (ADR 0063) for the function-
-/// callee path used when invoking a function value retrieved
-/// through a tagged slot (`local g = t[k]; g()`).
-pub(crate) fn emit_value_slot_check_function<'a, 'c>(
-    context: &'c Context,
-    block: &'a Block<'c>,
-    slot_ptr: Value<'c, 'a>,
-    types: &Types<'c>,
-    loc: Location<'c>,
-) {
-    let tag = emit_load(block, slot_ptr, types.i64, loc);
-    let expected = block
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    let mismatch: Value<'c, 'a> = block
-        .append_operation(arith::cmpi(
-            context,
-            arith::CmpiPredicate::Ne,
-            tag,
-            expected,
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    let then_region = Region::new();
-    let then_blk = Block::new(&[]);
-    let msg_ptr = emit_addressof(context, &then_blk, "s_table_type_mismatch", types, loc);
-    emit_exit_with_message(context, &then_blk, msg_ptr, types, loc);
-    then_blk.append_operation(scf::r#yield(&[], loc));
-    then_region.append_block(then_blk);
-    let else_region = Region::new();
-    let else_blk = Block::new(&[]);
-    else_blk.append_operation(scf::r#yield(&[], loc));
-    else_region.append_block(else_blk);
-    block.append_operation(scf::r#if(mismatch, &[], then_region, else_region, loc));
-}
-
 /// Phase 2.6c-tag-hetero (ADR 0064): print a `TaggedValue` local
 /// by reading its slot's tag at offset 0 and dispatching on the
 /// runtime value: Number → `%g`, Bool → `s_true`/`s_false`,

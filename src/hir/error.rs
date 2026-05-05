@@ -47,6 +47,20 @@ pub enum HirError {
     /// ADR 0044).
     #[error("closure with upvalues cannot escape via {position} — direct call only")]
     ClosureEscapes { position: String, offset: usize },
+
+    /// Phase 2.6c-tag-callee-arity (ADR 0075): an indirect call
+    /// through a TaggedValue local cannot prove the callee's
+    /// arity at HIR time — the slot's payload is a bare function
+    /// pointer with no signature descriptor. ADR 0072's
+    /// `args.len()` reconstruction was unsound (UB on arity
+    /// mismatch); ADR 0075 rejects the path entirely. Workaround:
+    /// use a direct call or expand a static dispatch at the
+    /// call site.
+    #[error(
+        "indirect call through TaggedValue local '{local_name}' is not supported \
+         (LIC-2.6c-tag-callee-arity-1; ADR 0075). Use a direct call or static dispatch."
+    )]
+    IndirectCallThroughTaggedLocal { local_name: String, offset: usize },
 }
 
 impl HirError {
@@ -62,7 +76,8 @@ impl HirError {
             | HirError::ReturnOutsideFunction { offset }
             | HirError::UnknownFunction { offset, .. }
             | HirError::FunctionUsedAsValue { offset, .. }
-            | HirError::ClosureEscapes { offset, .. } => *offset,
+            | HirError::ClosureEscapes { offset, .. }
+            | HirError::IndirectCallThroughTaggedLocal { offset, .. } => *offset,
         }
     }
 }

@@ -6,7 +6,7 @@
 > consumer / tag semantics. ADRs continue to record *decisions*;
 > this page records *current state*.
 
-**Last updated:** 2026-05-04 (after ADR 0074)
+**Last updated:** 2026-05-04 (after ADR 0075)
 
 ---
 
@@ -172,17 +172,16 @@ and Local source shapes (ADR 0066, formerly two variants).
 
 ### `f(...)` — calling a TaggedValue callee
 
-| Source                                | TAG_FUNCTION                                | TAG_NUMBER / BOOL / STRING / NIL / TABLE | Truly-unknown tag (≥ 6) | ADR  |
-|---------------------------------------|---------------------------------------------|------------------------------------------|-------------------------|------|
-| `Local(TaggedValue)` as call callee   | extract payload as `!llvm.ptr`, `unrealized_cast` to `(f64,…) → f64` reconstructed from `args.len()`, `func.call_indirect` | trap via `emit_value_slot_check_function` (`s_table_type_mismatch`) | trap (same helper)     | 0072 |
+| Source                                | All tags                                                                                                               | ADR        |
+|---------------------------------------|------------------------------------------------------------------------------------------------------------------------|------------|
+| `Local(TaggedValue)` as call callee   | **Rejected at HIR** (`HirError::IndirectCallThroughTaggedLocal`). ADR 0072 reconstructed `(f64,…) → f64` from `args.len()` but that path was UB on arity / return-ABI mismatch; ADR 0075 removes it. Workaround: bind via a known FuncId path or expand a static dispatch at the call site. | 0072 / 0075 |
 
-The HIR `lower_call` arm allows `Local(TaggedValue)` as the
-callee whenever a name resolves to a TaggedValue-kind local;
-arity is inferred from `args.len()` because the tagged slot
-carries no static descriptor. Args remain Number-only at the
-call site to keep the existing argument-kind contract.
-Closure-with-upvalues callees never reach this site because
-ADR 0071 blocks them at the storage edge.
+`Callee::Indirect` is now reserved for `Function(arity)` locals
+(parameters with body-scan-inferred arity, or aliases of a
+top-level / `local function` definition with a known
+`FuncId`). TaggedValue-kind locals — typically bound from a
+table read — never reach the indirect call site after this
+phase.
 
 ### Arith / ordering on tagged operand
 
@@ -220,8 +219,10 @@ the introduction, when still open).
 | LIC-2.6a-arr-2                    | All six tag kinds supported as table elements           | 0064 + 0071   |
 | LIC-2.6a-wr-3                     | All six tag kinds supported as IndexAssign values       | 0064 + 0071   |
 | LIC-2.6b-hash-2                   | All six tag kinds supported as hash values + Nil-delete | 0064 + 0071   |
-| LIC-2.6c-tag-hetero-fn-tbl-call-1 | Calling a Function value retrieved through a tagged slot | 0072         |
+| LIC-2.6c-tag-hetero-fn-tbl-call-1 | Calling a Function value retrieved through a tagged slot — resolved by removal in ADR 0075 (Strict Plan C) | 0072 / 0075 |
 | LIC-2.6c-tag-locals-fn-1          | Heterogeneous direct-call return widening (`Callee::User`) | 0074        |
+| LIC-2.6c-tag-callee-arity-1       | Tagged-callee arity / signature reconstruction soundness — resolved by HIR-rejecting all TaggedValue indirect calls | 0075       |
+| LIC-2.6c-tag-locals-fn-indirect-1 | Calling a TaggedValue-returning function through `Callee::Indirect` — subsumed by ADR 0075's broader rejection | 0074 / 0075 |
 
 ### Partial
 
@@ -234,11 +235,9 @@ the introduction, when still open).
 | ID                                          | Behaviour                                                             | Notes                          |
 |---------------------------------------------|-----------------------------------------------------------------------|--------------------------------|
 | LIC-2.6c-tag-hetero-closure-escape-1        | Closure with upvalues stored in tables                                | HIR-rejects today (ADR 0044 + ADR 0071); needs escape-analysis relaxation |
-| LIC-2.6c-tag-locals-fn-indirect-1           | Calling a TaggedValue-returning function through `Callee::Indirect`   | HIR-rejects storing such functions in tables (ADR 0074); call-site arity reconstruction has no static signature |
 | LIC-2.6c-tag-locals-fn-multi-1              | Multi-return × TaggedValue interleaving (e.g. `return 1, nil` vs `return nil, 1`) | Single-position TaggedValue return only today (ADR 0074); caller-side result-index walker needs per-position width awareness |
-| LIC-2.6c-tag-callee-arity-1                 | Tagged Function callee arity / signature contract                     | ADR 0072 reconstructs `(f64,…) → f64` from `args.len()`; widening (ADR 0074) makes mismatches more reachable. Hardening needs payload expansion or a side table |
 
-**Total:** 18 LIC entries — 14 resolved, 1 partial, 4 pending.
+**Total:** 18 LIC entries — 16 resolved, 1 partial, 2 pending.
 
 ---
 
@@ -326,6 +325,31 @@ through `emit_expr` (lowers a `HirExpr`) belongs to `emit.rs`.
 A helper that wraps a single MLIR / LLVM op without touching
 Lua semantics belongs to `primitive.rs`.
 
+### Indirect call safety boundary (ADR 0075)
+
+`Callee::Indirect` is the codegen path for calling a function
+value through a local. Its acceptance is now bounded by what
+HIR can statically prove about the callee's arity:
+
+| Local kind                              | Arity source                            | Indirect call accepted? |
+|-----------------------------------------|-----------------------------------------|-------------------------|
+| `Function(arity)` parameter             | inferred via body scan (ADR 0018)       | ✅ (arity validated upfront in `lower_call`) |
+| `Function(arity)` alias of named fn     | `info.func_id` resolves to a `FuncId`   | ✅ (validated; `Callee::User` shortcut for the common case) |
+| `Function(arity)` from non-Index source | static ABI from the binding expression  | ✅ (validated) |
+| `TaggedValue` from any source           | (no static descriptor)                  | ❌ HIR rejects (`HirError::IndirectCallThroughTaggedLocal`, ADR 0075) |
+
+ADR 0072 had previously enabled the TaggedValue case by
+reconstructing the function type from `args.len()` at codegen
+time, but the reconstruction was unsound when the source
+table held heterogeneous-arity or heterogeneous-return-ABI
+functions. ADR 0075 closes the UB root cause by rejecting
+the unsafe path; the supported workaround is to bind the
+callable through one of the static-arity paths above, or to
+expand the dispatch as named-function calls inside a wrapper.
+
+A future phase (signature side table, or full closures) may
+re-enable the table-derived case without the soundness gap.
+
 ### Function-return ABI (ADR 0074)
 
 A `HirFunction::ret_kinds[i] = ValueKind::TaggedValue` lowers
@@ -359,28 +383,20 @@ walker needs per-position width awareness).
 
 ## 7. Open Questions / Known Gaps
 
-Listed in Codex review priority order (post-ADR-0074):
+Listed in Codex review priority order (post-ADR-0075):
 
-1. **Tag-dispatch skeleton extraction.** Five tag-dispatch
-   sites (`emit_print_tagged_local`, `emit_type_tagged_local`,
-   `emit_tostring_tagged_local`, `emit_tagged_eq_local_local`,
-   `Callee::Indirect` TaggedValue arm) share a tag-load + nested
-   `scf.if` chain + truly-unknown trap pattern. Worth a
-   callback-based helper now that they live (mostly) in
-   `tagged.rs`. Codex flagged this in the ADR 0073 review and
-   reconfirmed post-ADR-0074.
-2. **Tagged-callee arity hardening (LIC-2.6c-tag-callee-arity-1).**
-   ADR 0072 reconstructs `(f64,…) → f64` from `args.len()`.
-   ADR 0074's widening makes mismatches more reachable —
-   tagged-return functions can no longer enter the indirect
-   path safely. Needs payload expansion or a side table.
-3. **Multi-return × TaggedValue interleaving
+1. **Multi-return × TaggedValue interleaving
    (LIC-2.6c-tag-locals-fn-multi-1).** `return 1, nil` vs
    `return nil, 1` cross-position mixing. Caller-side result-
-   index walker needs per-position width awareness.
-4. **Indirect call returning TaggedValue
-   (LIC-2.6c-tag-locals-fn-indirect-1).** Requires the runtime
-   arity/kind descriptor that #2 designs.
+   index walker needs per-position width awareness; direct-
+   call ABI only (no indirect call interaction).
+2. **String → Number arith coerce** (`"5" + 1`). Lua-spec
+   feature, orthogonal to the tagged-value model.
+3. **Iteration `pairs(t)` / `ipairs(t)`.** Table runtime
+   completeness; depends on the widened source set.
+4. **Future indirect-call re-enablement** (signature side
+   table, ADR 0075 superseder candidate). Reopens
+   `local g = t[k]; g()` once a runtime descriptor exists.
 5. **Closure-with-upvalues in tables**
    (LIC-2.6c-tag-hetero-closure-escape-1). HIR rejects today
    via the existing escape analysis (ADR 0044 + ADR 0071);
@@ -426,3 +442,4 @@ Listed in Codex review priority order (post-ADR-0074):
 | 0072 | 2.6c-tag-fn-tbl-call         | Call a Function value retrieved through a tagged slot (`local g = t[k]; g()`) — TaggedValue arm in `Callee::Indirect` + `emit_value_slot_check_function` trap helper |
 | 0073 | 2.6c-tag-rs-split            | 2-layer codegen module split — `primitive.rs` (pure MLIR helpers + `Types`) + `tagged.rs` (tag constants, store/check helpers, pure-tag consumer dispatchers); `emit.rs` 8464 → 6856 LOC |
 | 0074 | 2.6c-tag-locals-fn           | Function-return TaggedValue widening — heterogeneous return paths widen `_ret_value_N` slot to TaggedValue; `ret_mlir_types` maps TaggedValue → `(i64 tag, i64 payload_raw)`; new helpers `emit_call_user_into_tagged_slot` / `_tmp` for caller-side result packing; HIR rejects storing tagged-return functions in tables |
+| 0075 | 2.6c-tag-callee-arity        | TaggedValue indirect call HIR-rejected (Strict Plan C, supersedes ADR 0072 in part) — `args.len()` arity reconstruction was unsound; LIC-callee-arity-1 + locals-fn-indirect-1 resolved by removal; `emit_value_slot_check_function` deleted |

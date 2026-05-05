@@ -41,8 +41,7 @@ use super::tagged::{
     ARRAY_ELEM_OFF_VALUE, ARRAY_ELEM_SIZE, TAG_BOOL, TAG_FUNCTION, TAG_NIL, TAG_NUMBER, TAG_STRING,
     TAG_TABLE, emit_alloca_slot_for_kind, emit_print_tagged_local, emit_tag_and_payload_ptr,
     emit_tagged_eq_local_local, emit_tagged_unknown_tag_trap, emit_type_tagged_local,
-    emit_value_slot_check_function, emit_value_slot_check_number, emit_value_slot_store_dispatched,
-    emit_value_slot_store_nil,
+    emit_value_slot_check_number, emit_value_slot_store_dispatched, emit_value_slot_store_nil,
 };
 
 // =============================================================
@@ -4120,37 +4119,25 @@ fn emit_expr<'a, 'c>(
                 // bound from a call/expression and lives in an
                 // alloca'd `ptr` slot.
                 //
-                // Phase 2.6c-tag-fn-tbl-call (ADR 0072) extends this
-                // to TaggedValue-kind locals (typically `local g =
-                // t[k]` after ADR 0071). The static arity is unknown
-                // — the tagged slot carries no descriptor — so the
-                // function type is reconstructed from `args.len()`
-                // f64 → f64 at the call site. A runtime check traps
-                // on tag mismatch (TAG ≠ TAG_FUNCTION).
+                // Phase 2.6c-tag-callee-arity (ADR 0075) removed
+                // the previous TaggedValue branch (ADR 0072): HIR
+                // now rejects every indirect call through a
+                // TaggedValue local, so by construction the local
+                // is `Function(arity)` here with statically-known
+                // arity. The codegen no longer reconstructs the
+                // function type from `args.len()`.
                 let callee_val = if *idx < params_len {
                     slots[*idx]
                 } else {
                     let info = &locals[*idx];
-                    let (ptr_val, arity) = match info.kind {
-                        ValueKind::Function(a) => {
-                            let ptr_val = emit_load(block, slots[*idx], types.ptr, loc);
-                            (ptr_val, a)
-                        }
-                        ValueKind::TaggedValue => {
-                            emit_value_slot_check_function(context, block, slots[*idx], types, loc);
-                            let payload_ptr = emit_byte_offset_ptr(
-                                context,
-                                block,
-                                slots[*idx],
-                                ARRAY_ELEM_OFF_VALUE,
-                                types,
-                                loc,
-                            );
-                            let ptr_val = emit_load(block, payload_ptr, types.ptr, loc);
-                            (ptr_val, args.len())
-                        }
-                        _ => unreachable!("Callee::Indirect on non-Function/TaggedValue local"),
+                    let arity = match info.kind {
+                        ValueKind::Function(a) => a,
+                        _ => unreachable!(
+                            "Callee::Indirect on non-Function local — ADR 0075 \
+                             removed the TaggedValue path; HIR rejects upstream"
+                        ),
                     };
+                    let ptr_val = emit_load(block, slots[*idx], types.ptr, loc);
                     let p_types: Vec<Type<'c>> = (0..arity).map(|_| types.f64).collect();
                     let fn_ty: Type<'c> = FunctionType::new(context, &p_types, &[types.f64]).into();
                     emit_unrealized_cast(block, ptr_val, fn_ty, loc)
