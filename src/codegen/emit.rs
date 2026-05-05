@@ -2196,6 +2196,34 @@ fn emit_local_init_tagged<'a, 'c>(
     Ok(())
 }
 
+/// Phase 2.6c-tag-fn-tbl Tidy First (post-ADR 0070): rule-of-
+/// three extract for the inline `Index → tmp tagged slot →
+/// consumer` pattern shared by `Builtin::Print` (ADR 0065),
+/// `Builtin::Type`, `Builtin::ToString` (ADR 0067 / 0070).
+/// Allocates a 16-byte `TaggedValue` slot, fills it via the
+/// non-trapping `emit_local_init_tagged`, and returns the slot
+/// pointer. The caller chains the appropriate
+/// `emit_<consumer>_tagged_local` helper.
+#[allow(clippy::too_many_arguments)]
+fn emit_inline_index_into_tagged_tmp<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    target: &HirExpr,
+    key: &HirExpr,
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    loc: Location<'c>,
+) -> Result<Value<'c, 'a>, CodegenError> {
+    let tmp = emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
+    emit_local_init_tagged(
+        context, block, tmp, target, key, slots, locals, functions, types, params_len, loc,
+    )?;
+    Ok(tmp)
+}
+
 /// Phase 2.6c-tag-arr (ADR 0059): fill slots `[from_idx, to_idx)`
 /// (1-based, half-open) with TAG_NIL. Used by hole-write to make
 /// gap slots deterministically Nil rather than UB. No-op when
@@ -4072,18 +4100,11 @@ fn emit_expr<'a, 'c>(
                         // when the source is `HirExprKind::Index`
                         // directly (codex review P1, ADR 0065).
                         if let HirExprKind::Index { target, key } = &a.kind {
-                            let tmp_slot = emit_alloca_slot_for_kind(
-                                context,
-                                block,
-                                ValueKind::TaggedValue,
-                                types,
-                                loc,
-                            );
-                            emit_local_init_tagged(
-                                context, block, tmp_slot, target, key, slots, locals, functions,
-                                types, params_len, loc,
+                            let tmp = emit_inline_index_into_tagged_tmp(
+                                context, block, target, key, slots, locals, functions, types,
+                                params_len, loc,
                             )?;
-                            emit_print_tagged_local(context, block, tmp_slot, types, loc);
+                            emit_print_tagged_local(context, block, tmp, types, loc);
                             continue;
                         }
                         let v = emit_expr(
@@ -4131,16 +4152,9 @@ fn emit_expr<'a, 'c>(
                 // payloads dispatch instead of trapping at the
                 // f64 extract.
                 if let HirExprKind::Index { target, key } = &args[0].kind {
-                    let tmp = emit_alloca_slot_for_kind(
-                        context,
-                        block,
-                        ValueKind::TaggedValue,
-                        types,
+                    let tmp = emit_inline_index_into_tagged_tmp(
+                        context, block, target, key, slots, locals, functions, types, params_len,
                         loc,
-                    );
-                    emit_local_init_tagged(
-                        context, block, tmp, target, key, slots, locals, functions, types,
-                        params_len, loc,
                     )?;
                     return Ok(emit_tostring_tagged_local(context, block, tmp, types, loc));
                 }
@@ -4225,16 +4239,9 @@ fn emit_expr<'a, 'c>(
                 // the typename, matching `Local(TaggedValue)`
                 // semantics (ADR 0067) at the inline source.
                 if let HirExprKind::Index { target, key } = &args[0].kind {
-                    let tmp = emit_alloca_slot_for_kind(
-                        context,
-                        block,
-                        ValueKind::TaggedValue,
-                        types,
+                    let tmp = emit_inline_index_into_tagged_tmp(
+                        context, block, target, key, slots, locals, functions, types, params_len,
                         loc,
-                    );
-                    emit_local_init_tagged(
-                        context, block, tmp, target, key, slots, locals, functions, types,
-                        params_len, loc,
                     )?;
                     return Ok(emit_type_tagged_local(context, block, tmp, types, loc));
                 }
