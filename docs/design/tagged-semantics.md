@@ -6,7 +6,7 @@
 > consumer / tag semantics. ADRs continue to record *decisions*;
 > this page records *current state*.
 
-**Last updated:** 2026-05-04 (after ADR 0075)
+**Last updated:** 2026-05-04 (after ADR 0076)
 
 ---
 
@@ -223,6 +223,7 @@ the introduction, when still open).
 | LIC-2.6c-tag-locals-fn-1          | Heterogeneous direct-call return widening (`Callee::User`) | 0074        |
 | LIC-2.6c-tag-callee-arity-1       | Tagged-callee arity / signature reconstruction soundness — resolved by HIR-rejecting all TaggedValue indirect calls | 0075       |
 | LIC-2.6c-tag-locals-fn-indirect-1 | Calling a TaggedValue-returning function through `Callee::Indirect` — subsumed by ADR 0075's broader rejection | 0074 / 0075 |
+| LIC-2.6c-tag-locals-fn-multi-1    | Multi-position TaggedValue interleaving (`return 1, nil` vs `return nil, 1`) — caller-side result-index walker generalised | 0076       |
 
 ### Partial
 
@@ -235,9 +236,8 @@ the introduction, when still open).
 | ID                                          | Behaviour                                                             | Notes                          |
 |---------------------------------------------|-----------------------------------------------------------------------|--------------------------------|
 | LIC-2.6c-tag-hetero-closure-escape-1        | Closure with upvalues stored in tables                                | HIR-rejects today (ADR 0044 + ADR 0071); needs escape-analysis relaxation |
-| LIC-2.6c-tag-locals-fn-multi-1              | Multi-return × TaggedValue interleaving (e.g. `return 1, nil` vs `return nil, 1`) | Single-position TaggedValue return only today (ADR 0074); caller-side result-index walker needs per-position width awareness |
 
-**Total:** 18 LIC entries — 16 resolved, 1 partial, 2 pending.
+**Total:** 18 LIC entries — 17 resolved, 1 partial, 1 pending.
 
 ---
 
@@ -373,31 +373,38 @@ this pattern for the LocalInit/Assign destination and the
 inline-consumer (Print / Type / ToString) tmp-slot
 materialization respectively.
 
-**Today (ADR 0074):** single-position TaggedValue return only.
-Multi-return × TaggedValue interleaving (`ret_kinds = [Number,
-TaggedValue]` etc.) is allowed by the ABI but rejected upstream
-(LIC-2.6c-tag-locals-fn-multi-1 — caller-side result-index
-walker needs per-position width awareness).
+**Multi-position interleaving (ADR 0076):** any combination of
+return-position kinds is supported, including multiple
+TaggedValue positions. The caller-side result-index walker
+(`flat_result_index` + `emit_pack_tagged_result_at_pos`) maps
+each logical position to its non-overlapping MLIR result range:
+
+| `ret_kinds`                              | MLIR signature                          | Position → result indices |
+|------------------------------------------|-----------------------------------------|---------------------------|
+| `[Number]`                               | `() → f64`                              | pos 0 → result 0          |
+| `[TaggedValue]`                          | `() → (i64, i64)`                       | pos 0 → results 0..2      |
+| `[Number, TaggedValue]`                  | `() → (f64, i64, i64)`                  | pos 0 → 0; pos 1 → 1..3   |
+| `[TaggedValue, TaggedValue]`             | `() → (i64, i64, i64, i64)`             | pos 0 → 0..2; pos 1 → 2..4 |
+| `[Number, TaggedValue, Bool]`            | `() → (f64, i64, i64, i1)`              | pos 0 → 0; pos 1 → 1..3; pos 2 → 3 |
+
+Each TaggedValue position contributes 2 MLIR results
+(`ret_kind_result_width(TaggedValue) = 2`); every other
+supported kind contributes 1.
 
 ---
 
 ## 7. Open Questions / Known Gaps
 
-Listed in Codex review priority order (post-ADR-0075):
+Listed in Codex review priority order (post-ADR-0076):
 
-1. **Multi-return × TaggedValue interleaving
-   (LIC-2.6c-tag-locals-fn-multi-1).** `return 1, nil` vs
-   `return nil, 1` cross-position mixing. Caller-side result-
-   index walker needs per-position width awareness; direct-
-   call ABI only (no indirect call interaction).
-2. **String → Number arith coerce** (`"5" + 1`). Lua-spec
+1. **String → Number arith coerce** (`"5" + 1`). Lua-spec
    feature, orthogonal to the tagged-value model.
-3. **Iteration `pairs(t)` / `ipairs(t)`.** Table runtime
+2. **Iteration `pairs(t)` / `ipairs(t)`.** Table runtime
    completeness; depends on the widened source set.
-4. **Future indirect-call re-enablement** (signature side
+3. **Future indirect-call re-enablement** (signature side
    table, ADR 0075 superseder candidate). Reopens
    `local g = t[k]; g()` once a runtime descriptor exists.
-5. **Closure-with-upvalues in tables**
+4. **Closure-with-upvalues in tables**
    (LIC-2.6c-tag-hetero-closure-escape-1). HIR rejects today
    via the existing escape analysis (ADR 0044 + ADR 0071);
    relaxing requires escape semantics + GC strategy.
@@ -443,3 +450,4 @@ Listed in Codex review priority order (post-ADR-0075):
 | 0073 | 2.6c-tag-rs-split            | 2-layer codegen module split — `primitive.rs` (pure MLIR helpers + `Types`) + `tagged.rs` (tag constants, store/check helpers, pure-tag consumer dispatchers); `emit.rs` 8464 → 6856 LOC |
 | 0074 | 2.6c-tag-locals-fn           | Function-return TaggedValue widening — heterogeneous return paths widen `_ret_value_N` slot to TaggedValue; `ret_mlir_types` maps TaggedValue → `(i64 tag, i64 payload_raw)`; new helpers `emit_call_user_into_tagged_slot` / `_tmp` for caller-side result packing; HIR rejects storing tagged-return functions in tables |
 | 0075 | 2.6c-tag-callee-arity        | TaggedValue indirect call HIR-rejected (Strict Plan C, supersedes ADR 0072 in part) — `args.len()` arity reconstruction was unsound; LIC-callee-arity-1 + locals-fn-indirect-1 resolved by removal; `emit_value_slot_check_function` deleted |
+| 0076 | 2.6c-tag-locals-fn-multi     | Multi-position TaggedValue caller-side walker — new `ret_kind_result_width` / `flat_result_index` / `emit_pack_tagged_result_at_pos` helpers generalise `emit_multi_assign_from_call` to handle multi-position TaggedValue ABI (`(i64, i64, i64, i64)` for two TaggedValue positions); LIC-locals-fn-multi-1 resolved |

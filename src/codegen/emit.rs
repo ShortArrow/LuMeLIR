@@ -689,6 +689,61 @@ fn ret_mlir_types<'c>(
         .collect()
 }
 
+/// Phase 2.6c-tag-locals-fn-multi (ADR 0076): MLIR `func.call`
+/// result count produced by a single logical return position of
+/// the given kind. Mirrors [`ret_mlir_types`]'s `flat_map`
+/// expansion: TaggedValue is 2 (tag + payload_raw), every other
+/// supported return kind is 1.
+fn ret_kind_result_width(kind: ValueKind) -> usize {
+    match kind {
+        ValueKind::TaggedValue => 2,
+        _ => 1,
+    }
+}
+
+/// Phase 2.6c-tag-locals-fn-multi (ADR 0076): flat MLIR result
+/// index where logical return position `pos` starts. For
+/// `ret_kinds = [Number, TaggedValue, Bool]`, position 0 starts
+/// at MLIR result 0, position 1 at MLIR result 1, position 2 at
+/// MLIR result 3 (because the TaggedValue at position 1 took 2
+/// MLIR results).
+fn flat_result_index(ret_kinds: &[ValueKind], pos: usize) -> usize {
+    ret_kinds[..pos]
+        .iter()
+        .map(|k| ret_kind_result_width(*k))
+        .sum()
+}
+
+/// Phase 2.6c-tag-locals-fn-multi (ADR 0076): pack the two i64
+/// MLIR results that materialise a TaggedValue return position
+/// into a 16-byte tagged destination slot. The caller emits the
+/// `func::call` once, then invokes this helper for each
+/// TaggedValue dst position. Position-aware via `flat_result_
+/// index` (ADR 0076) so multi-position TaggedValue returns
+/// resolve to non-overlapping MLIR result ranges.
+#[allow(clippy::too_many_arguments)]
+fn emit_pack_tagged_result_at_pos<'a, 'c, 'op>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    op_ref: &melior::ir::operation::OperationRef<'c, 'op>,
+    dst_slot: Value<'c, 'a>,
+    ret_kinds: &[ValueKind],
+    pos: usize,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) where
+    'op: 'a,
+{
+    debug_assert!(matches!(ret_kinds[pos], ValueKind::TaggedValue));
+    let start = flat_result_index(ret_kinds, pos);
+    let tag: Value<'c, 'a> = op_ref.result(start).unwrap().into();
+    let payload: Value<'c, 'a> = op_ref.result(start + 1).unwrap().into();
+    emit_store(block, tag, dst_slot, loc);
+    let payload_ptr =
+        emit_byte_offset_ptr(context, block, dst_slot, ARRAY_ELEM_OFF_VALUE, types, loc);
+    emit_store(block, payload, payload_ptr, loc);
+}
+
 /// Emit a `func.func @<mangled_name>(...) -> (...)` for a user-defined
 /// function. Phase 2.5a constrains every parameter and the optional
 /// return value to `Number` (f64). The `_returned` / `_ret_value`
@@ -1562,17 +1617,42 @@ fn emit_multi_assign_from_call<'a, 'c>(
         loc,
     );
     let op_ref = block.append_operation(call_op);
+    // Phase 2.6c-tag-locals-fn-multi (ADR 0076): per-position
+    // result-index walker. Each logical return position consumes
+    // 1 MLIR result for non-TaggedValue kinds, 2 results for
+    // TaggedValue (tag + payload_raw). The walker computes the
+    // flat MLIR result index for each position via
+    // `flat_result_index` so multiple TaggedValue positions
+    // resolve to non-overlapping ranges.
     for (i, dst) in dst_ids.iter().enumerate() {
-        let v: Value<'c, 'a> = op_ref.result(i).unwrap().into();
         let info = &locals[dst.0];
-        // Function-kind slots need the same ucast bridge used by
-        // ordinary LocalInit (Phase 2.5b.3).
-        let store_val = if matches!(info.kind, ValueKind::Function(_)) {
-            emit_unrealized_cast(block, v, types.ptr, loc)
-        } else {
-            v
-        };
-        emit_store(block, store_val, slots[dst.0], loc);
+        let dst_slot = slots[dst.0];
+        match info.kind {
+            ValueKind::TaggedValue => {
+                emit_pack_tagged_result_at_pos(
+                    context,
+                    block,
+                    &op_ref,
+                    dst_slot,
+                    &target.ret_kinds,
+                    i,
+                    types,
+                    loc,
+                );
+            }
+            _ => {
+                let result_idx = flat_result_index(&target.ret_kinds, i);
+                let v: Value<'c, 'a> = op_ref.result(result_idx).unwrap().into();
+                // Function-kind slots need the same ucast bridge used by
+                // ordinary LocalInit (Phase 2.5b.3).
+                let store_val = if matches!(info.kind, ValueKind::Function(_)) {
+                    emit_unrealized_cast(block, v, types.ptr, loc)
+                } else {
+                    v
+                };
+                emit_store(block, store_val, dst_slot, loc);
+            }
+        }
     }
     Ok(())
 }
@@ -1964,9 +2044,11 @@ fn emit_inline_index_into_tagged_tmp<'a, 'c>(
 /// Phase 2.6c-tag-locals-fn (ADR 0074): emit a `Callee::User`
 /// call whose `ret_kinds[0]` is `TaggedValue` and pack the two
 /// MLIR results (i64 tag, i64 payload_raw) into the tagged
-/// `dst_slot`. Single-position TaggedValue return only — multi-
-/// return × TaggedValue interleaving is rejected upstream
-/// (LIC-2.6c-tag-locals-fn-multi-1).
+/// `dst_slot`. Reads result position 0 only — for multi-
+/// position TaggedValue returns into multiple destination
+/// slots, see `emit_multi_assign_from_call` which uses
+/// [`emit_pack_tagged_result_at_pos`] per position
+/// (ADR 0076).
 #[allow(clippy::too_many_arguments)]
 fn emit_call_user_into_tagged_slot<'a, 'c>(
     context: &'c Context,
@@ -1997,12 +2079,16 @@ fn emit_call_user_into_tagged_slot<'a, 'c>(
         loc,
     );
     let op_ref = block.append_operation(call_op);
-    let tag: Value<'c, 'a> = op_ref.result(0).unwrap().into();
-    let payload: Value<'c, 'a> = op_ref.result(1).unwrap().into();
-    emit_store(block, tag, dst_slot, loc);
-    let payload_ptr =
-        emit_byte_offset_ptr(context, block, dst_slot, ARRAY_ELEM_OFF_VALUE, types, loc);
-    emit_store(block, payload, payload_ptr, loc);
+    emit_pack_tagged_result_at_pos(
+        context,
+        block,
+        &op_ref,
+        dst_slot,
+        &target.ret_kinds,
+        0,
+        types,
+        loc,
+    );
     Ok(())
 }
 
@@ -6388,6 +6474,25 @@ print(double(21))",
             !mlir.contains("(i64, i64)"),
             "pure-Number return must not produce TaggedValue ABI, got:\n{mlir}"
         );
+    }
+
+    #[test]
+    fn emit_function_with_multi_position_tagged_return_uses_4_i64_results() {
+        // ADR 0076: two return positions both widening to TaggedValue
+        // produce `(...) -> (i64, i64, i64, i64)` MLIR signature —
+        // 2 i64 per logical position, flattened by `ret_mlir_types`.
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src(
+                "local function pick(x) if x > 0 then return 1, nil end return nil, 1 end
+local a, b = pick(1)
+print(type(a), type(b))",
+            ),
+        )
+        .expect("multi-position widened module must verify");
+        let mlir = module.as_operation().to_string();
+        assert_mlir_has(&mlir, "(f64) -> (i64, i64, i64, i64)");
     }
 
     #[test]
