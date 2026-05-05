@@ -6,7 +6,7 @@
 > consumer / tag semantics. ADRs continue to record *decisions*;
 > this page records *current state*.
 
-**Last updated:** 2026-05-04 (after ADR 0077)
+**Last updated:** 2026-05-06 (after ADR 0078)
 
 ---
 
@@ -235,6 +235,7 @@ the introduction, when still open).
 | LIC-2.6c-tag-locals-fn-indirect-1 | Calling a TaggedValue-returning function through `Callee::Indirect` — subsumed by ADR 0075's broader rejection | 0074 / 0075 |
 | LIC-2.6c-tag-locals-fn-multi-1    | Multi-position TaggedValue interleaving (`return 1, nil` vs `return nil, 1`) — caller-side result-index walker generalised | 0076       |
 | LIC-2.7p-arith-coerce-1           | String → Number arithmetic coercion (`"5" + 1`); failure traps via `s_arith_coerce_failed` | 0077      |
+| LIC-2.8e-iter-ipairs-1            | `for i, v in ipairs(t) do … end` parser sugar with first-nil termination | 0078      |
 
 ### Partial
 
@@ -248,8 +249,10 @@ the introduction, when still open).
 |---------------------------------------------|-----------------------------------------------------------------------|--------------------------------|
 | LIC-2.6c-tag-hetero-closure-escape-1        | Closure with upvalues stored in tables                                | HIR-rejects today (ADR 0044 + ADR 0071); needs escape-analysis relaxation |
 | LIC-2.7p-arith-coerce-tagged-1              | TaggedValue operand arith coerce (`local x = t[1]; print(x + 1)` when x is runtime String) | HIR can't statically resolve the kind; current TaggedValue-arith path traps on non-Number tag (ADR 0063). Unlocking needs runtime tag dispatch in arith codegen |
+| LIC-2.8e-iter-pairs-1                       | `pairs(t)` hash-bucket iteration                                      | Requires hash-walk protocol design with tombstone awareness (ADR 0062) and expanded key-kind support (LIC-2.6a-arr-3). Defer until `pairs` semantics finalised |
+| LIC-2.8e-iter-generic-1                     | Generic-for protocol with arbitrary callable iterator (`for x in iter, state, init do …`) | Requires reopening the ADR 0075 indirect-call reject via signature side table or equivalent runtime descriptor |
 
-**Total:** 19 LIC entries — 18 resolved, 1 partial, 2 pending.
+**Total:** 21 LIC entries — 19 resolved, 1 partial, 3 pending.
 
 ---
 
@@ -407,15 +410,18 @@ supported kind contributes 1.
 
 ## 7. Open Questions / Known Gaps
 
-Listed in Codex review priority order (post-ADR-0077):
+Listed in Codex review priority order (post-ADR-0078):
 
-1. **Iteration `pairs(t)` / `ipairs(t)`.** Table runtime
-   completeness; depends on the widened source set.
-2. **Hash key kinds expansion** (LIC-2.6a-arr-3). Bool /
-   Function / Table keys.
+1. **Hash key kinds expansion** (LIC-2.6a-arr-3). Bool /
+   Function / Table keys. Prerequisite for full `pairs`
+   support.
+2. **`pairs(t)` hash iteration** (LIC-2.8e-iter-pairs-1) — once
+   hash key kinds are widened.
 3. **Future indirect-call re-enablement** (signature side
    table, ADR 0075 superseder candidate). Reopens
-   `local g = t[k]; g()` once a runtime descriptor exists.
+   `local g = t[k]; g()` once a runtime descriptor exists,
+   prerequisite for generic-for protocol (LIC-2.8e-iter-
+   generic-1).
 4. **Closure-with-upvalues in tables**
    (LIC-2.6c-tag-hetero-closure-escape-1). HIR rejects today
    via the existing escape analysis (ADR 0044 + ADR 0071);
@@ -464,3 +470,4 @@ Listed in Codex review priority order (post-ADR-0077):
 | 0075 | 2.6c-tag-callee-arity        | TaggedValue indirect call HIR-rejected (Strict Plan C, supersedes ADR 0072 in part) — `args.len()` arity reconstruction was unsound; LIC-callee-arity-1 + locals-fn-indirect-1 resolved by removal; `emit_value_slot_check_function` deleted |
 | 0076 | 2.6c-tag-locals-fn-multi     | Multi-position TaggedValue caller-side walker — new `ret_kind_result_width` / `flat_result_index` / `emit_pack_tagged_result_at_pos` helpers generalise `emit_multi_assign_from_call` to handle multi-position TaggedValue ABI (`(i64, i64, i64, i64)` for two TaggedValue positions); LIC-locals-fn-multi-1 resolved |
 | 0077 | 2.7p-arith-string-coerce     | String → Number arith coercion — HIR `ArithStringCoerce` wraps String operands of arith / bitwise BinOps; codegen `emit_tonumber_for_arith` reuses `emit_tonumber`'s sscanf path then promotes NaN sentinel to runtime trap (`s_arith_coerce_failed`); 12 arith / bitwise ops accept String operands; hex floats work via glibc's sscanf%lf; LIC-arith-coerce-1 resolved |
+| 0078 | 2.8e-iter-ipairs             | `for k, v in ipairs(t) do … end` parser sugar (Plan C) — new `Keyword::In`, `StmtKind::ForIpairs`, parser branch + `unwrap_ipairs_call` restrict iter form to `ipairs(table)`; HIR desugars to `Block { LocalInit; While { LocalInit IndexTagged; If IsNil → break; BODY; idx += 1 } }` using existing primitives; codegen unchanged; `pairs` and generic-for protocol remain LIC-tracked pending the ADR 0075 indirect-call reopening |

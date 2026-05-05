@@ -160,6 +160,60 @@ impl<'t> Parser<'t> {
                 });
             }
         };
+        // Phase 2.8e-iter-ipairs (ADR 0078): if the next token is
+        // `,` the form is a generic / ipairs-sugar for-loop
+        // (`for IDX, VAL in ipairs(t) do ...`); otherwise it's the
+        // original numeric for. A bare `for NAME in ...` is also
+        // rejected here — Plan C requires both `idx` and `val`
+        // names because `ipairs` always yields two values.
+        if matches!(self.peek().kind, TokenKind::Comma) {
+            self.bump(); // consume ','
+            let val_tok = self.peek().clone();
+            let val_name = match val_tok.kind {
+                TokenKind::Ident(n) => {
+                    self.bump();
+                    n
+                }
+                TokenKind::Eof => {
+                    return Err(ParseError::UnexpectedEof {
+                        offset: val_tok.span.start,
+                    });
+                }
+                other => {
+                    return Err(ParseError::UnexpectedToken {
+                        actual: other,
+                        offset: val_tok.span.start,
+                    });
+                }
+            };
+            let in_offset = self.peek().span.start;
+            self.expect_keyword(Keyword::In)?;
+            let iter_call = self.parse_expr(0)?;
+            let table_expr = unwrap_ipairs_call(iter_call)
+                .ok_or(ParseError::UnsupportedIterator { offset: in_offset })?;
+            self.expect_keyword(Keyword::Do)?;
+            let body =
+                self.parse_chunk_until(&[TokenKind::Keyword(Keyword::End), TokenKind::Eof])?;
+            let end_tok = self.expect_keyword(Keyword::End)?;
+            let span = Span::new(for_tok.span.start, end_tok.span.end);
+            return Ok(Stmt::new(
+                StmtKind::ForIpairs {
+                    idx_name: var,
+                    val_name,
+                    table: table_expr,
+                    body,
+                },
+                span,
+            ));
+        }
+        if matches!(self.peek().kind, TokenKind::Keyword(Keyword::In)) {
+            // Single-variable `for k in iter() do ...` is the
+            // unrestricted generic-for protocol (LIC-2.8e-iter-
+            // generic-1). Rejected in this phase.
+            return Err(ParseError::UnsupportedIterator {
+                offset: self.peek().span.start,
+            });
+        }
         self.expect_token(TokenKind::Equals)?;
         let start = self.parse_expr(0)?;
         self.expect_token(TokenKind::Comma)?;
@@ -863,6 +917,27 @@ struct InfixInfo {
     right_assoc: bool,
 }
 
+/// Phase 2.8e-iter-ipairs (ADR 0078): pattern-match
+/// `ipairs(table_expr)` — the only iterator shape recognised by
+/// the restricted Plan-C `for ... in` form. Returns the unwrapped
+/// `table_expr` on match; `None` for any other shape (including
+/// `pairs(t)`, custom iterators, multi-arg `ipairs`, etc.).
+fn unwrap_ipairs_call(expr: Expr) -> Option<Expr> {
+    let span = expr.span;
+    if let ExprKind::Call { callee, args } = expr.kind
+        && let ExprKind::Ident(ref name) = callee.kind
+        && name == "ipairs"
+        && args.len() == 1
+    {
+        let mut args = args;
+        Some(args.remove(0))
+    } else {
+        // Drop the unwrapped expr; leak nothing.
+        let _ = span;
+        None
+    }
+}
+
 fn infix_op(kind: &TokenKind) -> Option<InfixInfo> {
     match kind {
         TokenKind::Keyword(Keyword::Or) => Some(InfixInfo {
@@ -1060,6 +1135,17 @@ mod tests {
                 start: strip_span_expr(start),
                 stop: strip_span_expr(stop),
                 step: step.map(strip_span_expr),
+                body: body.into_iter().map(strip_span_stmt).collect(),
+            },
+            StmtKind::ForIpairs {
+                idx_name,
+                val_name,
+                table,
+                body,
+            } => StmtKind::ForIpairs {
+                idx_name,
+                val_name,
+                table: strip_span_expr(table),
                 body: body.into_iter().map(strip_span_stmt).collect(),
             },
             StmtKind::Break => StmtKind::Break,

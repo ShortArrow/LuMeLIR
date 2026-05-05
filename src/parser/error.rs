@@ -15,6 +15,17 @@ pub enum ParseError {
 
     #[error("unexpected token {actual:?}")]
     UnexpectedToken { actual: TokenKind, offset: usize },
+
+    /// Phase 2.8e-iter-ipairs (ADR 0078): a `for ... in EXPR do ...`
+    /// form whose iterator slot is not the supported
+    /// `ipairs(table_expr)` shape. `pairs(t)` and arbitrary
+    /// callable iterators are LIC-tracked
+    /// (LIC-2.8e-iter-pairs-1 / LIC-2.8e-iter-generic-1) until a
+    /// future phase reopens generic-for protocol.
+    #[error(
+        "unsupported iterator in `for ... in`: only `ipairs(table)` is recognised in this phase (LIC-2.8e-iter-pairs-1 / LIC-2.8e-iter-generic-1)"
+    )]
+    UnsupportedIterator { offset: usize },
 }
 
 impl ParseError {
@@ -23,9 +34,9 @@ impl ParseError {
     pub fn offset(&self) -> usize {
         match self {
             ParseError::Lex(e) => e.offset(),
-            ParseError::UnexpectedEof { offset } | ParseError::UnexpectedToken { offset, .. } => {
-                *offset
-            }
+            ParseError::UnexpectedEof { offset }
+            | ParseError::UnexpectedToken { offset, .. }
+            | ParseError::UnsupportedIterator { offset } => *offset,
         }
     }
 }

@@ -120,6 +120,9 @@ pub enum Keyword {
     Return,
     Repeat,
     Until,
+    /// Phase 2.8e-iter-ipairs (ADR 0078): generic / sugar
+    /// for-loop introducer (`for k, v in ipairs(t) do ...`).
+    In,
 }
 
 impl Keyword {
@@ -145,6 +148,7 @@ impl Keyword {
             "return" => Some(Keyword::Return),
             "repeat" => Some(Keyword::Repeat),
             "until" => Some(Keyword::Until),
+            "in" => Some(Keyword::In),
             _ => None,
         }
     }

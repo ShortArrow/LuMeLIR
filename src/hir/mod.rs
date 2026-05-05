@@ -237,7 +237,10 @@ fn stmt_contains_break(s: &Stmt) -> bool {
         StmtKind::Block(b) => body_contains_break(b),
         // Nested loops have their own break scope — their breaks do
         // not escape to this loop.
-        StmtKind::While { .. } | StmtKind::ForNumeric { .. } | StmtKind::Repeat { .. } => false,
+        StmtKind::While { .. }
+        | StmtKind::ForNumeric { .. }
+        | StmtKind::ForIpairs { .. }
+        | StmtKind::Repeat { .. } => false,
         _ => false,
     }
 }
@@ -362,7 +365,9 @@ fn ast_max_return_arity(stmts: &[Stmt]) -> usize {
                     }
                 }
             }
-            StmtKind::While { body, .. } | StmtKind::ForNumeric { body, .. } => {
+            StmtKind::While { body, .. }
+            | StmtKind::ForNumeric { body, .. }
+            | StmtKind::ForIpairs { body, .. } => {
                 for st in body {
                     visit(st, max);
                 }
@@ -481,6 +486,12 @@ fn infer_user_function_param_kinds(
                 if let Some(s) = step {
                     visit_expr(s, names, kinds, seen);
                 }
+                for st in body {
+                    visit_stmt(st, names, kinds, seen);
+                }
+            }
+            StmtKind::ForIpairs { table, body, .. } => {
+                visit_expr(table, names, kinds, seen);
                 for st in body {
                     visit_stmt(st, names, kinds, seen);
                 }
@@ -636,6 +647,12 @@ fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
                 if let Some(s) = step {
                     visit_expr(s, name_to_idx, kinds);
                 }
+                for s in body {
+                    visit_stmt(s, name_to_idx, kinds);
+                }
+            }
+            StmtKind::ForIpairs { table, body, .. } => {
+                visit_expr(table, name_to_idx, kinds);
                 for s in body {
                     visit_stmt(s, name_to_idx, kinds);
                 }
@@ -1458,6 +1475,177 @@ impl LowerCtx {
                     span: stmt.span,
                 };
                 Ok(wrap_with_break_init(for_stmt, break_id, stmt.span))
+            }
+            // Phase 2.8e-iter-ipairs (ADR 0078): desugar
+            // `for IDX, VAL in ipairs(TABLE) do BODY end`
+            // to existing primitives so codegen needs no new arm:
+            //
+            //   do
+            //     local __t = TABLE
+            //     local IDX = 1
+            //     local _broken_N = false
+            //     while true do
+            //       local VAL = __t[IDX]   -- IndexTagged → TaggedValue
+            //       if VAL == nil then _broken_N = true end
+            //       BODY
+            //       IDX = IDX + 1
+            //     end
+            //   end
+            //
+            // The While codegen (ADR 0015) AND-extends `cond` with
+            // `not load(break_slot)`, so a `while true` paired with
+            // a break flag terminates after the nil check fires.
+            StmtKind::ForIpairs {
+                idx_name,
+                val_name,
+                table,
+                body,
+            } => {
+                let span = stmt.span;
+                // Lower the table expression in the OUTER scope.
+                let table_hir = self.lower_expr(table)?;
+                let table_kind = infer_kind(&table_hir, &self.locals, &self.functions);
+                if table_kind != ValueKind::Table {
+                    return Err(HirError::TypeMismatch {
+                        op: "for-in-ipairs".to_owned(),
+                        lhs_kind: "table".to_owned(),
+                        rhs_kind: table_kind.name().to_owned(),
+                        offset: table.span.start,
+                    });
+                }
+                // Synthetic locals live in a fresh inner scope so
+                // user-shadowed names don't collide with __t /
+                // _broken.
+                self.scopes.push(HashMap::new());
+                let table_local = self.declare_local(
+                    format!("__lumelir_iter_t_{}", self.locals.len()),
+                    ValueKind::Table,
+                );
+                let idx_id = self.declare_local(idx_name.clone(), ValueKind::Number);
+                let val_id = self.declare_local(val_name.clone(), ValueKind::TaggedValue);
+                let break_id =
+                    self.declare_local(format!("_broken_{}", self.locals.len()), ValueKind::Bool);
+
+                // User body lowers in the same scope so it sees IDX
+                // and VAL. break inside the body targets break_id.
+                // `lower_scoped_body_no_push` wraps each user stmt
+                // in `if not _broken then STMT end` (ADR 0015) so a
+                // mid-body `break` skips the remainder of the body.
+                self.loop_break_targets.push(Some(break_id));
+                let body_result = self.lower_scoped_body_no_push(body);
+                self.loop_break_targets.pop();
+                self.scopes.pop();
+                let user_body_hir = body_result?;
+
+                // Build synthetic HIR statements.
+                let local_init = |id, value| HirStmt {
+                    kind: HirStmtKind::LocalInit { id, value },
+                    span,
+                };
+                let table_init = local_init(table_local, table_hir);
+                let idx_init = local_init(
+                    idx_id,
+                    HirExpr {
+                        kind: HirExprKind::Number(1.0),
+                        span,
+                    },
+                );
+                let break_init = local_init(
+                    break_id,
+                    HirExpr {
+                        kind: HirExprKind::Bool(false),
+                        span,
+                    },
+                );
+                let table_local_expr = HirExpr {
+                    kind: HirExprKind::Local(table_local),
+                    span,
+                };
+                let idx_local_expr = HirExpr {
+                    kind: HirExprKind::Local(idx_id),
+                    span,
+                };
+                let val_local_expr = HirExpr {
+                    kind: HirExprKind::Local(val_id),
+                    span,
+                };
+                // local VAL = __t[IDX] (IndexTagged widens VAL to
+                // TaggedValue per ADR 0063).
+                let val_init = local_init(
+                    val_id,
+                    HirExpr {
+                        kind: HirExprKind::IndexTagged {
+                            target: Box::new(table_local_expr.clone()),
+                            key: Box::new(idx_local_expr.clone()),
+                        },
+                        span,
+                    },
+                );
+                // if IsNil(VAL) then _broken := true else BODY; IDX += 1 end
+                //
+                // BODY runs only when VAL is non-nil, matching
+                // Lua spec for ipairs (stop at first nil, don't
+                // expose the nil to user code).
+                let break_assign = HirStmt {
+                    kind: HirStmtKind::Assign {
+                        id: break_id,
+                        value: HirExpr {
+                            kind: HirExprKind::Bool(true),
+                            span,
+                        },
+                    },
+                    span,
+                };
+                let idx_inc = HirStmt {
+                    kind: HirStmtKind::Assign {
+                        id: idx_id,
+                        value: HirExpr {
+                            kind: HirExprKind::BinOp {
+                                op: BinOp::Add,
+                                lhs: Box::new(idx_local_expr.clone()),
+                                rhs: Box::new(HirExpr {
+                                    kind: HirExprKind::Number(1.0),
+                                    span,
+                                }),
+                            },
+                            span,
+                        },
+                    },
+                    span,
+                };
+                let mut else_body: Vec<HirStmt> = Vec::with_capacity(user_body_hir.len() + 1);
+                else_body.extend(user_body_hir);
+                else_body.push(idx_inc);
+                let nil_check = HirStmt {
+                    kind: HirStmtKind::If {
+                        cond: HirExpr {
+                            kind: HirExprKind::IsNil(Box::new(val_local_expr.clone())),
+                            span,
+                        },
+                        then_body: vec![break_assign],
+                        elifs: Vec::new(),
+                        else_body: Some(else_body),
+                    },
+                    span,
+                };
+                let while_body: Vec<HirStmt> = vec![val_init, nil_check];
+                let while_loop = HirStmt {
+                    kind: HirStmtKind::While {
+                        cond: HirExpr {
+                            kind: HirExprKind::Bool(true),
+                            span,
+                        },
+                        body: while_body,
+                        break_id: Some(break_id),
+                    },
+                    span,
+                };
+                Ok(HirStmt {
+                    kind: HirStmtKind::Block {
+                        stmts: vec![table_init, idx_init, break_init, while_loop],
+                    },
+                    span,
+                })
             }
             StmtKind::ExprStmt(expr) => {
                 let hir_expr = self.lower_expr(expr)?;

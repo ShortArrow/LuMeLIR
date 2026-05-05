@@ -193,6 +193,22 @@ pub enum StmtKind {
         step: Option<Expr>,
         body: Chunk,
     },
+    /// Phase 2.8e-iter-ipairs (ADR 0078): `for IDX, VAL in
+    /// ipairs(TABLE) do BODY end` — restricted Lua iteration
+    /// sugar. Only the `ipairs(table_expr)` shape is recognised
+    /// in the iterator slot; `pairs(t)` and arbitrary callable
+    /// iterators (Lua's generic-for protocol) are parser-
+    /// rejected today (LIC-2.8e-iter-pairs-1 /
+    /// LIC-2.8e-iter-generic-1). HIR desugars this variant to a
+    /// synthetic `Block { LocalInit; While { LocalInit IndexTagged;
+    /// IsNil break; BODY; idx += 1 } }` so codegen needs no new
+    /// arm.
+    ForIpairs {
+        idx_name: String,
+        val_name: String,
+        table: Expr,
+        body: Chunk,
+    },
     /// `break` — exits the innermost enclosing loop. HIR rejects
     /// `break` outside of any loop with `BreakOutsideLoop`.
     Break,
