@@ -4088,6 +4088,23 @@ fn emit_expr<'a, 'c>(
             // are rejected at HIR-time and never reach codegen.
             Callee::Builtin(Builtin::ToString) => {
                 let kind = infer_kind(&args[0], locals, functions);
+                // Phase 2.6c-tag-consumers (ADR 0067): when the
+                // operand is a `Local(TaggedValue)`, dispatch on
+                // the runtime tag. Without this, `emit_expr` on
+                // the Local extracts as f64 with trap-on-non-
+                // Number, which is wrong for Bool/String/Nil
+                // payloads.
+                if kind == ValueKind::TaggedValue {
+                    if let HirExprKind::Local(LocalId(idx)) = &args[0].kind {
+                        return Ok(emit_tostring_tagged_local(
+                            context,
+                            block,
+                            slots[*idx],
+                            types,
+                            loc,
+                        ));
+                    }
+                }
                 let arg_val = emit_expr(
                     context, block, &args[0], slots, locals, functions, types, params_len, loc,
                 )?;
@@ -4147,6 +4164,22 @@ fn emit_expr<'a, 'c>(
             // arg is itself a function call that prints).
             Callee::Builtin(Builtin::Type) => {
                 let kind = infer_kind(&args[0], locals, functions);
+                // Phase 2.6c-tag-consumers (ADR 0067): when the
+                // operand is a `Local(TaggedValue)`, dispatch on
+                // the runtime tag instead of the inner kind. The
+                // ADR 0063 static-dispatch shortcut is what
+                // LIC-2.6c-tag-locals-1 flagged.
+                if kind == ValueKind::TaggedValue {
+                    if let HirExprKind::Local(LocalId(idx)) = &args[0].kind {
+                        return Ok(emit_type_tagged_local(
+                            context,
+                            block,
+                            slots[*idx],
+                            types,
+                            loc,
+                        ));
+                    }
+                }
                 if !matches!(
                     args[0].kind,
                     HirExprKind::FunctionRef(_) | HirExprKind::Local(_)
@@ -4162,13 +4195,10 @@ fn emit_expr<'a, 'c>(
                     ValueKind::Nil => "s_typename_nil",
                     ValueKind::Function(_) => "s_typename_function",
                     ValueKind::Table => "s_typename_table",
-                    // Phase 2.6c-tag-locals (ADR 0063): static
-                    // dispatch picks the inner kind's name. A
-                    // runtime nil-tagged read of `type(x)` will
-                    // mis-report "number" instead of "nil"; that
-                    // is logged as a follow-up LIC since the
-                    // widening tests in this sub-phase do not
-                    // exercise it.
+                    // TaggedValue not a Local — falls through to
+                    // the inner-kind name. In practice this arm
+                    // is unreachable for now (no other expression
+                    // shape produces TaggedValue).
                     ValueKind::TaggedValue => "s_typename_number",
                 };
                 Ok(emit_addressof(context, block, global, types, loc))
@@ -6006,6 +6036,327 @@ fn emit_tagged_eq_runtime_dispatch<'a, 'c>(
         _ => unreachable!(),
     };
     Ok(Some(final_val))
+}
+
+/// Phase 2.6c-tag-consumers (ADR 0067): runtime tag dispatch for
+/// `type(Local(TaggedValue))`. Reads the slot's tag at offset 0
+/// and yields a pointer to one of the existing `s_typename_*`
+/// global strings. Function/Table tags fall through to the
+/// `s_typename_number` default — those payloads aren't yet
+/// stored in tagged slots (LIC-2.6c-tag-hetero-fn-tbl-1) so the
+/// fallback is unreachable in current programs.
+fn emit_type_tagged_local<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let tag = emit_load(block, slot_ptr, types.i64, loc);
+    // Build the tag-vs-tag chain: Nil → "nil"; Number → "number";
+    // Bool → "boolean"; String → "string"; else → "number"
+    // (defensive). Every arm yields a `ptr` into the static
+    // typename pool.
+    let make_const_i64 = |b: &Block<'c>, v: i64| -> Value<'c, '_> {
+        b.append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, v).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into()
+    };
+    let tag_nil = make_const_i64(block, TAG_NIL);
+    let is_nil: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            tag,
+            tag_nil,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let nil_then = Region::new();
+    let nil_then_blk = Block::new(&[]);
+    let nil_str = emit_addressof(context, &nil_then_blk, "s_typename_nil", types, loc);
+    nil_then_blk.append_operation(scf::r#yield(&[nil_str], loc));
+    nil_then.append_block(nil_then_blk);
+    let nil_else = Region::new();
+    let nil_else_blk = Block::new(&[]);
+    {
+        let tag_number = make_const_i64(&nil_else_blk, TAG_NUMBER);
+        let is_number: Value<'c, '_> = nil_else_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                tag,
+                tag_number,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let num_then = Region::new();
+        let num_then_blk = Block::new(&[]);
+        let num_str = emit_addressof(context, &num_then_blk, "s_typename_number", types, loc);
+        num_then_blk.append_operation(scf::r#yield(&[num_str], loc));
+        num_then.append_block(num_then_blk);
+        let num_else = Region::new();
+        let num_else_blk = Block::new(&[]);
+        {
+            let tag_bool = make_const_i64(&num_else_blk, TAG_BOOL);
+            let is_bool: Value<'c, '_> = num_else_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    tag,
+                    tag_bool,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let bool_then = Region::new();
+            let bool_then_blk = Block::new(&[]);
+            let bool_str =
+                emit_addressof(context, &bool_then_blk, "s_typename_boolean", types, loc);
+            bool_then_blk.append_operation(scf::r#yield(&[bool_str], loc));
+            bool_then.append_block(bool_then_blk);
+            let bool_else = Region::new();
+            let bool_else_blk = Block::new(&[]);
+            {
+                let tag_string = make_const_i64(&bool_else_blk, TAG_STRING);
+                let is_string: Value<'c, '_> = bool_else_blk
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Eq,
+                        tag,
+                        tag_string,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let str_then = Region::new();
+                let str_then_blk = Block::new(&[]);
+                let str_str =
+                    emit_addressof(context, &str_then_blk, "s_typename_string", types, loc);
+                str_then_blk.append_operation(scf::r#yield(&[str_str], loc));
+                str_then.append_block(str_then_blk);
+                let str_else = Region::new();
+                let str_else_blk = Block::new(&[]);
+                let fallback =
+                    emit_addressof(context, &str_else_blk, "s_typename_number", types, loc);
+                str_else_blk.append_operation(scf::r#yield(&[fallback], loc));
+                str_else.append_block(str_else_blk);
+                let str_op = scf::r#if(is_string, &[types.ptr], str_then, str_else, loc);
+                let str_result: Value<'c, '_> = bool_else_blk
+                    .append_operation(str_op)
+                    .result(0)
+                    .unwrap()
+                    .into();
+                bool_else_blk.append_operation(scf::r#yield(&[str_result], loc));
+            }
+            bool_else.append_block(bool_else_blk);
+            let bool_op = scf::r#if(is_bool, &[types.ptr], bool_then, bool_else, loc);
+            let bool_result: Value<'c, '_> = num_else_blk
+                .append_operation(bool_op)
+                .result(0)
+                .unwrap()
+                .into();
+            num_else_blk.append_operation(scf::r#yield(&[bool_result], loc));
+        }
+        num_else.append_block(num_else_blk);
+        let num_op = scf::r#if(is_number, &[types.ptr], num_then, num_else, loc);
+        let num_result: Value<'c, '_> = nil_else_blk
+            .append_operation(num_op)
+            .result(0)
+            .unwrap()
+            .into();
+        nil_else_blk.append_operation(scf::r#yield(&[num_result], loc));
+    }
+    nil_else.append_block(nil_else_blk);
+    let if_op = scf::r#if(is_nil, &[types.ptr], nil_then, nil_else, loc);
+    block.append_operation(if_op).result(0).unwrap().into()
+}
+
+/// Phase 2.6c-tag-consumers (ADR 0067): runtime tag dispatch for
+/// `tostring(Local(TaggedValue))`. Reads the slot's tag and
+/// yields a `ptr` to the appropriate string representation:
+/// Number is materialised via `emit_tostring(... Number)` (a
+/// snprintf into a fresh buffer), Bool selects the static
+/// `s_true` / `s_false`, String returns the payload pointer
+/// directly, and Nil returns `s_nil`.
+fn emit_tostring_tagged_local<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let tag = emit_load(block, slot_ptr, types.i64, loc);
+    let value_ptr =
+        emit_byte_offset_ptr(context, block, slot_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
+    let make_const_i64 = |b: &Block<'c>, v: i64| -> Value<'c, '_> {
+        b.append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, v).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into()
+    };
+    let tag_nil = make_const_i64(block, TAG_NIL);
+    let is_nil: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            tag,
+            tag_nil,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let nil_then = Region::new();
+    let nil_then_blk = Block::new(&[]);
+    let nil_str = emit_addressof(context, &nil_then_blk, "s_nil", types, loc);
+    nil_then_blk.append_operation(scf::r#yield(&[nil_str], loc));
+    nil_then.append_block(nil_then_blk);
+    let nil_else = Region::new();
+    let nil_else_blk = Block::new(&[]);
+    {
+        let tag_number = make_const_i64(&nil_else_blk, TAG_NUMBER);
+        let is_number: Value<'c, '_> = nil_else_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                tag,
+                tag_number,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let num_then = Region::new();
+        let num_then_blk = Block::new(&[]);
+        {
+            let f = emit_load(&num_then_blk, value_ptr, types.f64, loc);
+            let formatted = emit_tostring(context, &num_then_blk, f, ValueKind::Number, types, loc);
+            num_then_blk.append_operation(scf::r#yield(&[formatted], loc));
+        }
+        num_then.append_block(num_then_blk);
+        let num_else = Region::new();
+        let num_else_blk = Block::new(&[]);
+        {
+            let tag_bool = make_const_i64(&num_else_blk, TAG_BOOL);
+            let is_bool: Value<'c, '_> = num_else_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    tag,
+                    tag_bool,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let bool_then = Region::new();
+            let bool_then_blk = Block::new(&[]);
+            {
+                let payload_i64 = emit_load(&bool_then_blk, value_ptr, types.i64, loc);
+                let zero_i64 = make_const_i64(&bool_then_blk, 0);
+                let payload_i1: Value<'c, '_> = bool_then_blk
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Ne,
+                        payload_i64,
+                        zero_i64,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let true_ptr = emit_addressof(context, &bool_then_blk, "s_true", types, loc);
+                let false_ptr = emit_addressof(context, &bool_then_blk, "s_false", types, loc);
+                let chosen: Value<'c, '_> = bool_then_blk
+                    .append_operation(
+                        OperationBuilder::new("llvm.select", loc)
+                            .add_operands(&[payload_i1, true_ptr, false_ptr])
+                            .add_results(&[types.ptr])
+                            .build()
+                            .expect("llvm.select"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                bool_then_blk.append_operation(scf::r#yield(&[chosen], loc));
+            }
+            bool_then.append_block(bool_then_blk);
+            let bool_else = Region::new();
+            let bool_else_blk = Block::new(&[]);
+            {
+                let tag_string = make_const_i64(&bool_else_blk, TAG_STRING);
+                let is_string: Value<'c, '_> = bool_else_blk
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Eq,
+                        tag,
+                        tag_string,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let str_then = Region::new();
+                let str_then_blk = Block::new(&[]);
+                {
+                    let payload_ptr = emit_load(&str_then_blk, value_ptr, types.ptr, loc);
+                    str_then_blk.append_operation(scf::r#yield(&[payload_ptr], loc));
+                }
+                str_then.append_block(str_then_blk);
+                let str_else = Region::new();
+                let str_else_blk = Block::new(&[]);
+                {
+                    // Defensive fallback for Function / Table.
+                    let fallback =
+                        emit_addressof(context, &str_else_blk, "s_typename_function", types, loc);
+                    str_else_blk.append_operation(scf::r#yield(&[fallback], loc));
+                }
+                str_else.append_block(str_else_blk);
+                let str_op = scf::r#if(is_string, &[types.ptr], str_then, str_else, loc);
+                let str_result: Value<'c, '_> = bool_else_blk
+                    .append_operation(str_op)
+                    .result(0)
+                    .unwrap()
+                    .into();
+                bool_else_blk.append_operation(scf::r#yield(&[str_result], loc));
+            }
+            bool_else.append_block(bool_else_blk);
+            let bool_op = scf::r#if(is_bool, &[types.ptr], bool_then, bool_else, loc);
+            let bool_result: Value<'c, '_> = num_else_blk
+                .append_operation(bool_op)
+                .result(0)
+                .unwrap()
+                .into();
+            num_else_blk.append_operation(scf::r#yield(&[bool_result], loc));
+        }
+        num_else.append_block(num_else_blk);
+        let num_op = scf::r#if(is_number, &[types.ptr], num_then, num_else, loc);
+        let num_result: Value<'c, '_> = nil_else_blk
+            .append_operation(num_op)
+            .result(0)
+            .unwrap()
+            .into();
+        nil_else_blk.append_operation(scf::r#yield(&[num_result], loc));
+    }
+    nil_else.append_block(nil_else_blk);
+    let if_op = scf::r#if(is_nil, &[types.ptr], nil_then, nil_else, loc);
+    block.append_operation(if_op).result(0).unwrap().into()
 }
 
 /// Phase 2.8b (ADR 0032): emit `printf("%s", @<global_name>)` for
