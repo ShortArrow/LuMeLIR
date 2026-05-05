@@ -6,7 +6,7 @@
 > consumer / tag semantics. ADRs continue to record *decisions*;
 > this page records *current state*.
 
-**Last updated:** 2026-05-05 (after ADR 0071)
+**Last updated:** 2026-05-04 (after ADR 0072)
 
 ---
 
@@ -167,6 +167,20 @@ unreachable — the HIR `value_ok` matrix only emits tags 0–5.
 `HirExprKind::IsNil(Box<HirExpr>)` variant unifies the Index
 and Local source shapes (ADR 0066, formerly two variants).
 
+### `f(...)` — calling a TaggedValue callee
+
+| Source                                | TAG_FUNCTION                                | TAG_NUMBER / BOOL / STRING / NIL / TABLE | Truly-unknown tag (≥ 6) | ADR  |
+|---------------------------------------|---------------------------------------------|------------------------------------------|-------------------------|------|
+| `Local(TaggedValue)` as call callee   | extract payload as `!llvm.ptr`, `unrealized_cast` to `(f64,…) → f64` reconstructed from `args.len()`, `func.call_indirect` | trap via `emit_value_slot_check_function` (`s_table_type_mismatch`) | trap (same helper)     | 0072 |
+
+The HIR `lower_call` arm allows `Local(TaggedValue)` as the
+callee whenever a name resolves to a TaggedValue-kind local;
+arity is inferred from `args.len()` because the tagged slot
+carries no static descriptor. Args remain Number-only at the
+call site to keep the existing argument-kind contract.
+Closure-with-upvalues callees never reach this site because
+ADR 0071 blocks them at the storage edge.
+
 ### Arith / ordering on tagged operand
 
 | Operator                            | TAG_NUMBER       | TAG_BOOL  | TAG_STRING  | TAG_NIL    | Lua spec             |
@@ -203,6 +217,7 @@ the introduction, when still open).
 | LIC-2.6a-arr-2                    | All six tag kinds supported as table elements           | 0064 + 0071   |
 | LIC-2.6a-wr-3                     | All six tag kinds supported as IndexAssign values       | 0064 + 0071   |
 | LIC-2.6b-hash-2                   | All six tag kinds supported as hash values + Nil-delete | 0064 + 0071   |
+| LIC-2.6c-tag-hetero-fn-tbl-call-1 | Calling a Function value retrieved through a tagged slot | 0072         |
 
 ### Partial
 
@@ -215,9 +230,8 @@ the introduction, when still open).
 | ID                                          | Behaviour                                                             | Notes                          |
 |---------------------------------------------|-----------------------------------------------------------------------|--------------------------------|
 | LIC-2.6c-tag-hetero-closure-escape-1        | Closure with upvalues stored in tables                                | HIR-rejects today (ADR 0044 + ADR 0071); needs escape-analysis relaxation |
-| LIC-2.6c-tag-hetero-fn-tbl-call-1           | Calling a Function value retrieved through a tagged slot              | Local read for TaggedValue still extracts as f64 (Number-only); see ADR 0071 §"Local read"  |
 
-**Total:** 14 LIC entries — 12 resolved, 1 partial, 2 pending.
+**Total:** 14 LIC entries — 13 resolved, 1 partial, 1 pending.
 
 ---
 
@@ -292,34 +306,35 @@ When **adding a new producer** (e.g. function-return widening):
 
 ## 7. Open Questions / Known Gaps
 
-Listed in Codex review priority order (post-ADR-0071):
+Listed in Codex review priority order (post-ADR-0072):
 
 1. **Function-return TaggedValue widening.** `local x = f()`
    where `f` returns nil/heterogeneous should widen `x`.
    Requires function ABI updates (return a 16-byte tagged
    payload, or pass a pointer). Most natural follow-up to the
    matrix scaffold (extends the source axis).
-2. **Calling a tagged Function value**
-   (LIC-2.6c-tag-hetero-fn-tbl-call-1). `local f = t[1]; f()`
-   currently traps because the Local read for `TaggedValue`
-   extracts as `f64` (Number-only); calling the function
-   needs a tag-aware extract path.
+2. **`tagged.rs` module split (Tidy First).** `emit.rs` is
+   ~8300 LOC after ADR 0072; tagged-related helpers total
+   ~2300 LOC. Clean split needs careful visibility / re-export
+   design; previously deferred (ADR 0067 / 0069 / 0070 / 0071).
 3. **Closure-with-upvalues in tables**
    (LIC-2.6c-tag-hetero-closure-escape-1). HIR rejects today
    via the existing escape analysis (ADR 0044 + ADR 0071);
    relaxing requires escape semantics + GC strategy.
-4. **`tagged.rs` module split (Tidy First).** `emit.rs` is
-   ~8200 LOC after ADR 0071; tagged-related helpers total
-   ~2200 LOC. Clean split needs careful visibility / re-export
-   design; previously deferred (ADR 0067 / 0069 / 0070 / 0071).
-5. **String → Number coercion on arith** (`"5" + 1`). Lua-spec
+4. **String → Number coercion on arith** (`"5" + 1`). Lua-spec
    feature, mostly orthogonal to the tagged-value redesign.
-6. **Iteration `pairs(t)` / `ipairs(t)`.** Depends on the
+5. **Iteration `pairs(t)` / `ipairs(t)`.** Depends on the
    widened source set.
-7. **Hash key kinds expansion** (LIC-2.6a-arr-3). Bool /
+6. **Hash key kinds expansion** (LIC-2.6a-arr-3). Bool /
    Function / Table keys.
-8. **Full closures** (`2.5c-full`). Independent track; heap-
+7. **Full closures** (`2.5c-full`). Independent track; heap-
    allocated environments.
+8. **Tagged-callee arity inference** — current implementation
+   reconstructs the function type from `args.len()`. A wrong
+   arity miscompiles; LuMeLIR's MLIR-level callees are all
+   `(f64,…) → f64` so the assumption holds for in-tree code,
+   but a hardened design would carry arity in the slot payload
+   or reject mismatched calls at runtime.
 
 ---
 
@@ -344,3 +359,4 @@ Listed in Codex review priority order (post-ADR-0071):
 | 0069 | 2.6c-tag-defensive-trap      | Trap on unknown tagged-slot tag (replaces silent fallbacks)        |
 | 0070 | 2.6c-tag-consumers-inline    | Inline `type(t[k])` / `tostring(t[k])` runtime tag dispatch        |
 | 0071 | 2.6c-tag-fn-tbl              | Closure-less Function and Table values in tables (TAG_FUNCTION/TABLE) + 4 consumer dispatch chains extended; `emit_inline_index_into_tagged_tmp` Tidy First; closure-with-upvalues HIR-rejected |
+| 0072 | 2.6c-tag-fn-tbl-call         | Call a Function value retrieved through a tagged slot (`local g = t[k]; g()`) — TaggedValue arm in `Callee::Indirect` + `emit_value_slot_check_function` trap helper |

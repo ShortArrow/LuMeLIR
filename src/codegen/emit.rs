@@ -1990,6 +1990,53 @@ fn emit_tagged_unknown_tag_trap<'c>(
     emit_exit_with_message(context, block, msg_ptr, types, loc);
 }
 
+/// Phase 2.6c-tag-fn-tbl-call (ADR 0072): assert a tagged-value
+/// slot's tag is `TAG_FUNCTION`, exiting with the standard
+/// type-mismatch diagnostic otherwise. Mirrors
+/// [`emit_value_slot_check_number`] (ADR 0063) for the function-
+/// callee path used when invoking a function value retrieved
+/// through a tagged slot (`local g = t[k]; g()`).
+fn emit_value_slot_check_function<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let tag = emit_load(block, slot_ptr, types.i64, loc);
+    let expected = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mismatch: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Ne,
+            tag,
+            expected,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    let msg_ptr = emit_addressof(context, &then_blk, "s_table_type_mismatch", types, loc);
+    emit_exit_with_message(context, &then_blk, msg_ptr, types, loc);
+    then_blk.append_operation(scf::r#yield(&[], loc));
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(mismatch, &[], then_region, else_region, loc));
+}
+
 /// Phase 2.6c-tag-locals (ADR 0063): non-trapping `IndexTagged`
 /// read that writes the resulting `{tag, value}` directly to a
 /// `TaggedValue` local slot. Mirror of the `IsNilQuery`
@@ -4383,15 +4430,38 @@ fn emit_expr<'a, 'c>(
                 // parameter (slot is the block argument) or it was
                 // bound from a call/expression and lives in an
                 // alloca'd `ptr` slot.
+                //
+                // Phase 2.6c-tag-fn-tbl-call (ADR 0072) extends this
+                // to TaggedValue-kind locals (typically `local g =
+                // t[k]` after ADR 0071). The static arity is unknown
+                // — the tagged slot carries no descriptor — so the
+                // function type is reconstructed from `args.len()`
+                // f64 → f64 at the call site. A runtime check traps
+                // on tag mismatch (TAG ≠ TAG_FUNCTION).
                 let callee_val = if *idx < params_len {
                     slots[*idx]
                 } else {
                     let info = &locals[*idx];
-                    let arity = match info.kind {
-                        ValueKind::Function(a) => a,
-                        _ => unreachable!("Callee::Indirect on non-Function local"),
+                    let (ptr_val, arity) = match info.kind {
+                        ValueKind::Function(a) => {
+                            let ptr_val = emit_load(block, slots[*idx], types.ptr, loc);
+                            (ptr_val, a)
+                        }
+                        ValueKind::TaggedValue => {
+                            emit_value_slot_check_function(context, block, slots[*idx], types, loc);
+                            let payload_ptr = emit_byte_offset_ptr(
+                                context,
+                                block,
+                                slots[*idx],
+                                ARRAY_ELEM_OFF_VALUE,
+                                types,
+                                loc,
+                            );
+                            let ptr_val = emit_load(block, payload_ptr, types.ptr, loc);
+                            (ptr_val, args.len())
+                        }
+                        _ => unreachable!("Callee::Indirect on non-Function/TaggedValue local"),
                     };
-                    let ptr_val = emit_load(block, slots[*idx], types.ptr, loc);
                     let p_types: Vec<Type<'c>> = (0..arity).map(|_| types.f64).collect();
                     let fn_ty: Type<'c> = FunctionType::new(context, &p_types, &[types.f64]).into();
                     emit_unrealized_cast(block, ptr_val, fn_ty, loc)

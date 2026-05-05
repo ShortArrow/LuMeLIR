@@ -2364,6 +2364,36 @@ impl LowerCtx {
                     args: all_args,
                 });
             }
+            // Phase 2.6c-tag-fn-tbl-call (ADR 0072): a TaggedValue
+            // local whose runtime tag may be TAG_FUNCTION (typically
+            // bound from `local g = t[k]` after ADR 0071) becomes
+            // callable via `Callee::Indirect`. Static arity is
+            // unknown — the slot's payload is a bare function
+            // pointer with no arity descriptor — so we trust the
+            // call site's arg count and reconstruct the function
+            // type at codegen time. Args remain Number-only to keep
+            // the existing argument-kind contract.
+            if matches!(self.locals[local_id.0].kind, ValueKind::TaggedValue) {
+                let lowered_args = args
+                    .iter()
+                    .map(|a| self.lower_expr(a))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for arg in &lowered_args {
+                    let k = infer_kind(arg, &self.locals, &self.functions);
+                    if !matches!(k, ValueKind::Number) {
+                        return Err(HirError::TypeMismatch {
+                            op: format!("call-{name}"),
+                            lhs_kind: "number".to_owned(),
+                            rhs_kind: k.name().to_owned(),
+                            offset: arg.span.start,
+                        });
+                    }
+                }
+                return Ok(HirExprKind::Call {
+                    callee: Callee::Indirect(local_id),
+                    args: lowered_args,
+                });
+            }
         }
         // User functions take precedence over builtins. (Phase 2.5a
         // doesn't allow shadowing `print` since users can't define a
