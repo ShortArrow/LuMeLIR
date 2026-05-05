@@ -2038,7 +2038,18 @@ impl LowerCtx {
                                 _ => unreachable!(),
                             }
                         } else {
-                            let fold = lk != rk || (lk == ValueKind::Nil && rk == ValueKind::Nil);
+                            // Phase 2.6c-tag-hetero-fix (ADR 0065):
+                            // skip the heterogeneous-kind Eq fold
+                            // whenever either side is `TaggedValue`.
+                            // The runtime tag of a TaggedValue can
+                            // match a Number / Bool / String literal,
+                            // so folding to `false` on static-kind
+                            // mismatch is a silent miscompile.
+                            // Codegen handles the runtime dispatch.
+                            let either_tagged =
+                                lk == ValueKind::TaggedValue || rk == ValueKind::TaggedValue;
+                            let fold = !either_tagged
+                                && (lk != rk || (lk == ValueKind::Nil && rk == ValueKind::Nil));
                             if fold {
                                 let equal = lk == rk; // both-Nil → true; heterogeneous → false
                                 let folded = match op {

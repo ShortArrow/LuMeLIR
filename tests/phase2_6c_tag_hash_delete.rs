@@ -45,13 +45,18 @@ print(t.a)";
 }
 
 #[test]
-fn delete_then_read_traps() {
+fn delete_then_read_prints_nil_post_2_6c_hetero_fix() {
+    // ADR 0065: inline `print(t.k)` after delete prints "nil"
+    // via the tagged dispatch path (Lua spec). Earlier ADR 0060
+    // trapped on the post-delete tag mismatch.
     let src = "local t = {}
 t.k = 1
 t.k = nil
 print(t.k)";
-    let out = compile_and_run(src, "lumelir_26c_tag_hash_read_after_del");
-    assert!(!out.status.success(), "delete-then-read must trap");
+    assert_eq!(
+        run(src, "lumelir_26c_tag_hash_read_after_del").trim(),
+        "nil"
+    );
 }
 
 #[test]

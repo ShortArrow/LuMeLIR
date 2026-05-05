@@ -4205,6 +4205,20 @@ fn emit_expr<'a, 'c>(
                     context, block, *op, lhs, rhs, slots, locals, functions, types, params_len, loc,
                 );
             }
+            // Phase 2.6c-tag-hetero-fix (ADR 0065): `TaggedValue ==
+            // <typed>` / `~= <typed>` lower to a runtime tag-
+            // dispatch compare. Without this, `emit_expr` on the
+            // `Local(TaggedValue)` side would extract f64 with
+            // trap-on-non-Number and the comparison would never
+            // see the runtime String / Bool tag — silent
+            // miscompile flagged by codex review.
+            if matches!(op, BinOp::Eq | BinOp::Ne) {
+                if let Some(v) = emit_tagged_eq_runtime_dispatch(
+                    context, block, *op, lhs, rhs, slots, locals, functions, types, params_len, loc,
+                )? {
+                    return Ok(v);
+                }
+            }
             let lhs_val = emit_expr(
                 context, block, lhs, slots, locals, functions, types, params_len, loc,
             )?;
@@ -4288,16 +4302,37 @@ fn emit_expr<'a, 'c>(
                         let kind = infer_kind(a, locals, functions);
                         // Phase 2.6c-tag-hetero (ADR 0064):
                         // `print(Local(TaggedValue))` dispatches at
-                        // runtime on the slot's tag — Number / Bool /
-                        // String / Nil all print the appropriate
-                        // representation. Bypass `emit_expr` (which
-                        // would force the trapping Number-only
-                        // extract) and read the slot directly.
+                        // runtime on the slot's tag.
                         if kind == ValueKind::TaggedValue {
                             if let HirExprKind::Local(LocalId(idx)) = &a.kind {
                                 emit_print_tagged_local(context, block, slots[*idx], types, loc);
                                 continue;
                             }
+                        }
+                        // Phase 2.6c-tag-hetero-fix (ADR 0065):
+                        // inline `print(t[k])` / `print(t.k)` is
+                        // also a tagged read — materialise it into
+                        // a tmp 16-byte slot via the existing
+                        // non-trapping `emit_local_init_tagged`
+                        // path, then dispatch print on the slot.
+                        // Without this, Bool / String / Nil
+                        // payloads abort with a tag-mismatch trap
+                        // when the source is `HirExprKind::Index`
+                        // directly (codex review P1, ADR 0065).
+                        if let HirExprKind::Index { target, key } = &a.kind {
+                            let tmp_slot = emit_alloca_slot_for_kind(
+                                context,
+                                block,
+                                ValueKind::TaggedValue,
+                                types,
+                                loc,
+                            );
+                            emit_local_init_tagged(
+                                context, block, tmp_slot, target, key, slots, locals, functions,
+                                types, params_len, loc,
+                            )?;
+                            emit_print_tagged_local(context, block, tmp_slot, types, loc);
+                            continue;
                         }
                         let v = emit_expr(
                             context, block, a, slots, locals, functions, types, params_len, loc,
@@ -5478,6 +5513,216 @@ fn emit_print_tagged_local<'a, 'c>(
     }
     number_else.append_block(number_else_blk);
     block.append_operation(scf::r#if(is_number, &[], number_then, number_else, loc));
+}
+
+/// Phase 2.6c-tag-hetero-fix (ADR 0065): `TaggedValue` operand
+/// `==` / `~=` runtime tag dispatch. When at least one side is
+/// `Local(TaggedValue)` and the other side is a Number / Bool /
+/// String typed operand, emit a tag check + per-kind compare
+/// instead of folding the heterogeneous-kind result. Returns
+/// `Some(i1)` when the dispatch fires, `None` to fall through
+/// to the existing BinOp path.
+///
+/// The TaggedValue ↔ TaggedValue case is intentionally left to
+/// the fall-through path — it lands as a Number-only extract and
+/// traps for non-Number operands (LIC-2.6c-tag-hetero-eq-1).
+#[allow(clippy::too_many_arguments)]
+fn emit_tagged_eq_runtime_dispatch<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    op: BinOp,
+    lhs: &HirExpr,
+    rhs: &HirExpr,
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    loc: Location<'c>,
+) -> Result<Option<Value<'c, 'a>>, CodegenError> {
+    fn tagged_local_idx(e: &HirExpr, locals: &[LocalInfo]) -> Option<LocalId> {
+        if let HirExprKind::Local(LocalId(idx)) = &e.kind {
+            if matches!(locals[*idx].kind, ValueKind::TaggedValue) {
+                return Some(LocalId(*idx));
+            }
+        }
+        None
+    }
+    // Identify which side carries the tagged local. Skip when
+    // both sides or neither side are TaggedValue locals.
+    let (tagged_id, typed_expr, typed_kind) =
+        match (tagged_local_idx(lhs, locals), tagged_local_idx(rhs, locals)) {
+            (Some(_), Some(_)) => return Ok(None), // both tagged — fall through
+            (Some(id), None) => {
+                let k = infer_kind(rhs, locals, functions);
+                (id, rhs, k)
+            }
+            (None, Some(id)) => {
+                let k = infer_kind(lhs, locals, functions);
+                (id, lhs, k)
+            }
+            (None, None) => return Ok(None),
+        };
+    // Only Number / Bool / String typed sides dispatch here. Nil
+    // is already handled via IsNilLocal in HIR lowering.
+    let (expected_tag, payload_ty) = match typed_kind {
+        ValueKind::Number => (TAG_NUMBER, types.f64),
+        ValueKind::Bool => (TAG_BOOL, types.i64),
+        ValueKind::String => (TAG_STRING, types.ptr),
+        _ => return Ok(None),
+    };
+    let slot_ptr = slots[tagged_id.0];
+    let typed_val = emit_expr(
+        context, block, typed_expr, slots, locals, functions, types, params_len, loc,
+    )?;
+    let tag = emit_load(block, slot_ptr, types.i64, loc);
+    let expected_const = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, expected_tag).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let tag_match: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            tag,
+            expected_const,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    // scf.if tag_match → compare payload; else → false.
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        let value_ptr = emit_byte_offset_ptr(
+            context,
+            &then_blk,
+            slot_ptr,
+            ARRAY_ELEM_OFF_VALUE,
+            types,
+            loc,
+        );
+        let payload = emit_load(&then_blk, value_ptr, payload_ty, loc);
+        let eq_inner: Value<'c, '_> = match typed_kind {
+            ValueKind::Number => then_blk
+                .append_operation(arith::cmpf(
+                    context,
+                    arith::CmpfPredicate::Oeq,
+                    payload,
+                    typed_val,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into(),
+            ValueKind::Bool => {
+                // Slot stores i1 zero-extended to i64; the typed
+                // RHS comes in as i1. Truncate the slot payload
+                // back to i1 before the cmpi, otherwise the
+                // operands don't share a width.
+                let payload_i1: Value<'c, '_> = then_blk
+                    .append_operation(
+                        OperationBuilder::new("llvm.trunc", loc)
+                            .add_operands(&[payload])
+                            .add_results(&[types.i1])
+                            .build()
+                            .expect("llvm.trunc i64→i1"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                then_blk
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Eq,
+                        payload_i1,
+                        typed_val,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into()
+            }
+            ValueKind::String => {
+                // strcmp(payload_ptr, typed_val) == 0
+                let cmp = emit_libc_call_i32(
+                    context,
+                    &then_blk,
+                    "strcmp",
+                    &[payload, typed_val],
+                    types,
+                    loc,
+                );
+                let zero_i32 = then_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i32, 0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                then_blk
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Eq,
+                        cmp,
+                        zero_i32,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into()
+            }
+            _ => unreachable!(),
+        };
+        then_blk.append_operation(scf::r#yield(&[eq_inner], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    {
+        let i1_zero = else_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i1, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        else_blk.append_operation(scf::r#yield(&[i1_zero], loc));
+    }
+    else_region.append_block(else_blk);
+    let if_op = scf::r#if(tag_match, &[types.i1], then_region, else_region, loc);
+    let eq_result: Value<'c, 'a> = block.append_operation(if_op).result(0).unwrap().into();
+    let final_val = match op {
+        BinOp::Eq => eq_result,
+        BinOp::Ne => {
+            let i1_one = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i1, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            block
+                .append_operation(arith::xori(eq_result, i1_one, loc))
+                .result(0)
+                .unwrap()
+                .into()
+        }
+        _ => unreachable!(),
+    };
+    Ok(Some(final_val))
 }
 
 /// Phase 2.8b (ADR 0032): emit `printf("%s", @<global_name>)` for

@@ -114,16 +114,11 @@ if y == nil then print(\"alias nil\") end";
 }
 
 #[test]
-fn regression_inline_index_still_traps() {
-    // ADR 0061's inline `t[5] == nil` already works. ADR 0063
-    // must not break the plain `print(t[5])` regression — that
-    // still goes through the trapping read path, since the
-    // widening trigger is `local x = t[i]` only.
+fn regression_inline_index_prints_nil_post_2_6c_hetero_fix() {
+    // ADR 0065 supersedes the earlier expectation: `print(t[oob])`
+    // now dispatches through the non-trapping tagged path and
+    // prints "nil" per Lua spec.
     let src = "local t = {1}
 print(t[5])";
-    let out = compile_and_run(src, "lumelir_locw_inline_traps");
-    assert!(
-        !out.status.success(),
-        "plain inline OOB read must still trap"
-    );
+    assert_eq!(run(src, "lumelir_locw_inline_traps").trim(), "nil");
 }

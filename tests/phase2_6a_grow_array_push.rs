@@ -136,12 +136,11 @@ print(t[2])";
 }
 
 #[test]
-fn read_oob_regression_after_grow() {
-    // Existing 2.6a-arr OOB read path still traps. (Read uses
-    // bounds check `[1, length]`, separate from write's
-    // `[1, length+1]`.)
+fn read_oob_prints_nil_after_grow_post_2_6c_hetero_fix() {
+    // ADR 0065: inline `print(t[oob])` returns "nil" via the
+    // tagged dispatch path. Grow-side semantics (push at
+    // `length + 1`) are unchanged.
     let src = "local t = {1, 2}
 print(t[5])";
-    let out = compile_and_run(src, "lumelir_26a_grow_oob_read");
-    assert!(!out.status.success(), "OOB read must still trap");
+    assert_eq!(run(src, "lumelir_26a_grow_oob_read").trim(), "nil");
 }

@@ -97,33 +97,36 @@ print(t[i])";
 }
 
 #[test]
-fn out_of_bounds_index_traps() {
-    // OOB read exits with `exit(1)` — the compiler emits a
-    // bounds check on every index op (ADR 0054). This is a
-    // diversion from Lua's "return nil"; until heterogeneous
-    // returns arrive, security wins over compatibility.
+fn out_of_bounds_index_prints_nil_post_2_6c_hetero_fix() {
+    // ADR 0065 (Phase 2.6c-tag-hetero-fix) routes inline
+    // `print(t[k])` through the non-trapping tagged path so an
+    // OOB read prints "nil", matching Lua semantics. Earlier
+    // ADRs (0054 / 0061) intentionally trapped on the inline
+    // form; that decision is superseded under hetero values
+    // because trapping on a String / Bool payload is wrong.
     let src = "local t = {1, 2, 3}
 print(t[5])";
-    let out = compile_and_run(src, "lumelir_26a_arr_oob");
-    assert!(!out.status.success(), "OOB read must trap");
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    assert!(
-        combined.contains("table index out of bounds") || combined.contains("out of bounds"),
-        "expected OOB diagnostic, got: {combined}"
-    );
+    assert_eq!(run(src, "lumelir_26a_arr_oob").trim(), "nil");
 }
 
 #[test]
-fn zero_index_traps() {
-    // Lua arrays are 1-based — `t[0]` is OOB.
+fn zero_index_prints_nil_post_2_6c_hetero_fix() {
+    // Lua arrays are 1-based — `t[0]` is OOB → nil.
     let src = "local t = {1, 2, 3}
 print(t[0])";
-    let out = compile_and_run(src, "lumelir_26a_arr_zero");
-    assert!(!out.status.success(), "t[0] must trap");
+    assert_eq!(run(src, "lumelir_26a_arr_zero").trim(), "nil");
+}
+
+#[test]
+fn out_of_bounds_arith_use_still_traps() {
+    // The trap path remains for arithmetic on a Nil-tagged
+    // local — Lua spec: nil + 1 errors. The widening read is
+    // non-trapping; only the arith use trips.
+    let src = "local t = {1, 2, 3}
+local x = t[5]
+print(x + 1)";
+    let out = compile_and_run(src, "lumelir_26a_arr_oob_arith");
+    assert!(!out.status.success(), "nil + 1 must trap");
 }
 
 #[test]

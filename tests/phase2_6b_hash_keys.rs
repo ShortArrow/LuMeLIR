@@ -103,12 +103,14 @@ print(#t)";
 }
 
 #[test]
-fn missing_key_traps() {
-    // LIC-2.6b-hash-1: Lua returns nil; we trap.
+fn missing_key_prints_nil_post_2_6c_hetero_fix() {
+    // ADR 0065 (Phase 2.6c-tag-hetero-fix): inline `print(t.k)`
+    // dispatches at runtime on the slot tag; missing keys
+    // print "nil" per Lua spec. The earlier trap (LIC-2.6b-hash-1)
+    // is now resolved at this surface.
     let src = "local t = {}
 print(t.missing)";
-    let out = compile_and_run(src, "lumelir_26b_missing");
-    assert!(!out.status.success(), "missing key must trap");
+    assert_eq!(run(src, "lumelir_26b_missing").trim(), "nil");
 }
 
 #[test]

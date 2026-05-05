@@ -101,11 +101,14 @@ print(b.k)";
 }
 
 #[test]
-fn plain_read_after_delete_still_traps() {
+fn plain_read_after_delete_prints_nil_post_2_6c_hetero_fix() {
+    // ADR 0065: inline `print(t.k)` after a hard-tombstone
+    // delete prints "nil" via the tagged dispatch. The hard-
+    // tombstone behaviour itself (sentinel write + rehash) is
+    // unchanged.
     let src = "local t = {}
 t.k = 1
 t.k = nil
 print(t.k)";
-    let out = compile_and_run(src, "lumelir_hard_read_traps");
-    assert!(!out.status.success(), "read after delete must trap");
+    assert_eq!(run(src, "lumelir_hard_read_traps").trim(), "nil");
 }

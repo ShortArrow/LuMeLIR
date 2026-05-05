@@ -41,23 +41,27 @@ print(#t)";
 }
 
 #[test]
-fn hole_read_traps() {
-    // The slot at index 2 was filled with Nil tag; reading it
-    // into a Number-typed expression context fails the tag check.
+fn hole_read_prints_nil_post_2_6c_hetero_fix() {
+    // ADR 0065: inline `print(t[k])` dispatches on the slot
+    // tag; a Nil-tagged hole prints "nil" per Lua spec. Earlier
+    // ADR 0059 trapped on the tag mismatch; that decision is
+    // superseded under the heterogeneous-aware print path.
     let src = "local t = {1}
 t[3] = 3
 print(t[2])";
-    let out = compile_and_run(src, "lumelir_26c_hole_read");
-    assert!(!out.status.success(), "hole read must trap");
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    assert!(
-        combined.contains("type mismatch") || combined.contains("table"),
-        "expected type-mismatch diagnostic, got: {combined}"
-    );
+    assert_eq!(run(src, "lumelir_26c_hole_read").trim(), "nil");
+}
+
+#[test]
+fn hole_arith_still_traps() {
+    // The trap path remains for arithmetic on a Nil-tagged
+    // local — Lua spec: nil + 1 errors.
+    let src = "local t = {1}
+t[3] = 3
+local x = t[2]
+print(x + 1)";
+    let out = compile_and_run(src, "lumelir_26c_hole_arith");
+    assert!(!out.status.success(), "hole arith use must trap");
 }
 
 #[test]
@@ -118,13 +122,13 @@ t[0] = 99";
 }
 
 #[test]
-fn read_oob_still_traps() {
-    // Reading past length still traps (read bound stays
-    // `[1, length]`); LIC-2.6a-arr-1 unchanged.
+fn read_oob_prints_nil_post_2_6c_hetero_fix() {
+    // ADR 0065: OOB inline `print(t[k])` prints "nil" via the
+    // tagged dispatch path; arith on the Nil-tagged result
+    // would still trap.
     let src = "local t = {1}
 print(t[5])";
-    let out = compile_and_run(src, "lumelir_26c_read_oob");
-    assert!(!out.status.success(), "OOB read must still trap");
+    assert_eq!(run(src, "lumelir_26c_read_oob").trim(), "nil");
 }
 
 #[test]

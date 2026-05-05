@@ -99,12 +99,11 @@ if nil == t.x then print(\"yes\") end";
 }
 
 #[test]
-fn plain_read_still_traps_regression() {
-    // The IsNilQuery pattern only activates when paired with `nil`
-    // in a BinOp::Eq/Ne. Plain `print(t[oob])` keeps trapping —
-    // separate code path, regression coverage.
+fn plain_read_prints_nil_post_2_6c_hetero_fix() {
+    // ADR 0065 supersedes ADR 0061's "plain reads keep trapping"
+    // claim: inline `print(t[oob])` now dispatches through the
+    // non-trapping tagged path and prints "nil" per Lua spec.
     let src = "local t = {1}
 print(t[5])";
-    let out = compile_and_run(src, "lumelir_isnil_plain_regression");
-    assert!(!out.status.success(), "plain OOB read must still trap");
+    assert_eq!(run(src, "lumelir_isnil_plain_regression").trim(), "nil");
 }
