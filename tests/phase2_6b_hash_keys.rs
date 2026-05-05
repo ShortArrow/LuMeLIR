@@ -133,13 +133,14 @@ print(t[2])";
 }
 
 #[test]
-fn hash_value_function_still_rejects_post_2_6c_hetero() {
-    // ADR 0064 (Phase 2.6c-tag-hetero) accepts Number / Bool /
-    // String / Nil-delete for hash values. Function values
-    // still reject — closure-escape / ucast handling is a
-    // follow-up sub-phase.
+fn hash_value_closure_with_upvalue_still_rejects_post_2_6c_tag_fn_tbl() {
+    // ADR 0071 (Phase 2.6c-tag-fn-tbl) accepts closure-less
+    // Function and Table hash values alongside Number / Bool /
+    // String / Nil-delete. Closures with upvalues still reject
+    // (LIC-2.6c-tag-hetero-closure-escape-1).
     let chunk = lumelir::parser::parse(
-        "local function f() return 1 end
+        "local x = 1
+local f = function() return x end
 local t = {}
 t.k = f",
     )

@@ -91,6 +91,20 @@ fn widen_index_for_local_init(value: HirExpr) -> HirExpr {
     }
 }
 
+/// Phase 2.6c-tag-fn-tbl (ADR 0071): identify the underlying
+/// `FuncId` for a Function-kind expression — either a direct
+/// `FunctionRef` or a `Local` whose `func_id` was recorded at
+/// declaration time. Used to query `upvalues` for the
+/// closure-escape check on `IndexAssign` / `Table` constructor
+/// values.
+fn function_ref_id(expr: &HirExpr, locals: &[LocalInfo]) -> Option<FuncId> {
+    match &expr.kind {
+        HirExprKind::FunctionRef(fid) => Some(*fid),
+        HirExprKind::Local(LocalId(idx)) => locals[*idx].func_id,
+        _ => None,
+    }
+}
+
 pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction]) -> ValueKind {
     match &expr.kind {
         HirExprKind::Number(_) => ValueKind::Number,
@@ -1463,18 +1477,25 @@ impl LowerCtx {
                 // happens implicitly via the upper-bound lift.
                 // Phase 2.6c-tag-hetero (ADR 0064): both array and
                 // hash writes additionally accept Bool / String
-                // values. Function / Table values stay rejected
-                // (separate sub-phase).
+                // values. Phase 2.6c-tag-fn-tbl (ADR 0071) opens
+                // Function and Table values too; closure-with-
+                // upvalues remains rejected via the existing
+                // `ClosureEscapes` check (LIC-2.6c-tag-hetero-
+                // closure-escape-1).
                 let value_kind = infer_kind(&value_hir, &self.locals, &self.functions);
                 let value_ok = matches!(
                     (key_kind, value_kind),
                     (ValueKind::Number, ValueKind::Number)
                         | (ValueKind::Number, ValueKind::Bool)
                         | (ValueKind::Number, ValueKind::String)
+                        | (ValueKind::Number, ValueKind::Function(_))
+                        | (ValueKind::Number, ValueKind::Table)
                         | (ValueKind::String, ValueKind::Number)
                         | (ValueKind::String, ValueKind::Bool)
                         | (ValueKind::String, ValueKind::String)
                         | (ValueKind::String, ValueKind::Nil)
+                        | (ValueKind::String, ValueKind::Function(_))
+                        | (ValueKind::String, ValueKind::Table)
                 );
                 if !value_ok {
                     return Err(HirError::TypeMismatch {
@@ -1483,6 +1504,20 @@ impl LowerCtx {
                         rhs_kind: value_kind.name().to_owned(),
                         offset: value.span.start,
                     });
+                }
+                // Phase 2.6c-tag-fn-tbl (ADR 0071): closure with
+                // upvalues escapes through the table — reject
+                // the same way ADR 0044 already rejects argument
+                // / return escape. Plain `function() ... end`
+                // (no upvalues) and top-level `local function f`
+                // references pass through.
+                if let Some(fid) = function_ref_id(&value_hir, &self.locals) {
+                    if !self.functions[fid.0].upvalues.is_empty() {
+                        return Err(HirError::ClosureEscapes {
+                            position: "table value".to_owned(),
+                            offset: value.span.start,
+                        });
+                    }
                 }
                 Ok(HirStmt {
                     kind: HirStmtKind::IndexAssign {
@@ -2170,11 +2205,12 @@ impl LowerCtx {
             }
             ExprKind::Call { callee, args } => self.lower_call(callee, args, expr)?,
             // Phase 2.6a-min (ADR 0053) / 2.6a-arr (ADR 0054) /
-            // 2.6c-tag-hetero (ADR 0064): table constructor.
-            // Number / Bool / String / Nil all land in a 16-byte
-            // tagged slot. Function / Table elements still
-            // reject — those payloads need a follow-up sub-phase
-            // (ucast / cycle handling).
+            // 2.6c-tag-hetero (ADR 0064) / 2.6c-tag-fn-tbl
+            // (ADR 0071): table constructor. All six kinds —
+            // Number / Bool / String / Nil / Function / Table —
+            // land in a 16-byte tagged slot. Closure with
+            // upvalues is rejected via the existing
+            // `ClosureEscapes` analysis.
             ExprKind::Table(elems) => {
                 let lowered: Vec<HirExpr> = elems
                     .iter()
@@ -2184,15 +2220,30 @@ impl LowerCtx {
                     let k = infer_kind(elem, &self.locals, &self.functions);
                     let elem_ok = matches!(
                         k,
-                        ValueKind::Number | ValueKind::Bool | ValueKind::String | ValueKind::Nil
+                        ValueKind::Number
+                            | ValueKind::Bool
+                            | ValueKind::String
+                            | ValueKind::Nil
+                            | ValueKind::Function(_)
+                            | ValueKind::Table
                     );
                     if !elem_ok {
                         return Err(HirError::TypeMismatch {
                             op: "table element".to_owned(),
-                            lhs_kind: "number/bool/string/nil".to_owned(),
+                            lhs_kind: "number/bool/string/nil/function/table".to_owned(),
                             rhs_kind: k.name().to_owned(),
                             offset: elem.span.start,
                         });
+                    }
+                    // Phase 2.6c-tag-fn-tbl (ADR 0071): closure
+                    // with upvalues escapes through the table.
+                    if let Some(fid) = function_ref_id(elem, &self.locals) {
+                        if !self.functions[fid.0].upvalues.is_empty() {
+                            return Err(HirError::ClosureEscapes {
+                                position: "table element".to_owned(),
+                                offset: elem.span.start,
+                            });
+                        }
                     }
                 }
                 HirExprKind::Table(lowered)

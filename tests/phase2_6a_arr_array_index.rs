@@ -130,12 +130,15 @@ print(x + 1)";
 }
 
 #[test]
-fn function_element_is_static_error_post_2_6c_hetero() {
-    // ADR 0064 (Phase 2.6c-tag-hetero) opened Bool / String /
-    // Nil as valid table elements alongside Number. Function
-    // elements still reject — the closure-escape / ucast path
-    // is left for a follow-up sub-phase.
-    let chunk = lumelir::parser::parse("local function f() return 1 end\nlocal t = {f}").unwrap();
+fn closure_with_upvalue_element_is_static_error_post_2_6c_tag_fn_tbl() {
+    // ADR 0071 (Phase 2.6c-tag-fn-tbl) opened closure-less
+    // Function values as valid table elements. Closures with
+    // upvalues still reject (LIC-2.6c-tag-hetero-closure-
+    // escape-1) — the escape-analysis relaxation is a follow-
+    // up sub-phase. This test pins the boundary.
+    let chunk =
+        lumelir::parser::parse("local x = 1\nlocal f = function() return x end\nlocal t = {f}")
+            .unwrap();
     assert!(lumelir::hir::lower(&chunk).is_err());
 }
 

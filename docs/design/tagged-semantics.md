@@ -6,7 +6,7 @@
 > consumer / tag semantics. ADRs continue to record *decisions*;
 > this page records *current state*.
 
-**Last updated:** 2026-05-05 (after ADR 0070)
+**Last updated:** 2026-05-05 (after ADR 0071)
 
 ---
 
@@ -41,8 +41,11 @@ const TAG_NIL: i64 = 0;
 const TAG_NUMBER: i64 = 1;
 const TAG_BOOL: i64 = 2;
 const TAG_STRING: i64 = 3;
-// TAG_FUNCTION = 4 / TAG_TABLE = 5 are reserved for future
-// sub-phases (LIC-2.6c-tag-hetero-fn-tbl-1).
+// Phase 2.6c-tag-fn-tbl (ADR 0071): closure-less Function and
+// Table values now use these tags. Closures with upvalues are
+// HIR-rejected (LIC-2.6c-tag-hetero-closure-escape-1).
+const TAG_FUNCTION: i64 = 4;
+const TAG_TABLE: i64 = 5;
 ```
 
 ### Payload type per tag
@@ -53,7 +56,8 @@ const TAG_STRING: i64 = 3;
 | TAG_NUMBER  | `f64`              | IEEE-754 double                        |
 | TAG_BOOL    | `i64` (zext of i1) | Low bit holds the bool value           |
 | TAG_STRING  | `!llvm.ptr`        | Pointer to a `.data`-section global     |
-| (reserved)  | —                  | Function/Table tags pending sub-phase  |
+| TAG_FUNCTION| `!llvm.ptr`        | Function pointer via `unrealized_cast` (ADR 0019); ADR 0071 |
+| TAG_TABLE   | `!llvm.ptr`        | Stable table header pointer (ADR 0056); ADR 0071 |
 
 Internal slot-to-slot copies load the payload as **raw `i64`**
 so any tag round-trips byte-for-byte without a kind-specific
@@ -69,14 +73,15 @@ a tagged slot, or whose result **carries** a tagged value.
 | Source shape                                | Where it writes / lives                              | Introduced |
 |---------------------------------------------|------------------------------------------------------|------------|
 | `HirExprKind::Table([elem₀, …])`            | `array_buf` slots, kind-dispatched store             | ADR 0059, 0064 |
-| `HirStmtKind::IndexAssign { target, key, value }` (Number key) | `array_buf[key-1]` slot   | ADR 0055, 0059, 0064 |
-| `HirStmtKind::IndexAssign { target, key, value }` (String key) | `hash_buf` entry value slot | ADR 0058, 0060, 0064 |
+| `HirStmtKind::IndexAssign { target, key, value }` (Number key) | `array_buf[key-1]` slot — value can be Number / Bool / String / Function (closure-less) / Table | ADR 0055, 0059, 0064, 0071 |
+| `HirStmtKind::IndexAssign { target, key, value }` (String key) | `hash_buf` entry value slot — value can be Number / Bool / String / Nil-delete / Function (closure-less) / Table | ADR 0058, 0060, 0064, 0071 |
+| `HirExprKind::Table([elem, …])`             | `array_buf` slot per elem — same kind set as IndexAssign | ADR 0064, 0071 |
 | `HirExprKind::IndexTagged { target, key }`  | LocalInit / Assign **only** — populates a `TaggedValue` slot via `emit_local_init_tagged` | ADR 0063 |
 | `HirExprKind::Local(id)` with `info.kind == TaggedValue` | Existing 16-byte alloca holds the tagged value | ADR 0063 |
 | Hard-tombstone delete (`t.k = nil`)         | `hash_buf` entry: key→sentinel + value tag→Nil       | ADR 0062 |
 | **(future)** function-return widening       | Pending — LIC-2.6c-tag-locals-fn                     | —          |
 | **(future)** iterator (`pairs` / `ipairs`)  | Pending — depends on widening                        | —          |
-| **(future)** Function / Table tags          | Pending — LIC-2.6c-tag-hetero-fn-tbl-1               | —          |
+| **(future)** closure with upvalues          | HIR-rejects today — LIC-2.6c-tag-hetero-closure-escape-1 | —      |
 
 `HirExprKind::IndexTagged` is **statement-context only**:
 calling `emit_expr` on it is `unreachable!()`. It exists purely
@@ -104,11 +109,11 @@ Legend:
 
 ### `print(x)`
 
-| Source                              | Number  | Bool      | String  | Nil    | ADR  |
-|-------------------------------------|---------|-----------|---------|--------|------|
-| inline `Index { … }`                | `%g`    | s_true/false | `%s` | s_nil  | 0065 |
-| `Local(TaggedValue)`                | `%g`    | s_true/false | `%s` | s_nil  | 0064 |
-| `IndexTagged` (statement-only)      | n/a — never reaches expression context              ||| 0063 |
+| Source                              | Number  | Bool      | String  | Nil    | Function | Table | ADR  |
+|-------------------------------------|---------|-----------|---------|--------|----------|-------|------|
+| inline `Index { … }`                | `%g`    | s_true/false | `%s` | s_nil  | `s_typename_function` | `s_typename_table` | 0065 + 0071 |
+| `Local(TaggedValue)`                | `%g`    | s_true/false | `%s` | s_nil  | `s_typename_function` | `s_typename_table` | 0064 + 0071 |
+| `IndexTagged` (statement-only)      | n/a — never reaches expression context                                  |||||| 0063 |
 
 Implementation path: `Builtin::Print` arg loop special-cases
 both shapes; inline `Index` materialises through a tmp tagged
@@ -116,36 +121,38 @@ slot via `emit_local_init_tagged` + `emit_print_tagged_local`.
 
 ### `type(x)`
 
-| Source                              | Number      | Bool        | String      | Nil       | ADR  |
-|-------------------------------------|-------------|-------------|-------------|-----------|------|
-| `Local(TaggedValue)`                | `"number"`  | `"boolean"` | `"string"`  | `"nil"`   | 0067 |
-| inline `Index`                      | `"number"`  | `"boolean"` | `"string"`  | `"nil"`   | 0070 |
+| Source                              | Number      | Bool        | String      | Nil       | Function       | Table       | ADR  |
+|-------------------------------------|-------------|-------------|-------------|-----------|----------------|-------------|------|
+| `Local(TaggedValue)`                | `"number"`  | `"boolean"` | `"string"`  | `"nil"`   | `"function"`   | `"table"`   | 0067 + 0071 |
+| inline `Index`                      | `"number"`  | `"boolean"` | `"string"`  | `"nil"`   | `"function"`   | `"table"`   | 0070 + 0071 |
 
 ### `tostring(x)`
 
-| Source                              | Number    | Bool          | String         | Nil      | ADR  |
-|-------------------------------------|-----------|---------------|----------------|----------|------|
-| `Local(TaggedValue)`                | `%g` snprintf | `s_true`/`s_false` | payload ptr | `s_nil` | 0067 |
-| inline `Index`                      | `%g` snprintf | `s_true`/`s_false` | payload ptr | `s_nil` | 0070 |
+| Source                              | Number    | Bool          | String         | Nil      | Function     | Table     | ADR  |
+|-------------------------------------|-----------|---------------|----------------|----------|--------------|-----------|------|
+| `Local(TaggedValue)`                | `%g` snprintf | `s_true`/`s_false` | payload ptr | `s_nil` | `"function"` | `"table"` | 0067 + 0071 |
+| inline `Index`                      | `%g` snprintf | `s_true`/`s_false` | payload ptr | `s_nil` | `"function"` | `"table"` | 0070 + 0071 |
 
-Both inline rows use the ADR 0065 print pattern: `Builtin::Type`
-/ `Builtin::ToString` allocate a tmp 16-byte slot, fill it via
-`emit_local_init_tagged` (non-trapping read), then dispatch via
-`emit_type_tagged_local` / `emit_tostring_tagged_local`.
+Both inline rows use the ADR 0065 print pattern, factored into
+`emit_inline_index_into_tagged_tmp` (Tidy First, ADR 0071):
+`Builtin::Type` / `Builtin::ToString` allocate a tmp 16-byte
+slot, fill it via `emit_local_init_tagged` (non-trapping read),
+then dispatch via `emit_type_tagged_local` /
+`emit_tostring_tagged_local`. Function / Table emit the literal
+typename string (`"function"` / `"table"`); address-prefixed
+forms (`"function: 0x..."`) are out of scope.
 
 `..` (concat) auto-coerces non-String operands via
 `tostring(...)` (ADR 0026), so concat with a `Local(TaggedValue)`
 or inline `Index` inherits the runtime dispatch for free
 (matrix tests cover both shapes).
 
-**Reserved tags (TAG_FUNCTION = 4 / TAG_TABLE = 5)**: every
-runtime-dispatch consumer (`print`, `type`, `tostring`,
-Local-Local `==`) traps via `emit_tagged_unknown_tag_trap` (ADR
-0069) when an unsupported tag reaches the dispatch chain.
-Currently unreachable — HIR rejects Function / Table values in
-tables (LIC-2.6c-tag-hetero-fn-tbl-1) — but the trap is the
-fail-fast guard rail for the day a sub-phase begins lowering
-those tags.
+**Truly-unknown tag (≥ 6)**: every runtime-dispatch consumer
+(`print`, `type`, `tostring`, Local-Local `==`) still traps via
+`emit_tagged_unknown_tag_trap` (ADR 0069) for tag values that
+neither the supported set (Number/Bool/String/Nil/Function/Table)
+nor a future sub-phase has wired up. Today the path is
+unreachable — the HIR `value_ok` matrix only emits tags 0–5.
 
 ### `==` / `~=` (tagged operand)
 
@@ -154,7 +161,7 @@ those tags.
 | inline `Index`                      | `Nil` literal           | non-trapping `IsNil(Index{…})`            | 0061 |
 | `Local(TaggedValue)`                | `Nil` literal           | non-trapping `IsNil(Local(…))`            | 0063 |
 | `Local(TaggedValue)`                | Number / Bool / String literal | tag check + per-kind compare        | 0065 |
-| `Local(TaggedValue)`                | `Local(TaggedValue)`    | tag-vs-tag dispatch + per-kind compare; both Nil → true | 0066 |
+| `Local(TaggedValue)`                | `Local(TaggedValue)`    | tag-vs-tag dispatch + per-kind compare; both Nil → true; Function / Table → ptr equality (Lua reference equality) | 0066 + 0071 |
 
 `Ne` is `UnaryOp::Not(Eq)` throughout (HIR rewrite). The
 `HirExprKind::IsNil(Box<HirExpr>)` variant unifies the Index
@@ -192,25 +199,25 @@ the introduction, when still open).
 | LIC-2.6c-tag-hetero-eq-1          | `==`/`~=` Local-Local runtime dispatch      | 0066          |
 | LIC-2.6c-tag-hetero-inline-1      | inline `print(t[k])` runtime dispatch       | 0065          |
 | LIC-2.6c-tag-consumers-inline-1   | inline `type(t[k])` / `tostring(t[k])` runtime dispatch | 0070 |
+| LIC-2.6c-tag-hetero-fn-tbl-1      | Function (closure-less) and Table values storable      | 0071          |
+| LIC-2.6a-arr-2                    | All six tag kinds supported as table elements           | 0064 + 0071   |
+| LIC-2.6a-wr-3                     | All six tag kinds supported as IndexAssign values       | 0064 + 0071   |
+| LIC-2.6b-hash-2                   | All six tag kinds supported as hash values + Nil-delete | 0064 + 0071   |
 
 ### Partial
 
 | ID                                | Resolved range                              | Pending range                    |
 |-----------------------------------|---------------------------------------------|----------------------------------|
-| LIC-2.6a-arr-2                    | Bool/String values via tagged slot (ADR 0064) | Function/Table — see fn-tbl-1   |
-| LIC-2.6a-wr-3                     | Bool/String writes (ADR 0064)               | Function/Table — see fn-tbl-1    |
-| LIC-2.6b-hash-2                   | Bool/String hash values + Nil-delete (ADR 0064) | Function/Table — see fn-tbl-1 |
 | LIC-2.6a-arr-3                    | Number + String keys (ADR 0058)             | Bool/Function/Table keys         |
 
 ### Pending
 
-| ID                                | Behaviour                                                             | Notes                          |
-|-----------------------------------|-----------------------------------------------------------------------|--------------------------------|
-| LIC-2.6c-tag-hetero-fn-tbl-1      | Function/Table values rejected by HIR                                 | Needs ucast / cycle / closure-escape work |
+| ID                                          | Behaviour                                                             | Notes                          |
+|---------------------------------------------|-----------------------------------------------------------------------|--------------------------------|
+| LIC-2.6c-tag-hetero-closure-escape-1        | Closure with upvalues stored in tables                                | HIR-rejects today (ADR 0044 + ADR 0071); needs escape-analysis relaxation |
+| LIC-2.6c-tag-hetero-fn-tbl-call-1           | Calling a Function value retrieved through a tagged slot              | Local read for TaggedValue still extracts as f64 (Number-only); see ADR 0071 §"Local read"  |
 
-**Total:** 12 LIC entries — 9 resolved, 3 partial, 1 pending
-(3 partial entries roll into `fn-tbl-1`; the partial form is
-preserved for granular tracking).
+**Total:** 14 LIC entries — 12 resolved, 1 partial, 2 pending.
 
 ---
 
@@ -285,28 +292,33 @@ When **adding a new producer** (e.g. function-return widening):
 
 ## 7. Open Questions / Known Gaps
 
-Listed in Codex review priority order (post-ADR-0067):
+Listed in Codex review priority order (post-ADR-0071):
 
-1. **`tagged.rs` module split (Tidy First).** `emit.rs` is
-   ~7800 LOC; tagged-related helpers (constants, store
-   helpers, dispatch helpers) total ~1900 LOC. A clean split
-   needs careful visibility / re-export work; deferred to a
-   dedicated phase. ADR 0067 explicitly defers.
-2. **Function-return TaggedValue widening.** `local x = f()`
+1. **Function-return TaggedValue widening.** `local x = f()`
    where `f` returns nil/heterogeneous should widen `x`.
    Requires function ABI updates (return a 16-byte tagged
    payload, or pass a pointer). Most natural follow-up to the
    matrix scaffold (extends the source axis).
-3. **Function/Table values in tables** (LIC-2.6c-tag-hetero-
-   fn-tbl-1). Needs ucast / cycle / closure-escape work for
-   the payload representations.
-4. **String → Number coercion on arith** (`"5" + 1`). Lua-spec
+2. **Calling a tagged Function value**
+   (LIC-2.6c-tag-hetero-fn-tbl-call-1). `local f = t[1]; f()`
+   currently traps because the Local read for `TaggedValue`
+   extracts as `f64` (Number-only); calling the function
+   needs a tag-aware extract path.
+3. **Closure-with-upvalues in tables**
+   (LIC-2.6c-tag-hetero-closure-escape-1). HIR rejects today
+   via the existing escape analysis (ADR 0044 + ADR 0071);
+   relaxing requires escape semantics + GC strategy.
+4. **`tagged.rs` module split (Tidy First).** `emit.rs` is
+   ~8200 LOC after ADR 0071; tagged-related helpers total
+   ~2200 LOC. Clean split needs careful visibility / re-export
+   design; previously deferred (ADR 0067 / 0069 / 0070 / 0071).
+5. **String → Number coercion on arith** (`"5" + 1`). Lua-spec
    feature, mostly orthogonal to the tagged-value redesign.
-5. **Iteration `pairs(t)` / `ipairs(t)`.** Depends on the
+6. **Iteration `pairs(t)` / `ipairs(t)`.** Depends on the
    widened source set.
-6. **Hash key kinds expansion** (LIC-2.6a-arr-3). Bool /
+7. **Hash key kinds expansion** (LIC-2.6a-arr-3). Bool /
    Function / Table keys.
-7. **Full closures** (`2.5c-full`). Independent track; heap-
+8. **Full closures** (`2.5c-full`). Independent track; heap-
    allocated environments.
 
 ---
@@ -331,3 +343,4 @@ Listed in Codex review priority order (post-ADR-0067):
 | 0068 | 2.6c-tag-doc-consolidate     | This SoT doc + LIC consolidation                                   |
 | 0069 | 2.6c-tag-defensive-trap      | Trap on unknown tagged-slot tag (replaces silent fallbacks)        |
 | 0070 | 2.6c-tag-consumers-inline    | Inline `type(t[k])` / `tostring(t[k])` runtime tag dispatch        |
+| 0071 | 2.6c-tag-fn-tbl              | Closure-less Function and Table values in tables (TAG_FUNCTION/TABLE) + 4 consumer dispatch chains extended; `emit_inline_index_into_tagged_tmp` Tidy First; closure-with-upvalues HIR-rejected |

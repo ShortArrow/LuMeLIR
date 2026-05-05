@@ -100,12 +100,15 @@ print(a[1])";
 }
 
 #[test]
-fn write_function_value_still_rejects_post_2_6c_hetero() {
-    // ADR 0064 (Phase 2.6c-tag-hetero) accepts Number / Bool /
-    // String values for `t[i] = v`. Function values still
-    // reject — separate sub-phase.
+fn write_closure_with_upvalue_still_rejects_post_2_6c_tag_fn_tbl() {
+    // ADR 0071 (Phase 2.6c-tag-fn-tbl) accepts Number / Bool /
+    // String / Function (closure-less) / Table values for
+    // `t[i] = v`. Closures with upvalues still reject
+    // (LIC-2.6c-tag-hetero-closure-escape-1) via the existing
+    // ClosureEscapes analysis (ADR 0044, extended in ADR 0071).
     let chunk = lumelir::parser::parse(
-        "local function f() return 1 end
+        "local x = 1
+local f = function() return x end
 local t = {1, 2, 3}
 t[1] = f",
     )

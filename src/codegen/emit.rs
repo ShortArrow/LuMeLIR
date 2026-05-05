@@ -123,10 +123,14 @@ const ARRAY_ELEM_OFF_VALUE: i64 = 8;
 const TAG_NIL: i64 = 0;
 const TAG_NUMBER: i64 = 1;
 // Phase 2.6c-tag-hetero (ADR 0064): widen the tagged slot to
-// carry Bool and String values. Function (4) and Table (5)
-// tags remain reserved for a follow-up sub-phase.
+// carry Bool and String values.
 const TAG_BOOL: i64 = 2;
 const TAG_STRING: i64 = 3;
+// Phase 2.6c-tag-fn-tbl (ADR 0071): Function (closure-less) and
+// Table values now occupy tags 4 and 5. Closures with upvalues
+// remain HIR-rejected (LIC-2.6c-tag-hetero-closure-escape-1).
+const TAG_FUNCTION: i64 = 4;
+const TAG_TABLE: i64 = 5;
 
 struct Types<'c> {
     i1: Type<'c>,
@@ -1351,12 +1355,18 @@ fn emit_stmt<'a, 'c>(
                     );
                     let value_kind = infer_kind(value, locals, functions);
                     match value_kind {
-                        // Phase 2.6c-tag-hetero (ADR 0064): Number /
-                        // Bool / String all share the new-key + count++
-                        // path; only the final tagged store helper
-                        // differs. Dispatch via
+                        // Phase 2.6c-tag-hetero (ADR 0064) +
+                        // 2.6c-tag-fn-tbl (ADR 0071): Number /
+                        // Bool / String / Function / Table all
+                        // share the new-key + count++ path; only
+                        // the final tagged store helper differs.
+                        // Dispatch via
                         // `emit_value_slot_store_dispatched`.
-                        ValueKind::Number | ValueKind::Bool | ValueKind::String => {
+                        ValueKind::Number
+                        | ValueKind::Bool
+                        | ValueKind::String
+                        | ValueKind::Function(_)
+                        | ValueKind::Table => {
                             let new_key_then = Region::new();
                             let new_key_blk = Block::new(&[]);
                             {
@@ -1484,7 +1494,7 @@ fn emit_stmt<'a, 'c>(
                             ));
                         }
                         _ => unreachable!(
-                            "HIR rejects non-Number/Bool/String/Nil values for hash insert"
+                            "HIR rejects non-Number/Bool/String/Nil/Function/Table values for hash insert"
                         ),
                     }
                 }
@@ -1825,10 +1835,69 @@ fn emit_value_slot_store_string<'a, 'c>(
     emit_store(block, value, value_slot, loc);
 }
 
-/// Phase 2.6c-tag-hetero (ADR 0064): kind-dispatched store into a
-/// tagged value slot. Mirrors the value-side dispatch used by
-/// `Table` constructor / `IndexAssign` / `LocalInit` so each
-/// caller has a single entry point regardless of element kind.
+/// Phase 2.6c-tag-fn-tbl (ADR 0071): write `{tag=Function,
+/// payload=ptr}` to a tagged value slot. The function value
+/// arrives as `!func.func<...>` from `emit_expr`; bridge it to
+/// `!llvm.ptr` via `emit_unrealized_cast` (ADR 0019) before the
+/// 8-byte store. Reverse cast lives at the eventual call site
+/// (out of scope this phase — see LIC-2.6c-tag-hetero-fn-tbl-
+/// call-1).
+fn emit_value_slot_store_function<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_ptr: Value<'c, 'a>,
+    value: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let tag = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_store(block, tag, slot_ptr, loc);
+    let value_ptr = emit_unrealized_cast(block, value, types.ptr, loc);
+    let value_slot =
+        emit_byte_offset_ptr(context, block, slot_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
+    emit_store(block, value_ptr, value_slot, loc);
+}
+
+/// Phase 2.6c-tag-fn-tbl (ADR 0071): write `{tag=Table,
+/// payload=ptr}` to a tagged value slot. Table values are
+/// already `!llvm.ptr` (the stable header pointer, ADR 0056) so
+/// no cast is needed.
+fn emit_value_slot_store_table<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_ptr: Value<'c, 'a>,
+    value: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let tag = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, TAG_TABLE).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_store(block, tag, slot_ptr, loc);
+    let value_slot =
+        emit_byte_offset_ptr(context, block, slot_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
+    emit_store(block, value, value_slot, loc);
+}
+
+/// Phase 2.6c-tag-hetero (ADR 0064) / 2.6c-tag-fn-tbl (ADR 0071):
+/// kind-dispatched store into a tagged value slot. Mirrors the
+/// value-side dispatch used by `Table` constructor /
+/// `IndexAssign` / `LocalInit` so each caller has a single
+/// entry point regardless of element kind.
 fn emit_value_slot_store_dispatched<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
@@ -1847,6 +1916,12 @@ fn emit_value_slot_store_dispatched<'a, 'c>(
             emit_value_slot_store_string(context, block, slot_ptr, value, types, loc)
         }
         ValueKind::Nil => emit_value_slot_store_nil(context, block, slot_ptr, types, loc),
+        ValueKind::Function(_) => {
+            emit_value_slot_store_function(context, block, slot_ptr, value, types, loc)
+        }
+        ValueKind::Table => {
+            emit_value_slot_store_table(context, block, slot_ptr, value, types, loc)
+        }
         _ => unreachable!("unsupported value kind for tagged slot store: {:?}", kind),
     }
 }
@@ -5626,7 +5701,108 @@ fn emit_print_tagged_local<'a, 'c>(
                 let nil_else = Region::new();
                 let nil_else_blk = Block::new(&[]);
                 {
-                    emit_tagged_unknown_tag_trap(context, &nil_else_blk, types, loc);
+                    // Phase 2.6c-tag-fn-tbl (ADR 0071): print
+                    // Function / Table values via the literal
+                    // typename string. Address-prefixed forms
+                    // are out of scope. Truly-unknown tag falls
+                    // through to the ADR 0069 trap.
+                    let tag_function_p = nil_else_blk
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let is_function: Value<'c, '_> = nil_else_blk
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Eq,
+                            tag,
+                            tag_function_p,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let fn_then = Region::new();
+                    let fn_then_blk = Block::new(&[]);
+                    {
+                        let fn_ptr = emit_addressof(
+                            context,
+                            &fn_then_blk,
+                            "s_typename_function",
+                            types,
+                            loc,
+                        );
+                        let fmt_ptr =
+                            emit_addressof(context, &fn_then_blk, "fmt_str_raw", types, loc);
+                        emit_printf(context, &fn_then_blk, fmt_ptr, fn_ptr, types, loc);
+                        fn_then_blk.append_operation(scf::r#yield(&[], loc));
+                    }
+                    fn_then.append_block(fn_then_blk);
+                    let fn_else = Region::new();
+                    let fn_else_blk = Block::new(&[]);
+                    {
+                        let tag_table_p = fn_else_blk
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(types.i64, TAG_TABLE).into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let is_table: Value<'c, '_> = fn_else_blk
+                            .append_operation(arith::cmpi(
+                                context,
+                                arith::CmpiPredicate::Eq,
+                                tag,
+                                tag_table_p,
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let tbl_then = Region::new();
+                        let tbl_then_blk = Block::new(&[]);
+                        {
+                            let tbl_ptr = emit_addressof(
+                                context,
+                                &tbl_then_blk,
+                                "s_typename_table",
+                                types,
+                                loc,
+                            );
+                            let fmt_ptr =
+                                emit_addressof(context, &tbl_then_blk, "fmt_str_raw", types, loc);
+                            emit_printf(context, &tbl_then_blk, fmt_ptr, tbl_ptr, types, loc);
+                            tbl_then_blk.append_operation(scf::r#yield(&[], loc));
+                        }
+                        tbl_then.append_block(tbl_then_blk);
+                        let tbl_else = Region::new();
+                        let tbl_else_blk = Block::new(&[]);
+                        emit_tagged_unknown_tag_trap(context, &tbl_else_blk, types, loc);
+                        tbl_else_blk.append_operation(scf::r#yield(&[], loc));
+                        tbl_else.append_block(tbl_else_blk);
+                        fn_else_blk.append_operation(scf::r#if(
+                            is_table,
+                            &[],
+                            tbl_then,
+                            tbl_else,
+                            loc,
+                        ));
+                        fn_else_blk.append_operation(scf::r#yield(&[], loc));
+                    }
+                    fn_else.append_block(fn_else_blk);
+                    nil_else_blk.append_operation(scf::r#if(
+                        is_function,
+                        &[],
+                        fn_then,
+                        fn_else,
+                        loc,
+                    ));
                     nil_else_blk.append_operation(scf::r#yield(&[], loc));
                 }
                 nil_else.append_block(nil_else_blk);
@@ -5838,24 +6014,152 @@ fn emit_tagged_eq_local_local<'a, 'c>(
                     let str_else = Region::new();
                     let str_else_blk = Block::new(&[]);
                     {
-                        // Phase 2.6c-tag-defensive-trap (ADR 0069):
-                        // unknown tag (Function/Table reserved) →
-                        // fail-fast trap. Lifts the previous silent
-                        // `false` fallback that masked a future bug
-                        // when tag space expands. Yield placeholder
-                        // i1 to satisfy scf.if's type contract; the
-                        // trap exits before the placeholder lands.
-                        emit_tagged_unknown_tag_trap(context, &str_else_blk, types, loc);
-                        let placeholder = str_else_blk
-                            .append_operation(arith::constant(
+                        // Phase 2.6c-tag-fn-tbl (ADR 0071):
+                        // Function / Table reference equality
+                        // (Lua spec: same object → true). Both
+                        // sides have the same tag here (the
+                        // outer tag_eq check fired), so a payload
+                        // ptr comparison suffices. Truly-unknown
+                        // tag stays as the ADR 0069 trap.
+                        let tag_function = make_const_i64(&str_else_blk, TAG_FUNCTION);
+                        let is_function: Value<'c, '_> = str_else_blk
+                            .append_operation(arith::cmpi(
                                 context,
-                                IntegerAttribute::new(types.i1, 0).into(),
+                                arith::CmpiPredicate::Eq,
+                                lhs_tag,
+                                tag_function,
                                 loc,
                             ))
                             .result(0)
                             .unwrap()
                             .into();
-                        str_else_blk.append_operation(scf::r#yield(&[placeholder], loc));
+                        let fn_then = Region::new();
+                        let fn_then_blk = Block::new(&[]);
+                        {
+                            let lp = emit_load(&fn_then_blk, lhs_payload, types.ptr, loc);
+                            let rp = emit_load(&fn_then_blk, rhs_payload, types.ptr, loc);
+                            let lp_i = fn_then_blk
+                                .append_operation(
+                                    OperationBuilder::new("llvm.ptrtoint", loc)
+                                        .add_operands(&[lp])
+                                        .add_results(&[types.i64])
+                                        .build()
+                                        .expect("llvm.ptrtoint"),
+                                )
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let rp_i = fn_then_blk
+                                .append_operation(
+                                    OperationBuilder::new("llvm.ptrtoint", loc)
+                                        .add_operands(&[rp])
+                                        .add_results(&[types.i64])
+                                        .build()
+                                        .expect("llvm.ptrtoint"),
+                                )
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let eq: Value<'c, '_> = fn_then_blk
+                                .append_operation(arith::cmpi(
+                                    context,
+                                    arith::CmpiPredicate::Eq,
+                                    lp_i,
+                                    rp_i,
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            fn_then_blk.append_operation(scf::r#yield(&[eq], loc));
+                        }
+                        fn_then.append_block(fn_then_blk);
+                        let fn_else = Region::new();
+                        let fn_else_blk = Block::new(&[]);
+                        {
+                            let tag_table = make_const_i64(&fn_else_blk, TAG_TABLE);
+                            let is_table: Value<'c, '_> = fn_else_blk
+                                .append_operation(arith::cmpi(
+                                    context,
+                                    arith::CmpiPredicate::Eq,
+                                    lhs_tag,
+                                    tag_table,
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let tbl_then = Region::new();
+                            let tbl_then_blk = Block::new(&[]);
+                            {
+                                let lp = emit_load(&tbl_then_blk, lhs_payload, types.ptr, loc);
+                                let rp = emit_load(&tbl_then_blk, rhs_payload, types.ptr, loc);
+                                let lp_i = tbl_then_blk
+                                    .append_operation(
+                                        OperationBuilder::new("llvm.ptrtoint", loc)
+                                            .add_operands(&[lp])
+                                            .add_results(&[types.i64])
+                                            .build()
+                                            .expect("llvm.ptrtoint"),
+                                    )
+                                    .result(0)
+                                    .unwrap()
+                                    .into();
+                                let rp_i = tbl_then_blk
+                                    .append_operation(
+                                        OperationBuilder::new("llvm.ptrtoint", loc)
+                                            .add_operands(&[rp])
+                                            .add_results(&[types.i64])
+                                            .build()
+                                            .expect("llvm.ptrtoint"),
+                                    )
+                                    .result(0)
+                                    .unwrap()
+                                    .into();
+                                let eq: Value<'c, '_> = tbl_then_blk
+                                    .append_operation(arith::cmpi(
+                                        context,
+                                        arith::CmpiPredicate::Eq,
+                                        lp_i,
+                                        rp_i,
+                                        loc,
+                                    ))
+                                    .result(0)
+                                    .unwrap()
+                                    .into();
+                                tbl_then_blk.append_operation(scf::r#yield(&[eq], loc));
+                            }
+                            tbl_then.append_block(tbl_then_blk);
+                            let tbl_else = Region::new();
+                            let tbl_else_blk = Block::new(&[]);
+                            emit_tagged_unknown_tag_trap(context, &tbl_else_blk, types, loc);
+                            let placeholder = tbl_else_blk
+                                .append_operation(arith::constant(
+                                    context,
+                                    IntegerAttribute::new(types.i1, 0).into(),
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            tbl_else_blk.append_operation(scf::r#yield(&[placeholder], loc));
+                            tbl_else.append_block(tbl_else_blk);
+                            let tbl_op = scf::r#if(is_table, &[types.i1], tbl_then, tbl_else, loc);
+                            let tbl_result: Value<'c, '_> = fn_else_blk
+                                .append_operation(tbl_op)
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            fn_else_blk.append_operation(scf::r#yield(&[tbl_result], loc));
+                        }
+                        fn_else.append_block(fn_else_blk);
+                        let fn_op = scf::r#if(is_function, &[types.i1], fn_then, fn_else, loc);
+                        let fn_result: Value<'c, '_> = str_else_blk
+                            .append_operation(fn_op)
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        str_else_blk.append_operation(scf::r#yield(&[fn_result], loc));
                     }
                     str_else.append_block(str_else_blk);
                     let str_op = scf::r#if(is_string, &[types.i1], str_then, str_else, loc);
@@ -6259,16 +6563,72 @@ fn emit_type_tagged_local<'a, 'c>(
                 let str_else = Region::new();
                 let str_else_blk = Block::new(&[]);
                 {
-                    // Phase 2.6c-tag-defensive-trap (ADR 0069):
-                    // unknown tag (Function/Table reserved) →
-                    // fail-fast trap. Lifts the previous silent
-                    // "number" fallback that mis-identified
-                    // future tag values. Yield placeholder ptr
-                    // to satisfy scf.if's type contract.
-                    emit_tagged_unknown_tag_trap(context, &str_else_blk, types, loc);
-                    let placeholder =
-                        emit_addressof(context, &str_else_blk, "s_typename_number", types, loc);
-                    str_else_blk.append_operation(scf::r#yield(&[placeholder], loc));
+                    // Phase 2.6c-tag-fn-tbl (ADR 0071): nested
+                    // dispatch for Function / Table tags. The
+                    // ADR 0069 trap stays as the truly-unknown
+                    // arm, kept under the Table check.
+                    let tag_function = make_const_i64(&str_else_blk, TAG_FUNCTION);
+                    let is_function: Value<'c, '_> = str_else_blk
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Eq,
+                            tag,
+                            tag_function,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let fn_then = Region::new();
+                    let fn_then_blk = Block::new(&[]);
+                    let fn_str =
+                        emit_addressof(context, &fn_then_blk, "s_typename_function", types, loc);
+                    fn_then_blk.append_operation(scf::r#yield(&[fn_str], loc));
+                    fn_then.append_block(fn_then_blk);
+                    let fn_else = Region::new();
+                    let fn_else_blk = Block::new(&[]);
+                    {
+                        let tag_table = make_const_i64(&fn_else_blk, TAG_TABLE);
+                        let is_table: Value<'c, '_> = fn_else_blk
+                            .append_operation(arith::cmpi(
+                                context,
+                                arith::CmpiPredicate::Eq,
+                                tag,
+                                tag_table,
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let tbl_then = Region::new();
+                        let tbl_then_blk = Block::new(&[]);
+                        let tbl_str =
+                            emit_addressof(context, &tbl_then_blk, "s_typename_table", types, loc);
+                        tbl_then_blk.append_operation(scf::r#yield(&[tbl_str], loc));
+                        tbl_then.append_block(tbl_then_blk);
+                        let tbl_else = Region::new();
+                        let tbl_else_blk = Block::new(&[]);
+                        emit_tagged_unknown_tag_trap(context, &tbl_else_blk, types, loc);
+                        let placeholder =
+                            emit_addressof(context, &tbl_else_blk, "s_typename_number", types, loc);
+                        tbl_else_blk.append_operation(scf::r#yield(&[placeholder], loc));
+                        tbl_else.append_block(tbl_else_blk);
+                        let tbl_op = scf::r#if(is_table, &[types.ptr], tbl_then, tbl_else, loc);
+                        let tbl_result: Value<'c, '_> = fn_else_blk
+                            .append_operation(tbl_op)
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        fn_else_blk.append_operation(scf::r#yield(&[tbl_result], loc));
+                    }
+                    fn_else.append_block(fn_else_blk);
+                    let fn_op = scf::r#if(is_function, &[types.ptr], fn_then, fn_else, loc);
+                    let fn_result: Value<'c, '_> = str_else_blk
+                        .append_operation(fn_op)
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    str_else_blk.append_operation(scf::r#yield(&[fn_result], loc));
                 }
                 str_else.append_block(str_else_blk);
                 let str_op = scf::r#if(is_string, &[types.ptr], str_then, str_else, loc);
@@ -6441,16 +6801,79 @@ fn emit_tostring_tagged_local<'a, 'c>(
                 let str_else = Region::new();
                 let str_else_blk = Block::new(&[]);
                 {
-                    // Phase 2.6c-tag-defensive-trap (ADR 0069):
-                    // unknown tag (Function/Table reserved) →
-                    // fail-fast trap. Lifts the previous silent
-                    // "function" fallback that mis-identified
-                    // future tag values. Yield placeholder ptr
-                    // to satisfy scf.if's type contract.
-                    emit_tagged_unknown_tag_trap(context, &str_else_blk, types, loc);
-                    let placeholder =
-                        emit_addressof(context, &str_else_blk, "s_typename_function", types, loc);
-                    str_else_blk.append_operation(scf::r#yield(&[placeholder], loc));
+                    // Phase 2.6c-tag-fn-tbl (ADR 0071): Function
+                    // and Table tagged values yield the literal
+                    // typename string (mirrors `tostring(<fn>)`
+                    // / `tostring(<tbl>)` from ADR 0026 / 0052).
+                    // Address-prefixed forms ("function: 0x..")
+                    // are out of scope.
+                    let tag_function = make_const_i64(&str_else_blk, TAG_FUNCTION);
+                    let is_function: Value<'c, '_> = str_else_blk
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Eq,
+                            tag,
+                            tag_function,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let fn_then = Region::new();
+                    let fn_then_blk = Block::new(&[]);
+                    let fn_str =
+                        emit_addressof(context, &fn_then_blk, "s_typename_function", types, loc);
+                    fn_then_blk.append_operation(scf::r#yield(&[fn_str], loc));
+                    fn_then.append_block(fn_then_blk);
+                    let fn_else = Region::new();
+                    let fn_else_blk = Block::new(&[]);
+                    {
+                        let tag_table = make_const_i64(&fn_else_blk, TAG_TABLE);
+                        let is_table: Value<'c, '_> = fn_else_blk
+                            .append_operation(arith::cmpi(
+                                context,
+                                arith::CmpiPredicate::Eq,
+                                tag,
+                                tag_table,
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let tbl_then = Region::new();
+                        let tbl_then_blk = Block::new(&[]);
+                        let tbl_str =
+                            emit_addressof(context, &tbl_then_blk, "s_typename_table", types, loc);
+                        tbl_then_blk.append_operation(scf::r#yield(&[tbl_str], loc));
+                        tbl_then.append_block(tbl_then_blk);
+                        let tbl_else = Region::new();
+                        let tbl_else_blk = Block::new(&[]);
+                        emit_tagged_unknown_tag_trap(context, &tbl_else_blk, types, loc);
+                        let placeholder = emit_addressof(
+                            context,
+                            &tbl_else_blk,
+                            "s_typename_function",
+                            types,
+                            loc,
+                        );
+                        tbl_else_blk.append_operation(scf::r#yield(&[placeholder], loc));
+                        tbl_else.append_block(tbl_else_blk);
+                        let tbl_op = scf::r#if(is_table, &[types.ptr], tbl_then, tbl_else, loc);
+                        let tbl_result: Value<'c, '_> = fn_else_blk
+                            .append_operation(tbl_op)
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        fn_else_blk.append_operation(scf::r#yield(&[tbl_result], loc));
+                    }
+                    fn_else.append_block(fn_else_blk);
+                    let fn_op = scf::r#if(is_function, &[types.ptr], fn_then, fn_else, loc);
+                    let fn_result: Value<'c, '_> = str_else_blk
+                        .append_operation(fn_op)
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    str_else_blk.append_operation(scf::r#yield(&[fn_result], loc));
                 }
                 str_else.append_block(str_else_blk);
                 let str_op = scf::r#if(is_string, &[types.ptr], str_then, str_else, loc);
