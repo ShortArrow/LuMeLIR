@@ -14,6 +14,7 @@ pub mod emit;
 pub mod error;
 pub mod link;
 pub mod lower;
+pub(crate) mod primitive;
 
 use std::path::Path;
 

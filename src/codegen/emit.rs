@@ -10,7 +10,7 @@ use melior::{
         DialectRegistry, arith,
         arith::CmpfPredicate,
         func, llvm,
-        ods::llvm::{AddressOfOperationBuilder, GlobalOperationBuilder, LLVMFuncOperationBuilder},
+        ods::llvm::{GlobalOperationBuilder, LLVMFuncOperationBuilder},
         scf,
     },
     ir::{
@@ -32,6 +32,10 @@ use crate::hir::{
 use crate::parser::{BinOp, UnaryOp};
 
 use super::error::CodegenError;
+use super::primitive::{
+    Types, emit_addressof, emit_byte_offset_ptr, emit_byte_offset_ptr_dynamic,
+    emit_exit_with_message, emit_load, emit_printf, emit_store, emit_unrealized_cast,
+};
 
 // =============================================================
 // Phase 2.6a-norm (ADR 0056): stable table header layout.
@@ -131,21 +135,6 @@ const TAG_STRING: i64 = 3;
 // remain HIR-rejected (LIC-2.6c-tag-hetero-closure-escape-1).
 const TAG_FUNCTION: i64 = 4;
 const TAG_TABLE: i64 = 5;
-
-struct Types<'c> {
-    i1: Type<'c>,
-    /// Phase 2.6a-arr (ADR 0054): i8 used as the GEP element type
-    /// for byte-offset pointer arithmetic on table heap regions.
-    i8: Type<'c>,
-    i32: Type<'c>,
-    i64: Type<'c>,
-    f64: Type<'c>,
-    ptr: Type<'c>,
-    /// Phase 2.7a (ADR 0024): string literal payload → MLIR global
-    /// symbol name. Built by [`collect_string_pool`] before any
-    /// `emit_*` runs and read at every `HirExprKind::Str` use site.
-    string_pool: std::collections::HashMap<String, String>,
-}
 
 /// Emit a verified MLIR module from a resolved HIR chunk.
 pub fn emit_module<'c>(context: &'c Context, chunk: &HirChunk) -> Result<Module<'c>, CodegenError> {
@@ -714,25 +703,6 @@ fn ret_mlir_types<'c>(
             }
         })
         .collect()
-}
-
-/// `builtin.unrealized_conversion_cast` — used to bridge `!func.func`
-/// values to/from `!llvm.ptr` so the value can be stored in an LLVM
-/// alloca slot. Subsequent `--convert-func-to-llvm` lowers `!func.func`
-/// to `!llvm.ptr`, and `--reconcile-unrealized-casts` then erases the
-/// pair as a no-op. Phase 2.5b.3 (ADR 0019).
-fn emit_unrealized_cast<'a, 'c>(
-    block: &'a Block<'c>,
-    value: Value<'c, 'a>,
-    target_ty: Type<'c>,
-    loc: Location<'c>,
-) -> Value<'c, 'a> {
-    let op = OperationBuilder::new("builtin.unrealized_conversion_cast", loc)
-        .add_operands(&[value])
-        .add_results(&[target_ty])
-        .build()
-        .expect("builtin.unrealized_conversion_cast");
-    block.append_operation(op).result(0).unwrap().into()
 }
 
 /// Emit a `func.func @<mangled_name>(...) -> (...)` for a user-defined
@@ -1604,33 +1574,6 @@ fn emit_alloca_slot_for_kind<'a, 'c>(
         .build()
         .expect("llvm.alloca");
     block.append_operation(alloca).result(0).unwrap().into()
-}
-
-fn emit_store<'a, 'c>(
-    block: &'a Block<'c>,
-    value: Value<'c, 'a>,
-    slot: Value<'c, 'a>,
-    loc: Location<'c>,
-) {
-    let store = OperationBuilder::new("llvm.store", loc)
-        .add_operands(&[value, slot])
-        .build()
-        .expect("llvm.store");
-    block.append_operation(store);
-}
-
-fn emit_load<'a, 'c>(
-    block: &'a Block<'c>,
-    slot: Value<'c, 'a>,
-    f64_type: Type<'c>,
-    loc: Location<'c>,
-) -> Value<'c, 'a> {
-    let load = OperationBuilder::new("llvm.load", loc)
-        .add_operands(&[slot])
-        .add_results(&[f64_type])
-        .build()
-        .expect("llvm.load");
-    block.append_operation(load).result(0).unwrap().into()
 }
 
 /// Phase 2.6a-norm (ADR 0056): emit a null `!llvm.ptr` constant
@@ -3597,57 +3540,6 @@ fn emit_hash_grow_if_needed<'a, 'c>(
     else_blk.append_operation(scf::r#yield(&[], loc));
     else_region.append_block(else_blk);
     block.append_operation(scf::r#if(need_grow, &[], then_region, else_region, loc));
-}
-
-/// Phase 2.6a-arr (ADR 0054): produce a `!llvm.ptr` pointing at
-fn emit_byte_offset_ptr<'a, 'c>(
-    context: &'c Context,
-    block: &'a Block<'c>,
-    base: Value<'c, 'a>,
-    offset_bytes: i64,
-    types: &Types<'c>,
-    loc: Location<'c>,
-) -> Value<'c, 'a> {
-    let offset_const = block
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(types.i64, offset_bytes).into(),
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    emit_byte_offset_ptr_dynamic(context, block, base, offset_const, types, loc)
-}
-
-/// Phase 2.6a-arr (ADR 0054): same as `emit_byte_offset_ptr` but
-/// the offset is a runtime `i64` value (used for variable-key
-/// indexing). `llvm.getelementptr` with `elem_type = i8` so the
-/// offset is interpreted in raw bytes.
-fn emit_byte_offset_ptr_dynamic<'a, 'c>(
-    context: &'c Context,
-    block: &'a Block<'c>,
-    base: Value<'c, 'a>,
-    offset_i64: Value<'c, 'a>,
-    types: &Types<'c>,
-    loc: Location<'c>,
-) -> Value<'c, 'a> {
-    let gep = OperationBuilder::new("llvm.getelementptr", loc)
-        .add_operands(&[base, offset_i64])
-        .add_attributes(&[
-            (
-                Identifier::new(context, "rawConstantIndices"),
-                DenseI32ArrayAttribute::new(context, &[i32::MIN]).into(),
-            ),
-            (
-                Identifier::new(context, "elem_type"),
-                TypeAttribute::new(types.i8).into(),
-            ),
-        ])
-        .add_results(&[types.ptr])
-        .build()
-        .expect("llvm.getelementptr (i8 byte offset)");
-    block.append_operation(gep).result(0).unwrap().into()
 }
 
 /// Phase 2.6a-arr (ADR 0054): runtime bounds check for `t[i]`.
@@ -6991,50 +6883,6 @@ fn emit_print_literal<'c>(
     emit_printf(context, block, fmt_ptr, payload, types, loc);
 }
 
-/// Phase 2.7h (ADR 0033, Tidy First): emit `printf("%s\n", msg_ptr)`
-/// followed by `exit(1)` into `block`. Pure-by-construction —
-/// only depends on its arguments — so it composes cleanly into
-/// both the conditional `assert` failure path and the
-/// unconditional `error(msg)` builtin (Phase 2.7h follow-up).
-fn emit_exit_with_message<'a, 'c>(
-    context: &'c Context,
-    block: &'a Block<'c>,
-    msg_ptr: Value<'c, 'a>,
-    types: &Types<'c>,
-    loc: Location<'c>,
-) {
-    let fmt_ptr = emit_addressof(context, block, "fmt_str", types, loc);
-    emit_printf(context, block, fmt_ptr, msg_ptr, types, loc);
-    let one_i32 = block
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(types.i32, 1).into(),
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    let exit_call = OperationBuilder::new("llvm.call", loc)
-        .add_operands(&[one_i32])
-        .add_attributes(&[
-            (
-                Identifier::new(context, "callee"),
-                FlatSymbolRefAttribute::new(context, "exit").into(),
-            ),
-            (
-                Identifier::new(context, "operandSegmentSizes"),
-                DenseI32ArrayAttribute::new(context, &[1, 0]).into(),
-            ),
-            (
-                Identifier::new(context, "op_bundle_sizes"),
-                DenseI32ArrayAttribute::new(context, &[]).into(),
-            ),
-        ])
-        .build()
-        .expect("llvm.call @exit");
-    block.append_operation(exit_call);
-}
-
 /// Phase 2.7g (ADR 0030): runtime check for `assert(cond)`. When
 /// `cond` is false, prints "assertion failed!" and `exit(1)`s via
 /// the shared `emit_exit_with_message` helper. The `scf.if` here
@@ -7086,58 +6934,6 @@ fn emit_assert<'a, 'c>(
     else_region.append_block(else_blk);
 
     block.append_operation(scf::r#if(not_cond, &[], then_region, else_region, loc));
-}
-
-fn emit_addressof<'a, 'c>(
-    context: &'c Context,
-    block: &'a Block<'c>,
-    global_name: &str,
-    types: &Types<'c>,
-    loc: Location<'c>,
-) -> Value<'c, 'a> {
-    let addr_op = AddressOfOperationBuilder::new(context, loc)
-        .res(types.ptr)
-        .global_name(FlatSymbolRefAttribute::new(context, global_name))
-        .build();
-    block
-        .append_operation(addr_op.into())
-        .result(0)
-        .unwrap()
-        .into()
-}
-
-fn emit_printf<'a, 'c>(
-    context: &'c Context,
-    block: &'a Block<'c>,
-    fmt_ptr: Value<'c, 'a>,
-    value: Value<'c, 'a>,
-    types: &Types<'c>,
-    loc: Location<'c>,
-) {
-    let call_op = OperationBuilder::new("llvm.call", loc)
-        .add_operands(&[fmt_ptr, value])
-        .add_attributes(&[
-            (
-                Identifier::new(context, "callee"),
-                FlatSymbolRefAttribute::new(context, "printf").into(),
-            ),
-            (
-                Identifier::new(context, "operandSegmentSizes"),
-                DenseI32ArrayAttribute::new(context, &[2, 0]).into(),
-            ),
-            (
-                Identifier::new(context, "op_bundle_sizes"),
-                DenseI32ArrayAttribute::new(context, &[]).into(),
-            ),
-            (
-                Identifier::new(context, "var_callee_type"),
-                TypeAttribute::new(llvm::r#type::function(types.i32, &[types.ptr], true)).into(),
-            ),
-        ])
-        .add_results(&[types.i32])
-        .build()
-        .expect("llvm.call @printf");
-    block.append_operation(call_op);
 }
 
 /// Convert a Lua value to its truthiness `i1`.
