@@ -4124,6 +4124,26 @@ fn emit_expr<'a, 'c>(
                         ));
                     }
                 }
+                // Phase 2.6c-tag-consumers-inline (ADR 0070):
+                // inline `tostring(t[k])` materialises through a
+                // tmp tagged slot (mirror of the `print(t[k])`
+                // path in ADR 0065) so Bool / String / Nil
+                // payloads dispatch instead of trapping at the
+                // f64 extract.
+                if let HirExprKind::Index { target, key } = &args[0].kind {
+                    let tmp = emit_alloca_slot_for_kind(
+                        context,
+                        block,
+                        ValueKind::TaggedValue,
+                        types,
+                        loc,
+                    );
+                    emit_local_init_tagged(
+                        context, block, tmp, target, key, slots, locals, functions, types,
+                        params_len, loc,
+                    )?;
+                    return Ok(emit_tostring_tagged_local(context, block, tmp, types, loc));
+                }
                 let arg_val = emit_expr(
                     context, block, &args[0], slots, locals, functions, types, params_len, loc,
                 )?;
@@ -4198,6 +4218,25 @@ fn emit_expr<'a, 'c>(
                             loc,
                         ));
                     }
+                }
+                // Phase 2.6c-tag-consumers-inline (ADR 0070):
+                // inline `type(t[k])` materialises through a
+                // tmp tagged slot so the runtime tag determines
+                // the typename, matching `Local(TaggedValue)`
+                // semantics (ADR 0067) at the inline source.
+                if let HirExprKind::Index { target, key } = &args[0].kind {
+                    let tmp = emit_alloca_slot_for_kind(
+                        context,
+                        block,
+                        ValueKind::TaggedValue,
+                        types,
+                        loc,
+                    );
+                    emit_local_init_tagged(
+                        context, block, tmp, target, key, slots, locals, functions, types,
+                        params_len, loc,
+                    )?;
+                    return Ok(emit_type_tagged_local(context, block, tmp, types, loc));
                 }
                 if !matches!(
                     args[0].kind,

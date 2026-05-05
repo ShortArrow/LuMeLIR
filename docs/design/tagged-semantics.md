@@ -6,7 +6,7 @@
 > consumer / tag semantics. ADRs continue to record *decisions*;
 > this page records *current state*.
 
-**Last updated:** 2026-05-05 (after ADR 0069)
+**Last updated:** 2026-05-05 (after ADR 0070)
 
 ---
 
@@ -119,22 +119,24 @@ slot via `emit_local_init_tagged` + `emit_print_tagged_local`.
 | Source                              | Number      | Bool        | String      | Nil       | ADR  |
 |-------------------------------------|-------------|-------------|-------------|-----------|------|
 | `Local(TaggedValue)`                | `"number"`  | `"boolean"` | `"string"`  | `"nil"`   | 0067 |
-| inline `Index`                      | `"number"`* | `"number"`* | `"number"`* | `"number"`* | LIC-2.6c-tag-consumers-inline-1 |
-
-`*` — static dispatch returns `"number"` regardless of runtime
-tag. Open LIC.
+| inline `Index`                      | `"number"`  | `"boolean"` | `"string"`  | `"nil"`   | 0070 |
 
 ### `tostring(x)`
 
 | Source                              | Number    | Bool          | String         | Nil      | ADR  |
 |-------------------------------------|-----------|---------------|----------------|----------|------|
 | `Local(TaggedValue)`                | `%g` snprintf | `s_true`/`s_false` | payload ptr | `s_nil` | 0067 |
-| inline `Index`                      | trap (extract f64 path)                                       |||| LIC-2.6c-tag-consumers-inline-1 |
+| inline `Index`                      | `%g` snprintf | `s_true`/`s_false` | payload ptr | `s_nil` | 0070 |
+
+Both inline rows use the ADR 0065 print pattern: `Builtin::Type`
+/ `Builtin::ToString` allocate a tmp 16-byte slot, fill it via
+`emit_local_init_tagged` (non-trapping read), then dispatch via
+`emit_type_tagged_local` / `emit_tostring_tagged_local`.
 
 `..` (concat) auto-coerces non-String operands via
 `tostring(...)` (ADR 0026), so concat with a `Local(TaggedValue)`
-inherits the runtime dispatch for free (matrix tests cover
-this).
+or inline `Index` inherits the runtime dispatch for free
+(matrix tests cover both shapes).
 
 **Reserved tags (TAG_FUNCTION = 4 / TAG_TABLE = 5)**: every
 runtime-dispatch consumer (`print`, `type`, `tostring`,
@@ -189,6 +191,7 @@ the introduction, when still open).
 | LIC-2.6c-tag-locals-1             | `type(x)` runtime dispatch                  | 0067          |
 | LIC-2.6c-tag-hetero-eq-1          | `==`/`~=` Local-Local runtime dispatch      | 0066          |
 | LIC-2.6c-tag-hetero-inline-1      | inline `print(t[k])` runtime dispatch       | 0065          |
+| LIC-2.6c-tag-consumers-inline-1   | inline `type(t[k])` / `tostring(t[k])` runtime dispatch | 0070 |
 
 ### Partial
 
@@ -204,10 +207,9 @@ the introduction, when still open).
 | ID                                | Behaviour                                                             | Notes                          |
 |-----------------------------------|-----------------------------------------------------------------------|--------------------------------|
 | LIC-2.6c-tag-hetero-fn-tbl-1      | Function/Table values rejected by HIR                                 | Needs ucast / cycle / closure-escape work |
-| LIC-2.6c-tag-consumers-inline-1   | inline `type(t[k])` / `tostring(t[k])` static-dispatch                | Mirror of ADR 0067 for inline form |
 
-**Total:** 12 LIC entries — 8 resolved, 3 partial, 2 pending
-(2 partial entries roll into `fn-tbl-1`; the partial form is
+**Total:** 12 LIC entries — 9 resolved, 3 partial, 1 pending
+(3 partial entries roll into `fn-tbl-1`; the partial form is
 preserved for granular tracking).
 
 ---
@@ -295,19 +297,16 @@ Listed in Codex review priority order (post-ADR-0067):
    Requires function ABI updates (return a 16-byte tagged
    payload, or pass a pointer). Most natural follow-up to the
    matrix scaffold (extends the source axis).
-3. **Inline `type(t[k])` / `tostring(t[k])`** (LIC-2.6c-tag-
-   consumers-inline-1). Mirror of ADR 0067 for inline `Index`
-   sources.
-4. **Function/Table values in tables** (LIC-2.6c-tag-hetero-
+3. **Function/Table values in tables** (LIC-2.6c-tag-hetero-
    fn-tbl-1). Needs ucast / cycle / closure-escape work for
    the payload representations.
-5. **String → Number coercion on arith** (`"5" + 1`). Lua-spec
+4. **String → Number coercion on arith** (`"5" + 1`). Lua-spec
    feature, mostly orthogonal to the tagged-value redesign.
-6. **Iteration `pairs(t)` / `ipairs(t)`.** Depends on the
+5. **Iteration `pairs(t)` / `ipairs(t)`.** Depends on the
    widened source set.
-7. **Hash key kinds expansion** (LIC-2.6a-arr-3). Bool /
+6. **Hash key kinds expansion** (LIC-2.6a-arr-3). Bool /
    Function / Table keys.
-8. **Full closures** (`2.5c-full`). Independent track; heap-
+7. **Full closures** (`2.5c-full`). Independent track; heap-
    allocated environments.
 
 ---
@@ -331,3 +330,4 @@ Listed in Codex review priority order (post-ADR-0067):
 | 0067 | 2.6c-tag-consumers           | `type` / `tostring` runtime dispatch + consumer matrix scaffold    |
 | 0068 | 2.6c-tag-doc-consolidate     | This SoT doc + LIC consolidation                                   |
 | 0069 | 2.6c-tag-defensive-trap      | Trap on unknown tagged-slot tag (replaces silent fallbacks)        |
+| 0070 | 2.6c-tag-consumers-inline    | Inline `type(t[k])` / `tostring(t[k])` runtime tag dispatch        |
