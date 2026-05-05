@@ -6363,6 +6363,68 @@ mod tests {
         );
     }
 
+    // ============================================================
+    // ADR 0074 (function-return TaggedValue widening) ABI shape
+    // tests. Pin the `(i64, i64)` return signature so future
+    // refactors (skeleton extraction, arity hardening) can't
+    // silently break the multi-result widening contract.
+    // ============================================================
+
+    #[test]
+    fn emit_function_with_heterogeneous_return_uses_tagged_abi() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src(
+                "local function maybe(x) if x > 0 then return 42 end return nil end
+print(maybe(1))",
+            ),
+        )
+        .expect("widened function must verify");
+        let mlir = module.as_operation().to_string();
+        assert_mlir_has(&mlir, "(f64) -> (i64, i64)");
+    }
+
+    #[test]
+    fn emit_pure_number_function_keeps_single_f64_return() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src(
+                "local function double(x) return x * 2 end
+print(double(21))",
+            ),
+        )
+        .expect("pure-number module must verify");
+        let mlir = module.as_operation().to_string();
+        assert_mlir_has(&mlir, "(f64) -> f64");
+        assert!(
+            !mlir.contains("(i64, i64)"),
+            "pure-Number return must not produce TaggedValue ABI, got:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn emit_call_to_widened_function_yields_two_results() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src(
+                "local function maybe(x) if x > 0 then return 1 end return nil end
+local v = maybe(7)
+print(v)",
+            ),
+        )
+        .expect("widened-call module must verify");
+        let mlir = module.as_operation().to_string();
+        assert_mlir_has(&mlir, "(f64) -> (i64, i64)");
+        let store_count = mlir.matches("llvm.store").count();
+        assert!(
+            store_count >= 2,
+            "expected >= 2 llvm.store after widened call (tag + payload), got {store_count}:\n{mlir}",
+        );
+    }
+
     #[test]
     fn emit_number_constant_produces_arith_constant() {
         let ctx = new_context();
