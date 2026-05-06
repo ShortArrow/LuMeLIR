@@ -33,7 +33,6 @@ cargo build --release
 - [`docs/PRD.md`](PRD.md) — 製品要求仕様（英語訳）
 - [`../README.md`](../README.md) — 英語版 README
 - [`docs/design/`](design/) — アーキテクチャ決定記録 (ADR)
-- [`docs/handover/`](handover/) — セッション引き継ぎメモ（環境移行等）
 - [`../AGENTS.md`](../AGENTS.md) — LLM エージェント向け作業規範（人間向け詳細もここ）
 - [`../CONTRIBUTING.md`](../CONTRIBUTING.md) — 人間 contributor クイックスタート
 

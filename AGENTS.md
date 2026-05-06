@@ -259,19 +259,23 @@ Do **not** run the following without the user explicitly asking:
 
 ### 10.3 Environment Gotchas
 
-**Primary dev environment as of Phase 1 MLIR work: WSL2 Arch Linux (see [ADR 0005](docs/design/0005-mlir-environment.md)).** The Rust crate builds on both Windows and WSL2; anything that pulls `melior` / `mlir-sys` needs WSL2.
-
-Under Windows 11 + Git Bash (historical scaffolding env, still usable for pure-Rust layers):
-- Shell is Git Bash / MSYS2-style. Use Unix syntax: `/dev/null` not `NUL`, forward slashes where possible.
-- **cwd may reset between tool invocations.** Prefer absolute paths (`V:/LuMeLIR/...`).
-- Line endings: repository is LF. Watch for `^M` in diffs — your editor may be inserting CRLF. **TBD: `.gitattributes` in Phase 1.**
-- Cargo cold builds take minutes; set generous timeouts for release builds.
-- `/usr/bin/link.exe` (Git Bash) shadows MSVC `link.exe`; affects any native link step. WSL2 sidesteps this.
+**Primary dev environment: WSL2 Arch Linux (see [ADR 0005](docs/design/0005-mlir-environment.md)).** Working tree lives at `~/LuMeLIR` (native ext4). Anything that pulls `melior` / `mlir-sys` needs WSL2; pure-Rust layers also build on Windows but Windows native MLIR is best-effort only.
 
 Under WSL2 Arch Linux:
-- Source tree lives at `/mnt/v/LuMeLIR` (Windows `V:/LuMeLIR/` shared). File I/O is slower than an ext4 home directory — acceptable for now; if build times become a problem, clone a pure ext4 copy into `~/LuMeLIR`.
-- MLIR toolchain: `sudo pacman -S base-devel llvm rust cmake ninja pkgconf clang zlib zstd libxml2` plus `paru -S mlir` (AUR).
-- Env vars for `melior`: `MLIR_SYS_220_PREFIX=/usr` etc. See `docs/handover/phase1-wsl2-migration.md` for the full bootstrap script.
+- MLIR toolchain: `sudo pacman -S base-devel llvm rust cmake ninja pkgconf clang zlib zstd libxml2` plus `paru -S mlir` (AUR; matches melior 0.27 = MLIR 22).
+- Env vars for `melior` (put in `~/.bashrc` or repo-local script):
+  ```bash
+  export MLIR_SYS_220_PREFIX=/usr
+  export LLVM_SYS_220_PREFIX=/usr
+  export TABLEGEN_220_PREFIX=/usr
+  ```
+- Sanity check: `llvm-config --version` and `mlir-tblgen --version` should both report 22.x.
+- `LIBCLANG_PATH` from a Windows host (e.g. Xtensa ESP clang) is sometimes imported into WSL2 shells. Usually harmless, but if `bindgen` complains about a weird libclang, `unset LIBCLANG_PATH` first.
+
+Historical Windows + Git Bash notes (kept for pure-Rust layers; do not run MLIR-linked builds here):
+- Shell is Git Bash / MSYS2-style. Use Unix syntax: `/dev/null` not `NUL`.
+- `/usr/bin/link.exe` (Git Bash) shadows MSVC `link.exe`. WSL2 sidesteps this.
+- Out-of-tree `/mnt/v/melior-spike/` records the Windows MSVC port attempt; see its `FINDINGS.md` before re-trying.
 
 ### 10.4 Commits & Pushes Require Explicit Instruction
 
