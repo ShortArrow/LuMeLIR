@@ -52,6 +52,16 @@ pub(crate) const TAG_STRING: i64 = 3;
 // remain HIR-rejected (LIC-2.6c-tag-hetero-closure-escape-1).
 pub(crate) const TAG_FUNCTION: i64 = 4;
 pub(crate) const TAG_TABLE: i64 = 5;
+// Phase 2.6b-hash-keys (ADR 0079): hash-bucket tombstone tag.
+// Marks a hash entry whose key was deleted by `t.k = nil`
+// (ADR 0062) but whose bucket position must remain reserved
+// to keep linear-probing chains intact. `TAG_DELETED` is only
+// ever observed in a hash entry's *key* slot — the value
+// dispatchers (print/type/tostring/eq) never see it because
+// the probe loop skips deleted buckets before any lookup
+// resolves. Replaces the previous ptr-sentinel
+// `HASH_DELETED_KEY=1` (retired by ADR 0079).
+pub(crate) const TAG_DELETED: i64 = 6;
 
 /// Allocate a stack slot whose layout matches `kind`. TaggedValue
 /// uses 2 × i64 (16 bytes, naturally 8-byte-aligned for the f64

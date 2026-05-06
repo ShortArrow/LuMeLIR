@@ -38,10 +38,11 @@ use super::primitive::{
     emit_libc_call_void, emit_load, emit_printf, emit_store, emit_unrealized_cast,
 };
 use super::tagged::{
-    ARRAY_ELEM_OFF_VALUE, ARRAY_ELEM_SIZE, TAG_BOOL, TAG_FUNCTION, TAG_NIL, TAG_NUMBER, TAG_STRING,
-    TAG_TABLE, emit_alloca_slot_for_kind, emit_print_tagged_local, emit_tag_and_payload_ptr,
-    emit_tagged_eq_local_local, emit_tagged_unknown_tag_trap, emit_type_tagged_local,
-    emit_value_slot_check_number, emit_value_slot_store_dispatched, emit_value_slot_store_nil,
+    ARRAY_ELEM_OFF_VALUE, ARRAY_ELEM_SIZE, TAG_BOOL, TAG_DELETED, TAG_FUNCTION, TAG_NIL,
+    TAG_NUMBER, TAG_STRING, TAG_TABLE, emit_alloca_slot_for_kind, emit_print_tagged_local,
+    emit_tag_and_payload_ptr, emit_tagged_eq_local_local, emit_tagged_unknown_tag_trap,
+    emit_type_tagged_local, emit_value_slot_check_number, emit_value_slot_store_dispatched,
+    emit_value_slot_store_nil, emit_value_slot_store_string,
 };
 
 // =============================================================
@@ -100,21 +101,18 @@ const TABLE_HEADER_SIZE: i64 = 32;
 const HASH_OFF_CAP: i64 = 0;
 const HASH_OFF_COUNT: i64 = 8;
 const HASH_OFF_ENTRIES: i64 = 16;
-// Phase 2.6c-tag-hash (ADR 0060): hash entry layout is now
-// `{ptr key, 16-byte tagged value slot}` = 24 bytes. The value
-// slot starts at offset 8 inside the entry; its internal
-// `{tag, value}` layout matches array_buf's element slot exactly,
-// so `emit_value_slot_*` helpers work unchanged on it.
-const HASH_ENTRY_SIZE: i64 = 24;
-const HASH_ENTRY_OFF_KEY: i64 = 0;
-const HASH_ENTRY_OFF_VALUE_SLOT: i64 = 8;
+// Phase 2.6b-hash-keys (ADR 0079): hash entry layout widens to
+// `{16-byte tagged key slot, 16-byte tagged value slot}` = 32
+// bytes. Both slots share the array element layout (ADR 0064)
+// so `emit_value_slot_*` helpers work unchanged on each. The
+// previous ptr-only `HASH_DELETED_KEY=1` sentinel (ADR 0062) is
+// retired; tombstones are now expressed by `TAG_DELETED` (= 6)
+// in the key slot's tag word, and empty buckets by `TAG_NIL`
+// (= 0) which `malloc` zero-init makes automatic.
+const HASH_ENTRY_SIZE: i64 = 32;
+const HASH_ENTRY_OFF_KEY_SLOT: i64 = 0;
+const HASH_ENTRY_OFF_VALUE_SLOT: i64 = 16;
 const HASH_INITIAL_CAP: i64 = 8;
-// Phase 2.6c-tag-hash-hard (ADR 0062): a deleted bucket has its
-// key replaced with this i64-comparable sentinel. Both `.data`-
-// section string globals and `malloc`'d buffers have alignment
-// well above 1, so the sentinel is unambiguously distinguishable
-// from any live key pointer (and from null = empty bucket).
-const HASH_DELETED_KEY: i64 = 1;
 
 /// Emit a verified MLIR module from a resolved HIR chunk.
 pub fn emit_module<'c>(context: &'c Context, chunk: &HirChunk) -> Result<Module<'c>, CodegenError> {
@@ -1462,7 +1460,18 @@ fn emit_stmt<'a, 'c>(
                             let new_key_then = Region::new();
                             let new_key_blk = Block::new(&[]);
                             {
-                                emit_store(&new_key_blk, key_str, entry_ptr, loc);
+                                // Phase 2.6b-hash-keys (ADR 0079):
+                                // store the key as a 16-byte
+                                // tagged String slot at entry+0
+                                // (tag at +0, payload ptr at +8).
+                                emit_value_slot_store_string(
+                                    context,
+                                    &new_key_blk,
+                                    entry_ptr,
+                                    key_str,
+                                    types,
+                                    loc,
+                                );
                                 let count_slot = emit_byte_offset_ptr(
                                     context,
                                     &new_key_blk,
@@ -1512,42 +1521,34 @@ fn emit_stmt<'a, 'c>(
                             );
                         }
                         ValueKind::Nil => {
-                            // Phase 2.6c-tag-hash-hard (ADR 0062):
+                            // Phase 2.6c-tag-hash-hard (ADR 0062),
+                            // updated by 2.6b-hash-keys (ADR 0079):
                             // hard delete. When the key is present
-                            // (was_empty == false), overwrite the
-                            // key slot with HASH_DELETED_KEY and
-                            // mark the value slot Nil. Probe will
-                            // skip past the sentinel and rehash
-                            // drops it physically. When the key is
-                            // absent (was_empty == true), this is a
-                            // no-op (Lua spec: deleting a missing
-                            // key is harmless). count is unchanged
-                            // either way — sentinel stays counted
-                            // against load factor until rehash.
+                            // (was_empty == false), write
+                            // `TAG_DELETED` to the key tag word at
+                            // entry+0; the payload is left intact
+                            // because the probe skips on the tag
+                            // alone. The value slot is reset to
+                            // Nil. Probe walks past `TAG_DELETED`
+                            // entries; rehash drops them
+                            // physically. Deleting a missing key is
+                            // a no-op (Lua spec). count is
+                            // unchanged either way — tombstones
+                            // stay counted against load factor
+                            // until rehash.
                             let del_then = Region::new();
                             let del_then_blk = Block::new(&[]);
                             {
-                                let sentinel_i = del_then_blk
+                                let tombstone_tag = del_then_blk
                                     .append_operation(arith::constant(
                                         context,
-                                        IntegerAttribute::new(types.i64, HASH_DELETED_KEY).into(),
+                                        IntegerAttribute::new(types.i64, TAG_DELETED).into(),
                                         loc,
                                     ))
                                     .result(0)
                                     .unwrap()
                                     .into();
-                                let sentinel_ptr: Value<'c, '_> = del_then_blk
-                                    .append_operation(
-                                        OperationBuilder::new("llvm.inttoptr", loc)
-                                            .add_operands(&[sentinel_i])
-                                            .add_results(&[types.ptr])
-                                            .build()
-                                            .expect("llvm.inttoptr"),
-                                    )
-                                    .result(0)
-                                    .unwrap()
-                                    .into();
-                                emit_store(&del_then_blk, sentinel_ptr, entry_ptr, loc);
+                                emit_store(&del_then_blk, tombstone_tag, entry_ptr, loc);
                                 emit_value_slot_store_nil(
                                     context,
                                     &del_then_blk,
@@ -2564,13 +2565,27 @@ fn emit_hash_ensure_buf<'a, 'c>(
         let count_slot =
             emit_byte_offset_ptr(context, &then_blk, new_buf, HASH_OFF_COUNT, types, loc);
         emit_store(&then_blk, zero_const, count_slot, loc);
-        // Zero-init each entry's key field (value field will be
-        // written on first occupancy; only key=null marks empty).
-        let null_key = emit_null_ptr(context, &then_blk, types, loc);
+        // Phase 2.6b-hash-keys (ADR 0079): zero-init each entry's
+        // key tag (offset 0 inside the key slot). TAG_NIL = 0
+        // marks the bucket empty; malloc doesn't zero-init so we
+        // write i64(0) explicitly at every key-tag position. The
+        // payload word and the value slot are left undefined —
+        // probe semantics never observe them while the tag says
+        // empty.
+        let zero_tag = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
         for i in 0..HASH_INITIAL_CAP {
-            let entry_off = HASH_OFF_ENTRIES + i * HASH_ENTRY_SIZE + HASH_ENTRY_OFF_KEY;
-            let key_slot = emit_byte_offset_ptr(context, &then_blk, new_buf, entry_off, types, loc);
-            emit_store(&then_blk, null_key, key_slot, loc);
+            let entry_off = HASH_OFF_ENTRIES + i * HASH_ENTRY_SIZE + HASH_ENTRY_OFF_KEY_SLOT;
+            let key_tag_slot =
+                emit_byte_offset_ptr(context, &then_blk, new_buf, entry_off, types, loc);
+            emit_store(&then_blk, zero_tag, key_tag_slot, loc);
         }
         // Store buf into header.
         let hash_buf_slot_inner = emit_byte_offset_ptr(
@@ -2676,22 +2691,24 @@ fn emit_hash_probe_loop<'a, 'c>(
             .into();
         let entry_ptr =
             emit_byte_offset_ptr_dynamic(context, &before_blk, hash_buf, entry_off, types, loc);
-        let key_at_slot = emit_load(&before_blk, entry_ptr, types.ptr, loc);
-        let key_at_slot_i = before_blk
-            .append_operation(
-                OperationBuilder::new("llvm.ptrtoint", loc)
-                    .add_operands(&[key_at_slot])
-                    .add_results(&[types.i64])
-                    .build()
-                    .expect("llvm.ptrtoint"),
-            )
-            .result(0)
-            .unwrap()
-            .into();
-        let zero_i64 = before_blk
+        // Phase 2.6b-hash-keys (ADR 0079): the entry's first 16
+        // bytes are now a tagged key slot — `{i64 tag, 8-byte
+        // payload}`. Load the tag at offset 0 and the payload
+        // (the actual `!llvm.ptr` String key) at offset 8.
+        let key_tag = emit_load(&before_blk, entry_ptr, types.i64, loc);
+        let key_payload_ptr = emit_byte_offset_ptr(
+            context,
+            &before_blk,
+            entry_ptr,
+            ARRAY_ELEM_OFF_VALUE,
+            types,
+            loc,
+        );
+        let key_at_slot = emit_load(&before_blk, key_payload_ptr, types.ptr, loc);
+        let tag_nil_const = before_blk
             .append_operation(arith::constant(
                 context,
-                IntegerAttribute::new(types.i64, 0).into(),
+                IntegerAttribute::new(types.i64, TAG_NIL).into(),
                 loc,
             ))
             .result(0)
@@ -2701,17 +2718,17 @@ fn emit_hash_probe_loop<'a, 'c>(
             .append_operation(arith::cmpi(
                 context,
                 arith::CmpiPredicate::Eq,
-                key_at_slot_i,
-                zero_i64,
+                key_tag,
+                tag_nil_const,
                 loc,
             ))
             .result(0)
             .unwrap()
             .into();
-        let sentinel_const = before_blk
+        let tag_deleted_const = before_blk
             .append_operation(arith::constant(
                 context,
-                IntegerAttribute::new(types.i64, HASH_DELETED_KEY).into(),
+                IntegerAttribute::new(types.i64, TAG_DELETED).into(),
                 loc,
             ))
             .result(0)
@@ -2721,8 +2738,8 @@ fn emit_hash_probe_loop<'a, 'c>(
             .append_operation(arith::cmpi(
                 context,
                 arith::CmpiPredicate::Eq,
-                key_at_slot_i,
-                sentinel_const,
+                key_tag,
+                tag_deleted_const,
                 loc,
             ))
             .result(0)
@@ -3166,22 +3183,24 @@ fn emit_hash_grow_if_needed<'a, 'c>(
                 .into();
             let old_entry_ptr =
                 emit_byte_offset_ptr_dynamic(context, &rehash_after_blk, hash_buf, off, types, loc);
-            let old_key = emit_load(&rehash_after_blk, old_entry_ptr, types.ptr, loc);
-            let old_key_i = rehash_after_blk
-                .append_operation(
-                    OperationBuilder::new("llvm.ptrtoint", loc)
-                        .add_operands(&[old_key])
-                        .add_results(&[types.i64])
-                        .build()
-                        .expect("llvm.ptrtoint"),
-                )
-                .result(0)
-                .unwrap()
-                .into();
-            let zero_i64_inner = rehash_after_blk
+            // Phase 2.6b-hash-keys (ADR 0079): load the key tag at
+            // entry+0 (i64) and the key payload (String ptr) at
+            // entry+8. Live = tag is neither TAG_NIL (= empty) nor
+            // TAG_DELETED (= tombstone, ADR 0062 hard delete).
+            let old_key_tag = emit_load(&rehash_after_blk, old_entry_ptr, types.i64, loc);
+            let old_key_payload_ptr = emit_byte_offset_ptr(
+                context,
+                &rehash_after_blk,
+                old_entry_ptr,
+                ARRAY_ELEM_OFF_VALUE,
+                types,
+                loc,
+            );
+            let old_key = emit_load(&rehash_after_blk, old_key_payload_ptr, types.ptr, loc);
+            let tag_nil_inner = rehash_after_blk
                 .append_operation(arith::constant(
                     context,
-                    IntegerAttribute::new(types.i64, 0).into(),
+                    IntegerAttribute::new(types.i64, TAG_NIL).into(),
                     loc,
                 ))
                 .result(0)
@@ -3191,20 +3210,17 @@ fn emit_hash_grow_if_needed<'a, 'c>(
                 .append_operation(arith::cmpi(
                     context,
                     arith::CmpiPredicate::Ne,
-                    old_key_i,
-                    zero_i64_inner,
+                    old_key_tag,
+                    tag_nil_inner,
                     loc,
                 ))
                 .result(0)
                 .unwrap()
                 .into();
-            // Phase 2.6c-tag-hash-hard (ADR 0062): treat sentinel
-            // entries as unoccupied so rehash physically drops
-            // them. Live = (key != null && key != sentinel).
-            let sentinel_const_inner = rehash_after_blk
+            let tag_deleted_inner = rehash_after_blk
                 .append_operation(arith::constant(
                     context,
-                    IntegerAttribute::new(types.i64, HASH_DELETED_KEY).into(),
+                    IntegerAttribute::new(types.i64, TAG_DELETED).into(),
                     loc,
                 ))
                 .result(0)
@@ -3214,8 +3230,8 @@ fn emit_hash_grow_if_needed<'a, 'c>(
                 .append_operation(arith::cmpi(
                     context,
                     arith::CmpiPredicate::Ne,
-                    old_key_i,
-                    sentinel_const_inner,
+                    old_key_tag,
+                    tag_deleted_inner,
                     loc,
                 ))
                 .result(0)
@@ -3275,7 +3291,20 @@ fn emit_hash_grow_if_needed<'a, 'c>(
                     types,
                     loc,
                 );
-                emit_store(&migrate_blk, old_key, new_entry_ptr, loc);
+                // Phase 2.6b-hash-keys (ADR 0079): write the key
+                // back as a 16-byte tagged String slot (tag at
+                // new_entry+0, payload ptr at new_entry+8). Phase
+                // A only ever rehashes String keys (HIR enforces);
+                // Phase B will route every kind through the
+                // tagged-key store dispatcher.
+                emit_value_slot_store_string(
+                    context,
+                    &migrate_blk,
+                    new_entry_ptr,
+                    old_key,
+                    types,
+                    loc,
+                );
                 // Phase 2.6c-tag-hash (ADR 0060): migrate the
                 // entire 16-byte tagged value slot (tag at +0,
                 // value at +8) so Nil-tagged entries (`t.k = nil`
