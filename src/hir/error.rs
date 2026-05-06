@@ -56,11 +56,37 @@ pub enum HirError {
     /// mismatch); ADR 0075 rejects the path entirely. Workaround:
     /// use a direct call or expand a static dispatch at the
     /// call site.
+    ///
+    /// **Status**: variant retained for binary-compatibility with
+    /// older lowering tests. ADR 0082 supersedes this rejection
+    /// with `IndirectCallNoCandidates` for the cases where no user
+    /// function in the module matches the call site's signature.
     #[error(
         "indirect call through TaggedValue local '{local_name}' is not supported \
          (LIC-2.6c-tag-callee-arity-1; ADR 0075). Use a direct call or static dispatch."
     )]
     IndirectCallThroughTaggedLocal { local_name: String, offset: usize },
+
+    /// Phase 2.5x-callee-dispatch (ADR 0082): an indirect call
+    /// through a TaggedValue local could not be lowered because
+    /// the call site's expected signature (`param_kinds` /
+    /// `ret_kinds`) doesn't match any user function declared in the
+    /// module. The compatible-candidate set is empty, so the
+    /// per-call-site dispatch chain has no branches to emit.
+    /// Workaround: declare a user function with the matching
+    /// signature, or call the function value through a direct path
+    /// (bind it to a `Function(arity)` local).
+    #[error(
+        "indirect call through TaggedValue local '{local_name}' has no compatible user \
+         function in this module (param_kinds={param_kinds:?}, ret_kinds={ret_kinds:?}; \
+         ADR 0082)"
+    )]
+    IndirectCallNoCandidates {
+        local_name: String,
+        param_kinds: Vec<crate::hir::ValueKind>,
+        ret_kinds: Vec<crate::hir::ValueKind>,
+        offset: usize,
+    },
 }
 
 impl HirError {
@@ -77,7 +103,8 @@ impl HirError {
             | HirError::UnknownFunction { offset, .. }
             | HirError::FunctionUsedAsValue { offset, .. }
             | HirError::ClosureEscapes { offset, .. }
-            | HirError::IndirectCallThroughTaggedLocal { offset, .. } => *offset,
+            | HirError::IndirectCallThroughTaggedLocal { offset, .. }
+            | HirError::IndirectCallNoCandidates { offset, .. } => *offset,
         }
     }
 }

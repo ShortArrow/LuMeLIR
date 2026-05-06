@@ -258,14 +258,44 @@ pub enum HirExprKind {
 
 /// Discriminates whether a [`HirExprKind::Call`] hits a built-in
 /// function (Phase 2.0 baseline), a statically-known user-defined
-/// function (Phase 2.5a; ADR 0016), or a runtime function value
+/// function (Phase 2.5a; ADR 0016), a runtime function value
 /// reached through a Function-kind local — typically a parameter
-/// (Phase 2.5b.2; ADR 0018).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// (Phase 2.5b.2; ADR 0018) — or a static-candidate dispatch over
+/// a TaggedValue local (Phase 2.5x-callee-dispatch; ADR 0082).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Callee {
     Builtin(Builtin),
     User(FuncId),
+    /// Function-kind local whose statically-known arity (from
+    /// `LocalInfo::kind`) reconstructs an `(...) → f64` signature.
+    /// Today only function parameters reach this arm — every other
+    /// Function local has a known FuncId and dispatches as `User`.
     Indirect(LocalId),
+    /// Phase 2.5x-callee-dispatch (ADR 0082): a TaggedValue local
+    /// (typically `local g = t[i]`) whose runtime value is one of
+    /// `candidates` — the set of user functions whose signature
+    /// matches `sig` (param + return kind vectors). Codegen emits
+    /// a tag check, loads the payload as `!llvm.ptr`, and dispatches
+    /// via per-candidate `if loaded == @user_fn_X then func.call
+    /// @user_fn_X(args)` branches with `func.call` — no
+    /// `func.call_indirect` cast (Codex pre-ADR-0082 review,
+    /// forward-edge integrity).
+    IndirectDispatch {
+        local_id: LocalId,
+        sig: IndirectSig,
+        candidates: Vec<FuncId>,
+    },
+}
+
+/// Phase 2.5x-callee-dispatch (ADR 0082): the static signature
+/// expected at an indirect call site. `compatible_user_functions`
+/// filters the module's user functions to those whose `params` and
+/// `ret_kinds` exactly match — full kind vectors, not just arity,
+/// so multi-position TaggedValue ABIs (ADR 0076) stay unambiguous.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndirectSig {
+    pub param_kinds: Vec<ValueKind>,
+    pub ret_kinds: Vec<ValueKind>,
 }
 
 /// Recognised builtin functions. Phase 2.0 had only `print`; Phase

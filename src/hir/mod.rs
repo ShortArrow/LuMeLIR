@@ -11,7 +11,7 @@ mod ir;
 pub use error::HirError;
 pub use ir::{
     Builtin, Callee, FuncId, HirChunk, HirExpr, HirExprKind, HirFunction, HirStmt, HirStmtKind,
-    LocalId, LocalInfo, UpvalueInfo,
+    IndirectSig, LocalId, LocalInfo, UpvalueInfo,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -229,6 +229,14 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // Indirect call (function-kind local): Phase 2.5b.2 fixes
             // returns to Number, so that's the answer.
             Callee::Indirect(_) => ValueKind::Number,
+            // Phase 2.5x-callee-dispatch (ADR 0082): the dispatch's
+            // `sig.ret_kinds[0]` carries the call-site's expected
+            // return kind. Truncates to the first result for
+            // single-value position (Lua spec); MultiAssignFromCall
+            // observes the full vector via `lower_local_multi`.
+            Callee::IndirectDispatch { sig, .. } => {
+                sig.ret_kinds.first().copied().unwrap_or(ValueKind::Number)
+            }
         },
         HirExprKind::FunctionRef(FuncId(id)) => {
             // Phase 2.5b.2: kind tracks arity, FuncId lives in LocalInfo.
@@ -2103,9 +2111,77 @@ impl LowerCtx {
         // declaring fresh.
         if values.len() == 1 && names.len() > 1 {
             let lowered = self.lower_expr(&values[0])?;
-            if let HirExprKind::Call { callee, args } = lowered.kind {
-                let ret_kinds: Vec<ValueKind> = match callee {
-                    Callee::User(FuncId(fid)) => self.functions[fid].ret_kinds.clone(),
+            if let HirExprKind::Call { mut callee, args } = lowered.kind {
+                // Phase 2.5x-callee-dispatch (ADR 0082): in multi-
+                // assign position the lowered IndirectDispatch's
+                // single-value-default `ret_kinds = [Number]` is
+                // wrong. Re-search the module for user fns whose
+                // params match AND whose ret_kinds.len() ==
+                // names.len(). All matching candidates must share
+                // identical ret_kinds; otherwise the dispatch chain
+                // would be ambiguous and we treat the call site as
+                // having no compatible candidates.
+                if let Callee::IndirectDispatch {
+                    local_id,
+                    sig,
+                    candidates: _,
+                } = &callee
+                {
+                    let n = names.len();
+                    let sig_param_kinds = sig.param_kinds.clone();
+                    let local_name = self.locals[local_id.0].name.clone();
+                    let arity_matches: Vec<&HirFunction> = self
+                        .functions
+                        .iter()
+                        .filter(|f| {
+                            let f_param_kinds: Vec<ValueKind> =
+                                f.params.iter().map(|p| p.kind).collect();
+                            f_param_kinds == sig_param_kinds && f.ret_kinds.len() == n
+                        })
+                        .collect();
+                    let multi_ret_kinds: Vec<ValueKind> = match arity_matches.first() {
+                        Some(first) => first.ret_kinds.clone(),
+                        None => Vec::new(),
+                    };
+                    let all_share = arity_matches.iter().all(|f| f.ret_kinds == multi_ret_kinds);
+                    if multi_ret_kinds.is_empty() || !all_share {
+                        return Err(HirError::IndirectCallNoCandidates {
+                            local_name,
+                            param_kinds: sig_param_kinds.clone(),
+                            ret_kinds: vec![ValueKind::Number; n],
+                            offset: span.start,
+                        });
+                    }
+                    // Re-build the dispatch with the multi-value
+                    // ret_kinds and re-filter candidates.
+                    let new_sig = IndirectSig {
+                        param_kinds: sig_param_kinds.clone(),
+                        ret_kinds: multi_ret_kinds.clone(),
+                    };
+                    let new_candidates: Vec<FuncId> = self
+                        .functions
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, f)| {
+                            let f_param_kinds: Vec<ValueKind> =
+                                f.params.iter().map(|p| p.kind).collect();
+                            if f_param_kinds == new_sig.param_kinds
+                                && f.ret_kinds == new_sig.ret_kinds
+                            {
+                                Some(FuncId(i))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    callee = Callee::IndirectDispatch {
+                        local_id: *local_id,
+                        sig: new_sig,
+                        candidates: new_candidates,
+                    };
+                }
+                let ret_kinds: Vec<ValueKind> = match &callee {
+                    Callee::User(FuncId(fid)) => self.functions[*fid].ret_kinds.clone(),
                     // Phase 2.8e-iter-next (ADR 0081): builtin-callee
                     // multi-assign. Until `Builtin::Next` lands every
                     // builtin returns at most one value, so this
@@ -2113,6 +2189,7 @@ impl LowerCtx {
                     // hit the arity mismatch below when names.len()
                     // doesn't match `b.ret_kinds().len()`.
                     Callee::Builtin(b) => b.ret_kinds().to_vec(),
+                    Callee::IndirectDispatch { sig, .. } => sig.ret_kinds.clone(),
                     Callee::Indirect(_) => {
                         return Err(HirError::ArityMismatch {
                             builtin: "multi-assign".to_owned(),
@@ -2345,6 +2422,7 @@ impl LowerCtx {
             let ret_kinds: Vec<ValueKind> = match callee {
                 Callee::User(FuncId(fid)) => self.functions[fid].ret_kinds.clone(),
                 Callee::Builtin(b) => b.ret_kinds().to_vec(),
+                Callee::IndirectDispatch { ref sig, .. } => sig.ret_kinds.clone(),
                 Callee::Indirect(_) => {
                     return Err(HirError::ArityMismatch {
                         builtin: "local =".to_owned(),
@@ -2775,6 +2853,24 @@ impl LowerCtx {
         args: &[Expr],
         whole: &Expr,
     ) -> Result<HirExprKind, HirError> {
+        // Local helper for the ADR 0082 indirect-dispatch path. Pure
+        // function over the module's user-function table; no table /
+        // local provenance analysis (Codex pre-ADR-0082 review:
+        // `IndexAssign` breaks any provenance immediately).
+        fn compatible_user_functions(sig: &IndirectSig, functions: &[HirFunction]) -> Vec<FuncId> {
+            functions
+                .iter()
+                .enumerate()
+                .filter_map(|(i, f)| {
+                    let f_param_kinds: Vec<ValueKind> = f.params.iter().map(|p| p.kind).collect();
+                    if f_param_kinds == sig.param_kinds && f.ret_kinds == sig.ret_kinds {
+                        Some(FuncId(i))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
         let name = match &callee.kind {
             ExprKind::Ident(n) => n,
             _ => {
@@ -2848,22 +2944,72 @@ impl LowerCtx {
                     args: all_args,
                 });
             }
-            // Phase 2.6c-tag-callee-arity (ADR 0075, supersedes
-            // ADR 0072 in part): the TaggedValue local's runtime
-            // tag may be TAG_FUNCTION but the slot's payload is a
-            // bare function pointer with no arity descriptor.
-            // ADR 0072 reconstructed `(f64,...) → f64` from
-            // `args.len()` at codegen time, but that produces UB
-            // when the table holds functions of different arities
-            // or different return ABIs. We now reject all such
-            // calls at HIR-time. Workaround: bind the callable
-            // through a direct path (`local f = function() end` or
-            // top-level `local function f`), or expand a static
-            // dispatch at the call site.
+            // Phase 2.5x-callee-dispatch (ADR 0082, part-supersedes
+            // ADR 0075 / ADR 0072): a TaggedValue local whose
+            // runtime tag is TAG_FUNCTION reaches the call site as
+            // a dispatcher. We compute the compatible-set of user
+            // functions whose `(param_kinds, ret_kinds)` matches
+            // the call site's signature at compile time, then emit
+            // a per-call-site `if loaded_ptr == @user_fn_X then
+            // func.call @user_fn_X(args)` chain (no
+            // `func.call_indirect` cast — Codex pre-ADR-0082
+            // review's forward-edge integrity recommendation).
+            //
+            // Single-value position truncates `ret_kinds` to
+            // `[Number]` by default. Multi-value position
+            // (`local k, v = g(...)`) is handled by
+            // `lower_local_multi` / `lower_assign_multi`, which
+            // re-run the candidate filter with the multi-target
+            // ret_kinds before reaching codegen.
             if matches!(self.locals[local_id.0].kind, ValueKind::TaggedValue) {
-                return Err(HirError::IndirectCallThroughTaggedLocal {
-                    local_name: name.clone(),
-                    offset: whole.span.start,
+                let lowered_args = args
+                    .iter()
+                    .map(|a| self.lower_expr(a))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let param_kinds: Vec<ValueKind> = lowered_args
+                    .iter()
+                    .map(|a| infer_kind(a, &self.locals, &self.functions))
+                    .collect();
+                // Filter user fns by `param_kinds` only and pick the
+                // first match's `ret_kinds` as the canonical
+                // signature. Multi-assign callers re-filter with the
+                // multi-position ret_kinds; single-value callers
+                // truncate to the first result.
+                let param_only_matches: Vec<&HirFunction> = self
+                    .functions
+                    .iter()
+                    .filter(|f| {
+                        let f_param_kinds: Vec<ValueKind> =
+                            f.params.iter().map(|p| p.kind).collect();
+                        f_param_kinds == param_kinds
+                    })
+                    .collect();
+                if param_only_matches.is_empty() {
+                    return Err(HirError::IndirectCallNoCandidates {
+                        local_name: name.clone(),
+                        param_kinds: param_kinds.clone(),
+                        ret_kinds: vec![ValueKind::Number],
+                        offset: whole.span.start,
+                    });
+                }
+                // Canonical ret_kinds: take the first match's. The
+                // dispatch chain's `result_types` follow this. If
+                // other param-matching user fns have a different
+                // ret_kinds vector, they're filtered OUT here — the
+                // contract is that all candidates share signature.
+                let canonical_ret_kinds = param_only_matches[0].ret_kinds.clone();
+                let sig = IndirectSig {
+                    param_kinds: param_kinds.clone(),
+                    ret_kinds: canonical_ret_kinds,
+                };
+                let candidates = compatible_user_functions(&sig, &self.functions);
+                return Ok(HirExprKind::Call {
+                    callee: Callee::IndirectDispatch {
+                        local_id,
+                        sig,
+                        candidates,
+                    },
+                    args: lowered_args,
                 });
             }
         }

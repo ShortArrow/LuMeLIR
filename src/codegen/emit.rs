@@ -27,10 +27,11 @@ use melior::{
 
 use crate::hir::{
     Builtin, Callee, FuncId, HirChunk, HirExpr, HirExprKind, HirFunction, HirStmt, HirStmtKind,
-    LocalId, LocalInfo, ValueKind, infer_kind,
+    IndirectSig, LocalId, LocalInfo, ValueKind, infer_kind,
 };
 use crate::parser::{BinOp, UnaryOp};
 
+use super::callabi::{flat_result_index, ret_mlir_types};
 use super::error::CodegenError;
 use super::primitive::{
     Types, emit_addressof, emit_byte_offset_ptr, emit_byte_offset_ptr_dynamic,
@@ -294,6 +295,29 @@ fn emit_fmt_global<'c>(
         i8_type,
         "s_arith_coerce_failed",
         "attempt to perform arithmetic on a string value\0",
+        loc,
+    );
+    // Phase 2.5x-callee-dispatch (ADR 0082): runtime traps for the
+    // indirect-dispatch chain. `s_call_non_function` fires when the
+    // tagged-slot's tag is not TAG_FUNCTION (e.g. `local g = "s";
+    // g()`). `s_call_unknown_fn_ptr` fires when the loaded fn
+    // pointer doesn't match any compile-time-known user function
+    // (impossible from Lua source today; defensive backstop for
+    // future FFI / dynamic loaders).
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_call_non_function",
+        "attempt to call a non-function value\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_call_unknown_fn_ptr",
+        "attempt to call an unknown function pointer\0",
         loc,
     );
 }
@@ -678,61 +702,6 @@ fn param_mlir_type<'c>(context: &'c Context, kind: ValueKind, types: &Types<'c>)
             unreachable!("TaggedValue is not yet a function param/return kind")
         }
     }
-}
-
-/// MLIR result types for a function whose HIR return-kinds list is
-/// `ret_kinds`. Phase 2.5b.3 (ADR 0019) added Function returns; 2.5e
-/// (ADR 0020) added Bool and Nil; 2.5d (ADR 0021) generalises to a
-/// `Vec` so multi-result functions emit a result type per position.
-fn ret_mlir_types<'c>(
-    context: &'c Context,
-    ret_kinds: &[ValueKind],
-    types: &Types<'c>,
-) -> Vec<Type<'c>> {
-    ret_kinds
-        .iter()
-        .flat_map(|k| match k {
-            ValueKind::Number => vec![types.f64],
-            ValueKind::Bool | ValueKind::Nil => vec![types.i1],
-            ValueKind::Function(arity) => {
-                let p_types: Vec<Type<'c>> = (0..*arity).map(|_| types.f64).collect();
-                vec![FunctionType::new(context, &p_types, &[types.f64]).into()]
-            }
-            ValueKind::String | ValueKind::Table => vec![types.ptr],
-            // Phase 2.6c-tag-locals-fn (ADR 0074): a TaggedValue
-            // return becomes 2 MLIR i64 results: (tag, payload_raw).
-            // The caller reassembles them into a 16-byte tagged
-            // slot. payload_raw is i64 because slot copies (ADR
-            // 0064) already round-trip any payload kind through
-            // raw i64.
-            ValueKind::TaggedValue => vec![types.i64, types.i64],
-        })
-        .collect()
-}
-
-/// Phase 2.6c-tag-locals-fn-multi (ADR 0076): MLIR `func.call`
-/// result count produced by a single logical return position of
-/// the given kind. Mirrors [`ret_mlir_types`]'s `flat_map`
-/// expansion: TaggedValue is 2 (tag + payload_raw), every other
-/// supported return kind is 1.
-fn ret_kind_result_width(kind: ValueKind) -> usize {
-    match kind {
-        ValueKind::TaggedValue => 2,
-        _ => 1,
-    }
-}
-
-/// Phase 2.6c-tag-locals-fn-multi (ADR 0076): flat MLIR result
-/// index where logical return position `pos` starts. For
-/// `ret_kinds = [Number, TaggedValue, Bool]`, position 0 starts
-/// at MLIR result 0, position 1 at MLIR result 1, position 2 at
-/// MLIR result 3 (because the TaggedValue at position 1 took 2
-/// MLIR results).
-fn flat_result_index(ret_kinds: &[ValueKind], pos: usize) -> usize {
-    ret_kinds[..pos]
-        .iter()
-        .map(|k| ret_kind_result_width(*k))
-        .sum()
 }
 
 /// Phase 2.6c-tag-locals-fn-multi (ADR 0076): pack the two i64
@@ -2099,8 +2068,8 @@ fn emit_stmt<'a, 'c>(
             args,
         } => {
             emit_multi_assign_from_call(
-                context, block, dst_ids, *callee, args, slots, locals, functions, types,
-                params_len, loc,
+                context, block, dst_ids, callee, args, slots, locals, functions, types, params_len,
+                loc,
             )?;
         }
         // Phase 2.6a-wr (ADR 0055) / 2.6a-norm (ADR 0056) /
@@ -2510,7 +2479,7 @@ fn emit_multi_assign_from_call<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     dst_ids: &[LocalId],
-    callee: Callee,
+    callee: &Callee,
     args: &[HirExpr],
     slots: &[Value<'c, 'a>],
     locals: &[LocalInfo],
@@ -2519,19 +2488,421 @@ fn emit_multi_assign_from_call<'a, 'c>(
     params_len: usize,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
-    // Phase 2.8e-iter-next (ADR 0081): dispatch on callee kind. Today
-    // the User path is the only one that materialises results; the
-    // Builtin path is a stub until `Builtin::Next` ships in commit 2.
+    // Phase 2.8e-iter-next (ADR 0081) / 2.5x-callee-dispatch (ADR
+    // 0082): dispatch on callee kind. The User path is the original
+    // multi-return shape; Builtin opens for `Next`; IndirectDispatch
+    // is the new ADR 0082 ABI for tagged-callee multi-return.
     match callee {
         Callee::User(FuncId(fid)) => emit_multi_assign_from_user_call(
-            context, block, dst_ids, fid, args, slots, locals, functions, types, params_len, loc,
+            context, block, dst_ids, *fid, args, slots, locals, functions, types, params_len, loc,
         ),
         Callee::Builtin(b) => emit_multi_assign_from_builtin(
-            context, block, dst_ids, b, args, slots, locals, functions, types, params_len, loc,
+            context, block, dst_ids, *b, args, slots, locals, functions, types, params_len, loc,
         ),
         Callee::Indirect(_) => {
             unreachable!("HIR rejects Indirect in MultiAssignFromCall (ADR 0075)")
         }
+        Callee::IndirectDispatch {
+            local_id: LocalId(idx),
+            sig,
+            candidates,
+        } => {
+            // Phase 2.5x-callee-dispatch (ADR 0082): multi-assign
+            // path. Reuse `emit_indirect_dispatch_call` to obtain
+            // the dispatch op (whose flat MLIR results match the
+            // call site's signature), then unpack each logical
+            // return position into its destination slot via the
+            // ADR 0076 walker (`flat_result_index` +
+            // `emit_pack_tagged_result_at_pos`).
+            emit_multi_assign_from_indirect_dispatch(
+                context, block, dst_ids, *idx, sig, candidates, args, slots, locals, functions,
+                types, params_len, loc,
+            )
+        }
+    }
+}
+
+/// Phase 2.5x-callee-dispatch (ADR 0082): emit a per-call-site
+/// dispatch chain over `candidates`. Steps:
+///
+/// 1. Tag check at slot+0 — trap with `s_call_non_function` if
+///    the runtime tag isn't `TAG_FUNCTION`.
+/// 2. Load fn pointer at slot+8.
+/// 3. Evaluate args once in the outer block.
+/// 4. Build a nested `scf.if` chain over `candidates`. Each level
+///    compares the loaded ptr to `func.constant @user_fn_X`; on
+///    match emits a *direct* `func.call @user_fn_X` (no
+///    `func.call_indirect` cast — Codex pre-ADR-0082 review's
+///    forward-edge integrity recommendation). The innermost
+///    else-branch traps with `s_call_unknown_fn_ptr` and yields
+///    dummy values to satisfy MLIR's region-yield type check.
+///
+/// Returns a single `Value` for single-value caller (`emit_expr`).
+/// Multi-value caller (`emit_multi_assign_from_indirect_dispatch`)
+/// uses `emit_indirect_dispatch_chain` directly to access the full
+/// flat result vector.
+#[allow(clippy::too_many_arguments)]
+fn emit_indirect_dispatch_call<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_idx: usize,
+    sig: &IndirectSig,
+    candidates: &[FuncId],
+    args: &[HirExpr],
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    loc: Location<'c>,
+) -> Result<Value<'c, 'a>, CodegenError> {
+    let chain_op_results = emit_indirect_dispatch_chain_in_block(
+        context, block, slot_idx, sig, candidates, args, slots, locals, functions, types,
+        params_len, loc,
+    )?;
+    Ok(chain_op_results[0])
+}
+
+/// Phase 2.5x-callee-dispatch (ADR 0082): multi-assign caller.
+/// Materialise the dispatch chain in the outer block, then unpack
+/// each logical return position via `flat_result_index` (ADR 0076).
+#[allow(clippy::too_many_arguments)]
+fn emit_multi_assign_from_indirect_dispatch<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    dst_ids: &[LocalId],
+    slot_idx: usize,
+    sig: &IndirectSig,
+    candidates: &[FuncId],
+    args: &[HirExpr],
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    let chain_results = emit_indirect_dispatch_chain_in_block(
+        context, block, slot_idx, sig, candidates, args, slots, locals, functions, types,
+        params_len, loc,
+    )?;
+    for (i, dst) in dst_ids.iter().enumerate() {
+        let info = &locals[dst.0];
+        let dst_slot = slots[dst.0];
+        match info.kind {
+            ValueKind::TaggedValue => {
+                // 2 MLIR results (tag, payload_raw) for this position.
+                let base = flat_result_index(&sig.ret_kinds, i);
+                let tag = chain_results[base];
+                let payload = chain_results[base + 1];
+                emit_store(block, tag, dst_slot, loc);
+                let pay_ptr = emit_byte_offset_ptr(
+                    context,
+                    block,
+                    dst_slot,
+                    ARRAY_ELEM_OFF_VALUE,
+                    types,
+                    loc,
+                );
+                emit_store(block, payload, pay_ptr, loc);
+            }
+            _ => {
+                let result_idx = flat_result_index(&sig.ret_kinds, i);
+                let v = chain_results[result_idx];
+                let store_val = if matches!(info.kind, ValueKind::Function(_)) {
+                    emit_unrealized_cast(block, v, types.ptr, loc)
+                } else {
+                    v
+                };
+                emit_store(block, store_val, dst_slot, loc);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Phase 2.5x-callee-dispatch (ADR 0082): the dispatch chain
+/// builder. Returns the flat MLIR result vector of the outer
+/// `scf.if`. Helper used by both the single-value and multi-assign
+/// callers above.
+#[allow(clippy::too_many_arguments)]
+fn emit_indirect_dispatch_chain_in_block<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_idx: usize,
+    sig: &IndirectSig,
+    candidates: &[FuncId],
+    args: &[HirExpr],
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    loc: Location<'c>,
+) -> Result<Vec<Value<'c, 'a>>, CodegenError> {
+    // ===== Step 1: tag check =====
+    let slot_ptr = slots[slot_idx];
+    let tag = emit_load(block, slot_ptr, types.i64, loc);
+    let tag_function_const = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let tag_mismatch: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Ne,
+            tag,
+            tag_function_const,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let trap_then = Region::new();
+    let trap_then_blk = Block::new(&[]);
+    {
+        let msg_ptr = emit_addressof(context, &trap_then_blk, "s_call_non_function", types, loc);
+        emit_exit_with_message(context, &trap_then_blk, msg_ptr, types, loc);
+        trap_then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    trap_then.append_block(trap_then_blk);
+    let trap_else = Region::new();
+    let trap_else_blk = Block::new(&[]);
+    trap_else_blk.append_operation(scf::r#yield(&[], loc));
+    trap_else.append_block(trap_else_blk);
+    block.append_operation(scf::r#if(tag_mismatch, &[], trap_then, trap_else, loc));
+
+    // ===== Step 2: load fn ptr =====
+    let payload_ptr =
+        emit_byte_offset_ptr(context, block, slot_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
+    let loaded_ptr = emit_load(block, payload_ptr, types.ptr, loc);
+
+    // ===== Step 3: evaluate args once =====
+    let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
+    for a in args {
+        arg_vals.push(emit_expr(
+            context, block, a, slots, locals, functions, types, params_len, loc,
+        )?);
+    }
+
+    // ===== Step 4: dispatch chain =====
+    let result_types = ret_mlir_types(context, &sig.ret_kinds, types);
+    let chain_op_results = emit_dispatch_chain_recursive(
+        context,
+        block,
+        loaded_ptr,
+        candidates,
+        &arg_vals,
+        functions,
+        &result_types,
+        types,
+        loc,
+    );
+    Ok(chain_op_results)
+}
+
+/// Phase 2.5x-callee-dispatch (ADR 0082): recursively build the
+/// nested `scf.if` chain. Each level compares `loaded_ptr` to a
+/// candidate's `func.constant` address; on match performs a direct
+/// `func.call`; on mismatch recurses with the remaining candidates.
+/// The base case (no more candidates) emits an unconditional trap
+/// with dummy yields to satisfy MLIR's region-yield type check.
+#[allow(clippy::too_many_arguments)]
+fn emit_dispatch_chain_recursive<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    loaded_ptr: Value<'c, 'a>,
+    candidates: &[FuncId],
+    arg_vals: &[Value<'c, 'a>],
+    functions: &[HirFunction],
+    result_types: &[Type<'c>],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Vec<Value<'c, 'a>> {
+    if candidates.is_empty() {
+        // Base: trap + dummy yields. The exit_with_message diverges,
+        // so the dummy values are never read at runtime.
+        let msg_ptr = emit_addressof(context, block, "s_call_unknown_fn_ptr", types, loc);
+        emit_exit_with_message(context, block, msg_ptr, types, loc);
+        result_types
+            .iter()
+            .map(|t| emit_dummy_value(context, block, *t, types, loc))
+            .collect()
+    } else {
+        let first = candidates[0];
+        let rest = &candidates[1..];
+        let target = &functions[first.0];
+
+        // Materialise @user_fn_X as a function-typed `func.constant`.
+        let p_types: Vec<Type<'c>> = target
+            .params
+            .iter()
+            .map(|p| match p.kind {
+                ValueKind::Number => types.f64,
+                ValueKind::Bool | ValueKind::Nil => types.i1,
+                ValueKind::Function(arity) => {
+                    let ip: Vec<Type<'c>> = (0..arity).map(|_| types.f64).collect();
+                    FunctionType::new(context, &ip, &[types.f64]).into()
+                }
+                ValueKind::String | ValueKind::Table => types.ptr,
+                ValueKind::TaggedValue => types.i64,
+            })
+            .collect();
+        let fn_ty = FunctionType::new(context, &p_types, result_types);
+        let fn_const_op = func::constant(
+            context,
+            FlatSymbolRefAttribute::new(context, &target.mangled_name),
+            fn_ty,
+            loc,
+        );
+        let fn_const_val: Value<'c, 'a> = block
+            .append_operation(fn_const_op)
+            .result(0)
+            .unwrap()
+            .into();
+        let fn_ptr_val = emit_unrealized_cast(block, fn_const_val, types.ptr, loc);
+
+        // ptr equality
+        let fn_ptr_iv: Value<'c, 'a> = block
+            .append_operation(
+                OperationBuilder::new("llvm.ptrtoint", loc)
+                    .add_operands(&[fn_ptr_val])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.ptrtoint @user_fn_X"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let loaded_iv: Value<'c, 'a> = block
+            .append_operation(
+                OperationBuilder::new("llvm.ptrtoint", loc)
+                    .add_operands(&[loaded_ptr])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.ptrtoint loaded"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let eq_cond: Value<'c, 'a> = block
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                loaded_iv,
+                fn_ptr_iv,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+
+        // Then region: direct `func.call @user_fn_X(args)` and yield results.
+        let then_region = Region::new();
+        let then_blk = Block::new(&[]);
+        {
+            let call_op = func::call(
+                context,
+                FlatSymbolRefAttribute::new(context, &target.mangled_name),
+                arg_vals,
+                result_types,
+                loc,
+            );
+            let call_ref = then_blk.append_operation(call_op);
+            let yields: Vec<Value<'c, '_>> = (0..result_types.len())
+                .map(|i| call_ref.result(i).unwrap().into())
+                .collect();
+            then_blk.append_operation(scf::r#yield(&yields, loc));
+        }
+        then_region.append_block(then_blk);
+
+        // Else region: recurse with `rest` candidates.
+        let else_region = Region::new();
+        let else_blk = Block::new(&[]);
+        {
+            let inner_results = emit_dispatch_chain_recursive(
+                context,
+                &else_blk,
+                unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(loaded_ptr) },
+                rest,
+                unsafe { std::mem::transmute::<&[Value<'c, 'a>], &[Value<'c, '_>]>(arg_vals) },
+                functions,
+                result_types,
+                types,
+                loc,
+            );
+            else_blk.append_operation(scf::r#yield(&inner_results, loc));
+        }
+        else_region.append_block(else_blk);
+
+        let outer_op = block.append_operation(scf::r#if(
+            eq_cond,
+            result_types,
+            then_region,
+            else_region,
+            loc,
+        ));
+        (0..result_types.len())
+            .map(|i| outer_op.result(i).unwrap().into())
+            .collect()
+    }
+}
+
+/// Phase 2.5x-callee-dispatch (ADR 0082): produce a dummy SSA
+/// value of the given MLIR type, used for unreachable scf.if
+/// yield branches (the runtime trap already diverged).
+fn emit_dummy_value<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    ty: Type<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    if ty == types.f64 {
+        block
+            .append_operation(arith::constant(
+                context,
+                FloatAttribute::new(context, types.f64, 0.0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into()
+    } else if ty == types.i1 {
+        block
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i1, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into()
+    } else if ty == types.i64 {
+        block
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into()
+    } else if ty == types.ptr {
+        emit_null_ptr(context, block, types, loc)
+    } else {
+        // Function-typed dummy: not exercised today (compatible-set
+        // never has Function in ret_kinds), but if it does, we'd
+        // need a func.constant. Trap defensively for now.
+        unreachable!(
+            "ADR 0082 dummy for unsupported result type {:?} (please widen if needed)",
+            ty
+        )
     }
 }
 
@@ -5636,6 +6007,14 @@ fn emit_expr<'a, 'c>(
                 let op_ref = block.append_operation(call_op);
                 Ok(op_ref.result(0).unwrap().into())
             }
+            Callee::IndirectDispatch {
+                local_id: LocalId(idx),
+                sig,
+                candidates,
+            } => emit_indirect_dispatch_call(
+                context, block, *idx, sig, candidates, args, slots, locals, functions, types,
+                params_len, loc,
+            ),
         },
         HirExprKind::FunctionRef(FuncId(id)) => {
             // Phase 2.5b.3: a function reference materialises as a
