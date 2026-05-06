@@ -11,6 +11,7 @@
 //! and 0007 for the Phase 1 baseline and Phase 2.0 extensions.
 
 pub(crate) mod callabi;
+pub(crate) mod closure;
 pub mod emit;
 pub mod error;
 pub mod link;
