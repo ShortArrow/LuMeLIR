@@ -422,24 +422,15 @@ Listed in Codex review priority order (post-ADR-0078):
    `local g = t[k]; g()` once a runtime descriptor exists,
    prerequisite for generic-for protocol (LIC-2.8e-iter-
    generic-1).
-4. **Closure-with-upvalues in tables**
+4. **Full closures** (`2.5c-full`). Heap-allocated environments.
+   The general problem of which closure-in-tables (LIC-2.6c-
+   tag-hetero-closure-escape-1) is a subset.
+5. **Closure-with-upvalues in tables**
    (LIC-2.6c-tag-hetero-closure-escape-1). HIR rejects today
    via the existing escape analysis (ADR 0044 + ADR 0071);
-   relaxing requires escape semantics + GC strategy.
-4. **String → Number coercion on arith** (`"5" + 1`). Lua-spec
-   feature, mostly orthogonal to the tagged-value redesign.
-5. **Iteration `pairs(t)` / `ipairs(t)`.** Depends on the
-   widened source set.
-6. **Hash key kinds expansion** (LIC-2.6a-arr-3). Bool /
-   Function / Table keys.
-7. **Full closures** (`2.5c-full`). Independent track; heap-
-   allocated environments.
-8. **Tagged-callee arity inference** — current implementation
-   reconstructs the function type from `args.len()`. A wrong
-   arity miscompiles; LuMeLIR's MLIR-level callees are all
-   `(f64,…) → f64` so the assumption holds for in-tree code,
-   but a hardened design would carry arity in the slot payload
-   or reject mismatched calls at runtime.
+   relaxing requires escape semantics + GC strategy. Best
+   tackled after #4 because it's a special case of the same
+   underlying GC/escape design.
 
 ---
 
