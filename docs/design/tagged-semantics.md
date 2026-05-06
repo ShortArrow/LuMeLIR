@@ -6,7 +6,7 @@
 > consumer / tag semantics. ADRs continue to record *decisions*;
 > this page records *current state*.
 
-**Last updated:** 2026-05-06 (after ADR 0080)
+**Last updated:** 2026-05-06 (after ADR 0081)
 
 ---
 
@@ -247,7 +247,8 @@ the introduction, when still open).
 | LIC-2.7p-arith-coerce-1           | String → Number arithmetic coercion (`"5" + 1`); failure traps via `s_arith_coerce_failed` | 0077      |
 | LIC-2.8e-iter-ipairs-1            | `for i, v in ipairs(t) do … end` parser sugar with first-nil termination | 0078      |
 | LIC-2.6a-arr-3                    | All hash key kinds (Number / String / Bool / Function / Table) via tagged-key 32-byte entry layout | 0058 / 0079 |
-| LIC-2.8e-iter-pairs-1             | `for k, v in pairs(t) do … end` dual-phase walker (array + hash, tombstone-aware, body-mutation safe) | 0080 |
+| LIC-2.8e-iter-pairs-1             | `for k, v in pairs(t) do … end` HIR-desugar via `Builtin::Next` + `@__lumelir_next` (refactored from ADR 0080's opaque codegen walker) | 0080 / 0081 |
+| LIC-2.8e-builtin-multi-return-1   | Builtin callees with multi-position return signatures; `MultiAssignFromCall` extended through `Callee::Builtin(b)` + `Builtin::ret_kinds()` | 0081 |
 
 ### Partial
 
@@ -264,7 +265,7 @@ the introduction, when still open).
 | LIC-2.6b-hash-key-nil-runtime-1             | Dynamic `nil` hash key via TaggedValue local — runtime probe currently fires the generic missing-key trap; Lua spec wants a specific "table index is nil" diagnostic | 0079 |
 | LIC-2.6b-hash-key-nan-runtime-1             | Dynamic `NaN` hash key via TaggedValue local — `cmpf Oeq` excludes NaN (NaN ≠ NaN), so the probe walks past and never finds the bucket. Lua spec wants a hard runtime error at insert time | 0079 |
 
-**Total:** 24 LIC entries — 21 resolved, 0 partial, 3 pending core + 2 pending runtime-diag.
+**Total:** 25 LIC entries — 22 resolved, 0 partial, 3 pending core + 2 pending runtime-diag.
 
 ---
 
@@ -418,47 +419,67 @@ Each TaggedValue position contributes 2 MLIR results
 (`ret_kind_result_width(TaggedValue) = 2`); every other
 supported kind contributes 1.
 
-### Iteration: `pairs` codegen (ADR 0080)
+### Iteration: `pairs` via `next` builtin (ADR 0081)
 
-`for k, v in pairs(t) do BODY end` lowers via a stmt-level
-codegen walker (`emit_for_pairs`) with two phases sharing a single
-`_broken` flag. Phase 1 walks the array part `i = 1..=len`, skipping
-`TAG_NIL` holes. Phase 2 walks the hash part `bi = 0..hash_cap`,
-skipping `TAG_NIL` (empty) and `TAG_DELETED` (tombstone) entries.
+`for k, v in pairs(t) do BODY end` HIR-desugars to a
+`MultiAssignFromCall(Builtin::Next)` inside a `while true` loop:
 
-**Rehash safety**: each iteration reloads `header.hash_buf` and
-ptr-equality compares against the captured initial pointer; on
-mismatch (the body forced a `emit_hash_grow_if_needed` which freed
-the old buffer) the walker sets `_broken = true` so the next
-`before`-region cond terminates the loop. The same ptr-equality
-discipline applies to `header.array_buf` for the array phase.
-Iteration order is therefore unspecified after a body-driven
-rehash, matching Lua spec.
+```text
+do
+  local __t = TABLE
+  local __ctl = nil   -- TaggedValue
+  local _broken_N = false
+  while true do
+    local k, v = next(__t, __ctl)   -- Builtin::Next
+    if IsNil(k) then _broken_N = true
+    else BODY ; __ctl = k end
+  end
+end
+```
 
-The k / v slot updates use `emit_value_slot_store_number` (phase
-1, k = i) and the new `emit_copy_value_slot_16b` helper (phase 1
-v from array slot; phase 2 k and v from the hash entry). The
-helper is a 2× i64 raw load/store of a 16-byte slot — the same
-pattern the rehash-migration block uses inline; consolidating
-both call sites is a future Tidy First.
+`Builtin::Next` is the first builtin to declare a multi-position
+return signature: `ret_kinds() = [TaggedValue, TaggedValue]`. The
+codegen materialises this into a `func.call @__lumelir_next` whose
+4-i64 result follows ADR 0076's flattened TaggedValue ABI: `(k_tag,
+k_payload, v_tag, v_payload)`.
 
-`HirStmtKind::ForPairs` is intentionally an **opaque** HIR shape
-(no desugaring, unlike ipairs). When ADR 0075's superseder lands
-and unblocks `next(t, k)`, this variant becomes a candidate for
-HIR-level desugaring to `for k, v in next, t, nil do … end` and
-`emit_for_pairs` becomes a deletion candidate.
+`@__lumelir_next` is a module-level helper emitted unconditionally
+per module. Body: a stateless linear scan with a `found` flag.
+Phase 1 walks `i = 1..=len` and Phase 2 walks `bi = 0..hash_cap`,
+both gated on a `done` alloca that flips once a result is recorded.
+The flag starts true when `prev_k == nil` (first call); subsequent
+calls flip it from false to true the moment the walker visits the
+slot whose tag/payload match `prev_k`. The next live slot after
+that is the answer.
+
+**Body-driven mutation safety**: because `__lumelir_next` runs as
+a single function call per iteration, each call freshly reads
+`header.hash_buf` and `header.array_buf`. The ADR 0080 ptr-
+equality guards are no longer needed — a rehash that frees the old
+buffer between calls is handled implicitly by the next call's
+header reload. Iteration order is unspecified after such mutation,
+matching Lua spec.
+
+**Cost**: `next(t, k)` is O(N) per call (linear scan of the entire
+table to find the resume point and the next live slot), so a full
+`pairs` loop is O(N²). For typical small Lua tables this is fine;
+a future Tidy First can swap the linear scan for a bucket-resume
+via the existing dispatched probe (ADR 0079) if benchmarks demand.
 
 ---
 
 ## 7. Open Questions / Known Gaps
 
-Listed in Codex review priority order (post-ADR-0080):
+Listed in Codex review priority order (post-ADR-0081):
 
-1. **Future indirect-call re-enablement** (signature side
-   table, ADR 0075 superseder candidate). Prerequisite for
-   generic-for protocol (LIC-2.8e-iter-generic-1) and for
-   refactoring `ForPairs` (ADR 0080) into a `for k,v in next,
-   t, nil` HIR-desugar.
+1. **General indirect-call re-enablement** (Plan B with full
+   Codex review fixes — `FuncId`-less function values via
+   parameter-source detection, signature-id encoding for
+   ADR 0076's multi-position TaggedValue ABIs, tag-check-first
+   safety; ADR 0082 candidate, supersedes ADR 0075 in part).
+   Prerequisite for generic-for protocol (LIC-2.8e-iter-
+   generic-1) with arbitrary callable iterators and for OOP /
+   metatable method dispatch.
 2. **Full closures** (`2.5c-full`). Heap-allocated environments.
    The general problem of which closure-in-tables (LIC-2.6c-
    tag-hetero-closure-escape-1) is a subset.
@@ -511,3 +532,4 @@ Listed in Codex review priority order (post-ADR-0080):
 | 0078 | 2.8e-iter-ipairs             | `for k, v in ipairs(t) do … end` parser sugar (Plan C) — new `Keyword::In`, `StmtKind::ForIpairs`, parser branch + `unwrap_ipairs_call` restrict iter form to `ipairs(table)`; HIR desugars to `Block { LocalInit; While { LocalInit IndexTagged; If IsNil → break; BODY; idx += 1 } }` using existing primitives; codegen unchanged; `pairs` and generic-for protocol remain LIC-tracked pending the ADR 0075 indirect-call reopening |
 | 0079 | 2.6b-hash-keys               | Hash key kinds expansion (Plan E tagged-key) — hash entry widens 24→32 bytes with `{16-byte tagged key, 16-byte tagged value}`; new `TAG_DELETED=6` retires the `HASH_DELETED_KEY=1` ptr sentinel; new helpers `emit_build_search_key_slot`, `emit_hash_key_hash_dispatched`, `emit_hash_key_eq_dispatched` route 5-kind keys (Number / String / Bool / Function / Table) through the same probe; LIC-2.6a-arr-3 resolved (was partial) |
 | 0080 | 2.8e-iter-pairs              | `for k, v in pairs(t) do … end` dual-phase codegen walker — parser + HIR sibling of ForIpairs; codegen `emit_for_pairs` walks array part 1..=len then hash part 0..cap with tombstone (`TAG_DELETED`) skip; per-iteration `header.hash_buf` / `header.array_buf` reload + ptr-equality detect aborts on body-driven rehash (Codex pre-review P1); new helper `emit_copy_value_slot_16b` consolidates the rehash-migration copy pattern; LIC-2.8e-iter-pairs-1 resolved; new pending LIC-2.8e-pairs-tagged-key-write-1 (TaggedValue key IndexAssign HIR-rejected) |
+| 0081 | 2.8e-iter-next               | `next(t, k)` builtin + ForPairs HIR-desugar (Plan Alpha, Codex post-ADR-0080) — `Builtin::Next` is the first multi-return builtin; `Builtin::ret_kinds()` + `MultiAssignFromCall(Callee::Builtin)` open the path. Module-level `@__lumelir_next` (stateless `(t, prev_k) → (k, v)` scan with linear find/resume) replaces ADR 0080's `emit_for_pairs` walker; ForPairs lowers to `Block + LocalInit + While + MultiAssignFromCall + If + Assign`. ~707 LOC of codegen deleted (`emit_for_pairs` and 4 helpers); ~750 LOC added (`__lumelir_next` body + multi-assign-from-builtin + extract-prev-k). 5 new e2e in `tests/phase2_8e_next.rs`, 16 ADR 0080 e2e regress green. LIC-2.8e-iter-pairs-1 resolution mechanism updated; new resolved LIC-2.8e-builtin-multi-return-1. 22/0/4 |

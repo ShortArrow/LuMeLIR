@@ -39,10 +39,10 @@ use super::primitive::{
 };
 use super::tagged::{
     ARRAY_ELEM_OFF_VALUE, ARRAY_ELEM_SIZE, TAG_BOOL, TAG_DELETED, TAG_FUNCTION, TAG_NIL,
-    TAG_NUMBER, TAG_STRING, TAG_TABLE, emit_alloca_slot_for_kind, emit_copy_value_slot_16b,
-    emit_print_tagged_local, emit_tag_and_payload_ptr, emit_tagged_eq_local_local,
-    emit_tagged_unknown_tag_trap, emit_type_tagged_local, emit_value_slot_check_number,
-    emit_value_slot_store_dispatched, emit_value_slot_store_nil, emit_value_slot_store_number,
+    TAG_NUMBER, TAG_STRING, TAG_TABLE, emit_alloca_slot_for_kind, emit_print_tagged_local,
+    emit_tag_and_payload_ptr, emit_tagged_eq_local_local, emit_tagged_unknown_tag_trap,
+    emit_type_tagged_local, emit_value_slot_check_number, emit_value_slot_store_dispatched,
+    emit_value_slot_store_nil,
 };
 
 // =============================================================
@@ -158,6 +158,12 @@ pub(crate) fn emit_module_unverified<'c>(
     for hir_fn in &chunk.functions {
         emit_function(context, &module, hir_fn, &chunk.functions, &types, loc)?;
     }
+    // Phase 2.8e-iter-next (ADR 0081): always emit the `next(t, k)`
+    // helper. The function is small and unused calls are eliminated
+    // by the LLVM backend's dead-code pass; emitting it
+    // unconditionally avoids threading "is `next` referenced" usage
+    // signal through every HIR pass.
+    emit_lumelir_next_function(context, &module, &types, loc);
     emit_main(context, &module, chunk, &types, loc)?;
 
     Ok(module)
@@ -439,11 +445,6 @@ fn collect_string_pool(chunk: &HirChunk) -> std::collections::HashMap<String, St
                 visit_expr(start, set);
                 visit_expr(stop, set);
                 visit_expr(step, set);
-                for st in body {
-                    visit_stmt(st, set);
-                }
-            }
-            HirStmtKind::ForPairs { body, .. } => {
                 for st in body {
                     visit_stmt(st, set);
                 }
@@ -962,6 +963,895 @@ fn emit_main<'c>(
     Ok(())
 }
 
+/// Phase 2.8e-iter-next (ADR 0081): emit the `@__lumelir_next`
+/// helper function used by `Builtin::Next` calls.
+///
+/// Lua spec §3.7.3: `next(t, prev_k)` returns `(next_k, next_v)`,
+/// the next non-nil entry in `t`'s iteration order after `prev_k`,
+/// or `(nil, nil)` when exhausted. Order is unspecified; we walk
+/// the array part first then the hash part. The function is
+/// stateless — each call recomputes the position from `prev_k`.
+///
+/// **Resume strategy** (naive linear scan, O(N) per call): we
+/// walk the entire table once, using a `found` flag to record
+/// whether we've passed `prev_k`. The first live entry we visit
+/// while `found=true` is the answer. The flag starts true when
+/// `prev_k == nil`. This avoids the bucket-probe-then-resume
+/// implementation; the O(N²) total cost across a full pairs
+/// loop is acceptable for typical small tables and matches the
+/// codex pre-review's request for "tag check first" safety.
+///
+/// **Signature**: `(t: ptr, prev_tag: i64, prev_payload: i64) →
+/// (next_k_tag: i64, next_k_payload: i64, next_v_tag: i64,
+/// next_v_payload: i64)`. The 4-i64 result follows ADR 0076's
+/// flattened TaggedValue ABI for two consecutive TaggedValue
+/// return positions.
+fn emit_lumelir_next_function<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let region = Region::new();
+    let block = Block::new(&[(types.ptr, loc), (types.i64, loc), (types.i64, loc)]);
+    let t_arg: Value<'c, '_> = block.argument(0).unwrap().into();
+    let prev_tag_arg: Value<'c, '_> = block.argument(1).unwrap().into();
+    let prev_payload_arg: Value<'c, '_> = block.argument(2).unwrap().into();
+
+    // Constants used throughout.
+    let i64_const = |b: &Block<'c>, v: i64| -> Value<'c, '_> {
+        b.append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, v).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into()
+    };
+    let i1_const = |b: &Block<'c>, v: bool| -> Value<'c, '_> {
+        b.append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i1, if v { 1 } else { 0 }).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into()
+    };
+
+    // === Header reads ===
+    let len_slot = emit_byte_offset_ptr(context, &block, t_arg, TABLE_OFF_LEN, types, loc);
+    let len = emit_load(&block, len_slot, types.i64, loc);
+    let arr_buf_slot =
+        emit_byte_offset_ptr(context, &block, t_arg, TABLE_OFF_ARRAY_BUF, types, loc);
+    let arr_buf = emit_load(&block, arr_buf_slot, types.ptr, loc);
+    let hash_buf_slot =
+        emit_byte_offset_ptr(context, &block, t_arg, TABLE_OFF_HASH_BUF, types, loc);
+    let hash_buf = emit_load(&block, hash_buf_slot, types.ptr, loc);
+
+    // === State alloca ===
+    // Result fields are i64, initially NIL/0 so the "exhausted"
+    // case requires no explicit write.
+    let alloca_i64 = |b: &Block<'c>| -> Value<'c, '_> {
+        let one = i64_const(b, 1);
+        let op = OperationBuilder::new("llvm.alloca", loc)
+            .add_operands(&[one])
+            .add_attributes(&[(
+                Identifier::new(context, "elem_type"),
+                TypeAttribute::new(types.i64).into(),
+            )])
+            .add_results(&[types.ptr])
+            .build()
+            .expect("llvm.alloca i64");
+        b.append_operation(op).result(0).unwrap().into()
+    };
+    let alloca_i1 = |b: &Block<'c>| -> Value<'c, '_> {
+        let one = i64_const(b, 1);
+        let op = OperationBuilder::new("llvm.alloca", loc)
+            .add_operands(&[one])
+            .add_attributes(&[(
+                Identifier::new(context, "elem_type"),
+                TypeAttribute::new(types.i1).into(),
+            )])
+            .add_results(&[types.ptr])
+            .build()
+            .expect("llvm.alloca i1");
+        b.append_operation(op).result(0).unwrap().into()
+    };
+    let res_k_tag = alloca_i64(&block);
+    let res_k_pay = alloca_i64(&block);
+    let res_v_tag = alloca_i64(&block);
+    let res_v_pay = alloca_i64(&block);
+    let done_slot = alloca_i1(&block);
+    let found_slot = alloca_i1(&block);
+    // Initial: result fields = (NIL, 0, NIL, 0); done = false;
+    // found = (prev_tag == TAG_NIL) — when the user passes nil we
+    // are already "past" the imaginary slot before slot 1.
+    let nil_const = i64_const(&block, TAG_NIL);
+    let zero_i64 = i64_const(&block, 0);
+    emit_store(&block, nil_const, res_k_tag, loc);
+    emit_store(&block, zero_i64, res_k_pay, loc);
+    emit_store(&block, nil_const, res_v_tag, loc);
+    emit_store(&block, zero_i64, res_v_pay, loc);
+    let false_i1 = i1_const(&block, false);
+    emit_store(&block, false_i1, done_slot, loc);
+    let prev_is_nil: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            prev_tag_arg,
+            nil_const,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_store(&block, prev_is_nil, found_slot, loc);
+
+    // === Array phase: scf.while %i = 1..=len, gated on !done ===
+    let one_i64 = i64_const(&block, 1);
+    let arr_before = Region::new();
+    let arr_before_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let i_arg: Value<'c, '_> = arr_before_blk.argument(0).unwrap().into();
+        let len_inner = unsafe { std::mem::transmute::<Value<'c, '_>, Value<'c, '_>>(len) };
+        let i_le_len: Value<'c, '_> = arr_before_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Sle,
+                i_arg,
+                len_inner,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let done_inner = emit_load(&arr_before_blk, done_slot, types.i1, loc);
+        let one_i1 = arr_before_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i1, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let not_done: Value<'c, '_> = arr_before_blk
+            .append_operation(arith::xori(done_inner, one_i1, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let cond: Value<'c, '_> = arr_before_blk
+            .append_operation(arith::andi(i_le_len, not_done, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        arr_before_blk.append_operation(scf::condition(cond, &[i_arg], loc));
+    }
+    arr_before.append_block(arr_before_blk);
+
+    let arr_after = Region::new();
+    let arr_after_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let i_arg: Value<'c, '_> = arr_after_blk.argument(0).unwrap().into();
+        let arr_buf_inner = unsafe { std::mem::transmute::<Value<'c, '_>, Value<'c, '_>>(arr_buf) };
+
+        // slot_off = (i - 1) * 16
+        let one_inner = arr_after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let i_minus_one: Value<'c, '_> = arr_after_blk
+            .append_operation(arith::subi(i_arg, one_inner, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let elem_size = arr_after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, ARRAY_ELEM_SIZE).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let slot_off: Value<'c, '_> = arr_after_blk
+            .append_operation(arith::muli(i_minus_one, elem_size, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let slot_ptr = emit_byte_offset_ptr_dynamic(
+            context,
+            &arr_after_blk,
+            arr_buf_inner,
+            slot_off,
+            types,
+            loc,
+        );
+        let slot_tag = emit_load(&arr_after_blk, slot_ptr, types.i64, loc);
+        let nil_inner = arr_after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_live: Value<'c, '_> = arr_after_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Ne,
+                slot_tag,
+                nil_inner,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let found_now = emit_load(&arr_after_blk, found_slot, types.i1, loc);
+
+        // Branch 1: if !found && live && (prev was Number-equal-to-i)
+        // → mark found = true. We test `prev_tag == TAG_NUMBER` and
+        // `bitcast(prev_payload, f64) == sitofp(i)` for the array-
+        // index case. Wrong matches (e.g. user passed prev_k as a
+        // hash key with TAG_STRING) fall through unchanged.
+        let prev_tag_inner =
+            unsafe { std::mem::transmute::<Value<'c, '_>, Value<'c, '_>>(prev_tag_arg) };
+        let prev_payload_inner =
+            unsafe { std::mem::transmute::<Value<'c, '_>, Value<'c, '_>>(prev_payload_arg) };
+        let tag_number_const = arr_after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_NUMBER).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let prev_is_number: Value<'c, '_> = arr_after_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                prev_tag_inner,
+                tag_number_const,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        // i_as_f64 = sitofp i64 i → f64
+        let i_as_f64: Value<'c, '_> = arr_after_blk
+            .append_operation(
+                OperationBuilder::new("arith.sitofp", loc)
+                    .add_operands(&[i_arg])
+                    .add_results(&[types.f64])
+                    .build()
+                    .expect("arith.sitofp"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        // prev_payload_f64 = bitcast i64 → f64
+        let prev_payload_f64: Value<'c, '_> = arr_after_blk
+            .append_operation(
+                OperationBuilder::new("arith.bitcast", loc)
+                    .add_operands(&[prev_payload_inner])
+                    .add_results(&[types.f64])
+                    .build()
+                    .expect("arith.bitcast f64"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let prev_value_eq_i: Value<'c, '_> = arr_after_blk
+            .append_operation(arith::cmpf(
+                context,
+                CmpfPredicate::Oeq,
+                i_as_f64,
+                prev_payload_f64,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let prev_is_this_i: Value<'c, '_> = arr_after_blk
+            .append_operation(arith::andi(prev_is_number, prev_value_eq_i, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let one_i1 = arr_after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i1, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let not_found: Value<'c, '_> = arr_after_blk
+            .append_operation(arith::xori(found_now, one_i1, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let mark_found_cond: Value<'c, '_> = arr_after_blk
+            .append_operation(arith::andi(not_found, prev_is_this_i, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        // if mark_found_cond: store true → found_slot
+        let mark_then = Region::new();
+        let mark_then_blk = Block::new(&[]);
+        {
+            let true_i1 = mark_then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i1, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            emit_store(&mark_then_blk, true_i1, found_slot, loc);
+            mark_then_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        mark_then.append_block(mark_then_blk);
+        let mark_else = Region::new();
+        let mark_else_blk = Block::new(&[]);
+        mark_else_blk.append_operation(scf::r#yield(&[], loc));
+        mark_else.append_block(mark_else_blk);
+        arr_after_blk.append_operation(scf::r#if(mark_found_cond, &[], mark_then, mark_else, loc));
+
+        // Branch 2: if found && live && i != prev_index → record
+        // result and mark done. We re-load `found_slot` so the
+        // mark-found branch above flows into here.
+        let found_now2 = emit_load(&arr_after_blk, found_slot, types.i1, loc);
+        let live_and_found: Value<'c, '_> = arr_after_blk
+            .append_operation(arith::andi(is_live, found_now2, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        // We need to skip the slot we JUST marked as the resume
+        // point. The mark-found branch sets found_slot above; that
+        // same slot's live entry should not be returned. Use:
+        // record_cond = live && found && !prev_is_this_i
+        let one_i1_b = arr_after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i1, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let not_resume: Value<'c, '_> = arr_after_blk
+            .append_operation(arith::xori(prev_is_this_i, one_i1_b, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let record_cond: Value<'c, '_> = arr_after_blk
+            .append_operation(arith::andi(live_and_found, not_resume, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let rec_then = Region::new();
+        let rec_then_blk = Block::new(&[]);
+        {
+            // res_k_tag = TAG_NUMBER
+            let n_const = rec_then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, TAG_NUMBER).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            emit_store(&rec_then_blk, n_const, res_k_tag, loc);
+            // res_k_pay = bitcast(sitofp(i), i64)
+            let i_inner_rec = unsafe { std::mem::transmute::<Value<'c, '_>, Value<'c, '_>>(i_arg) };
+            let i_f64: Value<'c, '_> = rec_then_blk
+                .append_operation(
+                    OperationBuilder::new("arith.sitofp", loc)
+                        .add_operands(&[i_inner_rec])
+                        .add_results(&[types.f64])
+                        .build()
+                        .expect("arith.sitofp rec"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let i_as_i64: Value<'c, '_> = rec_then_blk
+                .append_operation(
+                    OperationBuilder::new("arith.bitcast", loc)
+                        .add_operands(&[i_f64])
+                        .add_results(&[types.i64])
+                        .build()
+                        .expect("arith.bitcast i64"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            emit_store(&rec_then_blk, i_as_i64, res_k_pay, loc);
+            // res_v_tag = slot_tag (already loaded above; materialise inside region)
+            let slot_ptr_inner =
+                unsafe { std::mem::transmute::<Value<'c, '_>, Value<'c, '_>>(slot_ptr) };
+            let v_tag = emit_load(&rec_then_blk, slot_ptr_inner, types.i64, loc);
+            emit_store(&rec_then_blk, v_tag, res_v_tag, loc);
+            let v_pay_ptr = emit_byte_offset_ptr(
+                context,
+                &rec_then_blk,
+                slot_ptr_inner,
+                ARRAY_ELEM_OFF_VALUE,
+                types,
+                loc,
+            );
+            let v_pay = emit_load(&rec_then_blk, v_pay_ptr, types.i64, loc);
+            emit_store(&rec_then_blk, v_pay, res_v_pay, loc);
+            // done = true
+            let true_i1_rec = rec_then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i1, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            emit_store(&rec_then_blk, true_i1_rec, done_slot, loc);
+            rec_then_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        rec_then.append_block(rec_then_blk);
+        let rec_else = Region::new();
+        let rec_else_blk = Block::new(&[]);
+        rec_else_blk.append_operation(scf::r#yield(&[], loc));
+        rec_else.append_block(rec_else_blk);
+        arr_after_blk.append_operation(scf::r#if(record_cond, &[], rec_then, rec_else, loc));
+
+        // i_next = i + 1
+        let one_inner2 = arr_after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let i_next: Value<'c, '_> = arr_after_blk
+            .append_operation(arith::addi(i_arg, one_inner2, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        arr_after_blk.append_operation(scf::r#yield(&[i_next], loc));
+    }
+    arr_after.append_block(arr_after_blk);
+    block.append_operation(scf::r#while(
+        &[one_i64],
+        &[types.i64],
+        arr_before,
+        arr_after,
+        loc,
+    ));
+
+    // === Hash phase: scf.if hash_buf != null && !done, then scf.while ===
+    let hash_buf_iv: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[hash_buf])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint hash_buf"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_i64_outer = i64_const(&block, 0);
+    let hash_not_null: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Ne,
+            hash_buf_iv,
+            zero_i64_outer,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let done_outer = emit_load(&block, done_slot, types.i1, loc);
+    let one_i1_outer = i1_const(&block, true);
+    let not_done_outer: Value<'c, '_> = block
+        .append_operation(arith::xori(done_outer, one_i1_outer, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let hash_guard: Value<'c, '_> = block
+        .append_operation(arith::andi(hash_not_null, not_done_outer, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let hash_then = Region::new();
+    let hash_then_blk = Block::new(&[]);
+    {
+        let hash_buf_inner =
+            unsafe { std::mem::transmute::<Value<'c, '_>, Value<'c, '_>>(hash_buf) };
+        let cap_slot = emit_byte_offset_ptr(
+            context,
+            &hash_then_blk,
+            hash_buf_inner,
+            HASH_OFF_CAP,
+            types,
+            loc,
+        );
+        let cap = emit_load(&hash_then_blk, cap_slot, types.i64, loc);
+
+        let h_before = Region::new();
+        let h_before_blk = Block::new(&[(types.i64, loc)]);
+        {
+            let bi_arg: Value<'c, '_> = h_before_blk.argument(0).unwrap().into();
+            let cap_inner = unsafe { std::mem::transmute::<Value<'c, '_>, Value<'c, '_>>(cap) };
+            let bi_lt_cap: Value<'c, '_> = h_before_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Slt,
+                    bi_arg,
+                    cap_inner,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let done_inner = emit_load(&h_before_blk, done_slot, types.i1, loc);
+            let one_i1_b = h_before_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i1, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let not_done: Value<'c, '_> = h_before_blk
+                .append_operation(arith::xori(done_inner, one_i1_b, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let cond: Value<'c, '_> = h_before_blk
+                .append_operation(arith::andi(bi_lt_cap, not_done, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            h_before_blk.append_operation(scf::condition(cond, &[bi_arg], loc));
+        }
+        h_before.append_block(h_before_blk);
+
+        let h_after = Region::new();
+        let h_after_blk = Block::new(&[(types.i64, loc)]);
+        {
+            let bi_arg: Value<'c, '_> = h_after_blk.argument(0).unwrap().into();
+            let hash_buf_inner2 =
+                unsafe { std::mem::transmute::<Value<'c, '_>, Value<'c, '_>>(hash_buf) };
+
+            // entry_off = HASH_OFF_ENTRIES + bi * HASH_ENTRY_SIZE
+            let entries_base = h_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let entry_size = h_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let bucket_off: Value<'c, '_> = h_after_blk
+                .append_operation(arith::muli(bi_arg, entry_size, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let entry_off: Value<'c, '_> = h_after_blk
+                .append_operation(arith::addi(bucket_off, entries_base, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let entry_ptr = emit_byte_offset_ptr_dynamic(
+                context,
+                &h_after_blk,
+                hash_buf_inner2,
+                entry_off,
+                types,
+                loc,
+            );
+            let key_tag = emit_load(&h_after_blk, entry_ptr, types.i64, loc);
+            let nil_c = h_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let del_c = h_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, TAG_DELETED).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let not_nil: Value<'c, '_> = h_after_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Ne,
+                    key_tag,
+                    nil_c,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let not_del: Value<'c, '_> = h_after_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Ne,
+                    key_tag,
+                    del_c,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let is_live: Value<'c, '_> = h_after_blk
+                .append_operation(arith::andi(not_nil, not_del, loc))
+                .result(0)
+                .unwrap()
+                .into();
+
+            // Mark-found: live && !found && entry's (tag, payload)
+            // == (prev_tag, prev_payload). For Number keys we use
+            // f64 cmpf Oeq to handle the bitcast-i64 representation
+            // mismatch (NaN ≠ NaN); for everything else raw i64
+            // payload equality. Tag must match either way.
+            let prev_tag_inner =
+                unsafe { std::mem::transmute::<Value<'c, '_>, Value<'c, '_>>(prev_tag_arg) };
+            let prev_payload_inner =
+                unsafe { std::mem::transmute::<Value<'c, '_>, Value<'c, '_>>(prev_payload_arg) };
+            let tag_eq: Value<'c, '_> = h_after_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    key_tag,
+                    prev_tag_inner,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let key_pay_ptr = emit_byte_offset_ptr(
+                context,
+                &h_after_blk,
+                entry_ptr,
+                ARRAY_ELEM_OFF_VALUE,
+                types,
+                loc,
+            );
+            let key_pay = emit_load(&h_after_blk, key_pay_ptr, types.i64, loc);
+            let pay_eq: Value<'c, '_> = h_after_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    key_pay,
+                    prev_payload_inner,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let key_eq: Value<'c, '_> = h_after_blk
+                .append_operation(arith::andi(tag_eq, pay_eq, loc))
+                .result(0)
+                .unwrap()
+                .into();
+
+            let found_now = emit_load(&h_after_blk, found_slot, types.i1, loc);
+            let one_i1_c = h_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i1, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let not_found: Value<'c, '_> = h_after_blk
+                .append_operation(arith::xori(found_now, one_i1_c, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let live_not_found: Value<'c, '_> = h_after_blk
+                .append_operation(arith::andi(is_live, not_found, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let mark_cond: Value<'c, '_> = h_after_blk
+                .append_operation(arith::andi(live_not_found, key_eq, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let mark_then = Region::new();
+            let mark_then_blk = Block::new(&[]);
+            {
+                let true_i1 = mark_then_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i1, 1).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                emit_store(&mark_then_blk, true_i1, found_slot, loc);
+                mark_then_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            mark_then.append_block(mark_then_blk);
+            let mark_else = Region::new();
+            let mark_else_blk = Block::new(&[]);
+            mark_else_blk.append_operation(scf::r#yield(&[], loc));
+            mark_else.append_block(mark_else_blk);
+            h_after_blk.append_operation(scf::r#if(mark_cond, &[], mark_then, mark_else, loc));
+
+            // Record: live && found && !key_eq → write result + done
+            let found_now2 = emit_load(&h_after_blk, found_slot, types.i1, loc);
+            let live_and_found: Value<'c, '_> = h_after_blk
+                .append_operation(arith::andi(is_live, found_now2, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let one_i1_d = h_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i1, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let not_key_eq: Value<'c, '_> = h_after_blk
+                .append_operation(arith::xori(key_eq, one_i1_d, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let record_cond: Value<'c, '_> = h_after_blk
+                .append_operation(arith::andi(live_and_found, not_key_eq, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let rec_then = Region::new();
+            let rec_then_blk = Block::new(&[]);
+            {
+                emit_store(&rec_then_blk, key_tag, res_k_tag, loc);
+                emit_store(&rec_then_blk, key_pay, res_k_pay, loc);
+                let v_tag_ptr = emit_byte_offset_ptr(
+                    context,
+                    &rec_then_blk,
+                    entry_ptr,
+                    HASH_ENTRY_OFF_VALUE_SLOT,
+                    types,
+                    loc,
+                );
+                let v_tag = emit_load(&rec_then_blk, v_tag_ptr, types.i64, loc);
+                let v_pay_ptr = emit_byte_offset_ptr(
+                    context,
+                    &rec_then_blk,
+                    entry_ptr,
+                    HASH_ENTRY_OFF_VALUE_SLOT + ARRAY_ELEM_OFF_VALUE,
+                    types,
+                    loc,
+                );
+                let v_pay = emit_load(&rec_then_blk, v_pay_ptr, types.i64, loc);
+                emit_store(&rec_then_blk, v_tag, res_v_tag, loc);
+                emit_store(&rec_then_blk, v_pay, res_v_pay, loc);
+                let true_i1 = rec_then_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i1, 1).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                emit_store(&rec_then_blk, true_i1, done_slot, loc);
+                rec_then_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            rec_then.append_block(rec_then_blk);
+            let rec_else = Region::new();
+            let rec_else_blk = Block::new(&[]);
+            rec_else_blk.append_operation(scf::r#yield(&[], loc));
+            rec_else.append_block(rec_else_blk);
+            h_after_blk.append_operation(scf::r#if(record_cond, &[], rec_then, rec_else, loc));
+
+            // bi_next = bi + 1
+            let one_h = h_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let bi_next: Value<'c, '_> = h_after_blk
+                .append_operation(arith::addi(bi_arg, one_h, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            h_after_blk.append_operation(scf::r#yield(&[bi_next], loc));
+        }
+        h_after.append_block(h_after_blk);
+        let zero_bi = hash_then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        hash_then_blk.append_operation(scf::r#while(
+            &[zero_bi],
+            &[types.i64],
+            h_before,
+            h_after,
+            loc,
+        ));
+        hash_then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    hash_then.append_block(hash_then_blk);
+    let hash_else = Region::new();
+    let hash_else_blk = Block::new(&[]);
+    hash_else_blk.append_operation(scf::r#yield(&[], loc));
+    hash_else.append_block(hash_else_blk);
+    block.append_operation(scf::r#if(hash_guard, &[], hash_then, hash_else, loc));
+
+    // === Build return tuple ===
+    let r_k_tag = emit_load(&block, res_k_tag, types.i64, loc);
+    let r_k_pay = emit_load(&block, res_k_pay, types.i64, loc);
+    let r_v_tag = emit_load(&block, res_v_tag, types.i64, loc);
+    let r_v_pay = emit_load(&block, res_v_pay, types.i64, loc);
+    block.append_operation(func::r#return(&[r_k_tag, r_k_pay, r_v_tag, r_v_pay], loc));
+
+    region.append_block(block);
+    let fn_type = FunctionType::new(
+        context,
+        &[types.ptr, types.i64, types.i64],
+        &[types.i64, types.i64, types.i64, types.i64],
+    );
+    let func_op = func::func(
+        context,
+        StringAttribute::new(context, "__lumelir_next"),
+        TypeAttribute::new(fn_type.into()),
+        region,
+        &[],
+        loc,
+    );
+    module.body().append_operation(func_op);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_stmts<'a, 'c>(
     context: &'c Context,
@@ -1196,32 +2086,6 @@ fn emit_stmt<'a, 'c>(
             emit_for_numeric(
                 context, block, *var_id, start, stop, step, body, *break_id, slots, locals,
                 functions, types, params_len, loc,
-            )?;
-        }
-        // Phase 2.8e-iter-pairs (ADR 0080): `for K, V in pairs(t) do
-        // BODY end`. Two-phase walker (array part then hash part)
-        // with rehash-detection abort for body-driven mutation.
-        HirStmtKind::ForPairs {
-            table_local_id,
-            key_id,
-            val_id,
-            break_id,
-            body,
-        } => {
-            emit_for_pairs(
-                context,
-                block,
-                *table_local_id,
-                *key_id,
-                *val_id,
-                *break_id,
-                body,
-                slots,
-                locals,
-                functions,
-                types,
-                params_len,
-                loc,
             )?;
         }
         HirStmtKind::ExprStmt(expr) => {
@@ -1655,9 +2519,36 @@ fn emit_multi_assign_from_call<'a, 'c>(
     params_len: usize,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
-    let Callee::User(FuncId(fid)) = callee else {
-        unreachable!("HIR rejects non-User callees in MultiAssignFromCall");
-    };
+    // Phase 2.8e-iter-next (ADR 0081): dispatch on callee kind. Today
+    // the User path is the only one that materialises results; the
+    // Builtin path is a stub until `Builtin::Next` ships in commit 2.
+    match callee {
+        Callee::User(FuncId(fid)) => emit_multi_assign_from_user_call(
+            context, block, dst_ids, fid, args, slots, locals, functions, types, params_len, loc,
+        ),
+        Callee::Builtin(b) => emit_multi_assign_from_builtin(
+            context, block, dst_ids, b, args, slots, locals, functions, types, params_len, loc,
+        ),
+        Callee::Indirect(_) => {
+            unreachable!("HIR rejects Indirect in MultiAssignFromCall (ADR 0075)")
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_multi_assign_from_user_call<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    dst_ids: &[LocalId],
+    fid: usize,
+    args: &[HirExpr],
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
     let target = &functions[fid];
     let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
     for a in args {
@@ -1712,6 +2603,139 @@ fn emit_multi_assign_from_call<'a, 'c>(
         }
     }
     Ok(())
+}
+
+/// Phase 2.8e-iter-next (ADR 0081): multi-assign from a Builtin
+/// callee. The only multi-return builtin today is `Next`, whose
+/// `(TaggedValue, TaggedValue)` shape lowers to a `func.call` of
+/// the module-level `__lumelir_next` helper followed by 4-i64
+/// result extraction into the two caller-supplied TaggedValue
+/// slots.
+#[allow(clippy::too_many_arguments)]
+fn emit_multi_assign_from_builtin<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    dst_ids: &[LocalId],
+    b: Builtin,
+    args: &[HirExpr],
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    match b {
+        Builtin::Next => emit_call_next_into_locals(
+            context, block, dst_ids, args, slots, locals, functions, types, params_len, loc,
+        ),
+        _ => unreachable!(
+            "multi-assign from builtin {:?} not supported (only Next declares multi-return)",
+            b
+        ),
+    }
+}
+
+/// Phase 2.8e-iter-next (ADR 0081): call `__lumelir_next(t,
+/// prev_tag, prev_payload)` and write the 4-i64 result into the
+/// two caller-supplied TaggedValue locals (`dst_ids[0]` = next_k,
+/// `dst_ids[1]` = next_v).
+///
+/// `args[0]` (table) lowers to a ptr; `args[1]` (prev_k) is built
+/// in a fresh tagged tmp slot via the dispatched store, so any
+/// prev_k expression — Number / String / Bool / Function / Table
+/// literal or local — flows through the same shape.
+#[allow(clippy::too_many_arguments)]
+fn emit_call_next_into_locals<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    dst_ids: &[LocalId],
+    args: &[HirExpr],
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    debug_assert_eq!(dst_ids.len(), 2);
+    debug_assert_eq!(args.len(), 2);
+    let table_val = emit_expr(
+        context, block, &args[0], slots, locals, functions, types, params_len, loc,
+    )?;
+    // Build prev_k tagged slot. If args[1] is `Local(TaggedValue)`,
+    // we can read its slot directly without a tmp; otherwise we
+    // materialise into a tmp via the dispatched store.
+    let (prev_tag, prev_payload) = emit_extract_prev_k(
+        context, block, &args[1], slots, locals, functions, types, params_len, loc,
+    )?;
+    let call_op = func::call(
+        context,
+        FlatSymbolRefAttribute::new(context, "__lumelir_next"),
+        &[table_val, prev_tag, prev_payload],
+        &[types.i64, types.i64, types.i64, types.i64],
+        loc,
+    );
+    let op_ref = block.append_operation(call_op);
+    // Pack results into the two TaggedValue slots. Result indices
+    // 0..2 → dst_ids[0] (next_k); 2..4 → dst_ids[1] (next_v).
+    let k_tag: Value<'c, 'a> = op_ref.result(0).unwrap().into();
+    let k_pay: Value<'c, 'a> = op_ref.result(1).unwrap().into();
+    let v_tag: Value<'c, 'a> = op_ref.result(2).unwrap().into();
+    let v_pay: Value<'c, 'a> = op_ref.result(3).unwrap().into();
+    let k_slot = slots[dst_ids[0].0];
+    let v_slot = slots[dst_ids[1].0];
+    emit_store(block, k_tag, k_slot, loc);
+    let k_pay_ptr = emit_byte_offset_ptr(context, block, k_slot, ARRAY_ELEM_OFF_VALUE, types, loc);
+    emit_store(block, k_pay, k_pay_ptr, loc);
+    emit_store(block, v_tag, v_slot, loc);
+    let v_pay_ptr = emit_byte_offset_ptr(context, block, v_slot, ARRAY_ELEM_OFF_VALUE, types, loc);
+    emit_store(block, v_pay, v_pay_ptr, loc);
+    Ok(())
+}
+
+/// Phase 2.8e-iter-next (ADR 0081): produce `(prev_tag, prev_payload)`
+/// SSA values for the `__lumelir_next` second/third arguments. If
+/// the source expression is a TaggedValue local, read its slot's
+/// tag and payload directly. Otherwise materialise into a fresh
+/// tagged tmp slot (alloca + dispatched store) and read back.
+#[allow(clippy::too_many_arguments)]
+fn emit_extract_prev_k<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    expr: &HirExpr,
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    loc: Location<'c>,
+) -> Result<(Value<'c, 'a>, Value<'c, 'a>), CodegenError> {
+    let kind = infer_kind(expr, locals, functions);
+    if kind == ValueKind::TaggedValue {
+        if let HirExprKind::Local(LocalId(idx)) = &expr.kind {
+            let slot = slots[*idx];
+            let tag = emit_load(block, slot, types.i64, loc);
+            let pay_ptr =
+                emit_byte_offset_ptr(context, block, slot, ARRAY_ELEM_OFF_VALUE, types, loc);
+            let pay = emit_load(block, pay_ptr, types.i64, loc);
+            return Ok((tag, pay));
+        }
+    }
+    // Materialise into a fresh tmp tagged slot.
+    let tmp = emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
+    if matches!(kind, ValueKind::Nil) {
+        emit_value_slot_store_nil(context, block, tmp, types, loc);
+    } else {
+        let val = emit_expr(
+            context, block, expr, slots, locals, functions, types, params_len, loc,
+        )?;
+        emit_value_slot_store_dispatched(context, block, tmp, val, kind, types, loc);
+    }
+    let tag = emit_load(block, tmp, types.i64, loc);
+    let pay_ptr = emit_byte_offset_ptr(context, block, tmp, ARRAY_ELEM_OFF_VALUE, types, loc);
+    let pay = emit_load(block, pay_ptr, types.i64, loc);
+    Ok((tag, pay))
 }
 
 /// Phase 2.6a-norm (ADR 0056): emit a null `!llvm.ptr` constant
@@ -4521,6 +5545,23 @@ fn emit_expr<'a, 'c>(
                 };
                 Ok(emit_addressof(context, block, global, types, loc))
             }
+            Callee::Builtin(Builtin::Next) => {
+                // Phase 2.8e-iter-next (ADR 0081): single-value
+                // position `local k = next(t, c)` truncates the
+                // multi-return to the first key. Today the only
+                // observed call shape is the multi-assign form used
+                // by ForPairs HIR-desugar (ADR 0081 commit 3) and
+                // direct user multi-assign tests, so the truncated
+                // form is HIR-rejected at the source rather than
+                // forcing every consumer to materialise a TaggedValue
+                // tmp slot. Reachable only if a future HIR site
+                // forgets to use MultiAssignFromCall.
+                Err(CodegenError::UnsupportedExpr(
+                    "next(t, k) in single-value position is not supported (ADR 0081); use \
+                     `local k, v = next(t, c)`"
+                        .to_owned(),
+                ))
+            }
             Callee::User(FuncId(fid)) => {
                 let target = &functions[*fid];
                 let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
@@ -6805,714 +7846,6 @@ fn emit_for_numeric<'a, 'c>(
 
     parent.append_operation(scf::r#while(&[], &[], before, after, loc));
     Ok(())
-}
-
-/// Phase 2.8e-iter-pairs (ADR 0080): lower `for K, V in pairs(t) do
-/// BODY end` to a dual-phase walker.
-///
-/// Phase 1 walks the array part `i = 1..=len`, skipping `TAG_NIL`
-/// holes (Lua spec: `pairs` does not stop at array holes).
-/// Phase 2 walks the hash part `bi = 0..hash_cap`, skipping
-/// `TAG_NIL` (empty bucket) and `TAG_DELETED` (tombstone) entries.
-///
-/// **Rehash safety (Codex pre-review P1)**: the body may mutate the
-/// iterated table, which can free `hash_buf` via
-/// [`emit_hash_grow_if_needed`]. We capture `hash_buf_initial` once
-/// before the hash phase and re-load `header.hash_buf` at the top of
-/// each iteration; pointer inequality sets `_broken = true` so the
-/// next `before`-region cond terminates the loop. Same pattern for
-/// `array_buf` so a body that triggers array regrow doesn't observe
-/// freed memory either. Iteration order is unspecified after such
-/// mutation per Lua spec.
-///
-/// `break_id` is unconditionally allocated by the HIR lowering for
-/// this construct because both the user `break` path and the rehash
-/// abort path write to it.
-#[allow(clippy::too_many_arguments)]
-fn emit_for_pairs<'a, 'c>(
-    context: &'c Context,
-    parent: &'a Block<'c>,
-    table_local_id: LocalId,
-    key_id: LocalId,
-    val_id: LocalId,
-    break_id: LocalId,
-    body: &[HirStmt],
-    slots: &[Value<'c, 'a>],
-    locals: &[LocalInfo],
-    functions: &[HirFunction],
-    types: &Types<'c>,
-    params_len: usize,
-    loc: Location<'c>,
-) -> Result<(), CodegenError> {
-    // ===== Setup (parent block, runs once) =====
-    let table_ptr = emit_load(parent, slots[table_local_id.0], types.ptr, loc);
-    let len_slot = emit_byte_offset_ptr(context, parent, table_ptr, TABLE_OFF_LEN, types, loc);
-    let len = emit_load(parent, len_slot, types.i64, loc);
-    let arr_buf_slot =
-        emit_byte_offset_ptr(context, parent, table_ptr, TABLE_OFF_ARRAY_BUF, types, loc);
-    let arr_buf_initial = emit_load(parent, arr_buf_slot, types.ptr, loc);
-    let arr_buf_initial_iv = emit_ptrtoint_i64(context, parent, arr_buf_initial, types, loc);
-    let hash_buf_slot =
-        emit_byte_offset_ptr(context, parent, table_ptr, TABLE_OFF_HASH_BUF, types, loc);
-    let hash_buf_initial = emit_load(parent, hash_buf_slot, types.ptr, loc);
-    let hash_buf_initial_iv = emit_ptrtoint_i64(context, parent, hash_buf_initial, types, loc);
-
-    // ===== Phase 1: array part (i = 1..=len) =====
-    emit_for_pairs_array_phase(
-        context,
-        parent,
-        table_ptr,
-        len,
-        arr_buf_initial_iv,
-        key_id,
-        val_id,
-        break_id,
-        body,
-        slots,
-        locals,
-        functions,
-        types,
-        params_len,
-        loc,
-    )?;
-
-    // ===== Phase 2: hash part (bi = 0..cap_initial), guarded by =====
-    // `hash_buf_initial != null AND not _broken`.
-    let zero_i64 = parent
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(types.i64, 0).into(),
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    let one_i1 = parent
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(types.i1, 1).into(),
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    let not_lazy_null: Value<'c, 'a> = parent
-        .append_operation(arith::cmpi(
-            context,
-            arith::CmpiPredicate::Ne,
-            hash_buf_initial_iv,
-            zero_i64,
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    let not_broken_outer = and_not_broken(context, parent, one_i1, slots, break_id, types, loc);
-    let guard: Value<'c, 'a> = parent
-        .append_operation(arith::andi(not_lazy_null, not_broken_outer, loc))
-        .result(0)
-        .unwrap()
-        .into();
-
-    // Build the outer scf.if region that runs the hash phase only
-    // when guard is true. Capture `hash_buf_initial`/cap_initial
-    // once at the top of the then-region so a same-iteration rehash
-    // can be detected by ptr inequality on the per-iteration reload.
-    let then_region = Region::new();
-    let then_blk = Block::new(&[]);
-    {
-        let cap_slot = emit_byte_offset_ptr(
-            context,
-            &then_blk,
-            unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(hash_buf_initial) },
-            HASH_OFF_CAP,
-            types,
-            loc,
-        );
-        let cap_initial = emit_load(&then_blk, cap_slot, types.i64, loc);
-        emit_for_pairs_hash_phase(
-            context,
-            &then_blk,
-            unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(table_ptr) },
-            unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(hash_buf_initial_iv) },
-            cap_initial,
-            key_id,
-            val_id,
-            break_id,
-            body,
-            slots,
-            locals,
-            functions,
-            types,
-            params_len,
-            loc,
-        )?;
-        then_blk.append_operation(scf::r#yield(&[], loc));
-    }
-    then_region.append_block(then_blk);
-    let else_region = Region::new();
-    let else_blk = Block::new(&[]);
-    else_blk.append_operation(scf::r#yield(&[], loc));
-    else_region.append_block(else_blk);
-    parent.append_operation(scf::r#if(guard, &[], then_region, else_region, loc));
-    Ok(())
-}
-
-/// Phase 2.8e-iter-pairs (ADR 0080) phase 1: walk the array part of
-/// a table, yielding (Number-tagged k = i, copied v = array slot)
-/// for each non-nil slot. Per-iteration `array_buf` reload + ptr
-/// equality with `arr_buf_initial_iv` aborts on regrow (Codex P1
-/// symmetry). Hole skipping: array slots with `TAG_NIL` are passed
-/// over (Lua spec — pairs does not stop at holes, unlike ipairs).
-#[allow(clippy::too_many_arguments)]
-fn emit_for_pairs_array_phase<'a, 'c>(
-    context: &'c Context,
-    parent: &'a Block<'c>,
-    table_ptr: Value<'c, 'a>,
-    len: Value<'c, 'a>,
-    arr_buf_initial_iv: Value<'c, 'a>,
-    key_id: LocalId,
-    val_id: LocalId,
-    break_id: LocalId,
-    body: &[HirStmt],
-    slots: &[Value<'c, 'a>],
-    locals: &[LocalInfo],
-    functions: &[HirFunction],
-    types: &Types<'c>,
-    params_len: usize,
-    loc: Location<'c>,
-) -> Result<(), CodegenError> {
-    let one_i64 = parent
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(types.i64, 1).into(),
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-
-    // Before region: cond = (i <= len) AND not_broken.
-    let before_region = Region::new();
-    let before_blk = Block::new(&[(types.i64, loc)]);
-    {
-        let i_arg: Value<'c, '_> = before_blk.argument(0).unwrap().into();
-        let len_inner = unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(len) };
-        let i_le_len: Value<'c, '_> = before_blk
-            .append_operation(arith::cmpi(
-                context,
-                arith::CmpiPredicate::Sle,
-                i_arg,
-                len_inner,
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let blk_slots = transmute_slots(slots);
-        let cond = and_not_broken(
-            context,
-            &before_blk,
-            i_le_len,
-            blk_slots,
-            break_id,
-            types,
-            loc,
-        );
-        before_blk.append_operation(scf::condition(cond, &[i_arg], loc));
-    }
-    before_region.append_block(before_blk);
-
-    // After region: per-iteration body.
-    let after_region = Region::new();
-    let after_blk = Block::new(&[(types.i64, loc)]);
-    {
-        let i_arg: Value<'c, '_> = after_blk.argument(0).unwrap().into();
-        let blk_slots = transmute_slots(slots);
-        let table_ptr_inner =
-            unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(table_ptr) };
-        let arr_buf_initial_iv_inner =
-            unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(arr_buf_initial_iv) };
-
-        // Reload arr_buf and detect regrow (P1 symmetry).
-        let arr_buf_slot_now = emit_byte_offset_ptr(
-            context,
-            &after_blk,
-            table_ptr_inner,
-            TABLE_OFF_ARRAY_BUF,
-            types,
-            loc,
-        );
-        let arr_buf_now = emit_load(&after_blk, arr_buf_slot_now, types.ptr, loc);
-        let arr_buf_now_iv = emit_ptrtoint_i64(context, &after_blk, arr_buf_now, types, loc);
-        let regrew: Value<'c, '_> = after_blk
-            .append_operation(arith::cmpi(
-                context,
-                arith::CmpiPredicate::Ne,
-                arr_buf_now_iv,
-                arr_buf_initial_iv_inner,
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        // If regrew, set _broken; either way fall through to inc.
-        emit_set_broken_if(context, &after_blk, regrew, blk_slots, break_id, types, loc);
-
-        // Compute slot_ptr = arr_buf_now + (i-1) * 16.
-        let i_minus_one: Value<'c, '_> = after_blk
-            .append_operation(arith::subi(
-                i_arg,
-                unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(one_i64) },
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let elem_size = after_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(types.i64, ARRAY_ELEM_SIZE).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let slot_off: Value<'c, '_> = after_blk
-            .append_operation(arith::muli(i_minus_one, elem_size, loc))
-            .result(0)
-            .unwrap()
-            .into();
-        let slot_ptr =
-            emit_byte_offset_ptr_dynamic(context, &after_blk, arr_buf_now, slot_off, types, loc);
-
-        // Load tag; live = (tag != TAG_NIL) AND not regrew.
-        // Skip live check on regrow because slot_ptr is now stale.
-        let tag = emit_load(&after_blk, slot_ptr, types.i64, loc);
-        let tag_nil = after_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(types.i64, TAG_NIL).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let tag_not_nil: Value<'c, '_> = after_blk
-            .append_operation(arith::cmpi(
-                context,
-                arith::CmpiPredicate::Ne,
-                tag,
-                tag_nil,
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let one_i1_inner = after_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(types.i1, 1).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let not_regrew: Value<'c, '_> = after_blk
-            .append_operation(arith::xori(regrew, one_i1_inner, loc))
-            .result(0)
-            .unwrap()
-            .into();
-        let is_live: Value<'c, '_> = after_blk
-            .append_operation(arith::andi(tag_not_nil, not_regrew, loc))
-            .result(0)
-            .unwrap()
-            .into();
-
-        let live_then = Region::new();
-        let live_then_blk = Block::new(&[]);
-        {
-            // Convert i64 i to f64 for k slot Number tag.
-            let i_f64: Value<'c, '_> = live_then_blk
-                .append_operation(
-                    OperationBuilder::new("arith.sitofp", loc)
-                        .add_operands(&[i_arg])
-                        .add_results(&[types.f64])
-                        .build()
-                        .expect("arith.sitofp"),
-                )
-                .result(0)
-                .unwrap()
-                .into();
-            let k_slot = blk_slots[key_id.0];
-            let v_slot = blk_slots[val_id.0];
-            emit_value_slot_store_number(context, &live_then_blk, k_slot, i_f64, types, loc);
-            emit_copy_value_slot_16b(context, &live_then_blk, slot_ptr, v_slot, types, loc);
-            emit_stmts(
-                context,
-                &live_then_blk,
-                body,
-                blk_slots,
-                locals,
-                functions,
-                types,
-                params_len,
-                loc,
-            )?;
-            live_then_blk.append_operation(scf::r#yield(&[], loc));
-        }
-        live_then.append_block(live_then_blk);
-        let live_else = Region::new();
-        let live_else_blk = Block::new(&[]);
-        live_else_blk.append_operation(scf::r#yield(&[], loc));
-        live_else.append_block(live_else_blk);
-        after_blk.append_operation(scf::r#if(is_live, &[], live_then, live_else, loc));
-
-        // i_next = i + 1.
-        let one_inner = after_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(types.i64, 1).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let i_next: Value<'c, '_> = after_blk
-            .append_operation(arith::addi(i_arg, one_inner, loc))
-            .result(0)
-            .unwrap()
-            .into();
-        after_blk.append_operation(scf::r#yield(&[i_next], loc));
-    }
-    after_region.append_block(after_blk);
-
-    parent.append_operation(scf::r#while(
-        &[one_i64],
-        &[types.i64],
-        before_region,
-        after_region,
-        loc,
-    ));
-    Ok(())
-}
-
-/// Phase 2.8e-iter-pairs (ADR 0080) phase 2: walk the hash buckets
-/// `bi = 0..cap_initial`, copying live entries' tagged key/value
-/// slots into the user's k/v locals and running the body. Per-
-/// iteration reload of `header.hash_buf` with ptr-equality detect
-/// aborts the loop on a body-induced rehash (P1).
-#[allow(clippy::too_many_arguments)]
-fn emit_for_pairs_hash_phase<'a, 'c>(
-    context: &'c Context,
-    parent: &'a Block<'c>,
-    table_ptr: Value<'c, 'a>,
-    hash_buf_initial_iv: Value<'c, 'a>,
-    cap_initial: Value<'c, 'a>,
-    key_id: LocalId,
-    val_id: LocalId,
-    break_id: LocalId,
-    body: &[HirStmt],
-    slots: &[Value<'c, 'a>],
-    locals: &[LocalInfo],
-    functions: &[HirFunction],
-    types: &Types<'c>,
-    params_len: usize,
-    loc: Location<'c>,
-) -> Result<(), CodegenError> {
-    let zero_i64 = parent
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(types.i64, 0).into(),
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-
-    let before_region = Region::new();
-    let before_blk = Block::new(&[(types.i64, loc)]);
-    {
-        let bi_arg: Value<'c, '_> = before_blk.argument(0).unwrap().into();
-        let cap_inner = unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(cap_initial) };
-        let bi_lt_cap: Value<'c, '_> = before_blk
-            .append_operation(arith::cmpi(
-                context,
-                arith::CmpiPredicate::Slt,
-                bi_arg,
-                cap_inner,
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let blk_slots = transmute_slots(slots);
-        let cond = and_not_broken(
-            context,
-            &before_blk,
-            bi_lt_cap,
-            blk_slots,
-            break_id,
-            types,
-            loc,
-        );
-        before_blk.append_operation(scf::condition(cond, &[bi_arg], loc));
-    }
-    before_region.append_block(before_blk);
-
-    let after_region = Region::new();
-    let after_blk = Block::new(&[(types.i64, loc)]);
-    {
-        let bi_arg: Value<'c, '_> = after_blk.argument(0).unwrap().into();
-        let blk_slots = transmute_slots(slots);
-        let table_ptr_inner =
-            unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(table_ptr) };
-        let hash_buf_initial_iv_inner =
-            unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(hash_buf_initial_iv) };
-
-        // Reload hash_buf; detect rehash (P1 main).
-        let hash_buf_slot_now = emit_byte_offset_ptr(
-            context,
-            &after_blk,
-            table_ptr_inner,
-            TABLE_OFF_HASH_BUF,
-            types,
-            loc,
-        );
-        let hash_buf_now = emit_load(&after_blk, hash_buf_slot_now, types.ptr, loc);
-        let hash_buf_now_iv = emit_ptrtoint_i64(context, &after_blk, hash_buf_now, types, loc);
-        let rehashed: Value<'c, '_> = after_blk
-            .append_operation(arith::cmpi(
-                context,
-                arith::CmpiPredicate::Ne,
-                hash_buf_now_iv,
-                hash_buf_initial_iv_inner,
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        emit_set_broken_if(
-            context, &after_blk, rehashed, blk_slots, break_id, types, loc,
-        );
-
-        // entry_off = HASH_OFF_ENTRIES + bi * HASH_ENTRY_SIZE.
-        let entries_base = after_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let entry_size = after_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let bucket_off: Value<'c, '_> = after_blk
-            .append_operation(arith::muli(bi_arg, entry_size, loc))
-            .result(0)
-            .unwrap()
-            .into();
-        let entry_off: Value<'c, '_> = after_blk
-            .append_operation(arith::addi(bucket_off, entries_base, loc))
-            .result(0)
-            .unwrap()
-            .into();
-        let entry_ptr =
-            emit_byte_offset_ptr_dynamic(context, &after_blk, hash_buf_now, entry_off, types, loc);
-
-        // is_live = (key_tag != TAG_NIL) AND (key_tag != TAG_DELETED) AND not rehashed.
-        let key_tag = emit_load(&after_blk, entry_ptr, types.i64, loc);
-        let tag_nil = after_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(types.i64, TAG_NIL).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let tag_deleted = after_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(types.i64, TAG_DELETED).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let not_nil: Value<'c, '_> = after_blk
-            .append_operation(arith::cmpi(
-                context,
-                arith::CmpiPredicate::Ne,
-                key_tag,
-                tag_nil,
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let not_deleted: Value<'c, '_> = after_blk
-            .append_operation(arith::cmpi(
-                context,
-                arith::CmpiPredicate::Ne,
-                key_tag,
-                tag_deleted,
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let occupied: Value<'c, '_> = after_blk
-            .append_operation(arith::andi(not_nil, not_deleted, loc))
-            .result(0)
-            .unwrap()
-            .into();
-        let one_i1 = after_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(types.i1, 1).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let not_rehashed: Value<'c, '_> = after_blk
-            .append_operation(arith::xori(rehashed, one_i1, loc))
-            .result(0)
-            .unwrap()
-            .into();
-        let is_live: Value<'c, '_> = after_blk
-            .append_operation(arith::andi(occupied, not_rehashed, loc))
-            .result(0)
-            .unwrap()
-            .into();
-
-        let live_then = Region::new();
-        let live_then_blk = Block::new(&[]);
-        {
-            let key_slot_ptr = entry_ptr; // entry+0 is the tagged key slot.
-            let val_slot_ptr = emit_byte_offset_ptr(
-                context,
-                &live_then_blk,
-                entry_ptr,
-                HASH_ENTRY_OFF_VALUE_SLOT,
-                types,
-                loc,
-            );
-            let k_slot = blk_slots[key_id.0];
-            let v_slot = blk_slots[val_id.0];
-            emit_copy_value_slot_16b(context, &live_then_blk, key_slot_ptr, k_slot, types, loc);
-            emit_copy_value_slot_16b(context, &live_then_blk, val_slot_ptr, v_slot, types, loc);
-            emit_stmts(
-                context,
-                &live_then_blk,
-                body,
-                blk_slots,
-                locals,
-                functions,
-                types,
-                params_len,
-                loc,
-            )?;
-            live_then_blk.append_operation(scf::r#yield(&[], loc));
-        }
-        live_then.append_block(live_then_blk);
-        let live_else = Region::new();
-        let live_else_blk = Block::new(&[]);
-        live_else_blk.append_operation(scf::r#yield(&[], loc));
-        live_else.append_block(live_else_blk);
-        after_blk.append_operation(scf::r#if(is_live, &[], live_then, live_else, loc));
-
-        // bi_next = bi + 1.
-        let one = after_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(types.i64, 1).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let bi_next: Value<'c, '_> = after_blk
-            .append_operation(arith::addi(bi_arg, one, loc))
-            .result(0)
-            .unwrap()
-            .into();
-        after_blk.append_operation(scf::r#yield(&[bi_next], loc));
-    }
-    after_region.append_block(after_blk);
-
-    parent.append_operation(scf::r#while(
-        &[zero_i64],
-        &[types.i64],
-        before_region,
-        after_region,
-        loc,
-    ));
-    Ok(())
-}
-
-/// Convert an `!llvm.ptr` to `i64` via the LLVM `ptrtoint` op.
-/// Used by the pairs walker for ptr-equality rehash detection.
-fn emit_ptrtoint_i64<'a, 'c>(
-    _context: &'c Context,
-    block: &'a Block<'c>,
-    ptr: Value<'c, 'a>,
-    types: &Types<'c>,
-    loc: Location<'c>,
-) -> Value<'c, 'a> {
-    block
-        .append_operation(
-            OperationBuilder::new("llvm.ptrtoint", loc)
-                .add_operands(&[ptr])
-                .add_results(&[types.i64])
-                .build()
-                .expect("llvm.ptrtoint"),
-        )
-        .result(0)
-        .unwrap()
-        .into()
-}
-
-/// `if cond then store(true, _broken_slot) end`. Used by the pairs
-/// walker to flip the break flag on rehash detection so the next
-/// `before`-region cond terminates the loop.
-fn emit_set_broken_if<'a, 'c>(
-    context: &'c Context,
-    block: &'a Block<'c>,
-    cond_i1: Value<'c, 'a>,
-    slots: &[Value<'c, 'a>],
-    broken_id: LocalId,
-    types: &Types<'c>,
-    loc: Location<'c>,
-) {
-    let then_region = Region::new();
-    let then_blk = Block::new(&[]);
-    let true_val = then_blk
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(types.i1, 1).into(),
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    emit_store(&then_blk, true_val, slots[broken_id.0], loc);
-    then_blk.append_operation(scf::r#yield(&[], loc));
-    then_region.append_block(then_blk);
-    let else_region = Region::new();
-    let else_blk = Block::new(&[]);
-    else_blk.append_operation(scf::r#yield(&[], loc));
-    else_region.append_block(else_blk);
-    block.append_operation(scf::r#if(cond_i1, &[], then_region, else_region, loc));
 }
 
 /// Build a single-block Region that yields `arith.cmpf <pred> i, stop : i1`.

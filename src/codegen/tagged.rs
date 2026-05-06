@@ -331,34 +331,6 @@ pub(crate) fn emit_value_slot_store_dispatched<'a, 'c>(
     }
 }
 
-/// Phase 2.8e-iter-pairs (ADR 0080): copy a 16-byte tagged value
-/// slot raw, byte-for-byte. Reads tag (i64 at +0) and payload
-/// (i64 at +8) and stores to the destination at the same offsets.
-/// Both pointers must be 8-byte aligned by construction (alloca
-/// of i64 × 2; hash entries land at multiples of 8).
-///
-/// Reading the payload as raw i64 lets any tag (Number f64,
-/// Bool/Function/Table/String pointer) round-trip without a
-/// per-tag bitcast — the same trick the rehash migration in
-/// `emit_hash_grow_if_needed` uses inline. Used by `pairs(t)`
-/// codegen to materialize hash-entry keys/values into TaggedValue
-/// locals.
-pub(crate) fn emit_copy_value_slot_16b<'a, 'c>(
-    context: &'c Context,
-    block: &'a Block<'c>,
-    src_ptr: Value<'c, 'a>,
-    dst_ptr: Value<'c, 'a>,
-    types: &Types<'c>,
-    loc: Location<'c>,
-) {
-    let tag_word = emit_load(block, src_ptr, types.i64, loc);
-    emit_store(block, tag_word, dst_ptr, loc);
-    let src_pay = emit_byte_offset_ptr(context, block, src_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
-    let dst_pay = emit_byte_offset_ptr(context, block, dst_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
-    let pay_word = emit_load(block, src_pay, types.i64, loc);
-    emit_store(block, pay_word, dst_pay, loc);
-}
-
 /// Phase 2.6c-tag-arr (ADR 0059) / 2.6c-tag-hash (ADR 0060):
 /// load the tag at offset 0 of a tagged value slot and trap if
 /// it isn't `TAG_NUMBER`. After this returns, the caller can

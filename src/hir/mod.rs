@@ -212,6 +212,10 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // time. The kind is a Number placeholder for static
             // typing only — code after `error(...)` is unreachable.
             Callee::Builtin(Builtin::Error) => ValueKind::Number,
+            // Phase 2.8e-iter-next (ADR 0081): `next(...)` in
+            // single-value position truncates to the first result —
+            // the next key, which is a TaggedValue.
+            Callee::Builtin(Builtin::Next) => ValueKind::TaggedValue,
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.
@@ -1681,12 +1685,29 @@ impl LowerCtx {
                     span,
                 })
             }
-            // Phase 2.8e-iter-pairs (ADR 0080):
-            // `for K, V in pairs(TABLE) do BODY end`. Mirror of the
-            // ipairs lowering above, but ForPairs is preserved as an
-            // opaque HIR shape — codegen owns the dual-phase
-            // (array + hash) walk because hash-bucket traversal has
-            // no existing HIR primitive.
+            // Phase 2.8e-iter-next (ADR 0081):
+            // `for K, V in pairs(TABLE) do BODY end` HIR-desugars to
+            // a `MultiAssignFromCall` over `Builtin::Next`, replacing
+            // the opaque `HirStmtKind::ForPairs` shape that ADR 0080
+            // shipped. The synthetic body is:
+            //
+            //   do
+            //     local __t = TABLE
+            //     local __ctl = nil               -- TaggedValue
+            //     local _broken_N = false
+            //     while true do
+            //       local k, v = next(__t, __ctl) -- Builtin::Next
+            //       if IsNil(k) then _broken_N = true
+            //       else BODY ; __ctl = k end
+            //     end
+            //   end
+            //
+            // Each user statement in BODY is wrapped with `if not
+            // _broken_N then STMT end` by `lower_scoped_body_no_push`
+            // (ADR 0015 break pattern), so a mid-body `break` skips
+            // the rest of the same iteration; the next `while`
+            // re-check terminates the loop because the `break` flag
+            // is AND-extended into `cond` by the While codegen.
             StmtKind::ForPairs {
                 key_name,
                 val_name,
@@ -1709,6 +1730,10 @@ impl LowerCtx {
                     format!("__lumelir_iter_t_{}", self.locals.len()),
                     ValueKind::Table,
                 );
+                let ctl_id = self.declare_local(
+                    format!("__lumelir_iter_ctl_{}", self.locals.len()),
+                    ValueKind::TaggedValue,
+                );
                 let key_id = self.declare_local(key_name.clone(), ValueKind::TaggedValue);
                 let val_id = self.declare_local(val_name.clone(), ValueKind::TaggedValue);
                 let break_id =
@@ -1725,6 +1750,13 @@ impl LowerCtx {
                     span,
                 };
                 let table_init = local_init(table_local, table_hir);
+                let ctl_init = local_init(
+                    ctl_id,
+                    HirExpr {
+                        kind: HirExprKind::Nil,
+                        span,
+                    },
+                );
                 let break_init = local_init(
                     break_id,
                     HirExpr {
@@ -1732,19 +1764,81 @@ impl LowerCtx {
                         span,
                     },
                 );
-                let for_pairs = HirStmt {
-                    kind: HirStmtKind::ForPairs {
-                        table_local_id: table_local,
-                        key_id,
-                        val_id,
-                        break_id,
-                        body: user_body_hir,
+                let table_local_expr = HirExpr {
+                    kind: HirExprKind::Local(table_local),
+                    span,
+                };
+                let ctl_local_expr = HirExpr {
+                    kind: HirExprKind::Local(ctl_id),
+                    span,
+                };
+                let key_local_expr = HirExpr {
+                    kind: HirExprKind::Local(key_id),
+                    span,
+                };
+                // `local k, v = next(__t, __ctl)` — every iteration
+                // reassigns both slots through the
+                // MultiAssignFromCall path (no LocalInit, since the
+                // slots were already declared above and we are inside
+                // the synthetic while body).
+                let next_step = HirStmt {
+                    kind: HirStmtKind::MultiAssignFromCall {
+                        dst_ids: vec![key_id, val_id],
+                        callee: Callee::Builtin(Builtin::Next),
+                        args: vec![table_local_expr, ctl_local_expr],
+                    },
+                    span,
+                };
+                // `_broken_N = true` (set when next returns nil key).
+                let break_assign = HirStmt {
+                    kind: HirStmtKind::Assign {
+                        id: break_id,
+                        value: HirExpr {
+                            kind: HirExprKind::Bool(true),
+                            span,
+                        },
+                    },
+                    span,
+                };
+                // `__ctl = k` (advance the iterator state for the
+                // next call).
+                let ctl_advance = HirStmt {
+                    kind: HirStmtKind::Assign {
+                        id: ctl_id,
+                        value: key_local_expr.clone(),
+                    },
+                    span,
+                };
+                let mut else_body: Vec<HirStmt> = Vec::with_capacity(user_body_hir.len() + 1);
+                else_body.extend(user_body_hir);
+                else_body.push(ctl_advance);
+                let nil_check = HirStmt {
+                    kind: HirStmtKind::If {
+                        cond: HirExpr {
+                            kind: HirExprKind::IsNil(Box::new(key_local_expr)),
+                            span,
+                        },
+                        then_body: vec![break_assign],
+                        elifs: Vec::new(),
+                        else_body: Some(else_body),
+                    },
+                    span,
+                };
+                let while_body: Vec<HirStmt> = vec![next_step, nil_check];
+                let while_loop = HirStmt {
+                    kind: HirStmtKind::While {
+                        cond: HirExpr {
+                            kind: HirExprKind::Bool(true),
+                            span,
+                        },
+                        body: while_body,
+                        break_id: Some(break_id),
                     },
                     span,
                 };
                 Ok(HirStmt {
                     kind: HirStmtKind::Block {
-                        stmts: vec![table_init, break_init, for_pairs],
+                        stmts: vec![table_init, ctl_init, break_init, while_loop],
                     },
                     span,
                 })
@@ -2012,7 +2106,14 @@ impl LowerCtx {
             if let HirExprKind::Call { callee, args } = lowered.kind {
                 let ret_kinds: Vec<ValueKind> = match callee {
                     Callee::User(FuncId(fid)) => self.functions[fid].ret_kinds.clone(),
-                    _ => {
+                    // Phase 2.8e-iter-next (ADR 0081): builtin-callee
+                    // multi-assign. Until `Builtin::Next` lands every
+                    // builtin returns at most one value, so this
+                    // branch only widens the shape — callers still
+                    // hit the arity mismatch below when names.len()
+                    // doesn't match `b.ret_kinds().len()`.
+                    Callee::Builtin(b) => b.ret_kinds().to_vec(),
+                    Callee::Indirect(_) => {
                         return Err(HirError::ArityMismatch {
                             builtin: "multi-assign".to_owned(),
                             expected: names.len(),
@@ -2228,8 +2329,10 @@ impl LowerCtx {
         }
         if values.len() == 1 {
             // Multi-bind from a single Call. The Call must be a User-
-            // dispatch (Builtin/Indirect ret arities aren't tracked
-            // statically), and its ret arity must equal `names.len()`.
+            // or Builtin-dispatch (Indirect ret arities aren't
+            // tracked statically); its ret arity must equal
+            // `names.len()`. Phase 2.8e-iter-next (ADR 0081) opened
+            // the Builtin path so `local k, v = next(t, c)` works.
             let lowered = self.lower_expr(&values[0])?;
             let HirExprKind::Call { callee, args } = lowered.kind else {
                 return Err(HirError::ArityMismatch {
@@ -2241,7 +2344,8 @@ impl LowerCtx {
             };
             let ret_kinds: Vec<ValueKind> = match callee {
                 Callee::User(FuncId(fid)) => self.functions[fid].ret_kinds.clone(),
-                _ => {
+                Callee::Builtin(b) => b.ret_kinds().to_vec(),
+                Callee::Indirect(_) => {
                     return Err(HirError::ArityMismatch {
                         builtin: "local =".to_owned(),
                         expected: names.len(),
@@ -2892,12 +2996,13 @@ impl LowerCtx {
             let k = infer_kind(arg, &self.locals, &self.functions);
             // Phase 2.7f (ADR 0029) / 2.7n (ADR 0052): `type(f)`
             // and `tostring(f)` both legitimately accept a Function
-            // value — `type` returns the typename string,
-            // `tostring` returns the literal "function". Every
-            // other call site keeps treating Function-as-value
-            // as a hard error.
+            // value. Phase 2.8e-iter-next (ADR 0081): `next(t, fn)`
+            // joins the allow-list because Function values are
+            // valid hash keys (Lua spec §3.4.5). Every other call
+            // site keeps treating Function-as-value as a hard
+            // error.
             if let ValueKind::Function(_) = k
-                && !matches!(builtin, Builtin::Type | Builtin::ToString)
+                && !matches!(builtin, Builtin::Type | Builtin::ToString | Builtin::Next)
             {
                 let arg_name = match &arg.kind {
                     HirExprKind::Local(LocalId(idx)) => self.locals[*idx].name.clone(),
@@ -2954,6 +3059,26 @@ impl LowerCtx {
                     rhs_kind: k.name().to_owned(),
                     offset: arg.span.start,
                 });
+            }
+            // Phase 2.8e-iter-next (ADR 0081): `next(t, k)` requires
+            // arg 0 = Table, arg 1 = TaggedValue / Nil / Number /
+            // Bool / String / Function / Table. Anything that can
+            // legally be a hash key qualifies as `prev_k`. Function
+            // values pass the FunctionUsedAsValue gate above only
+            // for Type/ToString — `next` joins that allow-list.
+            if matches!(builtin, Builtin::Next) {
+                let arg_idx = lowered_args
+                    .iter()
+                    .position(|a| std::ptr::eq(a as *const _, arg as *const _))
+                    .unwrap_or(0);
+                if arg_idx == 0 && k != ValueKind::Table {
+                    return Err(HirError::TypeMismatch {
+                        op: "next".to_owned(),
+                        lhs_kind: "table".to_owned(),
+                        rhs_kind: k.name().to_owned(),
+                        offset: arg.span.start,
+                    });
+                }
             }
         }
         Ok(HirExprKind::Call {

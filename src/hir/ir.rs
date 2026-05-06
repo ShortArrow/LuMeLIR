@@ -150,23 +150,6 @@ pub enum HirStmtKind {
         body: Vec<HirStmt>,
         break_id: Option<LocalId>,
     },
-    /// `for K, V in pairs(TABLE) do BODY end` — Phase 2.8e-iter-pairs
-    /// (ADR 0080). Unlike `StmtKind::ForIpairs` which HIR-desugars to
-    /// existing primitives, `ForPairs` is preserved as an opaque shape
-    /// because the hash-bucket walk is a new codegen primitive.
-    /// `break_id` is unconditionally allocated — codegen needs the
-    /// flag for the phase-1↔phase-2 boundary and for the rehash-abort
-    /// safety check, even when the user body contains no `break`.
-    /// When ADR 0075's superseder lands and unblocks `next(t, k)`,
-    /// this variant becomes a candidate for HIR-level desugaring to
-    /// `for k, v in next, t, nil do ... end`.
-    ForPairs {
-        table_local_id: LocalId,
-        key_id: LocalId,
-        val_id: LocalId,
-        break_id: LocalId,
-        body: Vec<HirStmt>,
-    },
     /// `local a, b, ... = f(args)` (Phase 2.5d, ADR 0021): a single
     /// multi-result call whose results are bound 1-1 to the listed
     /// destination locals. Equivalent in observable behaviour to
@@ -311,6 +294,14 @@ pub enum Builtin {
     /// `exit(1)`s. Phase 2.7h (ADR 0033); the optional `level`
     /// arg and table-as-message form are deferred.
     Error,
+    /// `next(t, k)` — Lua spec §3.7.3 stateless hash-iteration step.
+    /// Returns `(next_k, next_v)` where both are TaggedValue: the
+    /// next non-nil entry after `k` in `t`'s iteration order, or
+    /// `(nil, nil)` when the table is exhausted. The first builtin
+    /// to declare a multi-position return signature (ADR 0081);
+    /// `MultiAssignFromCall` is the only HIR shape that observes
+    /// both result positions. Phase 2.8e-iter-next (ADR 0081).
+    Next,
 }
 
 impl Builtin {
@@ -322,6 +313,7 @@ impl Builtin {
             "type" => Some(Builtin::Type),
             "assert" => Some(Builtin::Assert),
             "error" => Some(Builtin::Error),
+            "next" => Some(Builtin::Next),
             _ => None,
         }
     }
@@ -334,6 +326,7 @@ impl Builtin {
             Builtin::Type => 1,
             Builtin::Assert => 1,
             Builtin::Error => 1,
+            Builtin::Next => 2,
         }
     }
 
@@ -345,6 +338,26 @@ impl Builtin {
             Builtin::Type => "type",
             Builtin::Assert => "assert",
             Builtin::Error => "error",
+            Builtin::Next => "next",
+        }
+    }
+
+    /// Phase 2.8e-iter-next (ADR 0081): static return signature for a
+    /// builtin call, used by `MultiAssignFromCall` lowering. Today
+    /// every shipped builtin returns at most one value; the slot is
+    /// here so future multi-return builtins (`next` in Commit 2,
+    /// later `unpack` / `string.match` / etc.) can join the same
+    /// dispatch. `Print` returns nothing — no value is observable
+    /// from a `print(x)` call site.
+    pub fn ret_kinds(self) -> &'static [ValueKind] {
+        match self {
+            Builtin::Print => &[],
+            Builtin::ToString => &[ValueKind::String],
+            Builtin::ToNumber => &[ValueKind::Number],
+            Builtin::Type => &[ValueKind::String],
+            Builtin::Assert => &[ValueKind::Bool],
+            Builtin::Error => &[ValueKind::Number],
+            Builtin::Next => &[ValueKind::TaggedValue, ValueKind::TaggedValue],
         }
     }
 }
