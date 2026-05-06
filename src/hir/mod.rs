@@ -77,15 +77,15 @@ fn is_number_compatible(k: ValueKind) -> bool {
     matches!(k, ValueKind::Number | ValueKind::TaggedValue)
 }
 
-/// Phase 2.6b-hash-keys (ADR 0079): Lua spec §3.4.5 — every
-/// non-nil, non-NaN value can be used as a hash key. We accept
-/// Number / String / Bool / Function / Table at the HIR layer;
-/// `Nil` is hard-rejected, NaN is a runtime concern.
-/// `TaggedValue` operands (e.g. `local k = t[i]; t2[k] = v`)
-/// are out of scope this phase — the runtime tag dispatch in
-/// the codegen `emit_hash_key_*` helpers does not yet route
-/// through a dynamic kind classifier (LIC-2.6b-hash-key-nil-
-/// runtime-1 / -nan-runtime-1).
+/// Phase 2.6b-hash-keys (ADR 0079) / 2.8e-iter-tk (ADR 0084):
+/// Lua spec §3.4.5 — every non-nil, non-NaN value can be used as
+/// a hash key. We accept Number / String / Bool / Function / Table
+/// statically and `TaggedValue` for the dynamic-kind case (e.g.
+/// `for k, v in pairs(t) do t[k] = v + 100 end`). Nil is HIR-
+/// rejected for static keys; runtime nil via TaggedValue is
+/// trapped by codegen with `s_table_index_nil` (ADR 0084). NaN
+/// remains a runtime miss with the generic missing-key trap
+/// (LIC-2.6b-hash-key-nan-runtime-1).
 fn is_hash_key_eligible(k: ValueKind) -> bool {
     matches!(
         k,
@@ -94,6 +94,7 @@ fn is_hash_key_eligible(k: ValueKind) -> bool {
             | ValueKind::Bool
             | ValueKind::Function(_)
             | ValueKind::Table
+            | ValueKind::TaggedValue
     )
 }
 

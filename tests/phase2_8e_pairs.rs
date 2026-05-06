@@ -268,29 +268,30 @@ for k, v in pairs(t) do print(type(k)) end";
 // Mutation safety (P1)
 // ============================================================
 //
-// Note on `t[k] = v + 100` body shape:
-// the natural "bump every value" idiom rewrites to
-// `t[k] = v + 100` where `k` is TaggedValue (the pairs binding).
-// IndexAssign with a TaggedValue key is rejected at HIR today
-// (`is_hash_key_eligible` requires a static kind) — tracked as
-// LIC-2.8e-pairs-tagged-key-write-1. The test below uses a
-// separate-table aggregation pattern that exercises P1 safety
-// without hitting that limitation.
+// Phase 2.8e-iter-tk (ADR 0084) opened the natural "bump every
+// value" idiom: `t[k] = v + 100` with TaggedValue key. The
+// previous workaround (aggregate into a separate table) is no
+// longer required; the test below now exercises the direct
+// pattern as an end-to-end check that ADR 0084's IndexAssign
+// dispatch keeps the iterator's hash_buf identity stable across
+// in-place updates of existing keys.
 
 #[test]
-fn pairs_body_writes_separate_table_safely() {
-    let src = "local sums = {}
-sums.total = 0
-local t = {}
+fn pairs_body_mutates_existing_value_safely() {
+    let src = "local t = {}
 t.a = 1
 t.b = 2
 t.c = 3
-for k, v in pairs(t) do sums.total = sums.total + v end
-print(sums.total)";
-    // Body mutates a different table while iterating `t`; the
-    // iterated table's hash_buf never moves so the per-iteration
-    // ptr-equality check stays clean.
-    assert_eq!(run(src, "lumelir_pairs_mutate_other").trim(), "6");
+for k, v in pairs(t) do t[k] = v + 100 end
+print(t.a, t.b, t.c)";
+    // In-place value rewrites of *existing* hash entries don't
+    // grow the hash buffer (count is unchanged), so the ADR 0080
+    // per-iteration `header.hash_buf` reload sees a stable buffer
+    // and iteration terminates after visiting every key once.
+    assert_eq!(
+        run(src, "lumelir_pairs_mutate_in_place").trim(),
+        "101\t102\t103"
+    );
 }
 
 #[test]

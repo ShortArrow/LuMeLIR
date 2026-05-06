@@ -320,6 +320,18 @@ fn emit_fmt_global<'c>(
         "attempt to call an unknown function pointer\0",
         loc,
     );
+    // Phase 2.8e-iter-tk (ADR 0084): runtime trap for `t[k] = v`
+    // when `k` is a TaggedValue local whose dynamic tag is
+    // TAG_NIL. Lua spec §3.4.5 — `nil` values cannot be used as
+    // table keys.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_table_index_nil",
+        "table index is nil\0",
+        loc,
+    );
 }
 
 fn emit_string_global<'c>(
@@ -2460,6 +2472,297 @@ fn emit_stmt<'a, 'c>(
                         }
                         _ => unreachable!(
                             "HIR rejects non-Number/Bool/String/Nil/Function/Table values for hash insert"
+                        ),
+                    }
+                }
+                // Phase 2.8e-iter-tk (ADR 0084): TaggedValue key —
+                // `for k, v in pairs(t) do t[k] = v + 100 end` and
+                // friends. The TaggedValue local's slot is already a
+                // 16-byte tagged search-key slot, so we hand it
+                // directly to `emit_hash_probe_for_insert` after a
+                // tag check. Other key expr shapes (e.g.
+                // `IndexTagged`) would need tmp materialization;
+                // only `Local(TaggedValue)` is supported in scope.
+                ValueKind::TaggedValue => {
+                    let search_key_slot = match &key.kind {
+                        HirExprKind::Local(LocalId(idx)) => slots[*idx],
+                        _ => {
+                            return Err(CodegenError::UnsupportedExpr(
+                                "TaggedValue-key IndexAssign requires `Local` key (ADR 0084 \
+                                 scope)"
+                                    .to_owned(),
+                            ));
+                        }
+                    };
+                    // Tag check: TAG_NIL → trap with s_table_index_nil.
+                    let tag = emit_load(block, search_key_slot, types.i64, loc);
+                    let tag_nil_const = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let is_nil: Value<'c, 'a> = block
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Eq,
+                            tag,
+                            tag_nil_const,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let nil_then = Region::new();
+                    let nil_then_blk = Block::new(&[]);
+                    {
+                        let msg =
+                            emit_addressof(context, &nil_then_blk, "s_table_index_nil", types, loc);
+                        emit_exit_with_message(context, &nil_then_blk, msg, types, loc);
+                        nil_then_blk.append_operation(scf::r#yield(&[], loc));
+                    }
+                    nil_then.append_block(nil_then_blk);
+                    let nil_else = Region::new();
+                    let nil_else_blk = Block::new(&[]);
+                    nil_else_blk.append_operation(scf::r#yield(&[], loc));
+                    nil_else.append_block(nil_else_blk);
+                    block.append_operation(scf::r#if(is_nil, &[], nil_then, nil_else, loc));
+
+                    // Hash path — same structure as the static-key
+                    // arm above, but: (a) the search-key slot is the
+                    // TaggedValue local's slot rather than a freshly
+                    // built 16-byte tmp, and (b) the new-key commit
+                    // copies the slot's 16 bytes (tag at +0, payload
+                    // at +8) into entry+0 raw rather than calling
+                    // `emit_value_slot_store_dispatched` with a
+                    // static kind.
+                    emit_hash_ensure_buf(context, block, target_ptr, types, loc);
+                    emit_hash_grow_if_needed(context, block, target_ptr, types, loc);
+                    let hash_buf_slot = emit_byte_offset_ptr(
+                        context,
+                        block,
+                        target_ptr,
+                        TABLE_OFF_HASH_BUF,
+                        types,
+                        loc,
+                    );
+                    let hash_buf = emit_load(block, hash_buf_slot, types.ptr, loc);
+                    let cap_slot =
+                        emit_byte_offset_ptr(context, block, hash_buf, HASH_OFF_CAP, types, loc);
+                    let cap = emit_load(block, cap_slot, types.i64, loc);
+                    let bucket = emit_hash_probe_for_insert(
+                        context,
+                        block,
+                        hash_buf,
+                        cap,
+                        search_key_slot,
+                        types,
+                        loc,
+                    );
+                    let entry_size = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let entries_off = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let bucket_off: Value<'c, 'a> = block
+                        .append_operation(arith::muli(bucket, entry_size, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let entry_off: Value<'c, 'a> = block
+                        .append_operation(arith::addi(bucket_off, entries_off, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let entry_ptr = emit_byte_offset_ptr_dynamic(
+                        context, block, hash_buf, entry_off, types, loc,
+                    );
+                    // Empty bucket detection: tag at entry+0 is
+                    // TAG_NIL (= 0) iff the bucket is unused.
+                    let cur_tag = emit_load(block, entry_ptr, types.i64, loc);
+                    let zero_i64_t = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let was_empty: Value<'c, 'a> = block
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Eq,
+                            cur_tag,
+                            zero_i64_t,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let value_slot_ptr = emit_byte_offset_ptr(
+                        context,
+                        block,
+                        entry_ptr,
+                        HASH_ENTRY_OFF_VALUE_SLOT,
+                        types,
+                        loc,
+                    );
+                    let value_kind = infer_kind(value, locals, functions);
+                    match value_kind {
+                        ValueKind::Number
+                        | ValueKind::Bool
+                        | ValueKind::String
+                        | ValueKind::Function(_)
+                        | ValueKind::Table => {
+                            // New-key path: raw 16-byte copy of the
+                            // search slot (tag + payload words) into
+                            // entry+0; then count++.
+                            let new_key_then = Region::new();
+                            let new_key_blk = Block::new(&[]);
+                            {
+                                let key_tag =
+                                    emit_load(&new_key_blk, search_key_slot, types.i64, loc);
+                                emit_store(&new_key_blk, key_tag, entry_ptr, loc);
+                                let key_pay_ptr = emit_byte_offset_ptr(
+                                    context,
+                                    &new_key_blk,
+                                    search_key_slot,
+                                    ARRAY_ELEM_OFF_VALUE,
+                                    types,
+                                    loc,
+                                );
+                                let entry_pay_ptr = emit_byte_offset_ptr(
+                                    context,
+                                    &new_key_blk,
+                                    entry_ptr,
+                                    ARRAY_ELEM_OFF_VALUE,
+                                    types,
+                                    loc,
+                                );
+                                let key_pay = emit_load(&new_key_blk, key_pay_ptr, types.i64, loc);
+                                emit_store(&new_key_blk, key_pay, entry_pay_ptr, loc);
+                                let count_slot = emit_byte_offset_ptr(
+                                    context,
+                                    &new_key_blk,
+                                    hash_buf,
+                                    HASH_OFF_COUNT,
+                                    types,
+                                    loc,
+                                );
+                                let count = emit_load(&new_key_blk, count_slot, types.i64, loc);
+                                let one_inner = new_key_blk
+                                    .append_operation(arith::constant(
+                                        context,
+                                        IntegerAttribute::new(types.i64, 1).into(),
+                                        loc,
+                                    ))
+                                    .result(0)
+                                    .unwrap()
+                                    .into();
+                                let new_count: Value<'c, '_> = new_key_blk
+                                    .append_operation(arith::addi(count, one_inner, loc))
+                                    .result(0)
+                                    .unwrap()
+                                    .into();
+                                emit_store(&new_key_blk, new_count, count_slot, loc);
+                                new_key_blk.append_operation(scf::r#yield(&[], loc));
+                            }
+                            new_key_then.append_block(new_key_blk);
+                            let new_key_else = Region::new();
+                            let new_key_else_blk = Block::new(&[]);
+                            new_key_else_blk.append_operation(scf::r#yield(&[], loc));
+                            new_key_else.append_block(new_key_else_blk);
+                            block.append_operation(scf::r#if(
+                                was_empty,
+                                &[],
+                                new_key_then,
+                                new_key_else,
+                                loc,
+                            ));
+                            emit_value_slot_store_dispatched(
+                                context,
+                                block,
+                                value_slot_ptr,
+                                value_v,
+                                value_kind,
+                                types,
+                                loc,
+                            );
+                        }
+                        ValueKind::Nil => {
+                            // Soft-delete via TAG_DELETED at entry+0
+                            // when the key was present. No-op when
+                            // bucket was empty (deleting a missing
+                            // key is fine per Lua spec).
+                            let del_then = Region::new();
+                            let del_then_blk = Block::new(&[]);
+                            {
+                                let tombstone_tag = del_then_blk
+                                    .append_operation(arith::constant(
+                                        context,
+                                        IntegerAttribute::new(types.i64, TAG_DELETED).into(),
+                                        loc,
+                                    ))
+                                    .result(0)
+                                    .unwrap()
+                                    .into();
+                                emit_store(&del_then_blk, tombstone_tag, entry_ptr, loc);
+                                emit_value_slot_store_nil(
+                                    context,
+                                    &del_then_blk,
+                                    value_slot_ptr,
+                                    types,
+                                    loc,
+                                );
+                                del_then_blk.append_operation(scf::r#yield(&[], loc));
+                            }
+                            del_then.append_block(del_then_blk);
+                            let del_else = Region::new();
+                            let del_else_blk = Block::new(&[]);
+                            del_else_blk.append_operation(scf::r#yield(&[], loc));
+                            del_else.append_block(del_else_blk);
+                            let i1_one = block
+                                .append_operation(arith::constant(
+                                    context,
+                                    IntegerAttribute::new(types.i1, 1).into(),
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let not_empty: Value<'c, 'a> = block
+                                .append_operation(arith::xori(was_empty, i1_one, loc))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            block.append_operation(scf::r#if(
+                                not_empty,
+                                &[],
+                                del_then,
+                                del_else,
+                                loc,
+                            ));
+                        }
+                        _ => unreachable!(
+                            "HIR rejects non-Number/Bool/String/Nil/Function/Table values for \
+                             hash insert"
                         ),
                     }
                 }
@@ -5424,6 +5727,176 @@ fn emit_expr<'a, 'c>(
                     // value load. value slot starts at
                     // HASH_OFF_ENTRIES + bucket*HASH_ENTRY_SIZE +
                     // HASH_ENTRY_OFF_VALUE_SLOT.
+                    let entry_size = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let bucket_off: Value<'c, 'a> = block
+                        .append_operation(arith::muli(bucket, entry_size, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let value_slot_total_off = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(
+                                types.i64,
+                                HASH_OFF_ENTRIES + HASH_ENTRY_OFF_VALUE_SLOT,
+                            )
+                            .into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let total_off: Value<'c, 'a> = block
+                        .append_operation(arith::addi(bucket_off, value_slot_total_off, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let value_slot_ptr = emit_byte_offset_ptr_dynamic(
+                        context, block, hash_buf, total_off, types, loc,
+                    );
+                    emit_value_slot_check_number(context, block, value_slot_ptr, types, loc);
+                    let value_ptr = emit_byte_offset_ptr(
+                        context,
+                        block,
+                        value_slot_ptr,
+                        ARRAY_ELEM_OFF_VALUE,
+                        types,
+                        loc,
+                    );
+                    Ok(emit_load(block, value_ptr, types.f64, loc))
+                }
+                // Phase 2.8e-iter-tk (ADR 0084): TaggedValue key —
+                // `local x = t[k]` where `k` is the iterator binding
+                // from `for k, v in pairs(t)`. The local's slot is
+                // already a 16-byte tagged search-key slot; tag
+                // check + hash probe lookup + trapping value load
+                // mirror the static-kind arm above.
+                ValueKind::TaggedValue => {
+                    let search_key_slot = match &key.kind {
+                        HirExprKind::Local(LocalId(idx)) => slots[*idx],
+                        _ => {
+                            return Err(CodegenError::UnsupportedExpr(
+                                "TaggedValue-key Index read requires `Local` key (ADR 0084 \
+                                 scope)"
+                                    .to_owned(),
+                            ));
+                        }
+                    };
+                    let tag = emit_load(block, search_key_slot, types.i64, loc);
+                    let tag_nil_const = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let is_nil: Value<'c, 'a> = block
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Eq,
+                            tag,
+                            tag_nil_const,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let nil_then = Region::new();
+                    let nil_then_blk = Block::new(&[]);
+                    {
+                        let msg =
+                            emit_addressof(context, &nil_then_blk, "s_table_index_nil", types, loc);
+                        emit_exit_with_message(context, &nil_then_blk, msg, types, loc);
+                        nil_then_blk.append_operation(scf::r#yield(&[], loc));
+                    }
+                    nil_then.append_block(nil_then_blk);
+                    let nil_else = Region::new();
+                    let nil_else_blk = Block::new(&[]);
+                    nil_else_blk.append_operation(scf::r#yield(&[], loc));
+                    nil_else.append_block(nil_else_blk);
+                    block.append_operation(scf::r#if(is_nil, &[], nil_then, nil_else, loc));
+
+                    let hash_buf_slot = emit_byte_offset_ptr(
+                        context,
+                        block,
+                        target_ptr,
+                        TABLE_OFF_HASH_BUF,
+                        types,
+                        loc,
+                    );
+                    let hash_buf = emit_load(block, hash_buf_slot, types.ptr, loc);
+                    let hash_buf_i = block
+                        .append_operation(
+                            OperationBuilder::new("llvm.ptrtoint", loc)
+                                .add_operands(&[hash_buf])
+                                .add_results(&[types.i64])
+                                .build()
+                                .expect("llvm.ptrtoint"),
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let zero_i64 = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 0).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let null_buf: Value<'c, 'a> = block
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Eq,
+                            hash_buf_i,
+                            zero_i64,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let null_then = Region::new();
+                    let null_then_blk = Block::new(&[]);
+                    {
+                        let msg = emit_addressof(
+                            context,
+                            &null_then_blk,
+                            "s_table_missing_key",
+                            types,
+                            loc,
+                        );
+                        emit_exit_with_message(context, &null_then_blk, msg, types, loc);
+                        null_then_blk.append_operation(scf::r#yield(&[], loc));
+                    }
+                    null_then.append_block(null_then_blk);
+                    let null_else = Region::new();
+                    let null_else_blk = Block::new(&[]);
+                    null_else_blk.append_operation(scf::r#yield(&[], loc));
+                    null_else.append_block(null_else_blk);
+                    block.append_operation(scf::r#if(null_buf, &[], null_then, null_else, loc));
+                    let cap_slot =
+                        emit_byte_offset_ptr(context, block, hash_buf, HASH_OFF_CAP, types, loc);
+                    let cap = emit_load(block, cap_slot, types.i64, loc);
+                    let bucket = emit_hash_probe_lookup(
+                        context,
+                        block,
+                        hash_buf,
+                        cap,
+                        search_key_slot,
+                        types,
+                        loc,
+                    );
                     let entry_size = block
                         .append_operation(arith::constant(
                             context,
