@@ -274,6 +274,7 @@ fn stmt_contains_break(s: &Stmt) -> bool {
         | StmtKind::ForNumeric { .. }
         | StmtKind::ForIpairs { .. }
         | StmtKind::ForPairs { .. }
+        | StmtKind::ForGeneric { .. }
         | StmtKind::Repeat { .. } => false,
         _ => false,
     }
@@ -402,7 +403,8 @@ fn ast_max_return_arity(stmts: &[Stmt]) -> usize {
             StmtKind::While { body, .. }
             | StmtKind::ForNumeric { body, .. }
             | StmtKind::ForIpairs { body, .. }
-            | StmtKind::ForPairs { body, .. } => {
+            | StmtKind::ForPairs { body, .. }
+            | StmtKind::ForGeneric { body, .. } => {
                 for st in body {
                     visit(st, max);
                 }
@@ -533,6 +535,20 @@ fn infer_user_function_param_kinds(
             }
             StmtKind::ForPairs { table, body, .. } => {
                 visit_expr(table, names, kinds, seen);
+                for st in body {
+                    visit_stmt(st, names, kinds, seen);
+                }
+            }
+            StmtKind::ForGeneric {
+                iter,
+                state,
+                ctl,
+                body,
+                ..
+            } => {
+                visit_expr(iter, names, kinds, seen);
+                visit_expr(state, names, kinds, seen);
+                visit_expr(ctl, names, kinds, seen);
                 for st in body {
                     visit_stmt(st, names, kinds, seen);
                 }
@@ -700,6 +716,20 @@ fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
             }
             StmtKind::ForPairs { table, body, .. } => {
                 visit_expr(table, name_to_idx, kinds);
+                for s in body {
+                    visit_stmt(s, name_to_idx, kinds);
+                }
+            }
+            StmtKind::ForGeneric {
+                iter,
+                state,
+                ctl,
+                body,
+                ..
+            } => {
+                visit_expr(iter, name_to_idx, kinds);
+                visit_expr(state, name_to_idx, kinds);
+                visit_expr(ctl, name_to_idx, kinds);
                 for s in body {
                     visit_stmt(s, name_to_idx, kinds);
                 }
@@ -1849,6 +1879,327 @@ impl LowerCtx {
                     kind: HirStmtKind::Block {
                         stmts: vec![table_init, ctl_init, break_init, while_loop],
                     },
+                    span,
+                })
+            }
+            // Phase 2.8e-iter-generic (ADR 0085): `for k, v in ITER,
+            // STATE, CTL do BODY end`. Synthetic block desugar that
+            // mirrors ForPairs (ADR 0081) but with iter / state / ctl
+            // pinning + per-iteration `__iter(__state, __ctl)` call
+            // dispatched to the right `Callee` based on iter's HIR
+            // shape.
+            //
+            // Phase 1 scope: iter must resolve to `Builtin::Next`,
+            // a top-level user function, a Function-kind local, or
+            // a TaggedValue local with at least one compatible
+            // non-closure user function. Closure-as-iter is rejected
+            // until ADR 0083 lands.
+            StmtKind::ForGeneric {
+                names,
+                iter,
+                state,
+                ctl,
+                body,
+            } => {
+                let span = stmt.span;
+                if names.len() != 2 {
+                    return Err(HirError::ArityMismatch {
+                        builtin: "for-in-generic".to_owned(),
+                        expected: 2,
+                        actual: names.len(),
+                        offset: span.start,
+                    });
+                }
+                let key_name = names[0].clone();
+                let val_name = names[1].clone();
+
+                // Lower state and ctl in the OUTER scope (these are
+                // ordinary expressions). Iter is special — see below.
+                let state_hir = self.lower_expr(state)?;
+                let ctl_hir = self.lower_expr(ctl)?;
+                let state_kind = infer_kind(&state_hir, &self.locals, &self.functions);
+                let ctl_kind = infer_kind(&ctl_hir, &self.locals, &self.functions);
+
+                // Resolve the iter expression to a callee shape.
+                // Special case `next` ident → `Builtin::Next`.
+                // Otherwise lower normally and dispatch on the
+                // resulting kind.
+                let iter_is_next_builtin = matches!(
+                    &iter.kind,
+                    ExprKind::Ident(n) if n == "next"
+                );
+                let iter_hir_opt = if iter_is_next_builtin {
+                    None
+                } else {
+                    Some(self.lower_expr(iter)?)
+                };
+                let iter_kind = iter_hir_opt
+                    .as_ref()
+                    .map(|h| infer_kind(h, &self.locals, &self.functions));
+
+                // Determine the iter's effective ret_kinds — drives
+                // both the dst kind for key/val and the resolved
+                // callee. Phase 1 scope: must have exactly 2 return
+                // positions, both `TaggedValue` so a `nil` first
+                // result can terminate the loop.
+                let iter_ret_kinds: Vec<ValueKind> = if iter_is_next_builtin {
+                    vec![ValueKind::TaggedValue, ValueKind::TaggedValue]
+                } else {
+                    let kind = iter_kind.expect("iter_kind set when iter_hir_opt is Some");
+                    match (&iter_hir_opt.as_ref().unwrap().kind, kind) {
+                        (HirExprKind::FunctionRef(fid), _) => {
+                            self.functions[fid.0].ret_kinds.clone()
+                        }
+                        (HirExprKind::Local(LocalId(idx)), ValueKind::Function(_)) => {
+                            match self.locals[*idx].func_id {
+                                Some(fid) => self.functions[fid.0].ret_kinds.clone(),
+                                None => {
+                                    // Function param: ret is fixed to single Number per
+                                    // ADR 0019. Not a valid iter shape.
+                                    return Err(HirError::TypeMismatch {
+                                        op: "for-in-generic iter".to_owned(),
+                                        lhs_kind: "function returning (TaggedValue, TaggedValue)"
+                                            .to_owned(),
+                                        rhs_kind: "function parameter (single Number return)"
+                                            .to_owned(),
+                                        offset: iter.span.start,
+                                    });
+                                }
+                            }
+                        }
+                        (_, ValueKind::TaggedValue) => {
+                            vec![ValueKind::TaggedValue, ValueKind::TaggedValue]
+                        }
+                        (_, other) => {
+                            return Err(HirError::TypeMismatch {
+                                op: "for-in-generic iter".to_owned(),
+                                lhs_kind: "function or callable".to_owned(),
+                                rhs_kind: other.name().to_owned(),
+                                offset: iter.span.start,
+                            });
+                        }
+                    }
+                };
+                if iter_ret_kinds.len() != 2 {
+                    return Err(HirError::ArityMismatch {
+                        builtin: "for-in-generic iter return".to_owned(),
+                        expected: 2,
+                        actual: iter_ret_kinds.len(),
+                        offset: iter.span.start,
+                    });
+                }
+                if !matches!(iter_ret_kinds[0], ValueKind::TaggedValue | ValueKind::Nil) {
+                    // Without `nil` reachable as the first result,
+                    // generic-for can never terminate. TaggedValue
+                    // covers the typical widened-return case;
+                    // statically `Nil` covers the trivial `return
+                    // nil, nil` shape.
+                    return Err(HirError::TypeMismatch {
+                        op: "for-in-generic iter return".to_owned(),
+                        lhs_kind: "TaggedValue or Nil (first result must allow nil termination)"
+                            .to_owned(),
+                        rhs_kind: iter_ret_kinds[0].name().to_owned(),
+                        offset: iter.span.start,
+                    });
+                }
+
+                // Synthetic locals live in a fresh inner scope so
+                // user-shadowed names don't collide.
+                self.scopes.push(HashMap::new());
+                let state_id = self.declare_local(
+                    format!("__lumelir_iter_state_{}", self.locals.len()),
+                    state_kind,
+                );
+                let ctl_id = self.declare_local(
+                    format!("__lumelir_iter_ctl_{}", self.locals.len()),
+                    ValueKind::TaggedValue,
+                );
+                let iter_id_opt = if iter_is_next_builtin {
+                    None
+                } else {
+                    let kind = iter_kind.expect("iter_kind set when iter_hir_opt is Some");
+                    let func_id = match (&iter_hir_opt.as_ref().unwrap().kind, kind) {
+                        (HirExprKind::FunctionRef(fid), _) => Some(*fid),
+                        (HirExprKind::Local(LocalId(idx)), ValueKind::Function(_)) => {
+                            self.locals[*idx].func_id
+                        }
+                        _ => None,
+                    };
+                    Some(self.declare_local_with_func_id(
+                        format!("__lumelir_iter_fn_{}", self.locals.len()),
+                        kind,
+                        func_id,
+                    ))
+                };
+                let key_id = self.declare_local(key_name.clone(), iter_ret_kinds[0]);
+                let val_id = self.declare_local(val_name.clone(), iter_ret_kinds[1]);
+                let break_id =
+                    self.declare_local(format!("_broken_{}", self.locals.len()), ValueKind::Bool);
+
+                // Build the call's callee.
+                let callee = if iter_is_next_builtin {
+                    Callee::Builtin(Builtin::Next)
+                } else {
+                    let iter_id = iter_id_opt.unwrap();
+                    match self.locals[iter_id.0].kind {
+                        ValueKind::Function(arity) => {
+                            if arity != 2 {
+                                self.scopes.pop();
+                                return Err(HirError::ArityMismatch {
+                                    builtin: "for-in-generic iter".to_owned(),
+                                    expected: 2,
+                                    actual: arity,
+                                    offset: iter.span.start,
+                                });
+                            }
+                            match self.locals[iter_id.0].func_id {
+                                Some(fid) => Callee::User(fid),
+                                None => Callee::Indirect(iter_id),
+                            }
+                        }
+                        ValueKind::TaggedValue => {
+                            // Filter compatible candidates AND drop
+                            // any with non-empty upvalues (closure-
+                            // as-iter is deferred until ADR 0083
+                            // lands the env-threading ABI).
+                            let sig = IndirectSig {
+                                param_kinds: vec![state_kind, ctl_kind],
+                                ret_kinds: vec![ValueKind::TaggedValue, ValueKind::TaggedValue],
+                            };
+                            let candidates: Vec<FuncId> = self
+                                .functions
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, f)| {
+                                    let pk: Vec<ValueKind> =
+                                        f.params.iter().map(|p| p.kind).collect();
+                                    if pk == sig.param_kinds
+                                        && f.ret_kinds == sig.ret_kinds
+                                        && f.upvalues.is_empty()
+                                    {
+                                        Some(FuncId(i))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            if candidates.is_empty() {
+                                let local_name = self.locals[iter_id.0].name.clone();
+                                self.scopes.pop();
+                                return Err(HirError::IndirectCallNoCandidates {
+                                    local_name,
+                                    param_kinds: sig.param_kinds,
+                                    ret_kinds: sig.ret_kinds,
+                                    offset: iter.span.start,
+                                });
+                            }
+                            Callee::IndirectDispatch {
+                                local_id: iter_id,
+                                sig,
+                                candidates,
+                            }
+                        }
+                        other => {
+                            self.scopes.pop();
+                            return Err(HirError::TypeMismatch {
+                                op: "for-in-generic iter".to_owned(),
+                                lhs_kind: "function or callable".to_owned(),
+                                rhs_kind: other.name().to_owned(),
+                                offset: iter.span.start,
+                            });
+                        }
+                    }
+                };
+
+                self.loop_break_targets.push(Some(break_id));
+                let body_result = self.lower_scoped_body_no_push(body);
+                self.loop_break_targets.pop();
+                self.scopes.pop();
+                let user_body_hir = body_result?;
+
+                let local_init = |id, value| HirStmt {
+                    kind: HirStmtKind::LocalInit { id, value },
+                    span,
+                };
+                let mut block_stmts: Vec<HirStmt> = Vec::with_capacity(5);
+                block_stmts.push(local_init(state_id, state_hir));
+                block_stmts.push(local_init(ctl_id, ctl_hir));
+                if let Some(iter_id) = iter_id_opt {
+                    block_stmts.push(local_init(iter_id, iter_hir_opt.unwrap()));
+                }
+                block_stmts.push(local_init(
+                    break_id,
+                    HirExpr {
+                        kind: HirExprKind::Bool(false),
+                        span,
+                    },
+                ));
+                let state_local_expr = HirExpr {
+                    kind: HirExprKind::Local(state_id),
+                    span,
+                };
+                let ctl_local_expr = HirExpr {
+                    kind: HirExprKind::Local(ctl_id),
+                    span,
+                };
+                let key_local_expr = HirExpr {
+                    kind: HirExprKind::Local(key_id),
+                    span,
+                };
+                let next_step = HirStmt {
+                    kind: HirStmtKind::MultiAssignFromCall {
+                        dst_ids: vec![key_id, val_id],
+                        callee,
+                        args: vec![state_local_expr, ctl_local_expr],
+                    },
+                    span,
+                };
+                let break_assign = HirStmt {
+                    kind: HirStmtKind::Assign {
+                        id: break_id,
+                        value: HirExpr {
+                            kind: HirExprKind::Bool(true),
+                            span,
+                        },
+                    },
+                    span,
+                };
+                let ctl_advance = HirStmt {
+                    kind: HirStmtKind::Assign {
+                        id: ctl_id,
+                        value: key_local_expr.clone(),
+                    },
+                    span,
+                };
+                let mut else_body: Vec<HirStmt> = Vec::with_capacity(user_body_hir.len() + 1);
+                else_body.extend(user_body_hir);
+                else_body.push(ctl_advance);
+                let nil_check = HirStmt {
+                    kind: HirStmtKind::If {
+                        cond: HirExpr {
+                            kind: HirExprKind::IsNil(Box::new(key_local_expr)),
+                            span,
+                        },
+                        then_body: vec![break_assign],
+                        elifs: Vec::new(),
+                        else_body: Some(else_body),
+                    },
+                    span,
+                };
+                let while_loop = HirStmt {
+                    kind: HirStmtKind::While {
+                        cond: HirExpr {
+                            kind: HirExprKind::Bool(true),
+                            span,
+                        },
+                        body: vec![next_step, nil_check],
+                        break_id: Some(break_id),
+                    },
+                    span,
+                };
+                block_stmts.push(while_loop);
+                Ok(HirStmt {
+                    kind: HirStmtKind::Block { stmts: block_stmts },
                     span,
                 })
             }

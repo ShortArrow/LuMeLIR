@@ -188,18 +188,31 @@ impl<'t> Parser<'t> {
             };
             let in_offset = self.peek().span.start;
             self.expect_keyword(Keyword::In)?;
-            let iter_call = self.parse_expr(0)?;
-            // Try ipairs (ADR 0078) first, then pairs (ADR 0080).
-            // Both are recognised by name; any other callable is
-            // rejected as unsupported (LIC-2.8e-iter-generic-1).
-            let iter_match = match unwrap_named_unary_call(iter_call, "ipairs") {
-                Ok(table_expr) => IterMatch::Ipairs(table_expr),
-                Err(other) => match unwrap_named_unary_call(other, "pairs") {
-                    Ok(table_expr) => IterMatch::Pairs(table_expr),
-                    Err(_) => {
-                        return Err(ParseError::UnsupportedIterator { offset: in_offset });
-                    }
-                },
+            let first_expr = self.parse_expr(0)?;
+            // Phase 2.8e-iter-generic (ADR 0085): if a comma follows
+            // the first expression, this is a 3-tuple `iter, state,
+            // ctl` form (full Lua 5.4 generic-for). Otherwise try
+            // the existing ipairs / pairs sugars.
+            let iter_match = if matches!(self.peek().kind, TokenKind::Comma) {
+                self.bump(); // consume ','
+                let state = self.parse_expr(0)?;
+                self.expect_token(TokenKind::Comma)?;
+                let ctl = self.parse_expr(0)?;
+                IterMatch::Generic {
+                    iter: first_expr,
+                    state,
+                    ctl,
+                }
+            } else {
+                match unwrap_named_unary_call(first_expr, "ipairs") {
+                    Ok(table_expr) => IterMatch::Ipairs(table_expr),
+                    Err(other) => match unwrap_named_unary_call(other, "pairs") {
+                        Ok(table_expr) => IterMatch::Pairs(table_expr),
+                        Err(_) => {
+                            return Err(ParseError::UnsupportedIterator { offset: in_offset });
+                        }
+                    },
+                }
             };
             self.expect_keyword(Keyword::Do)?;
             let body =
@@ -219,13 +232,22 @@ impl<'t> Parser<'t> {
                     table: table_expr,
                     body,
                 },
+                IterMatch::Generic { iter, state, ctl } => StmtKind::ForGeneric {
+                    names: vec![var, val_name],
+                    iter,
+                    state,
+                    ctl,
+                    body,
+                },
             };
             return Ok(Stmt::new(stmt_kind, span));
         }
         if matches!(self.peek().kind, TokenKind::Keyword(Keyword::In)) {
-            // Single-variable `for k in iter() do ...` is the
-            // unrestricted generic-for protocol (LIC-2.8e-iter-
-            // generic-1). Rejected in this phase.
+            // Single-variable `for k in iter() do ...` would be the
+            // 1-name form of generic-for; ADR 0085 Phase 1 scope
+            // requires both index and value bindings (`for k, v in
+            // ...`). 1-name is parser-rejected; the user can pad with
+            // `_` to force the 2-name form.
             return Err(ParseError::UnsupportedIterator {
                 offset: self.peek().span.start,
             });
@@ -933,12 +955,14 @@ struct InfixInfo {
     right_assoc: bool,
 }
 
-/// `ipairs` (ADR 0078) / `pairs` (ADR 0080) parser sugar dispatch.
-/// `parse_for` records which iterator name matched so the right
-/// statement kind is built without re-walking the expression.
+/// `ipairs` (ADR 0078) / `pairs` (ADR 0080) / generic-for (ADR 0085)
+/// parser sugar dispatch. `parse_for` records which iterator shape
+/// matched so the right statement kind is built without re-walking
+/// the expression.
 enum IterMatch {
     Ipairs(Expr),
     Pairs(Expr),
+    Generic { iter: Expr, state: Expr, ctl: Expr },
 }
 
 /// Pattern-match `NAME(table_expr)` where `NAME` is `"ipairs"` or
@@ -1183,6 +1207,19 @@ mod tests {
                 key_name,
                 val_name,
                 table: strip_span_expr(table),
+                body: body.into_iter().map(strip_span_stmt).collect(),
+            },
+            StmtKind::ForGeneric {
+                names,
+                iter,
+                state,
+                ctl,
+                body,
+            } => StmtKind::ForGeneric {
+                names,
+                iter: strip_span_expr(iter),
+                state: strip_span_expr(state),
+                ctl: strip_span_expr(ctl),
                 body: body.into_iter().map(strip_span_stmt).collect(),
             },
             StmtKind::Break => StmtKind::Break,

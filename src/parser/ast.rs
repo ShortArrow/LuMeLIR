@@ -220,6 +220,23 @@ pub enum StmtKind {
         table: Expr,
         body: Chunk,
     },
+    /// `for k, v in ITER, STATE, CTL do BODY end` — Phase 2.8e-iter-
+    /// generic (ADR 0085) full Lua 5.4 §3.3.5 generic-for protocol.
+    /// `iter` may be a builtin (`next`), a top-level user function,
+    /// a function-typed local (parameter or alias), or — once ADR
+    /// 0083 lands — a closure-with-upvalues. Phase 1 scope filters
+    /// out closure-as-iter via the existing escape-analysis backstop
+    /// (LIC-2.6c-tag-hetero-closure-escape-1). HIR desugars to a
+    /// `Block { LocalInit __iter,__state,__ctl,_broken; While(true) {
+    /// MultiAssignFromCall; If IsNil(k) then _broken=true else BODY;
+    /// __ctl = k end } }` shape — no new codegen arm.
+    ForGeneric {
+        names: Vec<String>,
+        iter: Expr,
+        state: Expr,
+        ctl: Expr,
+        body: Chunk,
+    },
     /// `break` — exits the innermost enclosing loop. HIR rejects
     /// `break` outside of any loop with `BreakOutsideLoop`.
     Break,

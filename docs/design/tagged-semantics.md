@@ -6,7 +6,7 @@
 > consumer / tag semantics. ADRs continue to record *decisions*;
 > this page records *current state*.
 
-**Last updated:** 2026-05-06 (after ADR 0084)
+**Last updated:** 2026-05-06 (after ADR 0085)
 
 ---
 
@@ -251,6 +251,7 @@ the introduction, when still open).
 | LIC-2.8e-builtin-multi-return-1   | Builtin callees with multi-position return signatures; `MultiAssignFromCall` extended through `Callee::Builtin(b)` + `Builtin::ret_kinds()` | 0081 |
 | LIC-2.5x-callee-dispatch-1        | TaggedValue local indirect call via per-call-site static dispatch chain (tag-check + ptr-match + direct `func.call @user_fn_X`); reopens `LIC-2.6c-tag-hetero-fn-tbl-call-1` ("resolved by removal" → "resolved by safe static dispatch") | 0082 |
 | LIC-2.8e-pairs-tagged-key-write-1 | `t[k] = …` inside a `pairs` body where `k` is the iterator-bound TaggedValue local — codegen runtime tag dispatch (`TAG_NIL` trap, hash probe via the existing tag-aware helpers), Index read on the same shape | 0084 |
+| LIC-2.8e-iter-generic-1           | `for k, v in iter, state, ctl do … end` — Phase 1 scope: non-capturing user fn, builtin `next`, function alias. Closure-as-iter rejected via the existing `f.upvalues.is_empty()` filter; lifts automatically when ADR 0083 ships | 0085 |
 
 ### Partial
 
@@ -260,13 +261,12 @@ the introduction, when still open).
 
 | ID                                          | Behaviour                                                             | Notes                          |
 |---------------------------------------------|-----------------------------------------------------------------------|--------------------------------|
-| LIC-2.6c-tag-hetero-closure-escape-1        | Closure with upvalues stored in tables                                | HIR-rejects today (ADR 0044 + ADR 0071); needs escape-analysis relaxation |
+| LIC-2.6c-tag-hetero-closure-escape-1        | Closure with upvalues stored in tables                                | HIR-rejects today (ADR 0044 + ADR 0071); needs escape-analysis relaxation. ADR 0085 also rejects closure-as-iter via the same backstop until ADR 0083 (Full closures) lands |
 | LIC-2.7p-arith-coerce-tagged-1              | TaggedValue operand arith coerce (`local x = t[1]; print(x + 1)` when x is runtime String) | HIR can't statically resolve the kind; current TaggedValue-arith path traps on non-Number tag (ADR 0063). Unlocking needs runtime tag dispatch in arith codegen |
-| LIC-2.8e-iter-generic-1                     | Generic-for protocol with arbitrary callable iterator (`for x in iter, state, init do …`) | Requires reopening the ADR 0075 indirect-call reject via signature side table or equivalent runtime descriptor |
 | LIC-2.6b-hash-key-nil-runtime-1             | Dynamic `nil` hash key via TaggedValue local — runtime probe currently fires the generic missing-key trap; Lua spec wants a specific "table index is nil" diagnostic. ADR 0084 surfaces this for IndexAssign / Index via `s_table_index_nil`; remaining gap is the trap surface for hash-keyed reads through other producers | 0079 / 0084 (partial) |
 | LIC-2.6b-hash-key-nan-runtime-1             | Dynamic `NaN` hash key via TaggedValue local — `cmpf Oeq` excludes NaN (NaN ≠ NaN), so the probe walks past and never finds the bucket. Lua spec wants a hard runtime error at insert time | 0079 |
 
-**Total:** 26 LIC entries — 24 resolved, 0 partial, 2 pending core + 2 pending runtime-diag.
+**Total:** 27 LIC entries — 25 resolved, 0 partial, 2 pending core + 2 pending runtime-diag.
 
 ---
 
@@ -525,6 +525,28 @@ This is a documented trade-off: a future ADR may unify the
 read-side dispatch so static-Number reads check the hash mirror
 after the array slot.
 
+### Generic-for protocol (ADR 0085)
+
+`for k, v in ITER, STATE, CTL do BODY end` HIR-desugars to a
+synthetic block that pins state / ctl / iter to fresh locals and
+calls iter each iteration through whichever `Callee` shape the iter
+resolves to:
+
+| Source iter shape                                 | Callee                              |
+|---------------------------------------------------|-------------------------------------|
+| `Ident("next")`                                   | `Builtin::Next`                     |
+| `FunctionRef(fid)`                                | `User(fid)`                         |
+| `Local(idx)` / `Function(arity=2)` with FuncId    | `User(fid)`                         |
+| `Local(idx)` / `Function(arity=2)` parameter      | rejected (single-Number ret ABI)    |
+| `Local(idx)` / `TaggedValue`                      | `IndirectDispatch { sig, candidates }` filtered by `f.upvalues.is_empty()` |
+
+The filter `f.upvalues.is_empty()` keeps closure-as-iter behind
+the existing closure-escape backstop until ADR 0083's env-threading
+ABI lands; lifting it then is a one-line change. The iter must
+return `(TaggedValue|Nil, _)` so the loop can receive `nil` as the
+termination sentinel — Number-only or Bool-only first ret_kind is
+rejected at HIR (would loop forever).
+
 ---
 
 ## 7. Open Questions / Known Gaps
@@ -541,12 +563,7 @@ Listed in Codex review priority order (post-ADR-0082):
    via the existing escape analysis (ADR 0044 + ADR 0071).
    Best tackled after #1 because it's a special case of the
    same underlying GC/escape design.
-3. **Generic-for protocol** (LIC-2.8e-iter-generic-1): `for k,
-   v in iter, state, ctl do BODY end` with arbitrary callable
-   `iter`. ADR 0082 unblocks the codegen path; the remaining
-   work is the parser/HIR sugar that desugars the 3-tuple form
-   to a while loop over `MultiAssignFromCall(IndirectDispatch)`.
-4. **Hash key runtime diagnostics** (LIC-2.6b-hash-key-nan-
+3. **Hash key runtime diagnostics** (LIC-2.6b-hash-key-nan-
    runtime-1). NaN-tagged TaggedValue keys probe-miss with the
    generic `s_table_missing_key` trap; spec wants a dedicated
    "table index is NaN" error at insert time. ADR 0084
@@ -588,3 +605,4 @@ Listed in Codex review priority order (post-ADR-0082):
 | 0081 | 2.8e-iter-next               | `next(t, k)` builtin + ForPairs HIR-desugar (Plan Alpha, Codex post-ADR-0080) — `Builtin::Next` is the first multi-return builtin; `Builtin::ret_kinds()` + `MultiAssignFromCall(Callee::Builtin)` open the path. Module-level `@__lumelir_next` (stateless `(t, prev_k) → (k, v)` scan with linear find/resume) replaces ADR 0080's `emit_for_pairs` walker; ForPairs lowers to `Block + LocalInit + While + MultiAssignFromCall + If + Assign`. ~707 LOC of codegen deleted (`emit_for_pairs` and 4 helpers); ~750 LOC added (`__lumelir_next` body + multi-assign-from-builtin + extract-prev-k). 5 new e2e in `tests/phase2_8e_next.rs`, 16 ADR 0080 e2e regress green. LIC-2.8e-iter-pairs-1 resolution mechanism updated; new resolved LIC-2.8e-builtin-multi-return-1. 22/0/4 |
 | 0082 | 2.5x-callee-dispatch         | General indirect-call re-enablement (Plan B3, Codex post-ADR-0081, supersedes ADR 0075 in part) — `Callee::IndirectDispatch { local_id, sig: IndirectSig, candidates: Vec<FuncId> }` extends `Callee` (kept `Indirect` for parameter calls). HIR `lower_call` filters user fns by `param_kinds`, picks the first match's `ret_kinds` as canonical, and re-runs `compatible_user_functions` for full-sig candidates; `lower_local_multi` / `lower_assign_multi` re-search for multi-value position. Codegen `emit_indirect_dispatch_call` does (1) tag-check vs `TAG_FUNCTION` with `s_call_non_function` trap, (2) ptr load at slot+8, (3) nested `scf.if` chain comparing `loaded_ptr` to each candidate's `func.constant @user_fn_X` and emitting **direct** `func.call @user_fn_X(args)` (no `func.call_indirect` cast — Codex forward-edge integrity). New `src/codegen/callabi.rs` extracts `ret_mlir_types` / `ret_kind_result_width` / `flat_result_index` (Tidy First). 11 reframed tests (ADR 0072/0075 reject → positive) + 4 new e2e (multi-return indirect, closure-escape regression, no-candidates compile error, same-sig dispatch). 940 → 944 green. LIC-2.6c-tag-hetero-fn-tbl-call-1 reframed "resolved by safe static dispatch"; new resolved LIC-2.5x-callee-dispatch-1. 23/0/4 |
 | 0084 | 2.8e-iter-tk                 | TaggedValue-key IndexAssign + Index read (Codex pivot to (C), ADR 0083 deferred). HIR `is_hash_key_eligible` accepts `ValueKind::TaggedValue`; codegen runtime tag dispatch in IndexAssign / Index passes the local's slot directly to the ADR 0079 hash probe with a `TAG_NIL` trap (`s_table_index_nil`, Lua spec §3.4.5). New-key commit copies the 16-byte search slot into `entry+0` raw. Resolves the natural `for k, v in pairs(t) do t[k] = v + 100 end` idiom; ADR 0080's `pairs_body_writes_separate_table_safely` workaround reframed to `pairs_body_mutates_existing_value_safely`. 7 new e2e + 1 reframe, 944 → 951 green. LIC-2.8e-pairs-tagged-key-write-1 resolved; LIC-2.6b-hash-key-nil-runtime-1 noted as partial via the new trap surface. 24/0/3 |
+| 0085 | 2.8e-iter-generic            | Full Lua 5.4 §3.3.5 generic-for parser sugar — `for k, v in ITER, STATE, CTL do BODY end`. New `StmtKind::ForGeneric { names, iter, state, ctl, body }` parser variant + `IterMatch::Generic` discriminator; HIR synthetic-block desugar pins state / ctl / iter to fresh locals and dispatches the per-iteration call through `Callee::Builtin(Next)` / `User(fid)` / `IndirectDispatch` based on iter's resolved shape. Phase 1 scope filters closure-as-iter via `f.upvalues.is_empty()` (carries over to ADR 0083 follow-up). Iter must return `(TaggedValue\|Nil, _)` so a `nil` first result can terminate. 8 new e2e in `tests/phase2_8e_generic_for.rs`, 951 → 959 green. LIC-2.8e-iter-generic-1 resolved (Phase 1). 25/0/3 |
