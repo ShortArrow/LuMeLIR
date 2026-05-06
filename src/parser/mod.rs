@@ -189,22 +189,38 @@ impl<'t> Parser<'t> {
             let in_offset = self.peek().span.start;
             self.expect_keyword(Keyword::In)?;
             let iter_call = self.parse_expr(0)?;
-            let table_expr = unwrap_ipairs_call(iter_call)
-                .ok_or(ParseError::UnsupportedIterator { offset: in_offset })?;
+            // Try ipairs (ADR 0078) first, then pairs (ADR 0080).
+            // Both are recognised by name; any other callable is
+            // rejected as unsupported (LIC-2.8e-iter-generic-1).
+            let iter_match = match unwrap_named_unary_call(iter_call, "ipairs") {
+                Ok(table_expr) => IterMatch::Ipairs(table_expr),
+                Err(other) => match unwrap_named_unary_call(other, "pairs") {
+                    Ok(table_expr) => IterMatch::Pairs(table_expr),
+                    Err(_) => {
+                        return Err(ParseError::UnsupportedIterator { offset: in_offset });
+                    }
+                },
+            };
             self.expect_keyword(Keyword::Do)?;
             let body =
                 self.parse_chunk_until(&[TokenKind::Keyword(Keyword::End), TokenKind::Eof])?;
             let end_tok = self.expect_keyword(Keyword::End)?;
             let span = Span::new(for_tok.span.start, end_tok.span.end);
-            return Ok(Stmt::new(
-                StmtKind::ForIpairs {
+            let stmt_kind = match iter_match {
+                IterMatch::Ipairs(table_expr) => StmtKind::ForIpairs {
                     idx_name: var,
                     val_name,
                     table: table_expr,
                     body,
                 },
-                span,
-            ));
+                IterMatch::Pairs(table_expr) => StmtKind::ForPairs {
+                    key_name: var,
+                    val_name,
+                    table: table_expr,
+                    body,
+                },
+            };
+            return Ok(Stmt::new(stmt_kind, span));
         }
         if matches!(self.peek().kind, TokenKind::Keyword(Keyword::In)) {
             // Single-variable `for k in iter() do ...` is the
@@ -917,24 +933,34 @@ struct InfixInfo {
     right_assoc: bool,
 }
 
-/// Phase 2.8e-iter-ipairs (ADR 0078): pattern-match
-/// `ipairs(table_expr)` — the only iterator shape recognised by
-/// the restricted Plan-C `for ... in` form. Returns the unwrapped
-/// `table_expr` on match; `None` for any other shape (including
-/// `pairs(t)`, custom iterators, multi-arg `ipairs`, etc.).
-fn unwrap_ipairs_call(expr: Expr) -> Option<Expr> {
-    let span = expr.span;
-    if let ExprKind::Call { callee, args } = expr.kind
-        && let ExprKind::Ident(ref name) = callee.kind
-        && name == "ipairs"
-        && args.len() == 1
-    {
-        let mut args = args;
-        Some(args.remove(0))
-    } else {
-        // Drop the unwrapped expr; leak nothing.
-        let _ = span;
-        None
+/// `ipairs` (ADR 0078) / `pairs` (ADR 0080) parser sugar dispatch.
+/// `parse_for` records which iterator name matched so the right
+/// statement kind is built without re-walking the expression.
+enum IterMatch {
+    Ipairs(Expr),
+    Pairs(Expr),
+}
+
+/// Pattern-match `NAME(table_expr)` where `NAME` is `"ipairs"` or
+/// `"pairs"`. Returns `Ok(table_expr)` on a single-argument match;
+/// returns `Err(original_expr)` unchanged so the caller can re-try
+/// with a different name without losing the parsed expression.
+fn unwrap_named_unary_call(expr: Expr, name: &str) -> Result<Expr, Expr> {
+    let matches = matches!(
+        &expr.kind,
+        ExprKind::Call { callee, args }
+            if matches!(&callee.kind, ExprKind::Ident(n) if n == name)
+                && args.len() == 1
+    );
+    if !matches {
+        return Err(expr);
+    }
+    match expr.kind {
+        ExprKind::Call { args, .. } => {
+            let mut args = args;
+            Ok(args.remove(0))
+        }
+        _ => unreachable!(),
     }
 }
 
@@ -1144,6 +1170,17 @@ mod tests {
                 body,
             } => StmtKind::ForIpairs {
                 idx_name,
+                val_name,
+                table: strip_span_expr(table),
+                body: body.into_iter().map(strip_span_stmt).collect(),
+            },
+            StmtKind::ForPairs {
+                key_name,
+                val_name,
+                table,
+                body,
+            } => StmtKind::ForPairs {
+                key_name,
                 val_name,
                 table: strip_span_expr(table),
                 body: body.into_iter().map(strip_span_stmt).collect(),

@@ -6,7 +6,7 @@
 > consumer / tag semantics. ADRs continue to record *decisions*;
 > this page records *current state*.
 
-**Last updated:** 2026-05-06 (after ADR 0079)
+**Last updated:** 2026-05-06 (after ADR 0080)
 
 ---
 
@@ -247,6 +247,7 @@ the introduction, when still open).
 | LIC-2.7p-arith-coerce-1           | String → Number arithmetic coercion (`"5" + 1`); failure traps via `s_arith_coerce_failed` | 0077      |
 | LIC-2.8e-iter-ipairs-1            | `for i, v in ipairs(t) do … end` parser sugar with first-nil termination | 0078      |
 | LIC-2.6a-arr-3                    | All hash key kinds (Number / String / Bool / Function / Table) via tagged-key 32-byte entry layout | 0058 / 0079 |
+| LIC-2.8e-iter-pairs-1             | `for k, v in pairs(t) do … end` dual-phase walker (array + hash, tombstone-aware, body-mutation safe) | 0080 |
 
 ### Partial
 
@@ -258,12 +259,12 @@ the introduction, when still open).
 |---------------------------------------------|-----------------------------------------------------------------------|--------------------------------|
 | LIC-2.6c-tag-hetero-closure-escape-1        | Closure with upvalues stored in tables                                | HIR-rejects today (ADR 0044 + ADR 0071); needs escape-analysis relaxation |
 | LIC-2.7p-arith-coerce-tagged-1              | TaggedValue operand arith coerce (`local x = t[1]; print(x + 1)` when x is runtime String) | HIR can't statically resolve the kind; current TaggedValue-arith path traps on non-Number tag (ADR 0063). Unlocking needs runtime tag dispatch in arith codegen |
-| LIC-2.8e-iter-pairs-1                       | `pairs(t)` hash-bucket iteration                                      | Requires hash-walk protocol design with tombstone awareness (ADR 0062). The tagged-key layout (ADR 0079) is the prerequisite layout for emitting key/value pairs through the iterator |
 | LIC-2.8e-iter-generic-1                     | Generic-for protocol with arbitrary callable iterator (`for x in iter, state, init do …`) | Requires reopening the ADR 0075 indirect-call reject via signature side table or equivalent runtime descriptor |
-| LIC-2.6b-hash-key-nil-runtime-1             | Dynamic `nil` hash key via TaggedValue local — runtime probe currently fires the generic missing-key trap; Lua spec wants a specific "table index is nil" diagnostic | ADR 0079 |
-| LIC-2.6b-hash-key-nan-runtime-1             | Dynamic `NaN` hash key via TaggedValue local — `cmpf Oeq` excludes NaN (NaN ≠ NaN), so the probe walks past and never finds the bucket. Lua spec wants a hard runtime error at insert time | ADR 0079 |
+| LIC-2.8e-pairs-tagged-key-write-1           | `t[k] = …` inside a `pairs` body where `k` is the iterator-bound TaggedValue local | `is_hash_key_eligible` requires a static, non-`TaggedValue` kind. The natural Lua "bump every value" idiom must aggregate into a separate table (ADR 0080 test #15 demonstrates the workaround). Resolution requires IndexAssign to grow a TaggedValue-key arm with runtime tag dispatch | 0080 |
+| LIC-2.6b-hash-key-nil-runtime-1             | Dynamic `nil` hash key via TaggedValue local — runtime probe currently fires the generic missing-key trap; Lua spec wants a specific "table index is nil" diagnostic | 0079 |
+| LIC-2.6b-hash-key-nan-runtime-1             | Dynamic `NaN` hash key via TaggedValue local — `cmpf Oeq` excludes NaN (NaN ≠ NaN), so the probe walks past and never finds the bucket. Lua spec wants a hard runtime error at insert time | 0079 |
 
-**Total:** 23 LIC entries — 20 resolved, 0 partial, 3 pending core + 2 pending runtime-diag.
+**Total:** 24 LIC entries — 21 resolved, 0 partial, 3 pending core + 2 pending runtime-diag.
 
 ---
 
@@ -417,26 +418,61 @@ Each TaggedValue position contributes 2 MLIR results
 (`ret_kind_result_width(TaggedValue) = 2`); every other
 supported kind contributes 1.
 
+### Iteration: `pairs` codegen (ADR 0080)
+
+`for k, v in pairs(t) do BODY end` lowers via a stmt-level
+codegen walker (`emit_for_pairs`) with two phases sharing a single
+`_broken` flag. Phase 1 walks the array part `i = 1..=len`, skipping
+`TAG_NIL` holes. Phase 2 walks the hash part `bi = 0..hash_cap`,
+skipping `TAG_NIL` (empty) and `TAG_DELETED` (tombstone) entries.
+
+**Rehash safety**: each iteration reloads `header.hash_buf` and
+ptr-equality compares against the captured initial pointer; on
+mismatch (the body forced a `emit_hash_grow_if_needed` which freed
+the old buffer) the walker sets `_broken = true` so the next
+`before`-region cond terminates the loop. The same ptr-equality
+discipline applies to `header.array_buf` for the array phase.
+Iteration order is therefore unspecified after a body-driven
+rehash, matching Lua spec.
+
+The k / v slot updates use `emit_value_slot_store_number` (phase
+1, k = i) and the new `emit_copy_value_slot_16b` helper (phase 1
+v from array slot; phase 2 k and v from the hash entry). The
+helper is a 2× i64 raw load/store of a 16-byte slot — the same
+pattern the rehash-migration block uses inline; consolidating
+both call sites is a future Tidy First.
+
+`HirStmtKind::ForPairs` is intentionally an **opaque** HIR shape
+(no desugaring, unlike ipairs). When ADR 0075's superseder lands
+and unblocks `next(t, k)`, this variant becomes a candidate for
+HIR-level desugaring to `for k, v in next, t, nil do … end` and
+`emit_for_pairs` becomes a deletion candidate.
+
 ---
 
 ## 7. Open Questions / Known Gaps
 
-Listed in Codex review priority order (post-ADR-0079):
+Listed in Codex review priority order (post-ADR-0080):
 
-1. **`pairs(t)` hash iteration** (LIC-2.8e-iter-pairs-1).
-   Tagged-key layout (ADR 0079) is in place; the remaining
-   work is the hash-walk protocol with tombstone awareness.
-2. **Future indirect-call re-enablement** (signature side
+1. **Future indirect-call re-enablement** (signature side
    table, ADR 0075 superseder candidate). Prerequisite for
-   generic-for protocol (LIC-2.8e-iter-generic-1).
-3. **Full closures** (`2.5c-full`). Heap-allocated environments.
+   generic-for protocol (LIC-2.8e-iter-generic-1) and for
+   refactoring `ForPairs` (ADR 0080) into a `for k,v in next,
+   t, nil` HIR-desugar.
+2. **Full closures** (`2.5c-full`). Heap-allocated environments.
    The general problem of which closure-in-tables (LIC-2.6c-
    tag-hetero-closure-escape-1) is a subset.
-4. **Closure-with-upvalues in tables**
+3. **Closure-with-upvalues in tables**
    (LIC-2.6c-tag-hetero-closure-escape-1). HIR rejects today
    via the existing escape analysis (ADR 0044 + ADR 0071).
-   Best tackled after #3 because it's a special case of the
+   Best tackled after #2 because it's a special case of the
    same underlying GC/escape design.
+4. **TaggedValue-key IndexAssign**
+   (LIC-2.8e-pairs-tagged-key-write-1). `t[k] = …` inside a
+   `pairs` body where `k` is the iterator binding requires
+   IndexAssign to grow a TaggedValue-key arm with runtime tag
+   dispatch; mirrors the value-side dispatch already used for
+   table reads through tagged keys.
 5. **Hash key runtime diagnostics** (LIC-2.6b-hash-key-nil-
    runtime-1 / -nan-runtime-1). Dynamic `nil` and `NaN` keys
    via TaggedValue locals: improve the diagnostic surface
@@ -474,3 +510,4 @@ Listed in Codex review priority order (post-ADR-0079):
 | 0077 | 2.7p-arith-string-coerce     | String → Number arith coercion — HIR `ArithStringCoerce` wraps String operands of arith / bitwise BinOps; codegen `emit_tonumber_for_arith` reuses `emit_tonumber`'s sscanf path then promotes NaN sentinel to runtime trap (`s_arith_coerce_failed`); 12 arith / bitwise ops accept String operands; hex floats work via glibc's sscanf%lf; LIC-arith-coerce-1 resolved |
 | 0078 | 2.8e-iter-ipairs             | `for k, v in ipairs(t) do … end` parser sugar (Plan C) — new `Keyword::In`, `StmtKind::ForIpairs`, parser branch + `unwrap_ipairs_call` restrict iter form to `ipairs(table)`; HIR desugars to `Block { LocalInit; While { LocalInit IndexTagged; If IsNil → break; BODY; idx += 1 } }` using existing primitives; codegen unchanged; `pairs` and generic-for protocol remain LIC-tracked pending the ADR 0075 indirect-call reopening |
 | 0079 | 2.6b-hash-keys               | Hash key kinds expansion (Plan E tagged-key) — hash entry widens 24→32 bytes with `{16-byte tagged key, 16-byte tagged value}`; new `TAG_DELETED=6` retires the `HASH_DELETED_KEY=1` ptr sentinel; new helpers `emit_build_search_key_slot`, `emit_hash_key_hash_dispatched`, `emit_hash_key_eq_dispatched` route 5-kind keys (Number / String / Bool / Function / Table) through the same probe; LIC-2.6a-arr-3 resolved (was partial) |
+| 0080 | 2.8e-iter-pairs              | `for k, v in pairs(t) do … end` dual-phase codegen walker — parser + HIR sibling of ForIpairs; codegen `emit_for_pairs` walks array part 1..=len then hash part 0..cap with tombstone (`TAG_DELETED`) skip; per-iteration `header.hash_buf` / `header.array_buf` reload + ptr-equality detect aborts on body-driven rehash (Codex pre-review P1); new helper `emit_copy_value_slot_16b` consolidates the rehash-migration copy pattern; LIC-2.8e-iter-pairs-1 resolved; new pending LIC-2.8e-pairs-tagged-key-write-1 (TaggedValue key IndexAssign HIR-rejected) |

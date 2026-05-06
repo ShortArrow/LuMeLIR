@@ -260,6 +260,7 @@ fn stmt_contains_break(s: &Stmt) -> bool {
         StmtKind::While { .. }
         | StmtKind::ForNumeric { .. }
         | StmtKind::ForIpairs { .. }
+        | StmtKind::ForPairs { .. }
         | StmtKind::Repeat { .. } => false,
         _ => false,
     }
@@ -387,7 +388,8 @@ fn ast_max_return_arity(stmts: &[Stmt]) -> usize {
             }
             StmtKind::While { body, .. }
             | StmtKind::ForNumeric { body, .. }
-            | StmtKind::ForIpairs { body, .. } => {
+            | StmtKind::ForIpairs { body, .. }
+            | StmtKind::ForPairs { body, .. } => {
                 for st in body {
                     visit(st, max);
                 }
@@ -511,6 +513,12 @@ fn infer_user_function_param_kinds(
                 }
             }
             StmtKind::ForIpairs { table, body, .. } => {
+                visit_expr(table, names, kinds, seen);
+                for st in body {
+                    visit_stmt(st, names, kinds, seen);
+                }
+            }
+            StmtKind::ForPairs { table, body, .. } => {
                 visit_expr(table, names, kinds, seen);
                 for st in body {
                     visit_stmt(st, names, kinds, seen);
@@ -672,6 +680,12 @@ fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
                 }
             }
             StmtKind::ForIpairs { table, body, .. } => {
+                visit_expr(table, name_to_idx, kinds);
+                for s in body {
+                    visit_stmt(s, name_to_idx, kinds);
+                }
+            }
+            StmtKind::ForPairs { table, body, .. } => {
                 visit_expr(table, name_to_idx, kinds);
                 for s in body {
                     visit_stmt(s, name_to_idx, kinds);
@@ -1663,6 +1677,74 @@ impl LowerCtx {
                 Ok(HirStmt {
                     kind: HirStmtKind::Block {
                         stmts: vec![table_init, idx_init, break_init, while_loop],
+                    },
+                    span,
+                })
+            }
+            // Phase 2.8e-iter-pairs (ADR 0080):
+            // `for K, V in pairs(TABLE) do BODY end`. Mirror of the
+            // ipairs lowering above, but ForPairs is preserved as an
+            // opaque HIR shape — codegen owns the dual-phase
+            // (array + hash) walk because hash-bucket traversal has
+            // no existing HIR primitive.
+            StmtKind::ForPairs {
+                key_name,
+                val_name,
+                table,
+                body,
+            } => {
+                let span = stmt.span;
+                let table_hir = self.lower_expr(table)?;
+                let table_kind = infer_kind(&table_hir, &self.locals, &self.functions);
+                if table_kind != ValueKind::Table {
+                    return Err(HirError::TypeMismatch {
+                        op: "for-in-pairs".to_owned(),
+                        lhs_kind: "table".to_owned(),
+                        rhs_kind: table_kind.name().to_owned(),
+                        offset: table.span.start,
+                    });
+                }
+                self.scopes.push(HashMap::new());
+                let table_local = self.declare_local(
+                    format!("__lumelir_iter_t_{}", self.locals.len()),
+                    ValueKind::Table,
+                );
+                let key_id = self.declare_local(key_name.clone(), ValueKind::TaggedValue);
+                let val_id = self.declare_local(val_name.clone(), ValueKind::TaggedValue);
+                let break_id =
+                    self.declare_local(format!("_broken_{}", self.locals.len()), ValueKind::Bool);
+
+                self.loop_break_targets.push(Some(break_id));
+                let body_result = self.lower_scoped_body_no_push(body);
+                self.loop_break_targets.pop();
+                self.scopes.pop();
+                let user_body_hir = body_result?;
+
+                let local_init = |id, value| HirStmt {
+                    kind: HirStmtKind::LocalInit { id, value },
+                    span,
+                };
+                let table_init = local_init(table_local, table_hir);
+                let break_init = local_init(
+                    break_id,
+                    HirExpr {
+                        kind: HirExprKind::Bool(false),
+                        span,
+                    },
+                );
+                let for_pairs = HirStmt {
+                    kind: HirStmtKind::ForPairs {
+                        table_local_id: table_local,
+                        key_id,
+                        val_id,
+                        break_id,
+                        body: user_body_hir,
+                    },
+                    span,
+                };
+                Ok(HirStmt {
+                    kind: HirStmtKind::Block {
+                        stmts: vec![table_init, break_init, for_pairs],
                     },
                     span,
                 })

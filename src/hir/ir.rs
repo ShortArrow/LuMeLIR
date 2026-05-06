@@ -150,6 +150,23 @@ pub enum HirStmtKind {
         body: Vec<HirStmt>,
         break_id: Option<LocalId>,
     },
+    /// `for K, V in pairs(TABLE) do BODY end` — Phase 2.8e-iter-pairs
+    /// (ADR 0080). Unlike `StmtKind::ForIpairs` which HIR-desugars to
+    /// existing primitives, `ForPairs` is preserved as an opaque shape
+    /// because the hash-bucket walk is a new codegen primitive.
+    /// `break_id` is unconditionally allocated — codegen needs the
+    /// flag for the phase-1↔phase-2 boundary and for the rehash-abort
+    /// safety check, even when the user body contains no `break`.
+    /// When ADR 0075's superseder lands and unblocks `next(t, k)`,
+    /// this variant becomes a candidate for HIR-level desugaring to
+    /// `for k, v in next, t, nil do ... end`.
+    ForPairs {
+        table_local_id: LocalId,
+        key_id: LocalId,
+        val_id: LocalId,
+        break_id: LocalId,
+        body: Vec<HirStmt>,
+    },
     /// `local a, b, ... = f(args)` (Phase 2.5d, ADR 0021): a single
     /// multi-result call whose results are bound 1-1 to the listed
     /// destination locals. Equivalent in observable behaviour to

@@ -39,10 +39,10 @@ use super::primitive::{
 };
 use super::tagged::{
     ARRAY_ELEM_OFF_VALUE, ARRAY_ELEM_SIZE, TAG_BOOL, TAG_DELETED, TAG_FUNCTION, TAG_NIL,
-    TAG_NUMBER, TAG_STRING, TAG_TABLE, emit_alloca_slot_for_kind, emit_print_tagged_local,
-    emit_tag_and_payload_ptr, emit_tagged_eq_local_local, emit_tagged_unknown_tag_trap,
-    emit_type_tagged_local, emit_value_slot_check_number, emit_value_slot_store_dispatched,
-    emit_value_slot_store_nil,
+    TAG_NUMBER, TAG_STRING, TAG_TABLE, emit_alloca_slot_for_kind, emit_copy_value_slot_16b,
+    emit_print_tagged_local, emit_tag_and_payload_ptr, emit_tagged_eq_local_local,
+    emit_tagged_unknown_tag_trap, emit_type_tagged_local, emit_value_slot_check_number,
+    emit_value_slot_store_dispatched, emit_value_slot_store_nil, emit_value_slot_store_number,
 };
 
 // =============================================================
@@ -439,6 +439,11 @@ fn collect_string_pool(chunk: &HirChunk) -> std::collections::HashMap<String, St
                 visit_expr(start, set);
                 visit_expr(stop, set);
                 visit_expr(step, set);
+                for st in body {
+                    visit_stmt(st, set);
+                }
+            }
+            HirStmtKind::ForPairs { body, .. } => {
                 for st in body {
                     visit_stmt(st, set);
                 }
@@ -1191,6 +1196,32 @@ fn emit_stmt<'a, 'c>(
             emit_for_numeric(
                 context, block, *var_id, start, stop, step, body, *break_id, slots, locals,
                 functions, types, params_len, loc,
+            )?;
+        }
+        // Phase 2.8e-iter-pairs (ADR 0080): `for K, V in pairs(t) do
+        // BODY end`. Two-phase walker (array part then hash part)
+        // with rehash-detection abort for body-driven mutation.
+        HirStmtKind::ForPairs {
+            table_local_id,
+            key_id,
+            val_id,
+            break_id,
+            body,
+        } => {
+            emit_for_pairs(
+                context,
+                block,
+                *table_local_id,
+                *key_id,
+                *val_id,
+                *break_id,
+                body,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                loc,
             )?;
         }
         HirStmtKind::ExprStmt(expr) => {
@@ -6774,6 +6805,714 @@ fn emit_for_numeric<'a, 'c>(
 
     parent.append_operation(scf::r#while(&[], &[], before, after, loc));
     Ok(())
+}
+
+/// Phase 2.8e-iter-pairs (ADR 0080): lower `for K, V in pairs(t) do
+/// BODY end` to a dual-phase walker.
+///
+/// Phase 1 walks the array part `i = 1..=len`, skipping `TAG_NIL`
+/// holes (Lua spec: `pairs` does not stop at array holes).
+/// Phase 2 walks the hash part `bi = 0..hash_cap`, skipping
+/// `TAG_NIL` (empty bucket) and `TAG_DELETED` (tombstone) entries.
+///
+/// **Rehash safety (Codex pre-review P1)**: the body may mutate the
+/// iterated table, which can free `hash_buf` via
+/// [`emit_hash_grow_if_needed`]. We capture `hash_buf_initial` once
+/// before the hash phase and re-load `header.hash_buf` at the top of
+/// each iteration; pointer inequality sets `_broken = true` so the
+/// next `before`-region cond terminates the loop. Same pattern for
+/// `array_buf` so a body that triggers array regrow doesn't observe
+/// freed memory either. Iteration order is unspecified after such
+/// mutation per Lua spec.
+///
+/// `break_id` is unconditionally allocated by the HIR lowering for
+/// this construct because both the user `break` path and the rehash
+/// abort path write to it.
+#[allow(clippy::too_many_arguments)]
+fn emit_for_pairs<'a, 'c>(
+    context: &'c Context,
+    parent: &'a Block<'c>,
+    table_local_id: LocalId,
+    key_id: LocalId,
+    val_id: LocalId,
+    break_id: LocalId,
+    body: &[HirStmt],
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    // ===== Setup (parent block, runs once) =====
+    let table_ptr = emit_load(parent, slots[table_local_id.0], types.ptr, loc);
+    let len_slot = emit_byte_offset_ptr(context, parent, table_ptr, TABLE_OFF_LEN, types, loc);
+    let len = emit_load(parent, len_slot, types.i64, loc);
+    let arr_buf_slot =
+        emit_byte_offset_ptr(context, parent, table_ptr, TABLE_OFF_ARRAY_BUF, types, loc);
+    let arr_buf_initial = emit_load(parent, arr_buf_slot, types.ptr, loc);
+    let arr_buf_initial_iv = emit_ptrtoint_i64(context, parent, arr_buf_initial, types, loc);
+    let hash_buf_slot =
+        emit_byte_offset_ptr(context, parent, table_ptr, TABLE_OFF_HASH_BUF, types, loc);
+    let hash_buf_initial = emit_load(parent, hash_buf_slot, types.ptr, loc);
+    let hash_buf_initial_iv = emit_ptrtoint_i64(context, parent, hash_buf_initial, types, loc);
+
+    // ===== Phase 1: array part (i = 1..=len) =====
+    emit_for_pairs_array_phase(
+        context,
+        parent,
+        table_ptr,
+        len,
+        arr_buf_initial_iv,
+        key_id,
+        val_id,
+        break_id,
+        body,
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        loc,
+    )?;
+
+    // ===== Phase 2: hash part (bi = 0..cap_initial), guarded by =====
+    // `hash_buf_initial != null AND not _broken`.
+    let zero_i64 = parent
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let one_i1 = parent
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i1, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let not_lazy_null: Value<'c, 'a> = parent
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Ne,
+            hash_buf_initial_iv,
+            zero_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let not_broken_outer = and_not_broken(context, parent, one_i1, slots, break_id, types, loc);
+    let guard: Value<'c, 'a> = parent
+        .append_operation(arith::andi(not_lazy_null, not_broken_outer, loc))
+        .result(0)
+        .unwrap()
+        .into();
+
+    // Build the outer scf.if region that runs the hash phase only
+    // when guard is true. Capture `hash_buf_initial`/cap_initial
+    // once at the top of the then-region so a same-iteration rehash
+    // can be detected by ptr inequality on the per-iteration reload.
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        let cap_slot = emit_byte_offset_ptr(
+            context,
+            &then_blk,
+            unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(hash_buf_initial) },
+            HASH_OFF_CAP,
+            types,
+            loc,
+        );
+        let cap_initial = emit_load(&then_blk, cap_slot, types.i64, loc);
+        emit_for_pairs_hash_phase(
+            context,
+            &then_blk,
+            unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(table_ptr) },
+            unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(hash_buf_initial_iv) },
+            cap_initial,
+            key_id,
+            val_id,
+            break_id,
+            body,
+            slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            loc,
+        )?;
+        then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    parent.append_operation(scf::r#if(guard, &[], then_region, else_region, loc));
+    Ok(())
+}
+
+/// Phase 2.8e-iter-pairs (ADR 0080) phase 1: walk the array part of
+/// a table, yielding (Number-tagged k = i, copied v = array slot)
+/// for each non-nil slot. Per-iteration `array_buf` reload + ptr
+/// equality with `arr_buf_initial_iv` aborts on regrow (Codex P1
+/// symmetry). Hole skipping: array slots with `TAG_NIL` are passed
+/// over (Lua spec — pairs does not stop at holes, unlike ipairs).
+#[allow(clippy::too_many_arguments)]
+fn emit_for_pairs_array_phase<'a, 'c>(
+    context: &'c Context,
+    parent: &'a Block<'c>,
+    table_ptr: Value<'c, 'a>,
+    len: Value<'c, 'a>,
+    arr_buf_initial_iv: Value<'c, 'a>,
+    key_id: LocalId,
+    val_id: LocalId,
+    break_id: LocalId,
+    body: &[HirStmt],
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    let one_i64 = parent
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+
+    // Before region: cond = (i <= len) AND not_broken.
+    let before_region = Region::new();
+    let before_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let i_arg: Value<'c, '_> = before_blk.argument(0).unwrap().into();
+        let len_inner = unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(len) };
+        let i_le_len: Value<'c, '_> = before_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Sle,
+                i_arg,
+                len_inner,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let blk_slots = transmute_slots(slots);
+        let cond = and_not_broken(
+            context,
+            &before_blk,
+            i_le_len,
+            blk_slots,
+            break_id,
+            types,
+            loc,
+        );
+        before_blk.append_operation(scf::condition(cond, &[i_arg], loc));
+    }
+    before_region.append_block(before_blk);
+
+    // After region: per-iteration body.
+    let after_region = Region::new();
+    let after_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let i_arg: Value<'c, '_> = after_blk.argument(0).unwrap().into();
+        let blk_slots = transmute_slots(slots);
+        let table_ptr_inner =
+            unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(table_ptr) };
+        let arr_buf_initial_iv_inner =
+            unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(arr_buf_initial_iv) };
+
+        // Reload arr_buf and detect regrow (P1 symmetry).
+        let arr_buf_slot_now = emit_byte_offset_ptr(
+            context,
+            &after_blk,
+            table_ptr_inner,
+            TABLE_OFF_ARRAY_BUF,
+            types,
+            loc,
+        );
+        let arr_buf_now = emit_load(&after_blk, arr_buf_slot_now, types.ptr, loc);
+        let arr_buf_now_iv = emit_ptrtoint_i64(context, &after_blk, arr_buf_now, types, loc);
+        let regrew: Value<'c, '_> = after_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Ne,
+                arr_buf_now_iv,
+                arr_buf_initial_iv_inner,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        // If regrew, set _broken; either way fall through to inc.
+        emit_set_broken_if(context, &after_blk, regrew, blk_slots, break_id, types, loc);
+
+        // Compute slot_ptr = arr_buf_now + (i-1) * 16.
+        let i_minus_one: Value<'c, '_> = after_blk
+            .append_operation(arith::subi(
+                i_arg,
+                unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(one_i64) },
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let elem_size = after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, ARRAY_ELEM_SIZE).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let slot_off: Value<'c, '_> = after_blk
+            .append_operation(arith::muli(i_minus_one, elem_size, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let slot_ptr =
+            emit_byte_offset_ptr_dynamic(context, &after_blk, arr_buf_now, slot_off, types, loc);
+
+        // Load tag; live = (tag != TAG_NIL) AND not regrew.
+        // Skip live check on regrow because slot_ptr is now stale.
+        let tag = emit_load(&after_blk, slot_ptr, types.i64, loc);
+        let tag_nil = after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let tag_not_nil: Value<'c, '_> = after_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Ne,
+                tag,
+                tag_nil,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let one_i1_inner = after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i1, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let not_regrew: Value<'c, '_> = after_blk
+            .append_operation(arith::xori(regrew, one_i1_inner, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_live: Value<'c, '_> = after_blk
+            .append_operation(arith::andi(tag_not_nil, not_regrew, loc))
+            .result(0)
+            .unwrap()
+            .into();
+
+        let live_then = Region::new();
+        let live_then_blk = Block::new(&[]);
+        {
+            // Convert i64 i to f64 for k slot Number tag.
+            let i_f64: Value<'c, '_> = live_then_blk
+                .append_operation(
+                    OperationBuilder::new("arith.sitofp", loc)
+                        .add_operands(&[i_arg])
+                        .add_results(&[types.f64])
+                        .build()
+                        .expect("arith.sitofp"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let k_slot = blk_slots[key_id.0];
+            let v_slot = blk_slots[val_id.0];
+            emit_value_slot_store_number(context, &live_then_blk, k_slot, i_f64, types, loc);
+            emit_copy_value_slot_16b(context, &live_then_blk, slot_ptr, v_slot, types, loc);
+            emit_stmts(
+                context,
+                &live_then_blk,
+                body,
+                blk_slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                loc,
+            )?;
+            live_then_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        live_then.append_block(live_then_blk);
+        let live_else = Region::new();
+        let live_else_blk = Block::new(&[]);
+        live_else_blk.append_operation(scf::r#yield(&[], loc));
+        live_else.append_block(live_else_blk);
+        after_blk.append_operation(scf::r#if(is_live, &[], live_then, live_else, loc));
+
+        // i_next = i + 1.
+        let one_inner = after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let i_next: Value<'c, '_> = after_blk
+            .append_operation(arith::addi(i_arg, one_inner, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        after_blk.append_operation(scf::r#yield(&[i_next], loc));
+    }
+    after_region.append_block(after_blk);
+
+    parent.append_operation(scf::r#while(
+        &[one_i64],
+        &[types.i64],
+        before_region,
+        after_region,
+        loc,
+    ));
+    Ok(())
+}
+
+/// Phase 2.8e-iter-pairs (ADR 0080) phase 2: walk the hash buckets
+/// `bi = 0..cap_initial`, copying live entries' tagged key/value
+/// slots into the user's k/v locals and running the body. Per-
+/// iteration reload of `header.hash_buf` with ptr-equality detect
+/// aborts the loop on a body-induced rehash (P1).
+#[allow(clippy::too_many_arguments)]
+fn emit_for_pairs_hash_phase<'a, 'c>(
+    context: &'c Context,
+    parent: &'a Block<'c>,
+    table_ptr: Value<'c, 'a>,
+    hash_buf_initial_iv: Value<'c, 'a>,
+    cap_initial: Value<'c, 'a>,
+    key_id: LocalId,
+    val_id: LocalId,
+    break_id: LocalId,
+    body: &[HirStmt],
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    let zero_i64 = parent
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+
+    let before_region = Region::new();
+    let before_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let bi_arg: Value<'c, '_> = before_blk.argument(0).unwrap().into();
+        let cap_inner = unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(cap_initial) };
+        let bi_lt_cap: Value<'c, '_> = before_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Slt,
+                bi_arg,
+                cap_inner,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let blk_slots = transmute_slots(slots);
+        let cond = and_not_broken(
+            context,
+            &before_blk,
+            bi_lt_cap,
+            blk_slots,
+            break_id,
+            types,
+            loc,
+        );
+        before_blk.append_operation(scf::condition(cond, &[bi_arg], loc));
+    }
+    before_region.append_block(before_blk);
+
+    let after_region = Region::new();
+    let after_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let bi_arg: Value<'c, '_> = after_blk.argument(0).unwrap().into();
+        let blk_slots = transmute_slots(slots);
+        let table_ptr_inner =
+            unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(table_ptr) };
+        let hash_buf_initial_iv_inner =
+            unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(hash_buf_initial_iv) };
+
+        // Reload hash_buf; detect rehash (P1 main).
+        let hash_buf_slot_now = emit_byte_offset_ptr(
+            context,
+            &after_blk,
+            table_ptr_inner,
+            TABLE_OFF_HASH_BUF,
+            types,
+            loc,
+        );
+        let hash_buf_now = emit_load(&after_blk, hash_buf_slot_now, types.ptr, loc);
+        let hash_buf_now_iv = emit_ptrtoint_i64(context, &after_blk, hash_buf_now, types, loc);
+        let rehashed: Value<'c, '_> = after_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Ne,
+                hash_buf_now_iv,
+                hash_buf_initial_iv_inner,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        emit_set_broken_if(
+            context, &after_blk, rehashed, blk_slots, break_id, types, loc,
+        );
+
+        // entry_off = HASH_OFF_ENTRIES + bi * HASH_ENTRY_SIZE.
+        let entries_base = after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let entry_size = after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let bucket_off: Value<'c, '_> = after_blk
+            .append_operation(arith::muli(bi_arg, entry_size, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let entry_off: Value<'c, '_> = after_blk
+            .append_operation(arith::addi(bucket_off, entries_base, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let entry_ptr =
+            emit_byte_offset_ptr_dynamic(context, &after_blk, hash_buf_now, entry_off, types, loc);
+
+        // is_live = (key_tag != TAG_NIL) AND (key_tag != TAG_DELETED) AND not rehashed.
+        let key_tag = emit_load(&after_blk, entry_ptr, types.i64, loc);
+        let tag_nil = after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let tag_deleted = after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_DELETED).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let not_nil: Value<'c, '_> = after_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Ne,
+                key_tag,
+                tag_nil,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let not_deleted: Value<'c, '_> = after_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Ne,
+                key_tag,
+                tag_deleted,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let occupied: Value<'c, '_> = after_blk
+            .append_operation(arith::andi(not_nil, not_deleted, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let one_i1 = after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i1, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let not_rehashed: Value<'c, '_> = after_blk
+            .append_operation(arith::xori(rehashed, one_i1, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_live: Value<'c, '_> = after_blk
+            .append_operation(arith::andi(occupied, not_rehashed, loc))
+            .result(0)
+            .unwrap()
+            .into();
+
+        let live_then = Region::new();
+        let live_then_blk = Block::new(&[]);
+        {
+            let key_slot_ptr = entry_ptr; // entry+0 is the tagged key slot.
+            let val_slot_ptr = emit_byte_offset_ptr(
+                context,
+                &live_then_blk,
+                entry_ptr,
+                HASH_ENTRY_OFF_VALUE_SLOT,
+                types,
+                loc,
+            );
+            let k_slot = blk_slots[key_id.0];
+            let v_slot = blk_slots[val_id.0];
+            emit_copy_value_slot_16b(context, &live_then_blk, key_slot_ptr, k_slot, types, loc);
+            emit_copy_value_slot_16b(context, &live_then_blk, val_slot_ptr, v_slot, types, loc);
+            emit_stmts(
+                context,
+                &live_then_blk,
+                body,
+                blk_slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                loc,
+            )?;
+            live_then_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        live_then.append_block(live_then_blk);
+        let live_else = Region::new();
+        let live_else_blk = Block::new(&[]);
+        live_else_blk.append_operation(scf::r#yield(&[], loc));
+        live_else.append_block(live_else_blk);
+        after_blk.append_operation(scf::r#if(is_live, &[], live_then, live_else, loc));
+
+        // bi_next = bi + 1.
+        let one = after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let bi_next: Value<'c, '_> = after_blk
+            .append_operation(arith::addi(bi_arg, one, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        after_blk.append_operation(scf::r#yield(&[bi_next], loc));
+    }
+    after_region.append_block(after_blk);
+
+    parent.append_operation(scf::r#while(
+        &[zero_i64],
+        &[types.i64],
+        before_region,
+        after_region,
+        loc,
+    ));
+    Ok(())
+}
+
+/// Convert an `!llvm.ptr` to `i64` via the LLVM `ptrtoint` op.
+/// Used by the pairs walker for ptr-equality rehash detection.
+fn emit_ptrtoint_i64<'a, 'c>(
+    _context: &'c Context,
+    block: &'a Block<'c>,
+    ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[ptr])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint"),
+        )
+        .result(0)
+        .unwrap()
+        .into()
+}
+
+/// `if cond then store(true, _broken_slot) end`. Used by the pairs
+/// walker to flip the break flag on rehash detection so the next
+/// `before`-region cond terminates the loop.
+fn emit_set_broken_if<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    cond_i1: Value<'c, 'a>,
+    slots: &[Value<'c, 'a>],
+    broken_id: LocalId,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    let true_val = then_blk
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i1, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_store(&then_blk, true_val, slots[broken_id.0], loc);
+    then_blk.append_operation(scf::r#yield(&[], loc));
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(cond_i1, &[], then_region, else_region, loc));
 }
 
 /// Build a single-block Region that yields `arith.cmpf <pred> i, stop : i1`.

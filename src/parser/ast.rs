@@ -196,15 +196,26 @@ pub enum StmtKind {
     /// Phase 2.8e-iter-ipairs (ADR 0078): `for IDX, VAL in
     /// ipairs(TABLE) do BODY end` — restricted Lua iteration
     /// sugar. Only the `ipairs(table_expr)` shape is recognised
-    /// in the iterator slot; `pairs(t)` and arbitrary callable
-    /// iterators (Lua's generic-for protocol) are parser-
-    /// rejected today (LIC-2.8e-iter-pairs-1 /
-    /// LIC-2.8e-iter-generic-1). HIR desugars this variant to a
+    /// in the iterator slot; arbitrary callable iterators (Lua's
+    /// generic-for protocol) are parser-rejected today
+    /// (LIC-2.8e-iter-generic-1). HIR desugars this variant to a
     /// synthetic `Block { LocalInit; While { LocalInit IndexTagged;
     /// IsNil break; BODY; idx += 1 } }` so codegen needs no new
-    /// arm.
+    /// arm. `pairs(t)` is its sibling variant `ForPairs` (ADR 0080).
     ForIpairs {
         idx_name: String,
+        val_name: String,
+        table: Expr,
+        body: Chunk,
+    },
+    /// `for K, V in pairs(TABLE) do BODY end` — Phase 2.8e-iter-pairs
+    /// (ADR 0080) parser sugar. Only the `pairs(table_expr)` shape
+    /// is recognised in the iterator slot. Unlike `ForIpairs`, this
+    /// variant is preserved through HIR (as `HirStmtKind::ForPairs`)
+    /// and lowered by a dedicated codegen walker — the hash-bucket
+    /// traversal cannot be desugared to existing primitives.
+    ForPairs {
+        key_name: String,
         val_name: String,
         table: Expr,
         body: Chunk,

@@ -1,16 +1,17 @@
 //! Phase 2.8e-iter-ipairs (ADR 0078): `for i, v in ipairs(t) do
 //! body end` as a parser-level Lua iteration sugar. Plan C
-//! scope — only the `ipairs(table_expr)` shape is recognised;
-//! `pairs(t)` and arbitrary callable iterators (generic for
-//! protocol) remain unsupported until ADR 0075's indirect-call
-//! reject is reopened with a signature side table.
+//! scope — only the `ipairs(table_expr)` shape is recognised
+//! by this file; `pairs(t)` is now its sibling sugar (ADR 0080,
+//! covered in `tests/phase2_8e_pairs.rs`). Arbitrary callable
+//! iterators (generic for protocol) remain unsupported until
+//! ADR 0075's indirect-call reject is reopened with a signature
+//! side table.
 //!
 //! HIR desugars `ForIpairs` to existing primitives
 //! (LocalInit + While + IsNil + Break + BinOp), so codegen
 //! sees no new shape.
 //!
 //! Out of scope (separate LIC entries):
-//! - `pairs(t)` hash iteration — LIC-2.8e-iter-pairs-1.
 //! - Generic for protocol with arbitrary callable iter —
 //!   LIC-2.8e-iter-generic-1.
 
@@ -130,20 +131,6 @@ end";
 // ============================================================
 // Negative — restricted shapes (parser-level reject)
 // ============================================================
-
-#[test]
-fn pairs_call_rejected_at_parser() {
-    // Plan C scope: only `ipairs(t)` is recognised. `pairs(t)`
-    // requires hash-iteration protocol (LIC-2.8e-iter-pairs-1).
-    let result = lumelir::parser::parse(
-        "local t = {}
-for k, v in pairs(t) do print(k) end",
-    );
-    assert!(
-        result.is_err(),
-        "pairs(t) in for-in must be parser-rejected (LIC-2.8e-iter-pairs-1)"
-    );
-}
 
 #[test]
 fn arbitrary_iter_call_rejected_at_parser() {
