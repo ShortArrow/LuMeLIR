@@ -42,7 +42,7 @@ use super::tagged::{
     TAG_NUMBER, TAG_STRING, TAG_TABLE, emit_alloca_slot_for_kind, emit_print_tagged_local,
     emit_tag_and_payload_ptr, emit_tagged_eq_local_local, emit_tagged_unknown_tag_trap,
     emit_type_tagged_local, emit_value_slot_check_number, emit_value_slot_store_dispatched,
-    emit_value_slot_store_nil, emit_value_slot_store_string,
+    emit_value_slot_store_nil,
 };
 
 // =============================================================
@@ -1345,14 +1345,18 @@ fn emit_stmt<'a, 'c>(
                         context, block, elem_ptr, value_v, value_kind, types, loc,
                     );
                 }
-                ValueKind::String => {
-                    // Phase 2.6b-hash (ADR 0058): hash insert.
-                    // ensure_buf → grow_if_needed → probe → store
-                    // (handle both "new key" → count++ and
-                    // "existing key" → just overwrite value).
-                    let key_str = emit_expr(
+                // Phase 2.6b-hash-keys (ADR 0079): every non-Number
+                // hash-eligible kind (String / Bool / Function /
+                // Table) routes through the same hash insert
+                // path. The key value is materialised into a 16-
+                // byte tagged search-key slot for tag-aware probe
+                // and equality.
+                ValueKind::String | ValueKind::Bool | ValueKind::Function(_) | ValueKind::Table => {
+                    let key_value = emit_expr(
                         context, block, key, slots, locals, functions, types, params_len, loc,
                     )?;
+                    let key_slot =
+                        emit_build_search_key_slot(context, block, key_kind, key_value, types, loc);
                     emit_hash_ensure_buf(context, block, target_ptr, types, loc);
                     emit_hash_grow_if_needed(context, block, target_ptr, types, loc);
                     let hash_buf_slot = emit_byte_offset_ptr(
@@ -1368,7 +1372,7 @@ fn emit_stmt<'a, 'c>(
                         emit_byte_offset_ptr(context, block, hash_buf, HASH_OFF_CAP, types, loc);
                     let cap = emit_load(block, cap_slot, types.i64, loc);
                     let bucket = emit_hash_probe_for_insert(
-                        context, block, hash_buf, cap, key_str, types, loc,
+                        context, block, hash_buf, cap, key_slot, types, loc,
                     );
                     let entry_size = block
                         .append_operation(arith::constant(
@@ -1461,14 +1465,18 @@ fn emit_stmt<'a, 'c>(
                             let new_key_blk = Block::new(&[]);
                             {
                                 // Phase 2.6b-hash-keys (ADR 0079):
-                                // store the key as a 16-byte
-                                // tagged String slot at entry+0
-                                // (tag at +0, payload ptr at +8).
-                                emit_value_slot_store_string(
+                                // commit the key into entry+0 via
+                                // the kind-dispatched store; the
+                                // already-built search slot's
+                                // contents (tag + payload) are
+                                // re-emitted into the entry's
+                                // 16-byte key slot.
+                                emit_value_slot_store_dispatched(
                                     context,
                                     &new_key_blk,
                                     entry_ptr,
-                                    key_str,
+                                    key_value,
+                                    key_kind,
                                     types,
                                     loc,
                                 );
@@ -1858,10 +1866,16 @@ fn emit_local_init_tagged<'a, 'c>(
             else_region.append_block(else_blk);
             block.append_operation(scf::r#if(oob, &[], then_region, else_region, loc));
         }
-        ValueKind::String => {
-            let key_str = emit_expr(
+        // Phase 2.6b-hash-keys (ADR 0079): every non-Number
+        // hash-eligible kind shares the read path. The key value
+        // is materialised into a 16-byte tagged search slot for
+        // tag-aware probe.
+        ValueKind::String | ValueKind::Bool | ValueKind::Function(_) | ValueKind::Table => {
+            let key_value = emit_expr(
                 context, block, key, slots, locals, functions, types, params_len, loc,
             )?;
+            let key_slot =
+                emit_build_search_key_slot(context, block, key_kind, key_value, types, loc);
             let hash_buf_slot =
                 emit_byte_offset_ptr(context, block, target_ptr, TABLE_OFF_HASH_BUF, types, loc);
             let hash_buf = emit_load(block, hash_buf_slot, types.ptr, loc);
@@ -1908,7 +1922,7 @@ fn emit_local_init_tagged<'a, 'c>(
                     emit_byte_offset_ptr(context, &else_blk, hash_buf, HASH_OFF_CAP, types, loc);
                 let cap = emit_load(&else_blk, cap_slot, types.i64, loc);
                 let bucket = emit_hash_probe_for_insert(
-                    context, &else_blk, hash_buf, cap, key_str, types, loc,
+                    context, &else_blk, hash_buf, cap, key_slot, types, loc,
                 );
                 let entry_size = else_blk
                     .append_operation(arith::constant(
@@ -2622,17 +2636,292 @@ fn emit_hash_ensure_buf<'a, 'c>(
 ///     "insert here", `was_empty == true`)
 ///   - matching key terminates the loop (caller overwrites)
 ///
+/// Phase 2.6b-hash-keys (ADR 0079): allocate and fill a 16-byte
+/// tagged search-key slot. Caller passes the key's static
+/// `ValueKind` and its lowered SSA value; the helper invokes
+/// `emit_value_slot_store_dispatched` to populate the slot's
+/// `{tag, payload}` shape. The returned `!llvm.ptr` is then
+/// passed to `emit_hash_probe_*` for tag-aware probe and
+/// equality.
+fn emit_build_search_key_slot<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    key_kind: ValueKind,
+    key_value: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let slot = emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
+    emit_value_slot_store_dispatched(context, block, slot, key_value, key_kind, types, loc);
+    slot
+}
+
+/// Phase 2.6b-hash-keys (ADR 0079): hash a tagged-key slot.
+/// Dispatches on the runtime tag at slot+0 — Number uses the
+/// f64 bit-pattern, String calls FNV-1a on the payload, Bool
+/// extends the i64 zext payload, Function / Table use the
+/// payload pointer's bits. Each per-tag arm folds the raw bits
+/// through the FNV prime so neighboring values land in
+/// different buckets.
+fn emit_hash_key_hash_dispatched<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    const FNV_PRIME: i64 = 1099511628211;
+    let tag = emit_load(block, slot_ptr, types.i64, loc);
+    let payload_ptr =
+        emit_byte_offset_ptr(context, block, slot_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
+    let prime_val: Value<'c, 'a> = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, FNV_PRIME).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    // String tag → call FNV-1a directly.
+    let tag_string_const = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, TAG_STRING).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let is_string: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            tag,
+            tag_string_const,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let str_then = Region::new();
+    let str_then_blk = Block::new(&[]);
+    {
+        let str_ptr = emit_load(&str_then_blk, payload_ptr, types.ptr, loc);
+        let h = emit_string_hash(context, &str_then_blk, str_ptr, types, loc);
+        str_then_blk.append_operation(scf::r#yield(&[h], loc));
+    }
+    str_then.append_block(str_then_blk);
+    // All other tags: load payload as i64 and multiply by FNV_PRIME.
+    // This works for Number (f64 bitcast = same 8 bytes),
+    // Bool (zext i1→i64), Function/Table (ptrtoint).
+    let str_else = Region::new();
+    let str_else_blk = Block::new(&[]);
+    {
+        let payload_i64 = emit_load(&str_else_blk, payload_ptr, types.i64, loc);
+        let h: Value<'c, '_> = str_else_blk
+            .append_operation(arith::muli(payload_i64, prime_val, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        str_else_blk.append_operation(scf::r#yield(&[h], loc));
+    }
+    str_else.append_block(str_else_blk);
+    let if_op = scf::r#if(is_string, &[types.i64], str_then, str_else, loc);
+    block.append_operation(if_op).result(0).unwrap().into()
+}
+
+/// Phase 2.6b-hash-keys (ADR 0079): tag-aware key equality on
+/// two 16-byte tagged slots. Returns `i1 false` immediately
+/// when the tags differ (Lua spec: keys of different kinds
+/// are never equal, even if their bit patterns coincide).
+/// When the tags match, dispatches on the shared tag — Number
+/// uses `cmpf Oeq`, String uses `strcmp`, Bool / Function /
+/// Table use raw i64 / ptr equality. Function / Table are
+/// raw-pointer identity per Lua spec.
+fn emit_hash_key_eq_dispatched<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_a: Value<'c, 'a>,
+    slot_b: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let tag_a = emit_load(block, slot_a, types.i64, loc);
+    let tag_b = emit_load(block, slot_b, types.i64, loc);
+    let tags_eq: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            tag_a,
+            tag_b,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let payload_a = emit_byte_offset_ptr(context, block, slot_a, ARRAY_ELEM_OFF_VALUE, types, loc);
+    let payload_b = emit_byte_offset_ptr(context, block, slot_b, ARRAY_ELEM_OFF_VALUE, types, loc);
+    // tags differ → false; tags equal → dispatch.
+    let same_tag_then = Region::new();
+    let same_tag_then_blk = Block::new(&[]);
+    {
+        // String → strcmp; everything else → raw i64 compare.
+        let tag_string_const = same_tag_then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_STRING).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_string: Value<'c, '_> = same_tag_then_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                tag_a,
+                tag_string_const,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let str_then = Region::new();
+        let str_then_blk = Block::new(&[]);
+        {
+            let pa = emit_load(&str_then_blk, payload_a, types.ptr, loc);
+            let pb = emit_load(&str_then_blk, payload_b, types.ptr, loc);
+            let cmp = emit_libc_call_i32(context, &str_then_blk, "strcmp", &[pa, pb], types, loc);
+            let zero_i32 = str_then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i32, 0).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let eq: Value<'c, '_> = str_then_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    cmp,
+                    zero_i32,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            str_then_blk.append_operation(scf::r#yield(&[eq], loc));
+        }
+        str_then.append_block(str_then_blk);
+        // Number tag uses cmpf Oeq for IEEE-754 semantics
+        // (NaN != NaN); other tags (Bool / Function / Table)
+        // use bit-equality on the i64 payload word.
+        let str_else = Region::new();
+        let str_else_blk = Block::new(&[]);
+        {
+            let tag_number_const = str_else_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, TAG_NUMBER).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let is_number: Value<'c, '_> = str_else_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    tag_a,
+                    tag_number_const,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let num_then = Region::new();
+            let num_then_blk = Block::new(&[]);
+            {
+                let fa = emit_load(&num_then_blk, payload_a, types.f64, loc);
+                let fb = emit_load(&num_then_blk, payload_b, types.f64, loc);
+                let cmp_op = arith::cmpf(context, CmpfPredicate::Oeq, fa, fb, loc);
+                let eq: Value<'c, '_> = num_then_blk
+                    .append_operation(cmp_op)
+                    .result(0)
+                    .unwrap()
+                    .into();
+                num_then_blk.append_operation(scf::r#yield(&[eq], loc));
+            }
+            num_then.append_block(num_then_blk);
+            let num_else = Region::new();
+            let num_else_blk = Block::new(&[]);
+            {
+                let ia = emit_load(&num_else_blk, payload_a, types.i64, loc);
+                let ib = emit_load(&num_else_blk, payload_b, types.i64, loc);
+                let eq: Value<'c, '_> = num_else_blk
+                    .append_operation(arith::cmpi(context, arith::CmpiPredicate::Eq, ia, ib, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                num_else_blk.append_operation(scf::r#yield(&[eq], loc));
+            }
+            num_else.append_block(num_else_blk);
+            let n_op = scf::r#if(is_number, &[types.i1], num_then, num_else, loc);
+            let n_eq: Value<'c, '_> = str_else_blk
+                .append_operation(n_op)
+                .result(0)
+                .unwrap()
+                .into();
+            str_else_blk.append_operation(scf::r#yield(&[n_eq], loc));
+        }
+        str_else.append_block(str_else_blk);
+        let s_op = scf::r#if(is_string, &[types.i1], str_then, str_else, loc);
+        let s_eq: Value<'c, '_> = same_tag_then_blk
+            .append_operation(s_op)
+            .result(0)
+            .unwrap()
+            .into();
+        same_tag_then_blk.append_operation(scf::r#yield(&[s_eq], loc));
+    }
+    same_tag_then.append_block(same_tag_then_blk);
+    let same_tag_else = Region::new();
+    let same_tag_else_blk = Block::new(&[]);
+    {
+        let i1_false = same_tag_else_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i1, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        same_tag_else_blk.append_operation(scf::r#yield(&[i1_false], loc));
+    }
+    same_tag_else.append_block(same_tag_else_blk);
+    let outer = scf::r#if(tags_eq, &[types.i1], same_tag_then, same_tag_else, loc);
+    block.append_operation(outer).result(0).unwrap().into()
+}
+
 /// Sentinel buckets are never the terminating answer in either
 /// mode; the probe walks past them. Insert with sentinel reuse
 /// is intentionally not implemented — sentinels are dropped at
 /// the next rehash (ADR 0062).
+///
+/// Phase 2.6b-hash-keys (ADR 0079): the probe operates on a
+/// caller-supplied 16-byte tagged search key slot. Hash and
+/// equality dispatch on the slot's tag, supporting Number /
+/// String / Bool / Function / Table keys.
 #[allow(clippy::too_many_arguments)]
 fn emit_hash_probe_loop<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     hash_buf: Value<'c, 'a>,
     cap: Value<'c, 'a>,
-    key_str: Value<'c, 'a>,
+    search_key_slot: Value<'c, 'a>,
     trap_on_null: bool,
     types: &Types<'c>,
     loc: Location<'c>,
@@ -2651,7 +2940,7 @@ fn emit_hash_probe_loop<'a, 'c>(
         .result(0)
         .unwrap()
         .into();
-    let hash = emit_string_hash(context, block, key_str, types, loc);
+    let hash = emit_hash_key_hash_dispatched(context, block, search_key_slot, types, loc);
     let initial_bucket: Value<'c, 'a> = block
         .append_operation(arith::andi(hash, mask, loc))
         .result(0)
@@ -2693,18 +2982,10 @@ fn emit_hash_probe_loop<'a, 'c>(
             emit_byte_offset_ptr_dynamic(context, &before_blk, hash_buf, entry_off, types, loc);
         // Phase 2.6b-hash-keys (ADR 0079): the entry's first 16
         // bytes are now a tagged key slot — `{i64 tag, 8-byte
-        // payload}`. Load the tag at offset 0 and the payload
-        // (the actual `!llvm.ptr` String key) at offset 8.
+        // payload}`. Load only the tag here for the empty /
+        // tombstone skip test; payload comparison happens inside
+        // `emit_hash_key_eq_dispatched` via tag-aware dispatch.
         let key_tag = emit_load(&before_blk, entry_ptr, types.i64, loc);
-        let key_payload_ptr = emit_byte_offset_ptr(
-            context,
-            &before_blk,
-            entry_ptr,
-            ARRAY_ELEM_OFF_VALUE,
-            types,
-            loc,
-        );
-        let key_at_slot = emit_load(&before_blk, key_payload_ptr, types.ptr, loc);
         let tag_nil_const = before_blk
             .append_operation(arith::constant(
                 context,
@@ -2772,8 +3053,12 @@ fn emit_hash_probe_loop<'a, 'c>(
                 loc,
             ));
         }
-        // strcmp gated on is_skip (null OR sentinel): yield false
-        // directly when we cannot legally compare, otherwise call.
+        // Phase 2.6b-hash-keys (ADR 0079): tag-aware key equality
+        // gated on `is_skip`. Empty / tombstone buckets yield
+        // `false` immediately so the probe walks past them; live
+        // buckets dispatch on the search key's tag (Number cmpf,
+        // String strcmp, Bool/Function/Table integer or pointer
+        // equality).
         let eq_then = Region::new();
         let eq_then_blk = Block::new(&[]);
         {
@@ -2792,34 +3077,14 @@ fn emit_hash_probe_loop<'a, 'c>(
         let eq_else = Region::new();
         let eq_else_blk = Block::new(&[]);
         {
-            let cmp = emit_libc_call_i32(
+            let eq_inner = emit_hash_key_eq_dispatched(
                 context,
                 &eq_else_blk,
-                "strcmp",
-                &[key_at_slot, key_str],
+                entry_ptr,
+                search_key_slot,
                 types,
                 loc,
             );
-            let zero_i32 = eq_else_blk
-                .append_operation(arith::constant(
-                    context,
-                    IntegerAttribute::new(types.i32, 0).into(),
-                    loc,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            let eq_inner: Value<'c, '_> = eq_else_blk
-                .append_operation(arith::cmpi(
-                    context,
-                    arith::CmpiPredicate::Eq,
-                    cmp,
-                    zero_i32,
-                    loc,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
             eq_else_blk.append_operation(scf::r#yield(&[eq_inner], loc));
         }
         eq_else.append_block(eq_else_blk);
@@ -3188,15 +3453,6 @@ fn emit_hash_grow_if_needed<'a, 'c>(
             // entry+8. Live = tag is neither TAG_NIL (= empty) nor
             // TAG_DELETED (= tombstone, ADR 0062 hard delete).
             let old_key_tag = emit_load(&rehash_after_blk, old_entry_ptr, types.i64, loc);
-            let old_key_payload_ptr = emit_byte_offset_ptr(
-                context,
-                &rehash_after_blk,
-                old_entry_ptr,
-                ARRAY_ELEM_OFF_VALUE,
-                types,
-                loc,
-            );
-            let old_key = emit_load(&rehash_after_blk, old_key_payload_ptr, types.ptr, loc);
             let tag_nil_inner = rehash_after_blk
                 .append_operation(arith::constant(
                     context,
@@ -3245,13 +3501,17 @@ fn emit_hash_grow_if_needed<'a, 'c>(
             let migrate_then = Region::new();
             let migrate_blk = Block::new(&[]);
             {
-                // Probe new_buf for empty slot using old_key.
+                // Phase 2.6b-hash-keys (ADR 0079): the old entry's
+                // first 16 bytes already form a tagged search-key
+                // slot; pass `old_entry_ptr` directly so probe's
+                // tag-aware hash + equality kicks in for whatever
+                // kind sits in that slot.
                 let new_bucket = emit_hash_probe_for_insert(
                     context,
                     &migrate_blk,
                     new_buf,
                     new_cap,
-                    old_key,
+                    old_entry_ptr,
                     types,
                     loc,
                 );
@@ -3291,18 +3551,36 @@ fn emit_hash_grow_if_needed<'a, 'c>(
                     types,
                     loc,
                 );
-                // Phase 2.6b-hash-keys (ADR 0079): write the key
-                // back as a 16-byte tagged String slot (tag at
-                // new_entry+0, payload ptr at new_entry+8). Phase
-                // A only ever rehashes String keys (HIR enforces);
-                // Phase B will route every kind through the
-                // tagged-key store dispatcher.
-                emit_value_slot_store_string(
+                // Phase 2.6b-hash-keys (ADR 0079): copy the entire
+                // 16-byte tagged key slot from old_entry+0 to
+                // new_entry+0 — tag at +0 (i64), payload at +8
+                // (raw i64; reinterpreted by the consumer based on
+                // tag). This preserves every kind without needing
+                // a key-kind-specific store helper.
+                let old_key_tag_word = emit_load(&migrate_blk, old_entry_ptr, types.i64, loc);
+                emit_store(&migrate_blk, old_key_tag_word, new_entry_ptr, loc);
+                let old_key_payload_word_ptr = emit_byte_offset_ptr(
+                    context,
+                    &migrate_blk,
+                    old_entry_ptr,
+                    ARRAY_ELEM_OFF_VALUE,
+                    types,
+                    loc,
+                );
+                let old_key_payload_word =
+                    emit_load(&migrate_blk, old_key_payload_word_ptr, types.i64, loc);
+                let new_key_payload_word_ptr = emit_byte_offset_ptr(
                     context,
                     &migrate_blk,
                     new_entry_ptr,
-                    old_key,
+                    ARRAY_ELEM_OFF_VALUE,
                     types,
+                    loc,
+                );
+                emit_store(
+                    &migrate_blk,
+                    old_key_payload_word,
+                    new_key_payload_word_ptr,
                     loc,
                 );
                 // Phase 2.6c-tag-hash (ADR 0060): migrate the
@@ -3641,13 +3919,15 @@ fn emit_expr<'a, 'c>(
                     );
                     Ok(emit_load(block, value_slot, types.f64, loc))
                 }
-                ValueKind::String => {
-                    // Phase 2.6b-hash (ADR 0058): hash-keyed lookup.
-                    // header.hash_buf null → trap (no entries). Else
-                    // probe to find the bucket and load value.
-                    let key_str = emit_expr(
+                // Phase 2.6b-hash-keys (ADR 0079): every non-Number
+                // hash-eligible kind shares the lookup path; build
+                // a tagged search-key slot for tag-aware probe.
+                ValueKind::String | ValueKind::Bool | ValueKind::Function(_) | ValueKind::Table => {
+                    let key_value = emit_expr(
                         context, block, key, slots, locals, functions, types, params_len, loc,
                     )?;
+                    let key_slot =
+                        emit_build_search_key_slot(context, block, key_kind, key_value, types, loc);
                     let hash_buf_slot = emit_byte_offset_ptr(
                         context,
                         block,
@@ -3713,7 +3993,7 @@ fn emit_expr<'a, 'c>(
                         emit_byte_offset_ptr(context, block, hash_buf, HASH_OFF_CAP, types, loc);
                     let cap = emit_load(block, cap_slot, types.i64, loc);
                     let bucket =
-                        emit_hash_probe_lookup(context, block, hash_buf, cap, key_str, types, loc);
+                        emit_hash_probe_lookup(context, block, hash_buf, cap, key_slot, types, loc);
                     // Phase 2.6c-tag-hash (ADR 0060): tag-checked
                     // value load. value slot starts at
                     // HASH_OFF_ENTRIES + bucket*HASH_ENTRY_SIZE +
@@ -5167,10 +5447,16 @@ fn emit_isnil_index<'a, 'c>(
             let if_op = scf::r#if(oob, &[types.i1], then_region, else_region, loc);
             Ok(block.append_operation(if_op).result(0).unwrap().into())
         }
-        ValueKind::String => {
-            let key_str = emit_expr(
+        // Phase 2.6b-hash-keys (ADR 0079): the IsNil hash-path
+        // accepts every non-Number hash-eligible kind. Build a
+        // tagged search slot and probe for the bucket; missing
+        // keys fall through to the i1_true (= is nil) yield.
+        ValueKind::String | ValueKind::Bool | ValueKind::Function(_) | ValueKind::Table => {
+            let key_value = emit_expr(
                 context, block, key, slots, locals, functions, types, params_len, loc,
             )?;
+            let key_slot =
+                emit_build_search_key_slot(context, block, key_kind, key_value, types, loc);
             let hash_buf_slot =
                 emit_byte_offset_ptr(context, block, target_ptr, TABLE_OFF_HASH_BUF, types, loc);
             let hash_buf = emit_load(block, hash_buf_slot, types.ptr, loc);
@@ -5216,7 +5502,7 @@ fn emit_isnil_index<'a, 'c>(
                     emit_byte_offset_ptr(context, &else_blk, hash_buf, HASH_OFF_CAP, types, loc);
                 let cap = emit_load(&else_blk, cap_slot, types.i64, loc);
                 let bucket = emit_hash_probe_for_insert(
-                    context, &else_blk, hash_buf, cap, key_str, types, loc,
+                    context, &else_blk, hash_buf, cap, key_slot, types, loc,
                 );
                 let entry_size = else_blk
                     .append_operation(arith::constant(

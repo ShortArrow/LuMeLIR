@@ -77,6 +77,26 @@ fn is_number_compatible(k: ValueKind) -> bool {
     matches!(k, ValueKind::Number | ValueKind::TaggedValue)
 }
 
+/// Phase 2.6b-hash-keys (ADR 0079): Lua spec §3.4.5 — every
+/// non-nil, non-NaN value can be used as a hash key. We accept
+/// Number / String / Bool / Function / Table at the HIR layer;
+/// `Nil` is hard-rejected, NaN is a runtime concern.
+/// `TaggedValue` operands (e.g. `local k = t[i]; t2[k] = v`)
+/// are out of scope this phase — the runtime tag dispatch in
+/// the codegen `emit_hash_key_*` helpers does not yet route
+/// through a dynamic kind classifier (LIC-2.6b-hash-key-nil-
+/// runtime-1 / -nan-runtime-1).
+fn is_hash_key_eligible(k: ValueKind) -> bool {
+    matches!(
+        k,
+        ValueKind::Number
+            | ValueKind::String
+            | ValueKind::Bool
+            | ValueKind::Function(_)
+            | ValueKind::Table
+    )
+}
+
 /// Phase 2.7p-arith-string-coerce (ADR 0077, Codex Tidy First):
 /// if `expr` has static kind `String`, wrap it in
 /// `HirExprKind::ArithStringCoerce` so codegen runs `tonumber`
@@ -1678,10 +1698,10 @@ impl LowerCtx {
                     });
                 }
                 let key_kind = infer_kind(&key_hir, &self.locals, &self.functions);
-                if !matches!(key_kind, ValueKind::Number | ValueKind::String) {
+                if !is_hash_key_eligible(key_kind) {
                     return Err(HirError::TypeMismatch {
                         op: "[]=".to_owned(),
-                        lhs_kind: "number or string".to_owned(),
+                        lhs_kind: "non-nil hashable kind".to_owned(),
                         rhs_kind: key_kind.name().to_owned(),
                         offset: key.span.start,
                     });
@@ -1700,24 +1720,26 @@ impl LowerCtx {
                 // `ClosureEscapes` check (LIC-2.6c-tag-hetero-
                 // closure-escape-1).
                 let value_kind = infer_kind(&value_hir, &self.locals, &self.functions);
-                let value_ok = matches!(
-                    (key_kind, value_kind),
-                    (ValueKind::Number, ValueKind::Number)
-                        | (ValueKind::Number, ValueKind::Bool)
-                        | (ValueKind::Number, ValueKind::String)
-                        | (ValueKind::Number, ValueKind::Function(_))
-                        | (ValueKind::Number, ValueKind::Table)
-                        | (ValueKind::String, ValueKind::Number)
-                        | (ValueKind::String, ValueKind::Bool)
-                        | (ValueKind::String, ValueKind::String)
-                        | (ValueKind::String, ValueKind::Nil)
-                        | (ValueKind::String, ValueKind::Function(_))
-                        | (ValueKind::String, ValueKind::Table)
-                );
-                if !value_ok {
+                // Phase 2.6b-hash-keys (ADR 0079): the value-kind
+                // matrix factors out the array-vs-hash split. The
+                // array path (Number key) historically rejects
+                // `nil` because array slots use length-based hole
+                // semantics; every other key kind takes the hash
+                // path and accepts `nil` as the soft-delete /
+                // hard-tombstone signal.
+                let value_kind_ok = matches!(
+                    value_kind,
+                    ValueKind::Number
+                        | ValueKind::Bool
+                        | ValueKind::String
+                        | ValueKind::Function(_)
+                        | ValueKind::Table
+                ) || (key_kind != ValueKind::Number
+                    && value_kind == ValueKind::Nil);
+                if !value_kind_ok {
                     return Err(HirError::TypeMismatch {
                         op: "[]=".to_owned(),
-                        lhs_kind: "number".to_owned(),
+                        lhs_kind: "non-nil value (or nil for hash delete)".to_owned(),
                         rhs_kind: value_kind.name().to_owned(),
                         offset: value.span.start,
                     });
@@ -2541,10 +2563,10 @@ impl LowerCtx {
                     });
                 }
                 let key_kind = infer_kind(&key_hir, &self.locals, &self.functions);
-                if !matches!(key_kind, ValueKind::Number | ValueKind::String) {
+                if !is_hash_key_eligible(key_kind) {
                     return Err(HirError::TypeMismatch {
                         op: "[]".to_owned(),
-                        lhs_kind: "number or string".to_owned(),
+                        lhs_kind: "non-nil hashable kind".to_owned(),
                         rhs_kind: key_kind.name().to_owned(),
                         offset: key.span.start,
                     });

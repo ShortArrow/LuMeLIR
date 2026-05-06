@@ -143,15 +143,15 @@ fn closure_with_upvalue_element_is_static_error_post_2_6c_tag_fn_tbl() {
 }
 
 #[test]
-fn non_arithmetic_key_kind_is_static_error_after_2_6b() {
-    // Phase 2.6b-hash (ADR 0058) opened String keys as a valid
-    // index kind via the hash path. Other kinds (Bool / Nil /
-    // Function / Table) still reject — the only kinds we accept
-    // are Number (array path) and String (hash path). See
-    // `tests/phase2_6b_hash_keys.rs` for the string-key path.
+fn nil_key_kind_remains_rejected_post_2_6b_hash_keys() {
+    // Phase 2.6b-hash (ADR 0058) opened String keys via the
+    // hash path; ADR 0079 widened to Bool / Function / Table
+    // keys too. Nil keys remain HIR-rejected — Lua spec disallows
+    // `nil` as a hash key, and there is no observable use for it
+    // in the array path either.
     let chunk = lumelir::parser::parse(
         "local t = {1, 2, 3}
-print(t[true])",
+print(t[nil])",
     )
     .unwrap();
     assert!(lumelir::hir::lower(&chunk).is_err());

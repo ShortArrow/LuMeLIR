@@ -6,7 +6,7 @@
 > consumer / tag semantics. ADRs continue to record *decisions*;
 > this page records *current state*.
 
-**Last updated:** 2026-05-06 (after ADR 0078)
+**Last updated:** 2026-05-06 (after ADR 0079)
 
 ---
 
@@ -27,8 +27,12 @@ Storage sites that use this layout:
 
 - `array_buf` element slots (Phase 2.6c-tag-arr / ADR 0059) —
   `ARRAY_ELEM_SIZE = 16`.
-- `hash_buf` entry value slots (Phase 2.6c-tag-hash / ADR 0060) —
-  hash entry is `{ptr key, 16-byte tagged value}` totalling 24 B.
+- `hash_buf` entries (Phase 2.6c-tag-hash / ADR 0060, widened
+  by ADR 0079) — each entry is `{16-byte tagged key, 16-byte
+  tagged value}` totalling 32 B. Both halves share the array
+  element layout so `emit_value_slot_*` helpers work on each.
+  Empty buckets carry `TAG_NIL` in the key tag; deleted buckets
+  carry `TAG_DELETED`.
 - `MaybeNil`-style local alloca (Phase 2.6c-tag-locals / ADR 0063;
   later renamed `TaggedValue` / ADR 0066). Allocated as
   `alloca i64 × 2` for natural 8-byte alignment of the payload.
@@ -46,6 +50,11 @@ const TAG_STRING: i64 = 3;
 // HIR-rejected (LIC-2.6c-tag-hetero-closure-escape-1).
 const TAG_FUNCTION: i64 = 4;
 const TAG_TABLE: i64 = 5;
+// Phase 2.6b-hash-keys (ADR 0079): hash-bucket tombstone tag.
+// Lives in the key tag word at entry+0 when the entry was
+// deleted via `t.k = nil`. Probe walks past these; rehash
+// drops them physically.
+const TAG_DELETED: i64 = 6;
 ```
 
 ### Payload type per tag
@@ -58,6 +67,7 @@ const TAG_TABLE: i64 = 5;
 | TAG_STRING  | `!llvm.ptr`        | Pointer to a `.data`-section global     |
 | TAG_FUNCTION| `!llvm.ptr`        | Function pointer via `unrealized_cast` (ADR 0019); ADR 0071 |
 | TAG_TABLE   | `!llvm.ptr`        | Stable table header pointer (ADR 0056); ADR 0071 |
+| TAG_DELETED | (unused)           | Hash tombstone marker — only ever appears in a hash entry's **key** tag word; payload is left undefined; ADR 0079 |
 
 Internal slot-to-slot copies load the payload as **raw `i64`**
 so any tag round-trips byte-for-byte without a kind-specific
@@ -74,11 +84,11 @@ a tagged slot, or whose result **carries** a tagged value.
 |---------------------------------------------|------------------------------------------------------|------------|
 | `HirExprKind::Table([elem₀, …])`            | `array_buf` slots, kind-dispatched store             | ADR 0059, 0064 |
 | `HirStmtKind::IndexAssign { target, key, value }` (Number key) | `array_buf[key-1]` slot — value can be Number / Bool / String / Function (closure-less) / Table | ADR 0055, 0059, 0064, 0071 |
-| `HirStmtKind::IndexAssign { target, key, value }` (String key) | `hash_buf` entry value slot — value can be Number / Bool / String / Nil-delete / Function (closure-less) / Table | ADR 0058, 0060, 0064, 0071 |
+| `HirStmtKind::IndexAssign { target, key, value }` (non-Number key) | `hash_buf` entry — key occupies the 16-byte tagged key slot at entry+0 (Number / String / Bool / Function / Table; nil rejected), value at entry+16 (any non-Nil kind, plus Nil for soft-delete) | ADR 0058, 0060, 0064, 0071, 0079 |
 | `HirExprKind::Table([elem, …])`             | `array_buf` slot per elem — same kind set as IndexAssign | ADR 0064, 0071 |
 | `HirExprKind::IndexTagged { target, key }`  | LocalInit / Assign **only** — populates a `TaggedValue` slot via `emit_local_init_tagged` | ADR 0063 |
 | `HirExprKind::Local(id)` with `info.kind == TaggedValue` | Existing 16-byte alloca holds the tagged value | ADR 0063 |
-| Hard-tombstone delete (`t.k = nil`)         | `hash_buf` entry: key→sentinel + value tag→Nil       | ADR 0062 |
+| Hard-tombstone delete (`t.k = nil`)         | `hash_buf` entry: key tag → `TAG_DELETED`, value tag → Nil (ADR 0079 retired the prior `HASH_DELETED_KEY=1` ptr sentinel) | ADR 0062, 0079 |
 | Function-return widening (`Callee::User`)   | `_ret_value_N` slot widens to TaggedValue when same return position sees mixed kinds; ABI returns 2 MLIR results `(i64 tag, i64 payload_raw)` per TaggedValue position | ADR 0074 |
 | **(future)** iterator (`pairs` / `ipairs`)  | Pending — depends on widening                        | —          |
 | **(future)** closure with upvalues          | HIR-rejects today — LIC-2.6c-tag-hetero-closure-escape-1 | —      |
@@ -236,12 +246,11 @@ the introduction, when still open).
 | LIC-2.6c-tag-locals-fn-multi-1    | Multi-position TaggedValue interleaving (`return 1, nil` vs `return nil, 1`) — caller-side result-index walker generalised | 0076       |
 | LIC-2.7p-arith-coerce-1           | String → Number arithmetic coercion (`"5" + 1`); failure traps via `s_arith_coerce_failed` | 0077      |
 | LIC-2.8e-iter-ipairs-1            | `for i, v in ipairs(t) do … end` parser sugar with first-nil termination | 0078      |
+| LIC-2.6a-arr-3                    | All hash key kinds (Number / String / Bool / Function / Table) via tagged-key 32-byte entry layout | 0058 / 0079 |
 
 ### Partial
 
-| ID                                | Resolved range                              | Pending range                    |
-|-----------------------------------|---------------------------------------------|----------------------------------|
-| LIC-2.6a-arr-3                    | Number + String keys (ADR 0058)             | Bool/Function/Table keys         |
+(none)
 
 ### Pending
 
@@ -249,10 +258,12 @@ the introduction, when still open).
 |---------------------------------------------|-----------------------------------------------------------------------|--------------------------------|
 | LIC-2.6c-tag-hetero-closure-escape-1        | Closure with upvalues stored in tables                                | HIR-rejects today (ADR 0044 + ADR 0071); needs escape-analysis relaxation |
 | LIC-2.7p-arith-coerce-tagged-1              | TaggedValue operand arith coerce (`local x = t[1]; print(x + 1)` when x is runtime String) | HIR can't statically resolve the kind; current TaggedValue-arith path traps on non-Number tag (ADR 0063). Unlocking needs runtime tag dispatch in arith codegen |
-| LIC-2.8e-iter-pairs-1                       | `pairs(t)` hash-bucket iteration                                      | Requires hash-walk protocol design with tombstone awareness (ADR 0062) and expanded key-kind support (LIC-2.6a-arr-3). Defer until `pairs` semantics finalised |
+| LIC-2.8e-iter-pairs-1                       | `pairs(t)` hash-bucket iteration                                      | Requires hash-walk protocol design with tombstone awareness (ADR 0062). The tagged-key layout (ADR 0079) is the prerequisite layout for emitting key/value pairs through the iterator |
 | LIC-2.8e-iter-generic-1                     | Generic-for protocol with arbitrary callable iterator (`for x in iter, state, init do …`) | Requires reopening the ADR 0075 indirect-call reject via signature side table or equivalent runtime descriptor |
+| LIC-2.6b-hash-key-nil-runtime-1             | Dynamic `nil` hash key via TaggedValue local — runtime probe currently fires the generic missing-key trap; Lua spec wants a specific "table index is nil" diagnostic | ADR 0079 |
+| LIC-2.6b-hash-key-nan-runtime-1             | Dynamic `NaN` hash key via TaggedValue local — `cmpf Oeq` excludes NaN (NaN ≠ NaN), so the probe walks past and never finds the bucket. Lua spec wants a hard runtime error at insert time | ADR 0079 |
 
-**Total:** 21 LIC entries — 19 resolved, 1 partial, 3 pending.
+**Total:** 23 LIC entries — 20 resolved, 0 partial, 3 pending core + 2 pending runtime-diag.
 
 ---
 
@@ -410,27 +421,27 @@ supported kind contributes 1.
 
 ## 7. Open Questions / Known Gaps
 
-Listed in Codex review priority order (post-ADR-0078):
+Listed in Codex review priority order (post-ADR-0079):
 
-1. **Hash key kinds expansion** (LIC-2.6a-arr-3). Bool /
-   Function / Table keys. Prerequisite for full `pairs`
-   support.
-2. **`pairs(t)` hash iteration** (LIC-2.8e-iter-pairs-1) — once
-   hash key kinds are widened.
-3. **Future indirect-call re-enablement** (signature side
-   table, ADR 0075 superseder candidate). Reopens
-   `local g = t[k]; g()` once a runtime descriptor exists,
-   prerequisite for generic-for protocol (LIC-2.8e-iter-
-   generic-1).
-4. **Full closures** (`2.5c-full`). Heap-allocated environments.
+1. **`pairs(t)` hash iteration** (LIC-2.8e-iter-pairs-1).
+   Tagged-key layout (ADR 0079) is in place; the remaining
+   work is the hash-walk protocol with tombstone awareness.
+2. **Future indirect-call re-enablement** (signature side
+   table, ADR 0075 superseder candidate). Prerequisite for
+   generic-for protocol (LIC-2.8e-iter-generic-1).
+3. **Full closures** (`2.5c-full`). Heap-allocated environments.
    The general problem of which closure-in-tables (LIC-2.6c-
    tag-hetero-closure-escape-1) is a subset.
-5. **Closure-with-upvalues in tables**
+4. **Closure-with-upvalues in tables**
    (LIC-2.6c-tag-hetero-closure-escape-1). HIR rejects today
-   via the existing escape analysis (ADR 0044 + ADR 0071);
-   relaxing requires escape semantics + GC strategy. Best
-   tackled after #4 because it's a special case of the same
-   underlying GC/escape design.
+   via the existing escape analysis (ADR 0044 + ADR 0071).
+   Best tackled after #3 because it's a special case of the
+   same underlying GC/escape design.
+5. **Hash key runtime diagnostics** (LIC-2.6b-hash-key-nil-
+   runtime-1 / -nan-runtime-1). Dynamic `nil` and `NaN` keys
+   via TaggedValue locals: improve the diagnostic surface
+   (specific "table index is nil/NaN" error) without changing
+   the static reject behaviour.
 
 ---
 
@@ -462,3 +473,4 @@ Listed in Codex review priority order (post-ADR-0078):
 | 0076 | 2.6c-tag-locals-fn-multi     | Multi-position TaggedValue caller-side walker — new `ret_kind_result_width` / `flat_result_index` / `emit_pack_tagged_result_at_pos` helpers generalise `emit_multi_assign_from_call` to handle multi-position TaggedValue ABI (`(i64, i64, i64, i64)` for two TaggedValue positions); LIC-locals-fn-multi-1 resolved |
 | 0077 | 2.7p-arith-string-coerce     | String → Number arith coercion — HIR `ArithStringCoerce` wraps String operands of arith / bitwise BinOps; codegen `emit_tonumber_for_arith` reuses `emit_tonumber`'s sscanf path then promotes NaN sentinel to runtime trap (`s_arith_coerce_failed`); 12 arith / bitwise ops accept String operands; hex floats work via glibc's sscanf%lf; LIC-arith-coerce-1 resolved |
 | 0078 | 2.8e-iter-ipairs             | `for k, v in ipairs(t) do … end` parser sugar (Plan C) — new `Keyword::In`, `StmtKind::ForIpairs`, parser branch + `unwrap_ipairs_call` restrict iter form to `ipairs(table)`; HIR desugars to `Block { LocalInit; While { LocalInit IndexTagged; If IsNil → break; BODY; idx += 1 } }` using existing primitives; codegen unchanged; `pairs` and generic-for protocol remain LIC-tracked pending the ADR 0075 indirect-call reopening |
+| 0079 | 2.6b-hash-keys               | Hash key kinds expansion (Plan E tagged-key) — hash entry widens 24→32 bytes with `{16-byte tagged key, 16-byte tagged value}`; new `TAG_DELETED=6` retires the `HASH_DELETED_KEY=1` ptr sentinel; new helpers `emit_build_search_key_slot`, `emit_hash_key_hash_dispatched`, `emit_hash_key_eq_dispatched` route 5-kind keys (Number / String / Bool / Function / Table) through the same probe; LIC-2.6a-arr-3 resolved (was partial) |

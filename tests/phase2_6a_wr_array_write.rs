@@ -117,14 +117,13 @@ t[1] = f",
 }
 
 #[test]
-fn write_key_must_be_arithmetic_or_string_after_2_6b() {
-    // Phase 2.6b-hash (ADR 0058) opened String keys via the hash
-    // path. Bool/Nil/Function/Table keys still reject. See
-    // `tests/phase2_6b_hash_keys.rs` for the string-key write
-    // path coverage.
+fn write_nil_key_remains_rejected_post_2_6b_hash_keys() {
+    // ADR 0058 opened String keys via the hash path; ADR 0079
+    // widened to Bool / Function / Table keys too. Nil keys
+    // remain HIR-rejected per Lua spec.
     let chunk = lumelir::parser::parse(
         "local t = {1, 2, 3}
-t[true] = 99",
+t[nil] = 99",
     )
     .unwrap();
     assert!(lumelir::hir::lower(&chunk).is_err());
