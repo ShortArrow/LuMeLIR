@@ -332,6 +332,18 @@ fn emit_fmt_global<'c>(
         "table index is nil\0",
         loc,
     );
+    // Phase 2.6b-hash-key-nan (ADR 0086): runtime trap for `t[k]`
+    // when `k` is NaN. Lua spec §3.4.5 forbids NaN as a table
+    // index. Surface is wider than ADR 0084's nil case: NaN can
+    // arrive via the static Number-key array path (`t[0/0]`) too.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_table_index_nan",
+        "table index is NaN\0",
+        loc,
+    );
 }
 
 fn emit_string_global<'c>(
@@ -355,6 +367,97 @@ fn emit_string_global<'c>(
         .value(StringAttribute::new(context, value).into())
         .build();
     module.body().append_operation(global_op.into());
+}
+
+/// Phase 2.6b-hash-key-nan (ADR 0086): emit `if cond then exit
+/// "table index is NaN" end`. Reuses the ADR 0084 nil-trap shape:
+/// scf.if → printf("%s\n", s_table_index_nan) → exit(1) on the
+/// then branch, scf.yield no-op on the else branch.
+fn emit_table_index_nan_trap_if<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    cond_i1: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        let msg = emit_addressof(context, &then_blk, "s_table_index_nan", types, loc);
+        emit_exit_with_message(context, &then_blk, msg, types, loc);
+        then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(cond_i1, &[], then_region, else_region, loc));
+}
+
+/// Phase 2.6b-hash-key-nan (ADR 0086): NaN preflight at the
+/// hash probe entry. The search-key slot is a 16-byte tagged
+/// `{i64 tag, 8-byte payload}` value; only the TAG_NUMBER branch
+/// reads the payload as an f64 and tests it with `cmpf Une self
+/// self` (true iff payload is NaN, agnostic to qNaN/sNaN/±NaN).
+/// Other tags (String/Bool/Function/Table) skip the check.
+///
+/// Called once at the top of `emit_hash_probe_loop`; covers every
+/// TaggedValue-key carrier (`IndexAssign`, `Index`, the iterator-
+/// internal probes that `pairs` and friends use).
+fn emit_hash_key_nan_preflight<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    search_key_slot: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let tag = emit_load(block, search_key_slot, types.i64, loc);
+    let tag_number_const = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, TAG_NUMBER).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let tag_is_number: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            tag,
+            tag_number_const,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        let payload_ptr = emit_byte_offset_ptr(context, &then_blk, search_key_slot, 8, types, loc);
+        let payload = emit_load(&then_blk, payload_ptr, types.f64, loc);
+        let is_nan: Value<'c, '_> = then_blk
+            .append_operation(arith::cmpf(
+                context,
+                CmpfPredicate::Une,
+                payload,
+                payload,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        emit_table_index_nan_trap_if(context, &then_blk, is_nan, types, loc);
+        then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(tag_is_number, &[], then_region, else_region, loc));
 }
 
 fn emit_printf_decl<'c>(
@@ -2110,6 +2213,24 @@ fn emit_stmt<'a, 'c>(
                     let key_f = emit_expr(
                         context, block, key, slots, locals, functions, types, params_len, loc,
                     )?;
+                    // Phase 2.6b-hash-key-nan (ADR 0086): NaN
+                    // cannot be a table index (Lua spec §3.4.5).
+                    // `cmpf Une key_f key_f` is true iff key_f is
+                    // NaN. Trap before f2i (whose result on NaN
+                    // is implementation-defined) and the bounds
+                    // check.
+                    let is_nan: Value<'c, 'a> = block
+                        .append_operation(arith::cmpf(
+                            context,
+                            CmpfPredicate::Une,
+                            key_f,
+                            key_f,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    emit_table_index_nan_trap_if(context, block, is_nan, types, loc);
                     let key_i = emit_f2i(block, key_f, types, loc);
                     let length_i = emit_load(block, target_ptr, types.i64, loc);
                     // Lower bound: key >= 1 (else trap; same
@@ -3516,6 +3637,17 @@ fn emit_local_init_tagged<'a, 'c>(
             let key_f = emit_expr(
                 context, block, key, slots, locals, functions, types, params_len, loc,
             )?;
+            // Phase 2.6b-hash-key-nan (ADR 0086): inline tagged-
+            // tmp materialisation (e.g. `print(t[0/0])`) shares
+            // the NaN preflight with the standard Index Number-
+            // key arm. The OOB-returns-nil contract below applies
+            // to in-range misses, not to NaN.
+            let is_nan: Value<'c, 'a> = block
+                .append_operation(arith::cmpf(context, CmpfPredicate::Une, key_f, key_f, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            emit_table_index_nan_trap_if(context, block, is_nan, types, loc);
             let key_i = emit_f2i(block, key_f, types, loc);
             let length_i = emit_load(block, target_ptr, types.i64, loc);
             let one = block
@@ -4655,6 +4787,11 @@ fn emit_hash_probe_loop<'a, 'c>(
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
+    // Phase 2.6b-hash-key-nan (ADR 0086): every TaggedValue-key
+    // probe routes through this helper; a single preflight here
+    // covers the IndexAssign / Index / iterator-internal callers
+    // without per-call repetition. No-op for non-Number tags.
+    emit_hash_key_nan_preflight(context, block, search_key_slot, types, loc);
     let one = block
         .append_operation(arith::constant(
             context,
@@ -5631,6 +5768,21 @@ fn emit_expr<'a, 'c>(
                     let key_f = emit_expr(
                         context, block, key, slots, locals, functions, types, params_len, loc,
                     )?;
+                    // Phase 2.6b-hash-key-nan (ADR 0086): symmetric
+                    // to the IndexAssign arm — NaN preflight before
+                    // f2i / bounds-check.
+                    let is_nan: Value<'c, 'a> = block
+                        .append_operation(arith::cmpf(
+                            context,
+                            CmpfPredicate::Une,
+                            key_f,
+                            key_f,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    emit_table_index_nan_trap_if(context, block, is_nan, types, loc);
                     let key_i = emit_f2i(block, key_f, types, loc);
                     let length_i = emit_load(block, target_ptr, types.i64, loc);
                     emit_table_bounds_check(context, block, key_i, length_i, types, loc);
