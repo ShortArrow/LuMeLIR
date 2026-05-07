@@ -585,11 +585,15 @@ Listed in Codex review priority order (post-ADR-0082):
    user fn + `llvm.mlir.addressof` inside `llvm.mlir.global`
    initializer) is the green path. Migration carry-over verified
    the same day — `arith` / `scf` ops stay valid inside
-   `llvm.func` body, but `func::call @user_fn_NN` (7 sites) and
-   `func::constant @user_fn_NN` (3 sites) must migrate to
-   `llvm.call` / `llvm.mlir.addressof` in lockstep with
-   `emit_function`'s flip to `LLVMFuncOperationBuilder`.
-   Commit 2 go criteria are all met.
+   `llvm.func` body, but `func::call @user_fn_NN` and
+   `func::constant @user_fn_NN` had to migrate to `llvm.call` /
+   `llvm.mlir.addressof` in lockstep with `emit_function`'s flip
+   to `LLVMFuncOperationBuilder`. Commit 2a (2026-05-07) landed
+   the structural rewrite — Function-kind param/ret types now
+   `!llvm.ptr`, multi-return wraps as `!llvm.struct<(...)>` per
+   the B5b spike, behavior 不変 (965/0). Commit 2b (TAG_FUNCTION
+   semantic cutover via per-fn `@user_fn_NN_closure` static
+   globals) and Commit 3 (captured-local boxes) follow.
 2. **Closure-with-upvalues in tables**
    (LIC-2.6c-tag-hetero-closure-escape-1). HIR rejects today
    via the existing escape analysis (ADR 0044 + ADR 0071).

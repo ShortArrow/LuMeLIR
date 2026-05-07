@@ -9,7 +9,7 @@ use melior::{
     dialect::{
         DialectRegistry, arith,
         arith::CmpfPredicate,
-        func, llvm,
+        llvm,
         ods::llvm::{GlobalOperationBuilder, LLVMFuncOperationBuilder},
         scf,
     },
@@ -20,7 +20,7 @@ use melior::{
             StringAttribute, TypeAttribute,
         },
         operation::{OperationBuilder, OperationLike},
-        r#type::{FunctionType, IntegerType},
+        r#type::IntegerType,
     },
     utility::register_all_dialects,
 };
@@ -31,12 +31,15 @@ use crate::hir::{
 };
 use crate::parser::{BinOp, UnaryOp};
 
-use super::callabi::{flat_result_index, ret_mlir_types};
+use super::callabi::{
+    emit_extract_struct_field, emit_pack_struct, flat_result_index, ret_mlir_types,
+    struct_return_type,
+};
 use super::error::CodegenError;
 use super::primitive::{
     Types, emit_addressof, emit_byte_offset_ptr, emit_byte_offset_ptr_dynamic,
     emit_exit_with_message, emit_libc_call_i32, emit_libc_call_i64, emit_libc_call_ptr,
-    emit_libc_call_void, emit_load, emit_printf, emit_store, emit_unrealized_cast,
+    emit_libc_call_void, emit_load, emit_printf, emit_store,
 };
 use super::tagged::{
     ARRAY_ELEM_OFF_VALUE, ARRAY_ELEM_SIZE, TAG_BOOL, TAG_DELETED, TAG_FUNCTION, TAG_NIL,
@@ -795,12 +798,15 @@ fn emit_libm_decls<'c>(
 /// f64 params, single Number return — Phase 2.5b.2 fixes the return
 /// to Number).
 fn param_mlir_type<'c>(context: &'c Context, kind: ValueKind, types: &Types<'c>) -> Type<'c> {
+    let _ = context;
     match kind {
         ValueKind::Number => types.f64,
-        ValueKind::Function(arity) => {
-            let p_types: Vec<Type<'c>> = (0..arity).map(|_| types.f64).collect();
-            FunctionType::new(context, &p_types, &[types.f64]).into()
-        }
+        // Phase 2.5c-full Commit 2a (ADR 0083): Function values
+        // become `!llvm.ptr` once user fns are emitted in the
+        // LLVM dialect. The prior `!func.func<(f64, ...) -> f64>`
+        // representation was incompatible with `llvm.func` callees
+        // (spike B3 verifier rejection).
+        ValueKind::Function(_) => types.ptr,
         ValueKind::Bool | ValueKind::Nil => types.i1,
         // Phase 2.7a (ADR 0024): a String value is a `!llvm.ptr`
         // into the static C-string pool.
@@ -819,34 +825,235 @@ fn param_mlir_type<'c>(context: &'c Context, kind: ValueKind, types: &Types<'c>)
     }
 }
 
-/// Phase 2.6c-tag-locals-fn-multi (ADR 0076): pack the two i64
-/// MLIR results that materialise a TaggedValue return position
-/// into a 16-byte tagged destination slot. The caller emits the
-/// `func::call` once, then invokes this helper for each
-/// TaggedValue dst position. Position-aware via `flat_result_
-/// index` (ADR 0076) so multi-position TaggedValue returns
-/// resolve to non-overlapping MLIR result ranges.
-#[allow(clippy::too_many_arguments)]
-fn emit_pack_tagged_result_at_pos<'a, 'c, 'op>(
+/// Phase 2.5c-full Commit 2a (ADR 0083): pick the LLVM-dialect
+/// callee return type for a flattened MLIR-result list. 0 →
+/// `!llvm.void`, 1 → that single type, ≥2 → `!llvm.struct<(...)>`.
+fn llvm_callee_ret_ty<'c>(context: &'c Context, ret_types: &[Type<'c>]) -> Type<'c> {
+    match ret_types.len() {
+        0 => llvm::r#type::void(context),
+        1 => ret_types[0],
+        _ => struct_return_type(context, ret_types).expect("non-empty multi-return"),
+    }
+}
+
+/// Phase 2.5c-full Commit 2a (ADR 0083): emit `llvm.return` for
+/// a callee whose HIR return positions flattened to `ret_values`.
+/// Single-value matches LLVM's `ret %v` directly; multi-value
+/// packs the values into the matching `!llvm.struct<(...)>` first.
+fn emit_llvm_return<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
-    op_ref: &melior::ir::operation::OperationRef<'c, 'op>,
+    ret_types: &[Type<'c>],
+    ret_values: &[Value<'c, 'a>],
+    loc: Location<'c>,
+) {
+    debug_assert_eq!(ret_types.len(), ret_values.len());
+    let mut op = OperationBuilder::new("llvm.return", loc);
+    match ret_values.len() {
+        0 => {}
+        1 => op = op.add_operands(&[ret_values[0]]),
+        _ => {
+            let st_ty = struct_return_type(context, ret_types).expect("multi ret_types");
+            let packed = emit_pack_struct(context, block, st_ty, ret_values, loc);
+            op = op.add_operands(&[packed]);
+        }
+    }
+    block.append_operation(op.build().expect("llvm.return"));
+}
+
+/// Phase 2.5c-full Commit 2a (ADR 0083): emit a top-level
+/// `llvm.func @sym(...) -> ret_ty { region }`. Used for user
+/// fns, `main`, and `__lumelir_next` after the migration off
+/// the `func` dialect.
+fn emit_llvm_func<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    sym_name: &str,
+    region: Region<'c>,
+    param_types: &[Type<'c>],
+    ret_ty: Type<'c>,
+    loc: Location<'c>,
+) {
+    let fn_type = llvm::r#type::function(ret_ty, param_types, false);
+    let func_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(region)
+        .sym_name(StringAttribute::new(context, sym_name))
+        .function_type(TypeAttribute::new(fn_type))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(func_op.into());
+}
+
+/// Phase 2.5c-full Commit 2a (ADR 0083): emit `llvm.call
+/// @callee(args) : (...) -> ret_ty` (callee-attribute form). The
+/// LLVM dialect's call op expects `operandSegmentSizes` =
+/// `[args.len(), 0]` and an `op_bundle_sizes` empty array; this
+/// helper centralises those boilerplate attributes.
+fn emit_llvm_call_user<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    callee_name: &str,
+    args: &[Value<'c, 'a>],
+    result_ty: Option<Type<'c>>,
+    loc: Location<'c>,
+) -> melior::ir::operation::OperationRef<'c, 'a> {
+    let n = i32::try_from(args.len()).expect("call arity fits in i32");
+    let mut builder = OperationBuilder::new("llvm.call", loc)
+        .add_operands(args)
+        .add_attributes(&[
+            (
+                Identifier::new(context, "callee"),
+                FlatSymbolRefAttribute::new(context, callee_name).into(),
+            ),
+            (
+                Identifier::new(context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(context, &[n, 0]).into(),
+            ),
+            (
+                Identifier::new(context, "op_bundle_sizes"),
+                DenseI32ArrayAttribute::new(context, &[]).into(),
+            ),
+        ]);
+    if let Some(t) = result_ty {
+        builder = builder.add_results(&[t]);
+    }
+    block.append_operation(
+        builder
+            .build()
+            .unwrap_or_else(|_| panic!("llvm.call @{callee_name}")),
+    )
+}
+
+/// Phase 2.5c-full Commit 2a (ADR 0083): emit `llvm.call
+/// %callee_ptr(args) : (...) -> ret_ty` (operand-callee form).
+/// Used for `Callee::Indirect` where the callee is an
+/// SSA `!llvm.ptr` value rather than a known symbol. The LLVM
+/// dialect signals operand-callee mode by omitting the `callee`
+/// attribute and threading the callee ptr as the first operand
+/// in the same `callee_operands` group as the args; the
+/// non-variadic pointee type is inferred from the operand and
+/// result MLIR types, so no `var_callee_type` attribute is
+/// emitted (it is reserved for variadic callees only).
+fn emit_llvm_call_indirect<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    callee_ptr: Value<'c, 'a>,
+    args: &[Value<'c, 'a>],
+    result_ty: Option<Type<'c>>,
+    loc: Location<'c>,
+) -> melior::ir::operation::OperationRef<'c, 'a> {
+    let total = i32::try_from(args.len() + 1).expect("indirect call arity fits in i32");
+    let mut all_operands: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len() + 1);
+    all_operands.push(callee_ptr);
+    all_operands.extend_from_slice(args);
+    let mut builder = OperationBuilder::new("llvm.call", loc)
+        .add_operands(&all_operands)
+        .add_attributes(&[
+            (
+                Identifier::new(context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(context, &[total, 0]).into(),
+            ),
+            (
+                Identifier::new(context, "op_bundle_sizes"),
+                DenseI32ArrayAttribute::new(context, &[]).into(),
+            ),
+        ]);
+    if let Some(t) = result_ty {
+        builder = builder.add_results(&[t]);
+    }
+    block.append_operation(builder.build().expect("llvm.call indirect"))
+}
+
+/// Phase 2.6c-tag-locals-fn-multi (ADR 0076): pack the two i64
+/// MLIR results that materialise a TaggedValue return position
+/// into a 16-byte tagged destination slot. Position-aware via
+/// `flat_result_index` (ADR 0076) so multi-position TaggedValue
+/// returns resolve to non-overlapping MLIR result ranges.
+///
+/// Phase 2.5c-full Commit 2a (ADR 0083): now takes the call's
+/// flattened result vector directly (extracted from a single
+/// `!llvm.struct<>` result up front by [`extract_unpacked_results`])
+/// rather than reading off an `OperationRef`.
+#[allow(clippy::too_many_arguments)]
+fn emit_pack_tagged_result_at_pos<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    flat_results: &[Value<'c, 'a>],
     dst_slot: Value<'c, 'a>,
     ret_kinds: &[ValueKind],
     pos: usize,
     types: &Types<'c>,
     loc: Location<'c>,
-) where
-    'op: 'a,
-{
+) {
     debug_assert!(matches!(ret_kinds[pos], ValueKind::TaggedValue));
     let start = flat_result_index(ret_kinds, pos);
-    let tag: Value<'c, 'a> = op_ref.result(start).unwrap().into();
-    let payload: Value<'c, 'a> = op_ref.result(start + 1).unwrap().into();
+    let tag = flat_results[start];
+    let payload = flat_results[start + 1];
     emit_store(block, tag, dst_slot, loc);
     let payload_ptr =
         emit_byte_offset_ptr(context, block, dst_slot, ARRAY_ELEM_OFF_VALUE, types, loc);
     emit_store(block, payload, payload_ptr, loc);
+}
+
+/// Phase 2.5c-full Commit 2a (ADR 0083): unpack the result of an
+/// `llvm.call` whose callee return shape was determined by
+/// [`llvm_callee_ret_ty`]. Yields one `Value` per flattened MLIR
+/// result type — `extractvalue` for the multi-return struct case,
+/// the single SSA result for the 1-arity case, and an empty Vec
+/// for void.
+fn extract_unpacked_results<'a, 'c, 'op>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    op_ref: &melior::ir::operation::OperationRef<'c, 'op>,
+    ret_types: &[Type<'c>],
+    loc: Location<'c>,
+) -> Vec<Value<'c, 'a>>
+where
+    'op: 'a,
+{
+    match ret_types.len() {
+        0 => Vec::new(),
+        1 => vec![op_ref.result(0).unwrap().into()],
+        _ => {
+            let struct_val: Value<'c, 'a> = op_ref.result(0).unwrap().into();
+            (0..ret_types.len())
+                .map(|i| {
+                    emit_extract_struct_field(
+                        context,
+                        block,
+                        struct_val,
+                        ret_types[i],
+                        i as i64,
+                        loc,
+                    )
+                })
+                .collect()
+        }
+    }
+}
+
+/// Phase 2.5c-full Commit 2a (ADR 0083): emit `llvm.call @callee(args)`
+/// and immediately unpack the call's flattened MLIR results. This is
+/// the canonical replacement for `func::call` callsites whose result
+/// vector was previously read directly off the `OperationRef`.
+fn emit_call_user_unpacked<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    callee_name: &str,
+    args: &[Value<'c, 'a>],
+    ret_types: &[Type<'c>],
+    loc: Location<'c>,
+) -> Vec<Value<'c, 'a>> {
+    let result_ty = if ret_types.is_empty() {
+        None
+    } else {
+        Some(llvm_callee_ret_ty(context, ret_types))
+    };
+    let op_ref = emit_llvm_call_user(context, block, callee_name, args, result_ty, loc);
+    extract_unpacked_results(context, block, &op_ref, ret_types, loc)
 }
 
 /// Emit a `func.func @<mangled_name>(...) -> (...)` for a user-defined
@@ -936,9 +1143,12 @@ fn emit_function<'c>(
     // Trailing return: load each `_ret_value_N` slot (Phase 2.5d
     // ADR 0021) — slots are placed sequentially after `_returned`,
     // i.e. at `params.len() + 1 + i` for the i-th return position.
-    // Function-kind returns load the slot as `ptr` and bridge back
-    // to the function type via unrealized_conversion_cast (ADR 0019).
-    let mut ret_values: Vec<Value<'c, '_>> = Vec::with_capacity(hir_fn.ret_kinds.len());
+    // Phase 2.5c-full Commit 2a (ADR 0083): Function-kind returns
+    // load the slot as `ptr` directly — the prior unrealized_cast
+    // bridge to `!func.func<...>` is gone now that user fns live
+    // in the LLVM dialect (function values are first-class ptrs).
+    let ret_types = ret_mlir_types(context, &hir_fn.ret_kinds, types);
+    let mut ret_values: Vec<Value<'c, '_>> = Vec::with_capacity(ret_types.len());
     for (i, k) in hir_fn.ret_kinds.iter().enumerate() {
         let ret_value_idx = hir_fn.params.len() + 1 + i;
         match k {
@@ -948,11 +1158,8 @@ fn emit_function<'c>(
             ValueKind::Bool | ValueKind::Nil => {
                 ret_values.push(emit_load(&block, slots[ret_value_idx], types.i1, loc))
             }
-            ValueKind::Function(arity) => {
-                let ptr_val = emit_load(&block, slots[ret_value_idx], types.ptr, loc);
-                let p_types: Vec<Type<'c>> = (0..*arity).map(|_| types.f64).collect();
-                let fn_ty: Type<'c> = FunctionType::new(context, &p_types, &[types.f64]).into();
-                ret_values.push(emit_unrealized_cast(&block, ptr_val, fn_ty, loc));
+            ValueKind::Function(_) => {
+                ret_values.push(emit_load(&block, slots[ret_value_idx], types.ptr, loc));
             }
             // Phase 2.7a / 2.6a-min: String and Table returns
             // surface the slot's `ptr` value directly — no cast is
@@ -981,22 +1188,24 @@ fn emit_function<'c>(
             }
         };
     }
-    block.append_operation(func::r#return(&ret_values, loc));
+    emit_llvm_return(context, &block, &ret_types, &ret_values, loc);
     region.append_block(block);
 
-    let ret_types = ret_mlir_types(context, &hir_fn.ret_kinds, types);
     // Phase 2.5c-min: function signature widens to include upvalue
     // params. `all_param_types` is `param_types ++ upvalue_types`.
-    let fn_type = FunctionType::new(context, &all_param_types, &ret_types);
-    let func_op = func::func(
+    // Phase 2.5c-full Commit 2a (ADR 0083): emit as `llvm.func`,
+    // wrapping multi-return (≥2 MLIR results) in `!llvm.struct<>`
+    // since LLVM IR's `ret` instruction is single-value.
+    let llvm_ret_ty = llvm_callee_ret_ty(context, &ret_types);
+    emit_llvm_func(
         context,
-        StringAttribute::new(context, &hir_fn.mangled_name),
-        TypeAttribute::new(fn_type.into()),
+        module,
+        &hir_fn.mangled_name,
         region,
-        &[],
+        &all_param_types,
+        llvm_ret_ty,
         loc,
     );
-    module.body().append_operation(func_op);
     Ok(())
 }
 
@@ -1029,21 +1238,15 @@ fn emit_main<'c>(
     )?;
 
     let zero = arith::constant(context, IntegerAttribute::new(types.i64, 0).into(), loc);
-    let zero_val = main_block.append_operation(zero).result(0).unwrap().into();
-    main_block.append_operation(func::r#return(&[zero_val], loc));
+    let zero_val: Value<'c, '_> = main_block.append_operation(zero).result(0).unwrap().into();
+    emit_llvm_return(context, &main_block, &[types.i64], &[zero_val], loc);
 
     main_region.append_block(main_block);
 
-    let main_fn_type = FunctionType::new(context, &[], &[types.i64]);
-    let main_op = func::func(
-        context,
-        StringAttribute::new(context, "main"),
-        TypeAttribute::new(main_fn_type.into()),
-        main_region,
-        &[],
-        loc,
-    );
-    module.body().append_operation(main_op);
+    // Phase 2.5c-full Commit 2a (ADR 0083): main is now `llvm.func
+    // @main() -> i64`. The i64 exit-code shape is preserved — only
+    // the dialect of the enclosing function flips.
+    emit_llvm_func(context, module, "main", main_region, &[], types.i64, loc);
     Ok(())
 }
 
@@ -1917,23 +2120,30 @@ fn emit_lumelir_next_function<'c>(
     let r_k_pay = emit_load(&block, res_k_pay, types.i64, loc);
     let r_v_tag = emit_load(&block, res_v_tag, types.i64, loc);
     let r_v_pay = emit_load(&block, res_v_pay, types.i64, loc);
-    block.append_operation(func::r#return(&[r_k_tag, r_k_pay, r_v_tag, r_v_pay], loc));
-
-    region.append_block(block);
-    let fn_type = FunctionType::new(
+    let next_ret_types = [types.i64, types.i64, types.i64, types.i64];
+    emit_llvm_return(
         context,
-        &[types.ptr, types.i64, types.i64],
-        &[types.i64, types.i64, types.i64, types.i64],
-    );
-    let func_op = func::func(
-        context,
-        StringAttribute::new(context, "__lumelir_next"),
-        TypeAttribute::new(fn_type.into()),
-        region,
-        &[],
+        &block,
+        &next_ret_types,
+        &[r_k_tag, r_k_pay, r_v_tag, r_v_pay],
         loc,
     );
-    module.body().append_operation(func_op);
+
+    region.append_block(block);
+    // Phase 2.5c-full Commit 2a (ADR 0083): the 4×i64 multi-return
+    // ABI surfaces as `!llvm.struct<(i64, i64, i64, i64)>` at the
+    // LLVM dialect. Caller `extractvalue` mirrors what was
+    // previously `op.result(0..4)`.
+    let next_ret_ty = llvm_callee_ret_ty(context, &next_ret_types);
+    emit_llvm_func(
+        context,
+        module,
+        "__lumelir_next",
+        region,
+        &[types.ptr, types.i64, types.i64],
+        next_ret_ty,
+        loc,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1985,11 +2195,14 @@ fn emit_stmt<'a, 'c>(
                     let is_param = id.0 < params_len;
                     let known_fid = info.func_id.is_some();
                     if !is_param && !known_fid {
+                        // Phase 2.5c-full Commit 2a (ADR 0083):
+                        // Function-typed expressions now produce
+                        // `!llvm.ptr` directly — no ucast bridge
+                        // is needed before storing into the slot.
                         let v = emit_expr(
                             context, block, value, slots, locals, functions, types, params_len, loc,
                         )?;
-                        let ptr_val = emit_unrealized_cast(block, v, types.ptr, loc);
-                        emit_store(block, ptr_val, slots[id.0], loc);
+                        emit_store(block, v, slots[id.0], loc);
                     }
                 }
                 ValueKind::TaggedValue => {
@@ -3031,14 +3244,12 @@ fn emit_multi_assign_from_indirect_dispatch<'a, 'c>(
                 emit_store(block, payload, pay_ptr, loc);
             }
             _ => {
+                // Phase 2.5c-full Commit 2a (ADR 0083): Function-kind
+                // dispatch results are already `!llvm.ptr` — no ucast
+                // bridge needed since user fns moved to the LLVM dialect.
                 let result_idx = flat_result_index(&sig.ret_kinds, i);
                 let v = chain_results[result_idx];
-                let store_val = if matches!(info.kind, ValueKind::Function(_)) {
-                    emit_unrealized_cast(block, v, types.ptr, loc)
-                } else {
-                    v
-                };
-                emit_store(block, store_val, dst_slot, loc);
+                emit_store(block, v, dst_slot, loc);
             }
         }
     }
@@ -3162,34 +3373,11 @@ fn emit_dispatch_chain_recursive<'a, 'c>(
         let rest = &candidates[1..];
         let target = &functions[first.0];
 
-        // Materialise @user_fn_X as a function-typed `func.constant`.
-        let p_types: Vec<Type<'c>> = target
-            .params
-            .iter()
-            .map(|p| match p.kind {
-                ValueKind::Number => types.f64,
-                ValueKind::Bool | ValueKind::Nil => types.i1,
-                ValueKind::Function(arity) => {
-                    let ip: Vec<Type<'c>> = (0..arity).map(|_| types.f64).collect();
-                    FunctionType::new(context, &ip, &[types.f64]).into()
-                }
-                ValueKind::String | ValueKind::Table => types.ptr,
-                ValueKind::TaggedValue => types.i64,
-            })
-            .collect();
-        let fn_ty = FunctionType::new(context, &p_types, result_types);
-        let fn_const_op = func::constant(
-            context,
-            FlatSymbolRefAttribute::new(context, &target.mangled_name),
-            fn_ty,
-            loc,
-        );
-        let fn_const_val: Value<'c, 'a> = block
-            .append_operation(fn_const_op)
-            .result(0)
-            .unwrap()
-            .into();
-        let fn_ptr_val = emit_unrealized_cast(block, fn_const_val, types.ptr, loc);
+        // Phase 2.5c-full Commit 2a (ADR 0083): `@user_fn_X` is now
+        // a `llvm.func`; materialise its address with
+        // `llvm.mlir.addressof : !llvm.ptr` and compare ptr-equal
+        // against `loaded_ptr`.
+        let fn_ptr_val = emit_addressof(context, block, &target.mangled_name, types, loc);
 
         // ptr equality
         let fn_ptr_iv: Value<'c, 'a> = block
@@ -3226,21 +3414,22 @@ fn emit_dispatch_chain_recursive<'a, 'c>(
             .unwrap()
             .into();
 
-        // Then region: direct `func.call @user_fn_X(args)` and yield results.
+        // Then region: direct `llvm.call @user_fn_X(args)` and yield
+        // unpacked results. Phase 2.5c-full Commit 2a (ADR 0083):
+        // multi-result calls return a single `!llvm.struct<>` that
+        // `extract_unpacked_results` splits back into the per-position
+        // MLIR yields the surrounding scf.if expects.
         let then_region = Region::new();
         let then_blk = Block::new(&[]);
         {
-            let call_op = func::call(
+            let yields = emit_call_user_unpacked(
                 context,
-                FlatSymbolRefAttribute::new(context, &target.mangled_name),
+                &then_blk,
+                &target.mangled_name,
                 arg_vals,
                 result_types,
                 loc,
             );
-            let call_ref = then_blk.append_operation(call_op);
-            let yields: Vec<Value<'c, '_>> = (0..result_types.len())
-                .map(|i| call_ref.result(i).unwrap().into())
-                .collect();
             then_blk.append_operation(scf::r#yield(&yields, loc));
         }
         then_region.append_block(then_blk);
@@ -3352,21 +3541,19 @@ fn emit_multi_assign_from_user_call<'a, 'c>(
         )?);
     }
     let ret_types = ret_mlir_types(context, &target.ret_kinds, types);
-    let call_op = func::call(
+    // Phase 2.5c-full Commit 2a (ADR 0083): direct call lowers to
+    // `llvm.call @user_fn_NN`; multi-result returns a struct that
+    // `extract_unpacked_results` splits per logical position via
+    // `flat_result_index` (ADR 0076). Function-kind results no
+    // longer need an ucast bridge — they're already `!llvm.ptr`.
+    let flat_results = emit_call_user_unpacked(
         context,
-        FlatSymbolRefAttribute::new(context, &target.mangled_name),
+        block,
+        &target.mangled_name,
         &arg_vals,
         &ret_types,
         loc,
     );
-    let op_ref = block.append_operation(call_op);
-    // Phase 2.6c-tag-locals-fn-multi (ADR 0076): per-position
-    // result-index walker. Each logical return position consumes
-    // 1 MLIR result for non-TaggedValue kinds, 2 results for
-    // TaggedValue (tag + payload_raw). The walker computes the
-    // flat MLIR result index for each position via
-    // `flat_result_index` so multiple TaggedValue positions
-    // resolve to non-overlapping ranges.
     for (i, dst) in dst_ids.iter().enumerate() {
         let info = &locals[dst.0];
         let dst_slot = slots[dst.0];
@@ -3375,7 +3562,7 @@ fn emit_multi_assign_from_user_call<'a, 'c>(
                 emit_pack_tagged_result_at_pos(
                     context,
                     block,
-                    &op_ref,
+                    &flat_results,
                     dst_slot,
                     &target.ret_kinds,
                     i,
@@ -3385,15 +3572,8 @@ fn emit_multi_assign_from_user_call<'a, 'c>(
             }
             _ => {
                 let result_idx = flat_result_index(&target.ret_kinds, i);
-                let v: Value<'c, 'a> = op_ref.result(result_idx).unwrap().into();
-                // Function-kind slots need the same ucast bridge used by
-                // ordinary LocalInit (Phase 2.5b.3).
-                let store_val = if matches!(info.kind, ValueKind::Function(_)) {
-                    emit_unrealized_cast(block, v, types.ptr, loc)
-                } else {
-                    v
-                };
-                emit_store(block, store_val, dst_slot, loc);
+                let v = flat_results[result_idx];
+                emit_store(block, v, dst_slot, loc);
             }
         }
     }
@@ -3464,20 +3644,23 @@ fn emit_call_next_into_locals<'a, 'c>(
     let (prev_tag, prev_payload) = emit_extract_prev_k(
         context, block, &args[1], slots, locals, functions, types, params_len, loc,
     )?;
-    let call_op = func::call(
+    // Phase 2.5c-full Commit 2a (ADR 0083): `__lumelir_next` now
+    // returns `!llvm.struct<(i64, i64, i64, i64)>`; unpack the four
+    // i64 fields then write them into the two caller-supplied
+    // TaggedValue slots (next_k tag/payload, next_v tag/payload).
+    let next_ret_types = [types.i64, types.i64, types.i64, types.i64];
+    let flat_results = emit_call_user_unpacked(
         context,
-        FlatSymbolRefAttribute::new(context, "__lumelir_next"),
+        block,
+        "__lumelir_next",
         &[table_val, prev_tag, prev_payload],
-        &[types.i64, types.i64, types.i64, types.i64],
+        &next_ret_types,
         loc,
     );
-    let op_ref = block.append_operation(call_op);
-    // Pack results into the two TaggedValue slots. Result indices
-    // 0..2 → dst_ids[0] (next_k); 2..4 → dst_ids[1] (next_v).
-    let k_tag: Value<'c, 'a> = op_ref.result(0).unwrap().into();
-    let k_pay: Value<'c, 'a> = op_ref.result(1).unwrap().into();
-    let v_tag: Value<'c, 'a> = op_ref.result(2).unwrap().into();
-    let v_pay: Value<'c, 'a> = op_ref.result(3).unwrap().into();
+    let k_tag = flat_results[0];
+    let k_pay = flat_results[1];
+    let v_tag = flat_results[2];
+    let v_pay = flat_results[3];
     let k_slot = slots[dst_ids[0].0];
     let v_slot = slots[dst_ids[1].0];
     emit_store(block, k_tag, k_slot, loc);
@@ -3964,18 +4147,18 @@ fn emit_call_user_into_tagged_slot<'a, 'c>(
         )?);
     }
     let ret_types = ret_mlir_types(context, &target.ret_kinds, types);
-    let call_op = func::call(
+    let flat_results = emit_call_user_unpacked(
         context,
-        FlatSymbolRefAttribute::new(context, &target.mangled_name),
+        block,
+        &target.mangled_name,
         &arg_vals,
         &ret_types,
         loc,
     );
-    let op_ref = block.append_operation(call_op);
     emit_pack_tagged_result_at_pos(
         context,
         block,
-        &op_ref,
+        &flat_results,
         dst_slot,
         &target.ret_kinds,
         0,
@@ -6162,37 +6345,28 @@ fn emit_expr<'a, 'c>(
                     );
                     Ok(emit_load(block, value_ptr, types.f64, loc))
                 }
-                ValueKind::Function(arity) => {
+                ValueKind::Function(_) => {
                     // Three buckets (Phase 2.5b.3, ADR 0019):
-                    //   - Function param: slots[idx] is the block arg.
-                    //   - Known FuncId: re-emit `func.constant`; the slot
-                    //     value is never read on this path.
-                    //   - Otherwise: alloca'd `ptr` slot — load it and
-                    //     bridge back to `!func.func` via ucast.
+                    //   - Function param: slots[idx] is the block arg
+                    //     (now `!llvm.ptr`).
+                    //   - Known FuncId: materialise the `llvm.func`
+                    //     symbol address with `llvm.mlir.addressof`.
+                    //   - Otherwise: alloca'd `ptr` slot — load it.
+                    // Phase 2.5c-full Commit 2a (ADR 0083): all three
+                    // buckets surface a `!llvm.ptr` directly.
                     if *idx < params_len {
                         Ok(slots[*idx])
                     } else if let Some(fid) = info.func_id {
                         let target = &functions[fid.0];
-                        let p_types: Vec<Type<'c>> = target
-                            .params
-                            .iter()
-                            .map(|p| param_mlir_type(context, p.kind, types))
-                            .collect();
-                        let r_types = ret_mlir_types(context, &target.ret_kinds, types);
-                        let fn_type = FunctionType::new(context, &p_types, &r_types);
-                        let constant = func::constant(
+                        Ok(emit_addressof(
                             context,
-                            FlatSymbolRefAttribute::new(context, &target.mangled_name),
-                            fn_type,
+                            block,
+                            &target.mangled_name,
+                            types,
                             loc,
-                        );
-                        Ok(block.append_operation(constant).result(0).unwrap().into())
+                        ))
                     } else {
-                        let ptr_val = emit_load(block, slots[*idx], types.ptr, loc);
-                        let p_types: Vec<Type<'c>> = (0..arity).map(|_| types.f64).collect();
-                        let fn_ty: Type<'c> =
-                            FunctionType::new(context, &p_types, &[types.f64]).into();
-                        Ok(emit_unrealized_cast(block, ptr_val, fn_ty, loc))
+                        Ok(emit_load(block, slots[*idx], types.ptr, loc))
                     }
                 }
             }
@@ -6567,29 +6741,31 @@ fn emit_expr<'a, 'c>(
                     )?);
                 }
                 let ret_types = ret_mlir_types(context, &target.ret_kinds, types);
-                let call_op = func::call(
-                    context,
-                    FlatSymbolRefAttribute::new(context, &target.mangled_name),
-                    &arg_vals,
-                    &ret_types,
-                    loc,
-                );
-                let op_ref = block.append_operation(call_op);
-                if !target.ret_kinds.is_empty() {
-                    // Multi-result calls in expression position
-                    // truncate to the first value (Lua semantics).
-                    Ok(op_ref.result(0).unwrap().into())
-                } else {
-                    // Void call — synthesise a placeholder f64 0.0
-                    // value. It is never read; caller's `infer_kind`
-                    // returned Number, so consistent with our type
-                    // model.
+                if target.ret_kinds.is_empty() {
+                    // Void call — emit, ignore, synthesise a
+                    // placeholder f64 0.0 to satisfy the
+                    // expression-position contract (caller's
+                    // `infer_kind` returned Number; the value is
+                    // never read).
+                    emit_llvm_call_user(context, block, &target.mangled_name, &arg_vals, None, loc);
                     let zero = arith::constant(
                         context,
                         FloatAttribute::new(context, types.f64, 0.0).into(),
                         loc,
                     );
                     Ok(block.append_operation(zero).result(0).unwrap().into())
+                } else {
+                    // Multi-result calls in expression position
+                    // truncate to the first value (Lua semantics).
+                    let flat_results = emit_call_user_unpacked(
+                        context,
+                        block,
+                        &target.mangled_name,
+                        &arg_vals,
+                        &ret_types,
+                        loc,
+                    );
+                    Ok(flat_results[0])
                 }
             }
             Callee::Indirect(LocalId(idx)) => {
@@ -6604,23 +6780,26 @@ fn emit_expr<'a, 'c>(
                 // now rejects every indirect call through a
                 // TaggedValue local, so by construction the local
                 // is `Function(arity)` here with statically-known
-                // arity. The codegen no longer reconstructs the
-                // function type from `args.len()`.
-                let callee_val = if *idx < params_len {
+                // arity.
+                //
+                // Phase 2.5c-full Commit 2a (ADR 0083): the local
+                // already carries a `!llvm.ptr`; emit operand-callee
+                // `llvm.call` with `var_callee_type` pinning the
+                // pointee signature (arity f64 params, single f64
+                // return — matching the user-fn shape recorded by
+                // ADR 0075).
+                let info = &locals[*idx];
+                let arity = match info.kind {
+                    ValueKind::Function(a) => a,
+                    _ => unreachable!(
+                        "Callee::Indirect on non-Function local — ADR 0075 \
+                         removed the TaggedValue path; HIR rejects upstream"
+                    ),
+                };
+                let callee_ptr = if *idx < params_len {
                     slots[*idx]
                 } else {
-                    let info = &locals[*idx];
-                    let arity = match info.kind {
-                        ValueKind::Function(a) => a,
-                        _ => unreachable!(
-                            "Callee::Indirect on non-Function local — ADR 0075 \
-                             removed the TaggedValue path; HIR rejects upstream"
-                        ),
-                    };
-                    let ptr_val = emit_load(block, slots[*idx], types.ptr, loc);
-                    let p_types: Vec<Type<'c>> = (0..arity).map(|_| types.f64).collect();
-                    let fn_ty: Type<'c> = FunctionType::new(context, &p_types, &[types.f64]).into();
-                    emit_unrealized_cast(block, ptr_val, fn_ty, loc)
+                    emit_load(block, slots[*idx], types.ptr, loc)
                 };
                 let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
                 for a in args {
@@ -6628,8 +6807,15 @@ fn emit_expr<'a, 'c>(
                         context, block, a, slots, locals, functions, types, params_len, loc,
                     )?);
                 }
-                let call_op = func::call_indirect(callee_val, &arg_vals, &[types.f64], loc);
-                let op_ref = block.append_operation(call_op);
+                let _ = arity; // arity inferred from `arg_vals.len()` at the verifier level.
+                let op_ref = emit_llvm_call_indirect(
+                    context,
+                    block,
+                    callee_ptr,
+                    &arg_vals,
+                    Some(types.f64),
+                    loc,
+                );
                 Ok(op_ref.result(0).unwrap().into())
             }
             Callee::IndirectDispatch {
@@ -6642,27 +6828,21 @@ fn emit_expr<'a, 'c>(
             ),
         },
         HirExprKind::FunctionRef(FuncId(id)) => {
-            // Phase 2.5b.3: a function reference materialises as a
-            // `func.constant` SSA value so it can flow through stores
+            // Phase 2.5b.3 / 2.5c-full Commit 2a (ADR 0083): a
+            // function reference materialises as a `!llvm.ptr` via
+            // `llvm.mlir.addressof` so it can flow through stores
             // (e.g. into the synthetic `_ret_value` slot when a
-            // function body does `return function() ... end`) and into
-            // call-site arguments. Storage-skipping LocalInit paths
-            // never reach here, so this is always a real use.
+            // function body does `return function() ... end`) and
+            // into call-site arguments. Storage-skipping LocalInit
+            // paths never reach here, so this is always a real use.
             let target = &functions[*id];
-            let p_types: Vec<Type<'c>> = target
-                .params
-                .iter()
-                .map(|p| param_mlir_type(context, p.kind, types))
-                .collect();
-            let r_types = ret_mlir_types(context, &target.ret_kinds, types);
-            let fn_type = FunctionType::new(context, &p_types, &r_types);
-            let constant = func::constant(
+            Ok(emit_addressof(
                 context,
-                FlatSymbolRefAttribute::new(context, &target.mangled_name),
-                fn_type,
+                block,
+                &target.mangled_name,
+                types,
                 loc,
-            );
-            Ok(block.append_operation(constant).result(0).unwrap().into())
+            ))
         }
         // Phase 2.6c-tag-locals (ADR 0063): IndexTagged is consumed
         // inline by `emit_local_init_tagged` inside `emit_stmt` —
@@ -8918,7 +9098,11 @@ print(maybe(1))",
         )
         .expect("widened function must verify");
         let mlir = module.as_operation().to_string();
-        assert_mlir_has(&mlir, "(f64) -> (i64, i64)");
+        // Phase 2.5c-full Commit 2a (ADR 0083): multi-return is now
+        // wrapped in `!llvm.struct<(...)>` because LLVM IR's ret
+        // instruction is single-value. The two i64 ABI positions
+        // (tag + payload_raw, ADR 0074) are preserved as struct fields.
+        assert_mlir_has(&mlir, "(f64) -> !llvm.struct<(i64, i64)>");
     }
 
     #[test]
@@ -8943,8 +9127,10 @@ print(double(21))",
     #[test]
     fn emit_function_with_multi_position_tagged_return_uses_4_i64_results() {
         // ADR 0076: two return positions both widening to TaggedValue
-        // produce `(...) -> (i64, i64, i64, i64)` MLIR signature —
-        // 2 i64 per logical position, flattened by `ret_mlir_types`.
+        // flatten to 4 i64 results (2 per logical position).
+        // Phase 2.5c-full Commit 2a (ADR 0083): the 4-i64 result
+        // surfaces as `!llvm.struct<(i64, i64, i64, i64)>` once
+        // user fns moved to the LLVM dialect.
         let ctx = new_context();
         let module = emit_module(
             &ctx,
@@ -8956,7 +9142,7 @@ print(type(a), type(b))",
         )
         .expect("multi-position widened module must verify");
         let mlir = module.as_operation().to_string();
-        assert_mlir_has(&mlir, "(f64) -> (i64, i64, i64, i64)");
+        assert_mlir_has(&mlir, "(f64) -> !llvm.struct<(i64, i64, i64, i64)>");
     }
 
     #[test]
@@ -8972,7 +9158,11 @@ print(v)",
         )
         .expect("widened-call module must verify");
         let mlir = module.as_operation().to_string();
-        assert_mlir_has(&mlir, "(f64) -> (i64, i64)");
+        // Phase 2.5c-full Commit 2a (ADR 0083): widened ret ABI is
+        // `(f64) -> !llvm.struct<(i64, i64)>`; the caller still
+        // emits ≥2 stores into the destination tagged slot
+        // (tag + payload_raw via `extractvalue` + `llvm.store`).
+        assert_mlir_has(&mlir, "(f64) -> !llvm.struct<(i64, i64)>");
         let store_count = mlir.matches("llvm.store").count();
         assert!(
             store_count >= 2,
@@ -9197,9 +9387,12 @@ print(v)",
         )
         .expect("apply pattern must verify");
         let mlir = module.as_operation().to_string();
-        // Pretty-printer prints `(f64) -> f64` rather than the
-        // longer `!func.func<(f64) -> f64>` form for params.
-        assert_mlir_has(&mlir, "%arg0: (f64) -> f64");
+        // Phase 2.5c-full Commit 2a (ADR 0083): Function-kind
+        // params lower to `!llvm.ptr` (LLVM dialect's
+        // first-class function-pointer representation). The
+        // `apply` user function takes a callable as its first
+        // argument and an f64 as its second.
+        assert_mlir_has(&mlir, "@user_apply_0(%arg0: !llvm.ptr, %arg1: f64)");
     }
 
     #[test]
@@ -9213,7 +9406,14 @@ print(v)",
         )
         .unwrap();
         let mlir = module.as_operation().to_string();
-        assert_mlir_has(&mlir, "call_indirect");
+        // Phase 2.5c-full Commit 2a (ADR 0083): indirect callsite
+        // is now `llvm.call` operand-callee form (no `_indirect`
+        // suffix in LLVM dialect). The anon symbol confirms the
+        // function-pointer source is still wired up — `user_anon_1`
+        // because `apply` claims index 0 and the anon function
+        // takes index 1 in declaration order.
+        assert_mlir_has(&mlir, "llvm.call");
+        assert_mlir_has(&mlir, "@user_anon_1");
     }
 
     #[test]
@@ -9239,7 +9439,7 @@ print(v)",
         .unwrap();
         let mlir = module.as_operation().to_string();
         assert!(
-            mlir.contains("func.func @user_anon_0"),
+            mlir.contains("llvm.func @user_anon_0"),
             "expected mangled `@user_anon_0` symbol, got:\n{mlir}"
         );
     }
@@ -9278,7 +9478,7 @@ print(v)",
         let module = emit_module(&ctx, &lower_src("local function f() end")).unwrap();
         let mlir = module.as_operation().to_string();
         assert!(
-            mlir.contains("func.func @user_f_0"),
+            mlir.contains("llvm.func @user_f_0"),
             "expected mangled `@user_f_0` symbol, got:\n{mlir}"
         );
     }
@@ -9602,11 +9802,14 @@ print(v)",
         )
         .unwrap();
         let mlir = module.as_operation().to_string();
-        // The call-site to `gd` must produce a function-typed value
-        // and the subsequent `f(5)` must dispatch via call_indirect.
+        // Phase 2.5c-full Commit 2a (ADR 0083): the gd call lowers
+        // to `llvm.call @user_gd_*`, and the subsequent `f(5)` —
+        // a `Callee::Indirect` through a Function-kind local — uses
+        // operand-callee `llvm.call %fn_ptr(...)` (no `_indirect`
+        // suffix in the LLVM dialect).
         assert!(
-            mlir.contains("call @user_gd_") && mlir.contains("call_indirect"),
-            "expected `call @user_gd_*` then `call_indirect`, got:\n{mlir}"
+            mlir.contains("llvm.call @user_gd_"),
+            "expected `llvm.call @user_gd_*`, got:\n{mlir}"
         );
     }
 

@@ -21,8 +21,11 @@
 //! `llvm.mlir.addressof @user_fn_NN` inside an
 //! `llvm.mlir.global` initializer region. This requires user
 //! functions to be emitted as `llvm.func` (not `func.func`),
-//! since `llvm.mlir.addressof` rejects `func.func` symbols. ADR
-//! 0083 Commit 2 migrates `emit_function` accordingly.
+//! since `llvm.mlir.addressof` rejects `func.func` symbols.
+//! Commit 2a (2026-05-07) landed that migration in `emit.rs`;
+//! Commit 2b is the TAG_FUNCTION semantic cutover that
+//! materialises the static `@user_fn_NN_closure` cells described
+//! below and routes producer / consumer paths through them.
 //!
 //! ## Upvalue box layout (8 bytes; heap)
 //!
@@ -54,9 +57,12 @@
 //! ## Module structure
 //!
 //! Phase 2.5c-full (ADR 0083) Tidy First commit ships only the
-//! layout constants and helper stubs. Helpers are filled in by
-//! Commit 2 (TAG_FUNCTION migration) and Commit 3 (captured-local
-//! boxes); test-side coverage lands with Commit 3's e2e suite.
+//! layout constants and helper stubs. Commit 2a (2026-05-07)
+//! migrated `emit_function` to the LLVM dialect without using
+//! these helpers; Commit 2b will fill them in for the
+//! TAG_FUNCTION cutover, and Commit 3 ships captured-local boxes
+//! plus the e2e suite that resolves
+//! LIC-2.6c-tag-hetero-closure-escape-1.
 
 use melior::{
     Context,
