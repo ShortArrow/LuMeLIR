@@ -155,21 +155,111 @@ plan therefore requires user functions to be emitted as `llvm.func`.
   remain documented fallbacks if a future melior or MLIR version
   regresses this path.
 
+## Pattern B — Migration carry-over (run 2026-05-07)
+
+The Pattern A1 spike used a trivial `llvm.func` body (declaration
+only). Lumelir's real `emit_function` body packs `arith.*` (254
+sites), `scf.*` (60), `func.call` (7), and substantial `llvm.*`
+ops (already mixed). Pattern B verifies the body content carry-
+over by constructing minimal `llvm.func` bodies that exercise
+each op family.
+
+| Spike | Body content                                     | `Module::verify()` | `mlir-translate` | clang link + run | Notes                                            |
+|-------|--------------------------------------------------|--------------------|------------------|------------------|--------------------------------------------------|
+| B1    | `arith.constant`, `arith.addf`, `arith.fptosi`   | PASS               | PASS             | PASS (exit 3)    | `llvm.call @user_fn_add` from `main` also works  |
+| B2    | `arith.cmpf`, `scf.if -> f64`, `scf.yield`       | PASS               | PASS             | PASS (exit 7)    | structured control flow lowers to phi cleanly    |
+| B3    | `func.call @callee` where `@callee` is `llvm.func` | **FAIL**           | (not reached)    | (not reached)    | verifier: `'func.call' op 'callee' does not reference a valid function` |
+| B4    | `llvm.call @callee` (B3 fallback)                | PASS               | PASS             | PASS (exit 5)    | confirms migration target                         |
+
+### Resolved sub-hypotheses
+
+- **Sub-hyp 1 (arith inside `llvm.func`):** PASS. No migration
+  needed for the 254 `arith.*` sites.
+- **Sub-hyp 2 (scf inside `llvm.func`):** PASS. No migration
+  needed for the 60 `scf.*` sites.
+- **Sub-hyp 3 (`func.call` to `llvm.func`):** FAIL. `func.call`
+  cannot resolve an `llvm.func` symbol — verifier names this
+  explicitly. The 7 `func::call @user_fn_NN` sites and 3
+  `func::constant @user_fn_NN` sites in `emit.rs` must migrate
+  in lockstep with `emit_function`.
+- **Sub-hyp 4 (`llvm.call` fallback):** PASS. `llvm.call`
+  correctly resolves an `llvm.func` callee; B1 and B4 both
+  exercise this path end-to-end.
+
+### `func.call` 7-site migration plan
+
+After `emit_function` flips to `LLVMFuncOperationBuilder`, every
+`func::call @user_fn_NN` callsite must become `llvm.call`:
+
+| File:line                       | Site                                                |
+|---------------------------------|------------------------------------------------------|
+| `src/codegen/emit.rs:3233`      | ADR 0082 `emit_dispatch_chain_recursive` direct call |
+| `src/codegen/emit.rs:3355`      | direct user fn call                                  |
+| `src/codegen/emit.rs:3467`      | direct user fn call                                  |
+| `src/codegen/emit.rs:3967`      | `emit_call_user_into_tagged_slot` (ADR 0074)         |
+| `src/codegen/emit.rs:6570`      | call site                                            |
+| `src/codegen/emit.rs:6631`      | call site                                            |
+| `src/codegen/emit.rs:1920`-ish  | `__lumelir_next` call (if reached this site list)    |
+
+The 3 `func::constant @user_fn_NN` sites
+(`emit.rs:3181, 6183, 6659`) become `llvm.mlir.addressof` calls,
+yielding `!llvm.ptr` directly — the existing
+`emit_unrealized_cast` from `func`-typed value to `!llvm.ptr`
+disappears on this path.
+
+`func.return` sites (`emit.rs:984, 1033, 1920`) become
+`llvm.return`. `__lumelir_next` (ADR 0081) and `emit_main` are
+themselves user-fn-shaped, so they migrate alongside.
+
+## Commit 2 go / no-go
+
+**GO criteria** (all met after Pattern A1 + B1 + B2 + B4):
+- Pattern A1 verified: `@user_fn_NN_closure` static singleton
+  is realisable.
+- `arith` and `scf` ops do not need migration.
+- `llvm.call` is the proven replacement for `func.call`.
+
+Commit 2 may now land in a single atomic commit. The migration
+must touch all of the following in lockstep:
+
+1. `emit_function`: `func::func` → `LLVMFuncOperationBuilder`,
+   `func::r#return` → `llvm.return`. ABI-compatible (i64-tag
+   wide returns from ADR 0074 and Function-typed returns from
+   ADR 0019 stay valid; only the wrapping op kind changes).
+2. `__lumelir_next` (ADR 0081) and `emit_main`: same migration.
+3. All 7 `func::call @user_fn_NN` callsites → `llvm.call`.
+4. All 3 `func::constant @user_fn_NN` callsites →
+   `llvm.mlir.addressof`, removing the now-obsolete
+   `emit_unrealized_cast` to `!llvm.ptr`.
+5. Emit `@user_fn_NN_closure` static globals using Pattern A1.
+6. Flip the TAG_FUNCTION producer (closure-creation) to store
+   the cell pointer; flip ADR 0082 dispatch chain to load
+   `cell.fn_ptr` (offset 0) before the candidate compare.
+
+Steps 1-4 are pure-mechanical and could be split off as a Tidy
+First commit if the Commit 2 diff threatens test isolation.
+Steps 5-6 are the atomic semantic cutover.
+
+**NO-GO triggers** (none active; recorded for future regression):
+- Any future melior/MLIR upgrade that re-fails B1, B2, or B4 → fall
+  back to splitcase emission per the "Next experiment" section.
+
 ## ADR 0083 Commit 2 entry order
 
-With the static-singleton path open, Commit 2 ("TAG_FUNCTION
-payload semantic cutover") can land in this order:
+With the static-singleton path open and the migration carry-over
+verified, Commit 2 ("TAG_FUNCTION payload semantic cutover") can
+land in this order:
 
 1. **Migrate user-fn emission** to `llvm.func`. The body region
    today contains `arith.*` / `scf.*` / `func.call` / `func.return`
-   ops; these all remain valid inside an `llvm.func` body
-   (`llvm.func` permits any dialect inside its region — only the
-   *symbol kind* is restricted). The terminator changes from
-   `func.return %v` to `llvm.return %v`.
-2. **Migrate intra-fn callees** from `func::call` to `llvm.call`,
-   and from `func::constant` to `llvm.mlir.addressof` where the
-   value is meant as `!llvm.ptr` (e.g. ADR 0082's
-   `emit_dispatch_chain_recursive`). The existing
+   ops. Pattern B confirms `arith` and `scf` stay valid inside
+   `llvm.func`; only `func.call`/`func.return` need their LLVM
+   counterparts. The terminator changes from `func.return %v`
+   to `llvm.return %v`.
+2. **Migrate intra-fn callees** from `func::call` to `llvm.call`
+   (Pattern B4 verified), and from `func::constant` to
+   `llvm.mlir.addressof` where the value is meant as `!llvm.ptr`
+   (e.g. ADR 0082's `emit_dispatch_chain_recursive`). The existing
    `unrealized_conversion_cast` from function-typed value to
    `!llvm.ptr` becomes unnecessary on this path.
 3. **Emit `@user_fn_NN_closure` static globals** for every
@@ -194,14 +284,11 @@ cutover.
 
 ## Carry-overs (out of spike scope, but worth flagging)
 
-- **`arith` / `scf` / `func.call` inside `llvm.func` body:** the
-  spike used a trivial body. Whether the full lumelir codegen
-  output (with `arith.cmpi` / `scf.if` / `func.call` to other
-  user fns) verifies inside an `llvm.func` body is unverified.
-  Quickest follow-on spike: take a passing existing test, replace
-  one `func::func` emission with `LLVMFuncOperationBuilder` and a
-  `llvm.return` terminator, run the full pipeline. Likely a
-  one-line + one-terminator change.
+- **`arith` / `scf` / `func.call` inside `llvm.func` body:**
+  RESOLVED 2026-05-07 by the Pattern B sub-spikes above
+  (b1/b2/b3/b4 on `spike/closure-mlir`). `arith` and `scf` need
+  no migration; `func.call` must flip to `llvm.call` in lockstep
+  with `emit_function`'s migration to `LLVMFuncOperationBuilder`.
 - **TaggedValue upvalues:** ADR 0083 defers these (closure.rs
   line 27-28). When a captured local has `ValueKind::TaggedValue`,
   the 8-byte upvalue box widens to 16 bytes (tag + payload) and

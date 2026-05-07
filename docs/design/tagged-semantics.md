@@ -581,11 +581,15 @@ Listed in Codex review priority order (post-ADR-0082):
    tag-hetero-closure-escape-1) is a subset. Once shipped, it
    widens the dispatch-chain producer surface (ADR 0082
    §Refactor path). MLIR feasibility verified 2026-05-07 in
-   `docs/notes/closure-feasibility.md` — Pattern A1 (`llvm.func`
+   `docs/notes/closure-feasibility.md`: Pattern A1 (`llvm.func`
    user fn + `llvm.mlir.addressof` inside `llvm.mlir.global`
-   initializer) is the green path; Commit 2 must migrate
-   `emit_function` from `func::func` to `LLVMFuncOperationBuilder`
-   before emitting `@user_fn_NN_closure` static globals.
+   initializer) is the green path. Migration carry-over verified
+   the same day — `arith` / `scf` ops stay valid inside
+   `llvm.func` body, but `func::call @user_fn_NN` (7 sites) and
+   `func::constant @user_fn_NN` (3 sites) must migrate to
+   `llvm.call` / `llvm.mlir.addressof` in lockstep with
+   `emit_function`'s flip to `LLVMFuncOperationBuilder`.
+   Commit 2 go criteria are all met.
 2. **Closure-with-upvalues in tables**
    (LIC-2.6c-tag-hetero-closure-escape-1). HIR rejects today
    via the existing escape analysis (ADR 0044 + ADR 0071).
