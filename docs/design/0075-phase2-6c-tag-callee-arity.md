@@ -208,6 +208,39 @@ philosophy.
 - [x] §8 ADR index — ADR 0075 row added; "Last updated" stamp
       bumped.
 
+## Amendment 2026-05-07 — Commit 2a-fix (ADR 0083 follow-up)
+
+Codex review of ADR 0083 Commit 2a (`551d51c`, the `func` →
+`llvm` dialect migration of user fns) discovered that
+`Callee::Indirect`'s codegen hardcodes an `f64` MLIR result
+type. While Function values were typed `!func.func<(f64,...) ->
+f64>`, the MLIR verifier shielded any mismatch as a static
+error; once Commit 2a erased Function values to plain
+`!llvm.ptr` the verifier could no longer catch it, so a
+`Bool` / `Nil` / `String` / `Table` / multi-return user fn
+routed through a `Function`-kind parameter started silently
+miscompiling as f64.
+
+This ADR's reject set is therefore **extended** to cover one
+more case until ADR 0087 routes parameter-routed indirect
+calls through `Callee::IndirectDispatch` (which carries the
+full `IndirectSig::ret_kinds`):
+
+- A function value whose source `HirFunction` declares
+  `ret_kinds != [Number]` cannot flow as an argument into a
+  `Function`-kind parameter.
+
+By induction, parameters of the receiving fn that themselves
+hold Function values are already Number-only at their binding
+site, so no further check is needed at the inner
+`Callee::Indirect` site.
+
+The reject is implemented as `HirError::IndirectCallNonNumberReturn`
+in `src/hir/error.rs`, enforced by `check_function_arg_ret_kinds`
+inside `lower_call` in `src/hir/mod.rs`. It applies symmetrically
+to the `function_names` (named user fn called by name) and
+known-FuncId Local (alias) lower paths.
+
 ## Lua-Incompatibility Tracker
 
 See `docs/design/tagged-semantics.md` §4 for the authoritative

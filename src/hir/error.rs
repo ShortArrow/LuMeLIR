@@ -87,6 +87,29 @@ pub enum HirError {
         ret_kinds: Vec<crate::hir::ValueKind>,
         offset: usize,
     },
+
+    /// Phase 2.5c-full Commit 2a-fix (ADR 0083 / ADR 0075 amend): a
+    /// function value whose `ret_kinds` is not exactly `[Number]`
+    /// cannot flow into a `Function`-kind parameter, because inside
+    /// the receiving user fn it would be invoked via `Callee::Indirect`
+    /// — a path whose codegen hardcodes an `f64` MLIR result type
+    /// (the LLVM-dialect indirect call inferred from operand /
+    /// result types). The `!llvm.ptr` Function-value erasure
+    /// landed in Commit 2a removed the verifier-level safety net
+    /// that previously catch'd this mismatch, so we reject it at
+    /// HIR until ADR 0087 routes parameter-routed indirect calls
+    /// through `Callee::IndirectDispatch` (which carries the full
+    /// `ret_kinds`).
+    #[error(
+        "function '{source_name}' returning {ret_kinds:?} cannot be passed as a \
+         Function-kind argument — only ret_kinds=[Number] is supported here (ADR 0075 \
+         amend / ADR 0083 Commit 2a-fix; lifts when ADR 0087 ships)"
+    )]
+    IndirectCallNonNumberReturn {
+        source_name: String,
+        ret_kinds: Vec<crate::hir::ValueKind>,
+        offset: usize,
+    },
 }
 
 impl HirError {
@@ -104,7 +127,8 @@ impl HirError {
             | HirError::FunctionUsedAsValue { offset, .. }
             | HirError::ClosureEscapes { offset, .. }
             | HirError::IndirectCallThroughTaggedLocal { offset, .. }
-            | HirError::IndirectCallNoCandidates { offset, .. } => *offset,
+            | HirError::IndirectCallNoCandidates { offset, .. }
+            | HirError::IndirectCallNonNumberReturn { offset, .. } => *offset,
         }
     }
 }

@@ -3223,6 +3223,47 @@ impl LowerCtx {
                 })
                 .collect()
         }
+
+        // Phase 2.5c-full Commit 2a-fix (ADR 0083 / ADR 0075 amend):
+        // a `Function`-kind argument's source fn must declare
+        // `ret_kinds == [Number]`. Inside the receiving user fn the
+        // value is invoked via `Callee::Indirect`, whose codegen
+        // hardcodes an `f64` MLIR result type — Bool / Nil / String /
+        // Table / multi-return ABIs would silently miscompile after
+        // Commit 2a's `!llvm.ptr` Function-value erasure stripped the
+        // verifier's safety net. By induction Function-kind locals
+        // with no `func_id` (parameters) are already Number-only at
+        // their binding site, so we skip those here and only check
+        // statically resolvable sources (FunctionRef, known-FuncId
+        // Local).
+        fn check_function_arg_ret_kinds(
+            target_param_kinds: &[ValueKind],
+            lowered_args: &[HirExpr],
+            locals: &[LocalInfo],
+            functions: &[HirFunction],
+        ) -> Result<(), HirError> {
+            for (i, arg) in lowered_args.iter().enumerate() {
+                if !matches!(target_param_kinds.get(i), Some(ValueKind::Function(_))) {
+                    continue;
+                }
+                let source_fid = match &arg.kind {
+                    HirExprKind::FunctionRef(fid) => Some(*fid),
+                    HirExprKind::Local(LocalId(idx)) => locals[*idx].func_id,
+                    _ => None,
+                };
+                if let Some(fid) = source_fid {
+                    let ret_kinds = functions[fid.0].ret_kinds.clone();
+                    if !matches!(ret_kinds.as_slice(), [ValueKind::Number]) {
+                        return Err(HirError::IndirectCallNonNumberReturn {
+                            source_name: functions[fid.0].mangled_name.clone(),
+                            ret_kinds,
+                            offset: arg.span.start,
+                        });
+                    }
+                }
+            }
+            Ok(())
+        }
         let name = match &callee.kind {
             ExprKind::Ident(n) => n,
             _ => {
@@ -3275,6 +3316,25 @@ impl LowerCtx {
                     Some(fid) => Callee::User(fid),
                     None => Callee::Indirect(local_id),
                 };
+                // Phase 2.5c-full Commit 2a-fix (ADR 0083 / ADR 0075
+                // amend): when this resolves to a known user fn,
+                // restrict Function-kind args to ret_kinds=[Number].
+                // The Callee::Indirect branch (parameter passing
+                // through) needs no extra check — its enclosing
+                // fn's parameter binding already enforced the rule.
+                if let Callee::User(fid) = callee {
+                    let target_param_kinds: Vec<ValueKind> = self.functions[fid.0]
+                        .params
+                        .iter()
+                        .map(|p| p.kind)
+                        .collect();
+                    check_function_arg_ret_kinds(
+                        &target_param_kinds,
+                        &lowered_args,
+                        &self.locals,
+                        &self.functions,
+                    )?;
+                }
                 // Phase 2.5c-min (ADR 0037): direct calls to a
                 // closure with upvalues append the captured values
                 // as extra arguments, mirroring the matching code
@@ -3392,6 +3452,16 @@ impl LowerCtx {
                 .iter()
                 .map(|a| self.lower_expr(a))
                 .collect::<Result<Vec<_>, _>>()?;
+            // Phase 2.5c-full Commit 2a-fix (ADR 0083 / ADR 0075
+            // amend): same ret_kind restriction as the local-
+            // Function-kind path — Function-kind args must come
+            // from a Number-returning user fn.
+            check_function_arg_ret_kinds(
+                &param_kinds,
+                &lowered_args,
+                &self.locals,
+                &self.functions,
+            )?;
             // Phase 2.5b.2/2.5e: each arg's kind must match the
             // corresponding param's kind (Number ↔ Number, Bool ↔
             // Bool, Nil ↔ Nil, Function(arity) ↔ Function(arity)).

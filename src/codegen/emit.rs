@@ -6784,12 +6784,20 @@ fn emit_expr<'a, 'c>(
                 //
                 // Phase 2.5c-full Commit 2a (ADR 0083): the local
                 // already carries a `!llvm.ptr`; emit operand-callee
-                // `llvm.call` with `var_callee_type` pinning the
-                // pointee signature (arity f64 params, single f64
-                // return — matching the user-fn shape recorded by
-                // ADR 0075).
+                // `llvm.call`. The non-variadic pointee signature is
+                // inferred from the operand and result MLIR types,
+                // so no `var_callee_type` attribute is needed.
+                //
+                // Phase 2.5c-full Commit 2a-fix (ADR 0083 / ADR 0075
+                // amend): the f64 result type is sound because HIR's
+                // `check_function_arg_ret_kinds` rejects any
+                // Function-kind argument whose source fn declares
+                // `ret_kinds != [Number]`. The verifier-level safety
+                // net that `!func.func<...>` typing previously
+                // provided (and Commit 2a's `!llvm.ptr` erasure
+                // removed) is reinstated as a static HIR check.
                 let info = &locals[*idx];
-                let arity = match info.kind {
+                let _ = match info.kind {
                     ValueKind::Function(a) => a,
                     _ => unreachable!(
                         "Callee::Indirect on non-Function local — ADR 0075 \
@@ -6807,7 +6815,6 @@ fn emit_expr<'a, 'c>(
                         context, block, a, slots, locals, functions, types, params_len, loc,
                     )?);
                 }
-                let _ = arity; // arity inferred from `arg_vals.len()` at the verifier level.
                 let op_ref = emit_llvm_call_indirect(
                     context,
                     block,

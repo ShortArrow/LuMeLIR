@@ -38,31 +38,48 @@
 //! convention in `tagged.rs`). TaggedValue upvalues are deferred
 //! (Codex pre-ADR-0083 review §5).
 //!
-//! ## ABI contract
+//! ## ABI contract (planned, lands with Commit 2b)
 //!
-//! `TAG_FUNCTION` payload (8 bytes) is now a closure cell pointer
-//! — never a raw fn ptr. Every function ABI accepts upvalue box
-//! pointers as trailing parameters: signature is
-//! `(lua_params... , uv_box_0, uv_box_1, ...)`. ADR 0082's
-//! `emit_dispatch_chain_recursive` therefore loads
-//! `cell.fn_ptr` *before* comparing against candidates'
-//! `func.constant @user_fn_X` addresses, then forwards
-//! `(args, [load(cell, 16+i*8) for i in 0..upvalue_count])`
-//! to the matched direct call.
+//! After Commit 2b, `TAG_FUNCTION` payload (8 bytes) will be a
+//! closure cell pointer — never a raw fn ptr. **Current state
+//! (Commit 2a-fix): payload is still a raw fn ptr.** Commit 2b
+//! flips the producer / consumer paths atomically:
 //!
-//! Closure equality (`f == g`) compares cell pointers — same
-//! closure aliased through multiple locals is equal; two
-//! instances from the same factory are not (Lua spec).
+//! - Producers (`HirExprKind::FunctionRef`, known-FuncId
+//!   `Local`, dispatch chain candidate side) will materialise
+//!   `addressof @user_fn_NN_closure` instead of
+//!   `addressof @user_fn_NN`.
+//! - Consumers (ADR 0082 `emit_dispatch_chain_recursive`,
+//!   `Callee::Indirect`, the `tagged.rs` Function arms) will
+//!   load `cell.fn_ptr` (offset 0) before issuing the actual
+//!   `llvm.call` or comparing against candidate fn ptrs.
+//!
+//! Every capturing function ABI will accept upvalue box pointers
+//! as trailing parameters (`(lua_params..., uv_box_0,
+//! uv_box_1, ...)`); that surface arrives with Commit 3.
+//!
+//! Closure equality (`f == g`) compares cell pointers — for
+//! non-capturing closures the static `@user_fn_NN_closure`
+//! singleton makes `f == g` (alias) true. Capturing closures
+//! malloc per creation, so two factory products differ (Lua
+//! spec §3.4.4).
 //!
 //! ## Module structure
 //!
 //! Phase 2.5c-full (ADR 0083) Tidy First commit ships only the
 //! layout constants and helper stubs. Commit 2a (2026-05-07)
 //! migrated `emit_function` to the LLVM dialect without using
-//! these helpers; Commit 2b will fill them in for the
-//! TAG_FUNCTION cutover, and Commit 3 ships captured-local boxes
-//! plus the e2e suite that resolves
-//! LIC-2.6c-tag-hetero-closure-escape-1.
+//! these helpers (call sites still operate on raw fn ptrs).
+//! Commit 2a-fix (Codex review follow-up) closes a wrong-code
+//! gap exposed by Commit 2a's `!llvm.ptr` Function-value
+//! erasure: `Callee::Indirect`'s hardcoded f64 result type lost
+//! its MLIR-verifier safety net, so HIR now rejects non-Number
+//! return functions flowing into Function-kind parameters
+//! (ADR 0075 amend). Commit 2b will fill in
+//! `emit_load_closure_fn_ptr` / `emit_store_closure_fn_ptr` and
+//! flip TAG_FUNCTION producer / consumer paths to closure cells;
+//! Commit 3 ships captured-local boxes plus the e2e suite that
+//! resolves LIC-2.6c-tag-hetero-closure-escape-1.
 
 use melior::{
     Context,
