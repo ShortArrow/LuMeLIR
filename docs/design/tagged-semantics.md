@@ -6,7 +6,7 @@
 > consumer / tag semantics. ADRs continue to record *decisions*;
 > this page records *current state*.
 
-**Last updated:** 2026-05-07 (after ADR 0086)
+**Last updated:** 2026-05-07 (after closure feasibility spike)
 
 ---
 
@@ -580,7 +580,12 @@ Listed in Codex review priority order (post-ADR-0082):
    The general problem of which closure-in-tables (LIC-2.6c-
    tag-hetero-closure-escape-1) is a subset. Once shipped, it
    widens the dispatch-chain producer surface (ADR 0082
-   §Refactor path).
+   §Refactor path). MLIR feasibility verified 2026-05-07 in
+   `docs/notes/closure-feasibility.md` — Pattern A1 (`llvm.func`
+   user fn + `llvm.mlir.addressof` inside `llvm.mlir.global`
+   initializer) is the green path; Commit 2 must migrate
+   `emit_function` from `func::func` to `LLVMFuncOperationBuilder`
+   before emitting `@user_fn_NN_closure` static globals.
 2. **Closure-with-upvalues in tables**
    (LIC-2.6c-tag-hetero-closure-escape-1). HIR rejects today
    via the existing escape analysis (ADR 0044 + ADR 0071).

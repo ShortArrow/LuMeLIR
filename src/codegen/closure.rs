@@ -16,6 +16,14 @@
 //! emitted once per module (`@user_fn_NN_closure`). Capturing
 //! closures `malloc` a fresh cell at the closure-creation site.
 //!
+//! MLIR feasibility verified 2026-05-07 (see
+//! `docs/notes/closure-feasibility.md`): the static cell uses
+//! `llvm.mlir.addressof @user_fn_NN` inside an
+//! `llvm.mlir.global` initializer region. This requires user
+//! functions to be emitted as `llvm.func` (not `func.func`),
+//! since `llvm.mlir.addressof` rejects `func.func` symbols. ADR
+//! 0083 Commit 2 migrates `emit_function` accordingly.
+//!
 //! ## Upvalue box layout (8 bytes; heap)
 //!
 //! ```text
