@@ -186,6 +186,56 @@ each op family.
   correctly resolves an `llvm.func` callee; B1 and B4 both
   exercise this path end-to-end.
 
+### B5 — multi-return `llvm.func` (added 2026-05-07)
+
+`__lumelir_next` (ADR 0081, returns `(i64, i64, i64, i64)`) and
+every TaggedValue-widened user fn (ADR 0074) currently rely on
+the `func` dialect's native multi-result capability. LLVM IR has
+no native multi-return; MLIR's `llvm` dialect mirrors that
+restriction.
+
+| Probe | Form                                                | Result |
+|-------|-----------------------------------------------------|--------|
+| B5a   | `llvm.func @pair() -> (i64, i64)` direct multi-result | melior 0.27's `llvm::r#type::function` only accepts a single return type — the multi-result form is not expressible in the API. |
+| B5b   | `llvm.func @pair() -> !llvm.struct<(i64, i64)>` with `llvm.return` of a single struct value built via `llvm.mlir.undef` + chained `llvm.insertvalue`; caller extracts via `llvm.extractvalue %s[i]`. | **PASS** — verify, mlir-translate, clang link/run all green; LLVM IR shows `define { i64, i64 } @pair() { ret { i64, i64 } { i64 11, i64 22 } }`. |
+
+### Implication for Commit 2a scope
+
+B5b is the only available form, which expands Commit 2a beyond
+a `+20 LOC mechanical replacement` to a structural change:
+
+- Every user fn whose `ret_kinds.len() > 1` (multi-return per
+  ADR 0021, TaggedValue-widened per ADR 0074, plus
+  `__lumelir_next` per ADR 0081) needs:
+  1. function type's return becomes a single
+     `!llvm.struct<(t0, t1, ...)>` instead of an N-tuple.
+  2. body's terminator builds the struct via `llvm.mlir.undef`
+     + N × `llvm.insertvalue`, then `llvm.return %struct`.
+  3. every callsite (emit.rs:3233 / 3355 / 3467 / 3967 / 6570
+     and the call-multi machinery) extracts each result via
+     `llvm.extractvalue %ret[i]` instead of
+     `op_ref.result(i)`.
+- `flat_result_index` (`callabi.rs`) currently maps each
+  TaggedValue position to its 2-result span; after migration
+  the mapping shifts to struct-field indices.
+- Single-return user fns (the simpler majority) keep the
+  trivial `llvm.func ... -> single_ty` shape.
+
+The change is still **behavior-invariant** at the LLVM IR level
+(LLVM multi-return is always struct-coded), so 965 tests should
+stay green if the mapping stays consistent. The diff size shifts
+upward to roughly +150 LOC of careful structural rewrite plus
+`extractvalue` at every multi-result callsite, instead of the
+~+20 LOC pure-mechanical replacement originally scoped.
+
+Commit 2a is therefore best opened with a small Tidy First helper
+(`emit_pack_struct_return` / `emit_extract_struct_result` in
+`callabi.rs`), then flipping `emit_function` / `emit_main` /
+`emit_lumelir_next_function` / all call+constant sites in
+lockstep, finishing with the 4 IR-shape unit-test assertion
+updates. Spike branch `spike/closure-mlir` keeps the proof
+binaries (commits `976ad8b`, `865f6c6`, `3af1ac7`).
+
 ### `func.call` 7-site migration plan
 
 After `emit_function` flips to `LLVMFuncOperationBuilder`, every
