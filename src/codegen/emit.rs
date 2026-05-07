@@ -162,6 +162,19 @@ pub(crate) fn emit_module_unverified<'c>(
     for hir_fn in &chunk.functions {
         emit_function(context, &module, hir_fn, &chunk.functions, &types, loc)?;
     }
+    // Phase 2.5c-full Commit 2b (ADR 0083): one closure singleton
+    // global per user fn. The producer sites (`HirExprKind::FunctionRef`,
+    // known-FuncId Local) materialise the cell ptr via
+    // `addressof @user_fn_NN_closure` instead of the raw fn ptr.
+    for hir_fn in &chunk.functions {
+        super::closure::emit_user_fn_closure_global(
+            context,
+            &module,
+            &hir_fn.mangled_name,
+            &types,
+            loc,
+        );
+    }
     // Phase 2.8e-iter-next (ADR 0081): always emit the `next(t, k)`
     // helper. The function is small and unused calls are eliminated
     // by the LLVM backend's dead-code pass; emitting it
@@ -3312,10 +3325,17 @@ fn emit_indirect_dispatch_chain_in_block<'a, 'c>(
     trap_else.append_block(trap_else_blk);
     block.append_operation(scf::r#if(tag_mismatch, &[], trap_then, trap_else, loc));
 
-    // ===== Step 2: load fn ptr =====
+    // ===== Step 2: load cell ptr, then dereference cell.fn_ptr =====
+    // Phase 2.5c-full Commit 2b (ADR 0083): TAG_FUNCTION payload now
+    // holds the closure cell ptr (since the producer flip);
+    // dispatch-chain candidate comparison is still done against the
+    // raw fn ptr (`addressof @user_fn_NN`), so we extract `cell.fn_ptr`
+    // here. Static `@user_fn_NN_closure` singletons make the load a
+    // simple GEP-then-load, no allocation involved.
     let payload_ptr =
         emit_byte_offset_ptr(context, block, slot_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
-    let loaded_ptr = emit_load(block, payload_ptr, types.ptr, loc);
+    let cell_ptr = emit_load(block, payload_ptr, types.ptr, loc);
+    let loaded_ptr = super::closure::emit_load_closure_fn_ptr(context, block, cell_ptr, types, loc);
 
     // ===== Step 3: evaluate args once =====
     let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
@@ -6348,23 +6368,20 @@ fn emit_expr<'a, 'c>(
                 ValueKind::Function(_) => {
                     // Three buckets (Phase 2.5b.3, ADR 0019):
                     //   - Function param: slots[idx] is the block arg
-                    //     (now `!llvm.ptr`).
-                    //   - Known FuncId: materialise the `llvm.func`
-                    //     symbol address with `llvm.mlir.addressof`.
+                    //     (a closure cell `!llvm.ptr` since Commit 2b).
+                    //   - Known FuncId: materialise the static
+                    //     `@<fn_sym>_closure` singleton's address.
                     //   - Otherwise: alloca'd `ptr` slot — load it.
-                    // Phase 2.5c-full Commit 2a (ADR 0083): all three
-                    // buckets surface a `!llvm.ptr` directly.
+                    // Phase 2.5c-full Commit 2b (ADR 0083): TAG_FUNCTION
+                    // / Function-kind values are now closure cell ptrs;
+                    // the raw fn-code address is reachable via
+                    // `emit_load_closure_fn_ptr` at the call site.
                     if *idx < params_len {
                         Ok(slots[*idx])
                     } else if let Some(fid) = info.func_id {
                         let target = &functions[fid.0];
-                        Ok(emit_addressof(
-                            context,
-                            block,
-                            &target.mangled_name,
-                            types,
-                            loc,
-                        ))
+                        let closure_sym = format!("{}_closure", target.mangled_name);
+                        Ok(emit_addressof(context, block, &closure_sym, types, loc))
                     } else {
                         Ok(emit_load(block, slots[*idx], types.ptr, loc))
                     }
@@ -6804,11 +6821,17 @@ fn emit_expr<'a, 'c>(
                          removed the TaggedValue path; HIR rejects upstream"
                     ),
                 };
-                let callee_ptr = if *idx < params_len {
+                // Phase 2.5c-full Commit 2b (ADR 0083): the local
+                // holds a closure cell ptr (since the producer flip).
+                // Extract `cell.fn_ptr` (offset 0) before issuing the
+                // operand-callee `llvm.call`.
+                let cell_ptr = if *idx < params_len {
                     slots[*idx]
                 } else {
                     emit_load(block, slots[*idx], types.ptr, loc)
                 };
+                let callee_ptr =
+                    super::closure::emit_load_closure_fn_ptr(context, block, cell_ptr, types, loc);
                 let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
                 for a in args {
                     arg_vals.push(emit_expr(
@@ -6835,21 +6858,17 @@ fn emit_expr<'a, 'c>(
             ),
         },
         HirExprKind::FunctionRef(FuncId(id)) => {
-            // Phase 2.5b.3 / 2.5c-full Commit 2a (ADR 0083): a
-            // function reference materialises as a `!llvm.ptr` via
-            // `llvm.mlir.addressof` so it can flow through stores
-            // (e.g. into the synthetic `_ret_value` slot when a
-            // function body does `return function() ... end`) and
-            // into call-site arguments. Storage-skipping LocalInit
-            // paths never reach here, so this is always a real use.
+            // Phase 2.5b.3 / 2.5c-full Commit 2b (ADR 0083): a
+            // function reference materialises as a `!llvm.ptr` to
+            // the static `@<fn_sym>_closure` singleton (since Commit
+            // 2b), so producer-side `f == g` comparisons resolve
+            // through the singleton identity and consumers can
+            // dereference `cell.fn_ptr` (offset 0) for the actual
+            // call. Storage-skipping LocalInit paths never reach
+            // here, so this is always a real use.
             let target = &functions[*id];
-            Ok(emit_addressof(
-                context,
-                block,
-                &target.mangled_name,
-                types,
-                loc,
-            ))
+            let closure_sym = format!("{}_closure", target.mangled_name);
+            Ok(emit_addressof(context, block, &closure_sym, types, loc))
         }
         // Phase 2.6c-tag-locals (ADR 0063): IndexTagged is consumed
         // inline by `emit_local_init_tagged` inside `emit_stmt` —
@@ -9878,5 +9897,73 @@ print(v)",
         )
         .expect("Bool predicate module must verify");
         assert!(module.as_operation().verify());
+    }
+
+    // ============================================================
+    // ADR 0083 Commit 2b — closure cell singleton + producer /
+    // consumer flip. These tests pin the IR shape so future
+    // refactors can't silently regress the cutover.
+    // ============================================================
+
+    #[test]
+    fn emit_user_fn_emits_closure_singleton_global() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src("local function f() return 1 end\nprint(f())"),
+        )
+        .expect("closure singleton module must verify");
+        let mlir = module.as_operation().to_string();
+        // Each user fn `@user_<name>_<idx>` gets a static
+        // `@user_<name>_<idx>_closure` cell whose initializer
+        // packs `addressof @user_<name>_<idx>` + i64 0
+        // (upvalue_count) into `!llvm.struct<(ptr, i64)>`.
+        assert_mlir_has(&mlir, "llvm.mlir.global");
+        assert_mlir_has(&mlir, "@user_f_0_closure");
+    }
+
+    #[test]
+    fn emit_function_ref_routes_through_closure_singleton() {
+        // `local g = d` is optimised by HIR to skip storage (alias
+        // copy of `func_id`), so to actually materialise the
+        // Function-kind value we pass it as an argument. The
+        // `apply(d, 5)` site triggers the producer flip via the
+        // known-FuncId Local path in `HirExprKind::Local`.
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src(
+                "local function d(x) return x*2 end\nlocal function apply(g, x) return g(x) end\nprint(apply(d, 5))",
+            ),
+        )
+        .expect("apply-pattern module must verify");
+        let mlir = module.as_operation().to_string();
+        // Producer side: when a Function-kind value is materialised
+        // (FunctionRef / known-FuncId Local), the SSA value is the
+        // address of the closure singleton, not the raw fn ptr.
+        assert_mlir_has(&mlir, "addressof @user_d_0_closure");
+    }
+
+    #[test]
+    fn emit_indirect_dispatch_loads_cell_fn_ptr() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src(
+                "local function d(x) return x*2 end\nlocal function apply(g, x) return g(x) end\nprint(apply(d, 7))",
+            ),
+        )
+        .expect("indirect dispatch module must verify");
+        let mlir = module.as_operation().to_string();
+        // Consumer side: the `Callee::Indirect` arm dereferences the
+        // cell ptr's first slot (offset 0 = fn_ptr) before issuing
+        // the actual `llvm.call`. We look for a `getelementptr` +
+        // `llvm.load !llvm.ptr` pattern preceding the indirect call;
+        // the i8 byte-offset GEP pattern is what `emit_byte_offset_ptr`
+        // produces.
+        assert_mlir_has(&mlir, "llvm.getelementptr");
+        assert_mlir_has(&mlir, "llvm.load");
+        // Producer side must also have flipped to the singleton.
+        assert_mlir_has(&mlir, "@user_d_0_closure");
     }
 }

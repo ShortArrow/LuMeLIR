@@ -38,24 +38,29 @@
 //! convention in `tagged.rs`). TaggedValue upvalues are deferred
 //! (Codex pre-ADR-0083 review §5).
 //!
-//! ## ABI contract (planned, lands with Commit 2b)
+//! ## ABI contract (Commit 2b landed)
 //!
-//! After Commit 2b, `TAG_FUNCTION` payload (8 bytes) will be a
-//! closure cell pointer — never a raw fn ptr. **Current state
-//! (Commit 2a-fix): payload is still a raw fn ptr.** Commit 2b
-//! flips the producer / consumer paths atomically:
+//! `TAG_FUNCTION` payload (8 bytes) is a closure cell pointer —
+//! never a raw fn ptr. The producer / consumer paths flipped
+//! atomically in Commit 2b:
 //!
 //! - Producers (`HirExprKind::FunctionRef`, known-FuncId
-//!   `Local`, dispatch chain candidate side) will materialise
-//!   `addressof @user_fn_NN_closure` instead of
-//!   `addressof @user_fn_NN`.
-//! - Consumers (ADR 0082 `emit_dispatch_chain_recursive`,
-//!   `Callee::Indirect`, the `tagged.rs` Function arms) will
-//!   load `cell.fn_ptr` (offset 0) before issuing the actual
-//!   `llvm.call` or comparing against candidate fn ptrs.
+//!   `Local`) materialise the cell ptr via
+//!   `addressof @user_fn_NN_closure`. The dispatch-chain
+//!   candidate side stays at raw `addressof @user_fn_NN` because
+//!   consumers normalise to fn_ptr before comparison (avoids a
+//!   second addressof per candidate).
+//! - Consumers (`emit_indirect_dispatch_chain_in_block`,
+//!   `Callee::Indirect`) load `cell.fn_ptr` (offset 0) via
+//!   [`emit_load_closure_fn_ptr`] before issuing the actual
+//!   `llvm.call`. The `tagged.rs` Function arms still operate
+//!   on raw payload ptrs — print/tostring yield "function" /
+//!   "table" typename strings (no address printed) and tag-eq
+//!   compares ptrs which, for non-capturing singletons, retain
+//!   identity equality automatically.
 //!
-//! Every capturing function ABI will accept upvalue box pointers
-//! as trailing parameters (`(lua_params..., uv_box_0,
+//! Capturing function ABIs will accept upvalue box pointers as
+//! trailing parameters (`(lua_params..., uv_box_0,
 //! uv_box_1, ...)`); that surface arrives with Commit 3.
 //!
 //! Closure equality (`f == g`) compares cell pointers — for
@@ -66,29 +71,38 @@
 //!
 //! ## Module structure
 //!
-//! Phase 2.5c-full (ADR 0083) Tidy First commit ships only the
-//! layout constants and helper stubs. Commit 2a (2026-05-07)
-//! migrated `emit_function` to the LLVM dialect without using
-//! these helpers (call sites still operate on raw fn ptrs).
-//! Commit 2a-fix (Codex review follow-up) closes a wrong-code
-//! gap exposed by Commit 2a's `!llvm.ptr` Function-value
-//! erasure: `Callee::Indirect`'s hardcoded f64 result type lost
-//! its MLIR-verifier safety net, so HIR now rejects non-Number
-//! return functions flowing into Function-kind parameters
-//! (ADR 0075 amend). Commit 2b will fill in
-//! `emit_load_closure_fn_ptr` / `emit_store_closure_fn_ptr` and
-//! flip TAG_FUNCTION producer / consumer paths to closure cells;
+//! Phase 2.5c-full (ADR 0083) Tidy First commit shipped the layout
+//! constants and helper stubs. Commit 2a (2026-05-07) migrated
+//! `emit_function` to the LLVM dialect; Commit 2a-fix
+//! (`c81f16b`, Codex review follow-up) closed a wrong-code gap
+//! exposed by the `!llvm.ptr` Function-value erasure
+//! (`Callee::Indirect`'s hardcoded f64 result type lost its
+//! MLIR-verifier safety net) by HIR-rejecting non-Number return
+//! functions flowing into Function-kind parameters (ADR 0075
+//! amend). Commit 2b (2026-05-08) shipped this file's
+//! [`emit_load_closure_fn_ptr`] / [`emit_store_closure_fn_ptr`]
+//! and the new [`emit_user_fn_closure_global`], and flipped
+//! TAG_FUNCTION producer / consumer paths to closure cell ptrs.
 //! Commit 3 ships captured-local boxes plus the e2e suite that
 //! resolves LIC-2.6c-tag-hetero-closure-escape-1.
 
 use melior::{
     Context,
-    ir::{Block, Location, Value},
+    dialect::{
+        llvm,
+        ods::llvm::{AddressOfOperationBuilder, GlobalOperationBuilder},
+    },
+    ir::{
+        Block, BlockLike, Identifier, Location, Module, Region, RegionLike, Value,
+        attribute::{FlatSymbolRefAttribute, IntegerAttribute, StringAttribute, TypeAttribute},
+        operation::OperationBuilder,
+    },
 };
 
 use crate::hir::ValueKind;
 
-use super::primitive::Types;
+use super::callabi::emit_pack_struct;
+use super::primitive::{Types, emit_byte_offset_ptr, emit_load, emit_store};
 
 // ============================================================
 // Layout constants — referenced from `closure.rs` helpers; ADR
@@ -150,33 +164,41 @@ pub(crate) fn emit_allocate_closure_cell<'a, 'c>(
     unimplemented!("ADR 0083 commit 2 ships emit_allocate_closure_cell")
 }
 
-/// Phase 2.5c-full (ADR 0083): load `cell.fn_ptr` from a closure
-/// cell pointer. Used by ADR 0082's dispatch chain to compare
-/// against candidate `func.constant @user_fn_X` addresses.
+/// Phase 2.5c-full (ADR 0083) Commit 2b: load `cell.fn_ptr` (offset
+/// 0) from a closure cell pointer. Used by ADR 0082's dispatch chain
+/// to extract the raw function-code address before comparing
+/// against candidate `addressof @user_fn_NN` ptrs, and by
+/// `Callee::Indirect` to derive the actual call target.
 #[allow(dead_code)]
 pub(crate) fn emit_load_closure_fn_ptr<'a, 'c>(
-    _context: &'c Context,
-    _block: &'a Block<'c>,
-    _cell_ptr: Value<'c, 'a>,
-    _types: &Types<'c>,
-    _loc: Location<'c>,
+    context: &'c Context,
+    block: &'a Block<'c>,
+    cell_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
 ) -> Value<'c, 'a> {
-    unimplemented!("ADR 0083 commit 2 ships emit_load_closure_fn_ptr")
+    let fn_ptr_slot =
+        emit_byte_offset_ptr(context, block, cell_ptr, CLOSURE_OFF_FN_PTR, types, loc);
+    emit_load(block, fn_ptr_slot, types.ptr, loc)
 }
 
-/// Phase 2.5c-full (ADR 0083): store `fn_ptr` into a closure
-/// cell's `fn_ptr` field. Called once per closure allocation
-/// (static or heap).
+/// Phase 2.5c-full (ADR 0083) Commit 2b: store `fn_ptr` into a closure
+/// cell's `fn_ptr` field (offset 0). Called once per closure
+/// allocation; non-capturing static cells emit this through the
+/// `llvm.mlir.global` initializer region rather than through this
+/// helper, so today only capturing closures (Commit 3) reach it.
 #[allow(dead_code)]
 pub(crate) fn emit_store_closure_fn_ptr<'a, 'c>(
-    _context: &'c Context,
-    _block: &'a Block<'c>,
-    _cell_ptr: Value<'c, 'a>,
-    _fn_ptr: Value<'c, 'a>,
-    _types: &Types<'c>,
-    _loc: Location<'c>,
+    context: &'c Context,
+    block: &'a Block<'c>,
+    cell_ptr: Value<'c, 'a>,
+    fn_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
 ) {
-    unimplemented!("ADR 0083 commit 2 ships emit_store_closure_fn_ptr")
+    let fn_ptr_slot =
+        emit_byte_offset_ptr(context, block, cell_ptr, CLOSURE_OFF_FN_PTR, types, loc);
+    emit_store(block, fn_ptr, fn_ptr_slot, loc);
 }
 
 /// Phase 2.5c-full (ADR 0083): load the i-th upvalue box pointer
@@ -256,4 +278,83 @@ pub(crate) fn emit_store_upvalue_box_value<'a, 'c>(
     _loc: Location<'c>,
 ) {
     unimplemented!("ADR 0083 commit 3 ships emit_store_upvalue_box_value")
+}
+
+// ============================================================
+// Static singleton emit (Commit 2b)
+// ============================================================
+
+/// Phase 2.5c-full (ADR 0083) Commit 2b: emit a per-user-fn static
+/// singleton `@<fn_sym>_closure` of type `!llvm.struct<(ptr, i64)>`,
+/// initialised to `{ addressof @<fn_sym>, i64 0 }` (upvalue_count
+/// = 0, the non-capturing case). The cell pointer becomes the
+/// observable identity of the function value: producers
+/// (`HirExprKind::FunctionRef`, known-FuncId Local) materialise it
+/// via `addressof @<fn_sym>_closure`, while consumers
+/// (ADR 0082 dispatch chain, `Callee::Indirect`, the
+/// `tagged.rs` Function arms) load `cell.fn_ptr` (offset 0) before
+/// issuing the actual call or comparison.
+///
+/// Singleton property: one global per `HirFunction`. Aliasing a
+/// function value (`local g = f`) just copies the cell pointer, so
+/// `f == g` is true via raw pointer compare — matching Lua spec
+/// §3.4.4 for non-capturing functions. Capturing closures (Commit
+/// 3) malloc a fresh cell per creation, so factory products differ
+/// as required.
+pub(crate) fn emit_user_fn_closure_global<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    fn_sym: &str,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let cell_struct = llvm::r#type::r#struct(context, &[types.ptr, types.i64], false);
+    let init_region = Region::new();
+    let init_blk = Block::new(&[]);
+    let fn_addr: Value<'c, '_> = init_blk
+        .append_operation(
+            AddressOfOperationBuilder::new(context, loc)
+                .res(types.ptr)
+                .global_name(FlatSymbolRefAttribute::new(context, fn_sym))
+                .build()
+                .into(),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_count: Value<'c, '_> = init_blk
+        .append_operation(
+            OperationBuilder::new("llvm.mlir.constant", loc)
+                .add_attributes(&[(
+                    Identifier::new(context, "value"),
+                    IntegerAttribute::new(types.i64, 0).into(),
+                )])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.mlir.constant"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let packed = emit_pack_struct(context, &init_blk, cell_struct, &[fn_addr, zero_count], loc);
+    init_blk.append_operation(
+        OperationBuilder::new("llvm.return", loc)
+            .add_operands(&[packed])
+            .build()
+            .expect("llvm.return in closure singleton initializer"),
+    );
+    init_region.append_block(init_blk);
+
+    let closure_sym = format!("{fn_sym}_closure");
+    let global_op = GlobalOperationBuilder::new(context, loc)
+        .initializer(init_region)
+        .global_type(TypeAttribute::new(cell_struct))
+        .sym_name(StringAttribute::new(context, &closure_sym))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::Internal,
+        ))
+        .constant(melior::ir::attribute::Attribute::unit(context))
+        .build();
+    module.body().append_operation(global_op.into());
 }

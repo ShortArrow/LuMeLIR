@@ -326,11 +326,32 @@ land in this order:
    `llvm.mlir.addressof @user_fn_NN`, identical to what the
    `@user_fn_NN_closure` initializer uses.
 
-If steps 1 + 2 turn out to break tests when applied alone (e.g. an
-`arith` op rejected inside `llvm.func` body — currently believed to
-be allowed but unverified), they can land as a Tidy First commit
-ahead of step 3, splitting the migration from the semantic
-cutover.
+### Landed (2026-05-07/08)
+
+- **Commit 2a** (`551d51c`): steps 1 + 2 above — `emit_function`
+  / `emit_main` / `emit_lumelir_next_function` flipped to
+  `LLVMFuncOperationBuilder`, all `func::call` / `func::constant`
+  callees migrated, multi-return wrapped in `!llvm.struct<(...)>`.
+  Function-kind value type went from `!func.func<...>` to
+  `!llvm.ptr`. Behavior 不変 (965/0).
+- **Commit 2a-fix** (`c81f16b`): Codex review found that the
+  `!llvm.ptr` Function-value erasure removed an MLIR-verifier
+  safety net, exposing silent wrong-code in `Callee::Indirect`'s
+  hardcoded `f64` result type. HIR now rejects non-Number
+  ret_kinds on Function-kind parameter routes (ADR 0075 amend).
+  +5 reject tests (970/0).
+- **Commit 2b**: steps 3-5 above. Per-user-fn
+  `@user_fn_NN_closure` static globals emitted via
+  `closure::emit_user_fn_closure_global` (Pattern A1 +
+  `emit_pack_struct`). Producer flip in `HirExprKind::FunctionRef`
+  and known-FuncId `Local` paths. Consumer flip in
+  `emit_indirect_dispatch_chain_in_block` (payload load → cell
+  ptr) and `Callee::Indirect` arm — both insert
+  `closure::emit_load_closure_fn_ptr` before the actual call /
+  candidate compare. Dispatch-chain candidate side stays at raw
+  fn ptr (no double indirection). 3 new IR-shape tests
+  (973/0). Singleton property (1 fn = 1 global) preserves Lua
+  spec §3.4.4 closure equality without extra work.
 
 ## Carry-overs (out of spike scope, but worth flagging)
 

@@ -578,22 +578,34 @@ Listed in Codex review priority order (post-ADR-0082):
 
 1. **Full closures** (`2.5c-full`). Heap-allocated environments.
    The general problem of which closure-in-tables (LIC-2.6c-
-   tag-hetero-closure-escape-1) is a subset. Once shipped, it
-   widens the dispatch-chain producer surface (ADR 0082
-   §Refactor path). MLIR feasibility verified 2026-05-07 in
-   `docs/notes/closure-feasibility.md`: Pattern A1 (`llvm.func`
-   user fn + `llvm.mlir.addressof` inside `llvm.mlir.global`
-   initializer) is the green path. Migration carry-over verified
-   the same day — `arith` / `scf` ops stay valid inside
-   `llvm.func` body, but `func::call @user_fn_NN` and
-   `func::constant @user_fn_NN` had to migrate to `llvm.call` /
-   `llvm.mlir.addressof` in lockstep with `emit_function`'s flip
-   to `LLVMFuncOperationBuilder`. Commit 2a (2026-05-07) landed
-   the structural rewrite — Function-kind param/ret types now
-   `!llvm.ptr`, multi-return wraps as `!llvm.struct<(...)>` per
-   the B5b spike, behavior 不変 (965/0). Commit 2b (TAG_FUNCTION
-   semantic cutover via per-fn `@user_fn_NN_closure` static
-   globals) and Commit 3 (captured-local boxes) follow.
+   tag-hetero-closure-escape-1) is a subset. Commit 2a / 2a-fix /
+   2b have landed (2026-05-07/08); only Commit 3 (captured-local
+   boxes) remains:
+   - **Commit 2a** (`551d51c`): `emit_function` / `emit_main` /
+     `emit_lumelir_next_function` migrated to
+     `LLVMFuncOperationBuilder`, multi-return wrapped in
+     `!llvm.struct<(...)>` per the B5b spike. Function-kind
+     param/ret types went from `!func.func<...>` to
+     `!llvm.ptr`. 965/0 unchanged.
+   - **Commit 2a-fix** (`c81f16b`): HIR-level reject of
+     non-Number ret_kinds on Function-kind parameter routes,
+     restoring the verifier safety net that the `!llvm.ptr`
+     erasure removed (ADR 0075 amend). 5 reject tests added,
+     970/0.
+   - **Commit 2b**: per-user-fn static `@user_fn_NN_closure`
+     globals (16-byte `!llvm.struct<(ptr, i64)>` initialised to
+     `{addressof @user_fn_NN, 0}`). TAG_FUNCTION payload is
+     now a closure cell ptr; producers materialise the cell
+     via `addressof @<fn_sym>_closure`, consumers normalise
+     back to fn ptr via `closure::emit_load_closure_fn_ptr`
+     before the actual `llvm.call`. The dispatch-chain
+     candidate side stays at raw fn ptr (no double indirection).
+     Singleton property (1 fn = 1 global) preserves Lua spec
+     §3.4.4 closure equality without extra work. 3 new
+     IR-shape tests, 973/0.
+   - **Commit 3** (pending): captured-local boxes, ADR 0044
+     reject relaxation, closure-with-upvalues e2e — resolves
+     LIC-2.6c-tag-hetero-closure-escape-1.
 2. **Closure-with-upvalues in tables**
    (LIC-2.6c-tag-hetero-closure-escape-1). HIR rejects today
    via the existing escape analysis (ADR 0044 + ADR 0071).

@@ -23,7 +23,7 @@ use crate::hir::ValueKind;
 
 use super::primitive::{
     Types, emit_addressof, emit_byte_offset_ptr, emit_exit_with_message, emit_libc_call_i32,
-    emit_load, emit_printf, emit_store, emit_unrealized_cast,
+    emit_load, emit_printf, emit_store,
 };
 
 // =============================================================
@@ -47,9 +47,14 @@ pub(crate) const TAG_NUMBER: i64 = 1;
 // carry Bool and String values.
 pub(crate) const TAG_BOOL: i64 = 2;
 pub(crate) const TAG_STRING: i64 = 3;
-// Phase 2.6c-tag-fn-tbl (ADR 0071): Function (closure-less) and
-// Table values now occupy tags 4 and 5. Closures with upvalues
-// remain HIR-rejected (LIC-2.6c-tag-hetero-closure-escape-1).
+// Phase 2.6c-tag-fn-tbl (ADR 0071): Function and Table values
+// occupy tags 4 and 5. Phase 2.5c-full Commit 2b (ADR 0083):
+// the TAG_FUNCTION payload is now a closure cell ptr (`!llvm.ptr`
+// to `!llvm.struct<(ptr, i64)>` — see `closure.rs`), not a raw
+// fn ptr. Producers store cell ptr; consumers `cell.fn_ptr`-load
+// (offset 0) before issuing the actual call. Capturing closures
+// remain HIR-rejected until Commit 3
+// (LIC-2.6c-tag-hetero-closure-escape-1).
 pub(crate) const TAG_FUNCTION: i64 = 4;
 pub(crate) const TAG_TABLE: i64 = 5;
 // Phase 2.6b-hash-keys (ADR 0079): hash-bucket tombstone tag.
@@ -243,10 +248,14 @@ pub(crate) fn emit_value_slot_store_string<'a, 'c>(
 }
 
 /// Phase 2.6c-tag-fn-tbl (ADR 0071): write `{tag=Function,
-/// payload=ptr}` to a tagged value slot. The function value
-/// arrives as `!func.func<...>` from `emit_expr`; bridge it to
-/// `!llvm.ptr` via `emit_unrealized_cast` (ADR 0019) before the
-/// 8-byte store.
+/// payload=ptr}` to a tagged value slot. Phase 2.5c-full Commit 2a
+/// (ADR 0083) erased Function-kind values to `!llvm.ptr`, retiring
+/// the prior `!func.func<...>`→ptr unrealized_cast bridge. Phase
+/// 2.5c-full Commit 2b (ADR 0083) further specialises the payload
+/// semantics: `value` is now a closure cell ptr (== `addressof
+/// @<fn_sym>_closure` for non-capturing functions); consumers
+/// dereference it via `closure::emit_load_closure_fn_ptr` before
+/// issuing the actual call.
 pub(crate) fn emit_value_slot_store_function<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
@@ -265,10 +274,9 @@ pub(crate) fn emit_value_slot_store_function<'a, 'c>(
         .unwrap()
         .into();
     emit_store(block, tag, slot_ptr, loc);
-    let value_ptr = emit_unrealized_cast(block, value, types.ptr, loc);
     let value_slot =
         emit_byte_offset_ptr(context, block, slot_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
-    emit_store(block, value_ptr, value_slot, loc);
+    emit_store(block, value, value_slot, loc);
 }
 
 /// Phase 2.6c-tag-fn-tbl (ADR 0071): write `{tag=Table,
@@ -916,8 +924,12 @@ pub(crate) fn emit_tagged_eq_local_local<'a, 'c>(
                         // (Lua spec: same object → true). Both
                         // sides have the same tag here (the
                         // outer tag_eq check fired), so a payload
-                        // ptr comparison suffices. Truly-unknown
-                        // tag stays as the ADR 0069 trap.
+                        // ptr comparison suffices. Phase 2.5c-full
+                        // Commit 2b (ADR 0083): for TAG_FUNCTION
+                        // the payload is now a closure cell ptr;
+                        // non-capturing singletons (1 fn = 1
+                        // global) preserve identity equality. Truly
+                        // unknown tag stays as the ADR 0069 trap.
                         let tag_function = make_const_i64(&str_else_blk, TAG_FUNCTION);
                         let is_function: Value<'c, '_> = str_else_blk
                             .append_operation(arith::cmpi(

@@ -121,26 +121,6 @@ pub(crate) fn emit_byte_offset_ptr_dynamic<'a, 'c>(
     block.append_operation(gep).result(0).unwrap().into()
 }
 
-/// `builtin.unrealized_conversion_cast` — used to bridge
-/// `!func.func` values to/from `!llvm.ptr` so the value can be
-/// stored in an LLVM alloca slot. Subsequent
-/// `--convert-func-to-llvm` lowers `!func.func` to `!llvm.ptr`,
-/// and `--reconcile-unrealized-casts` then erases the pair as a
-/// no-op. Phase 2.5b.3 (ADR 0019).
-pub(crate) fn emit_unrealized_cast<'a, 'c>(
-    block: &'a Block<'c>,
-    value: Value<'c, 'a>,
-    target_ty: Type<'c>,
-    loc: Location<'c>,
-) -> Value<'c, 'a> {
-    let op = OperationBuilder::new("builtin.unrealized_conversion_cast", loc)
-        .add_operands(&[value])
-        .add_results(&[target_ty])
-        .build()
-        .expect("builtin.unrealized_conversion_cast");
-    block.append_operation(op).result(0).unwrap().into()
-}
-
 /// `llvm.mlir.addressof @<global_name> : !llvm.ptr` — load the
 /// address of a module-level global string / function symbol.
 pub(crate) fn emit_addressof<'a, 'c>(
