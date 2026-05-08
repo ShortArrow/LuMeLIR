@@ -222,7 +222,7 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // never appear in expression position legally.
             // For multi-return callees in expression position, Lua
             // truncates to the first result. Phase 2.5d (ADR 0021).
-            Callee::User(FuncId(id)) => functions[*id]
+            Callee::User { fid, .. } => functions[fid.0]
                 .ret_kinds
                 .first()
                 .copied()
@@ -2121,7 +2121,10 @@ impl LowerCtx {
                                 });
                             }
                             match self.locals[iter_id.0].func_id {
-                                Some(fid) => Callee::User(fid),
+                                Some(fid) => Callee::User {
+                                    fid,
+                                    holding_local: Some(iter_id),
+                                },
                                 None => Callee::Indirect(iter_id),
                             }
                         }
@@ -2602,7 +2605,7 @@ impl LowerCtx {
                     };
                 }
                 let ret_kinds: Vec<ValueKind> = match &callee {
-                    Callee::User(FuncId(fid)) => self.functions[*fid].ret_kinds.clone(),
+                    Callee::User { fid, .. } => self.functions[fid.0].ret_kinds.clone(),
                     // Phase 2.8e-iter-next (ADR 0081): builtin-callee
                     // multi-assign. Until `Builtin::Next` lands every
                     // builtin returns at most one value, so this
@@ -2841,7 +2844,7 @@ impl LowerCtx {
                 });
             };
             let ret_kinds: Vec<ValueKind> = match callee {
-                Callee::User(FuncId(fid)) => self.functions[fid].ret_kinds.clone(),
+                Callee::User { fid, .. } => self.functions[fid.0].ret_kinds.clone(),
                 Callee::Builtin(b) => b.ret_kinds().to_vec(),
                 Callee::IndirectDispatch { ref sig, .. } => sig.ret_kinds.clone(),
                 Callee::Indirect(_) => {
@@ -3385,8 +3388,16 @@ impl LowerCtx {
                         });
                     }
                 }
+                // Phase 2.5c-full Commit 3b (ADR 0083): the local
+                // resolved here IS the holding binding for the
+                // closure cell. Codegen will load the cell ptr
+                // from `slots[local_id]` (capturing) or fall back
+                // to the singleton (non-capturing).
                 let callee = match self.locals[local_id.0].func_id {
-                    Some(fid) => Callee::User(fid),
+                    Some(fid) => Callee::User {
+                        fid,
+                        holding_local: Some(local_id),
+                    },
                     None => Callee::Indirect(local_id),
                 };
                 // Phase 2.5c-full Commit 2a-fix (ADR 0083 / ADR 0075
@@ -3395,7 +3406,7 @@ impl LowerCtx {
                 // The Callee::Indirect branch (parameter passing
                 // through) needs no extra check — its enclosing
                 // fn's parameter binding already enforced the rule.
-                if let Callee::User(fid) = callee {
+                if let Callee::User { fid, .. } = callee {
                     let target_param_kinds: Vec<ValueKind> = self.functions[fid.0]
                         .params
                         .iter()
@@ -3412,8 +3423,11 @@ impl LowerCtx {
                 // closure with upvalues append the captured values
                 // as extra arguments, mirroring the matching code
                 // in the function_names dispatch path below.
+                // Phase 2.5c-full Commit 3b (ADR 0083) will retire
+                // this trailing-uv ABI in favour of cell-ptr-first;
+                // kept for now so the prep commit is behavior-neutral.
                 let mut all_args = lowered_args;
-                if let Callee::User(fid) = callee {
+                if let Callee::User { fid, .. } = callee {
                     let upvalue_args: Vec<HirExpr> = self.functions[fid.0]
                         .upvalues
                         .iter()
@@ -3576,7 +3590,17 @@ impl LowerCtx {
             // when the closure expression was evaluated, since the
             // outer slot is what was current at that moment and
             // `lower_call` runs after FunctionExpr lowering for
-            // sibling closures.
+            // sibling closures. (Commit 3b will retire this in
+            // favour of cell-ptr-first ABI.)
+            //
+            // Phase 2.5c-full Commit 3b prep (ADR 0083): record
+            // `holding_local` on the Callee::User so the upcoming
+            // codegen cutover can locate the binding's slot. None
+            // when only `function_names` knows about the name
+            // (top-level forward-ref / self-recursion inside the
+            // capturing fn body) — codegen will fall back to the
+            // entry `cell_ptr` block-arg.
+            let holding_local = self.resolve(name);
             let upvalue_args: Vec<HirExpr> = self.functions[fid.0]
                 .upvalues
                 .iter()
@@ -3588,7 +3612,7 @@ impl LowerCtx {
             let mut all_args = lowered_args;
             all_args.extend(upvalue_args);
             return Ok(HirExprKind::Call {
-                callee: Callee::User(fid),
+                callee: Callee::User { fid, holding_local },
                 args: all_args,
             });
         }
@@ -4510,7 +4534,7 @@ local f = function() return b end";
         let HirExprKind::Call { callee: inner, .. } = &args[0].kind else {
             panic!("expected nested Call");
         };
-        assert!(matches!(inner, Callee::User(FuncId(0))));
+        assert!(matches!(inner, Callee::User { fid: FuncId(0), .. }));
     }
 
     #[test]
@@ -4606,7 +4630,7 @@ local f = function() return b end";
         let HirExprKind::Call { callee: inner, .. } = &args[0].kind else {
             panic!("expected nested Call");
         };
-        assert!(matches!(inner, Callee::User(FuncId(0))));
+        assert!(matches!(inner, Callee::User { fid: FuncId(0), .. }));
     }
 
     #[test]

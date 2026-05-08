@@ -1069,6 +1069,77 @@ fn emit_call_user_unpacked<'a, 'c>(
     extract_unpacked_results(context, block, &op_ref, ret_types, loc)
 }
 
+/// Phase 2.5c-full Commit 3b (ADR 0083): emit `llvm.call
+/// @<callee_name>(%cell_ptr, lua_args...)` and unpack the result.
+/// This is the single canonical helper used by every direct-user-call
+/// codegen path (4 sites: Call expr arm, multi-assign, dispatch
+/// chain then-branch, TaggedValue pack helper) — Codex review of
+/// Commit 3a flagged that scattered cell-ptr threading across these
+/// sites was the most likely source of ABI cutover bugs.
+///
+/// **Status**: defined now (Commit 3b prep) but the 4 direct-user-call
+/// sites still use the legacy `emit_call_user_unpacked` until the
+/// atomic ABI cutover lands. `#[allow(dead_code)]` hides the warning
+/// for the prep window only.
+#[allow(dead_code)]
+///
+/// `cell_ptr` selection follows ADR 0083 §3:
+/// 1. non-capturing target → `addressof @<callee_name>_closure`
+///    (the static singleton; identity-stable across aliases)
+/// 2. capturing + `holding_local = Some(idx)` → load the cell ptr
+///    from `slots[idx]`. The LocalInit storage rule guarantees the
+///    slot was populated with the right cell ptr (fresh malloc at
+///    closure-creation site, or alias copy for `local g = f`).
+/// 3. capturing + `holding_local = None` → use `in_function_cell_ptr`
+///    (the entry block's `block.argument(0)`). Reachable only when
+///    the call resolved through `function_names` fallback inside
+///    the capturing fn's own body — i.e. self-recursion. The entry
+///    cell_ptr is exactly the caller-supplied "current self
+///    instance".
+/// 4. capturing + `holding_local = None` + `in_function_cell_ptr =
+///    None` → unreachable (would mean a top-level capturing fn,
+///    which has no enclosing scope to capture from; the HIR upvalue
+///    pass cannot construct such a function).
+#[allow(clippy::too_many_arguments)]
+fn emit_call_user_with_cell<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    target: &HirFunction,
+    holding_local: Option<LocalId>,
+    lua_args: &[Value<'c, 'a>],
+    ret_types: &[Type<'c>],
+    slots: &[Value<'c, 'a>],
+    types: &Types<'c>,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
+    loc: Location<'c>,
+) -> Vec<Value<'c, 'a>> {
+    let cell_ptr: Value<'c, 'a> = if target.upvalues.is_empty() {
+        let closure_sym = format!("{}_closure", target.mangled_name);
+        emit_addressof(context, block, &closure_sym, types, loc)
+    } else if let Some(LocalId(idx)) = holding_local {
+        emit_load(block, slots[idx], types.ptr, loc)
+    } else if let Some(cp) = in_function_cell_ptr {
+        cp
+    } else {
+        unreachable!(
+            "capturing target {} reached with no holding_local and no in-function cell_ptr — \
+             ADR 0083 invariant violated (top-level capturing fn is impossible)",
+            target.mangled_name
+        )
+    };
+    let mut all_args: Vec<Value<'c, 'a>> = Vec::with_capacity(lua_args.len() + 1);
+    all_args.push(cell_ptr);
+    all_args.extend_from_slice(lua_args);
+    emit_call_user_unpacked(
+        context,
+        block,
+        &target.mangled_name,
+        &all_args,
+        ret_types,
+        loc,
+    )
+}
+
 /// Emit a `func.func @<mangled_name>(...) -> (...)` for a user-defined
 /// function. Phase 2.5a constrains every parameter and the optional
 /// return value to `Number` (f64). The `_returned` / `_ret_value`
@@ -2233,7 +2304,11 @@ fn emit_stmt<'a, 'c>(
                     //     emit_value_slot_store_dispatched.
                     match &value.kind {
                         HirExprKind::Call {
-                            callee: Callee::User(FuncId(fid)),
+                            callee:
+                                Callee::User {
+                                    fid: FuncId(fid),
+                                    holding_local,
+                                },
                             args: call_args,
                         } if matches!(
                             functions[*fid].ret_kinds.first(),
@@ -2245,6 +2320,7 @@ fn emit_stmt<'a, 'c>(
                                 block,
                                 slots[id.0],
                                 *fid,
+                                *holding_local,
                                 call_args,
                                 slots,
                                 locals,
@@ -3143,8 +3219,22 @@ fn emit_multi_assign_from_call<'a, 'c>(
     // multi-return shape; Builtin opens for `Next`; IndirectDispatch
     // is the new ADR 0082 ABI for tagged-callee multi-return.
     match callee {
-        Callee::User(FuncId(fid)) => emit_multi_assign_from_user_call(
-            context, block, dst_ids, *fid, args, slots, locals, functions, types, params_len, loc,
+        Callee::User {
+            fid: FuncId(fid),
+            holding_local,
+        } => emit_multi_assign_from_user_call(
+            context,
+            block,
+            dst_ids,
+            *fid,
+            *holding_local,
+            args,
+            slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            loc,
         ),
         Callee::Builtin(b) => emit_multi_assign_from_builtin(
             context, block, dst_ids, *b, args, slots, locals, functions, types, params_len, loc,
@@ -3545,6 +3635,7 @@ fn emit_multi_assign_from_user_call<'a, 'c>(
     block: &'a Block<'c>,
     dst_ids: &[LocalId],
     fid: usize,
+    holding_local: Option<LocalId>,
     args: &[HirExpr],
     slots: &[Value<'c, 'a>],
     locals: &[LocalInfo],
@@ -3553,6 +3644,7 @@ fn emit_multi_assign_from_user_call<'a, 'c>(
     params_len: usize,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
+    let _ = holding_local; // wired up by Step 4 (cell_ptr threading)
     let target = &functions[fid];
     let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
     for a in args {
@@ -3561,11 +3653,6 @@ fn emit_multi_assign_from_user_call<'a, 'c>(
         )?);
     }
     let ret_types = ret_mlir_types(context, &target.ret_kinds, types);
-    // Phase 2.5c-full Commit 2a (ADR 0083): direct call lowers to
-    // `llvm.call @user_fn_NN`; multi-result returns a struct that
-    // `extract_unpacked_results` splits per logical position via
-    // `flat_result_index` (ADR 0076). Function-kind results no
-    // longer need an ucast bridge — they're already `!llvm.ptr`.
     let flat_results = emit_call_user_unpacked(
         context,
         block,
@@ -4151,6 +4238,7 @@ fn emit_call_user_into_tagged_slot<'a, 'c>(
     block: &'a Block<'c>,
     dst_slot: Value<'c, 'a>,
     fid: usize,
+    holding_local: Option<LocalId>,
     call_args: &[HirExpr],
     slots: &[Value<'c, 'a>],
     locals: &[LocalInfo],
@@ -4159,6 +4247,7 @@ fn emit_call_user_into_tagged_slot<'a, 'c>(
     params_len: usize,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
+    let _ = holding_local; // wired up by Step 4 (cell_ptr threading)
     let target = &functions[fid];
     let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(call_args.len());
     for a in call_args {
@@ -4198,6 +4287,7 @@ fn emit_call_user_into_tagged_tmp<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     fid: usize,
+    holding_local: Option<LocalId>,
     call_args: &[HirExpr],
     slots: &[Value<'c, 'a>],
     locals: &[LocalInfo],
@@ -4208,7 +4298,18 @@ fn emit_call_user_into_tagged_tmp<'a, 'c>(
 ) -> Result<Value<'c, 'a>, CodegenError> {
     let tmp = emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
     emit_call_user_into_tagged_slot(
-        context, block, tmp, fid, call_args, slots, locals, functions, types, params_len, loc,
+        context,
+        block,
+        tmp,
+        fid,
+        holding_local,
+        call_args,
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        loc,
     )?;
     Ok(tmp)
 }
@@ -6522,7 +6623,11 @@ fn emit_expr<'a, 'c>(
                         // TaggedValue — materialise into a tmp
                         // tagged slot and dispatch.
                         if let HirExprKind::Call {
-                            callee: Callee::User(FuncId(fid)),
+                            callee:
+                                Callee::User {
+                                    fid: FuncId(fid),
+                                    holding_local,
+                                },
                             args: call_args,
                         } = &a.kind
                             && matches!(
@@ -6531,8 +6636,17 @@ fn emit_expr<'a, 'c>(
                             )
                         {
                             let tmp = emit_call_user_into_tagged_tmp(
-                                context, block, *fid, call_args, slots, locals, functions, types,
-                                params_len, loc,
+                                context,
+                                block,
+                                *fid,
+                                *holding_local,
+                                call_args,
+                                slots,
+                                locals,
+                                functions,
+                                types,
+                                params_len,
+                                loc,
                             )?;
                             emit_print_tagged_local(context, block, tmp, types, loc);
                             continue;
@@ -6591,7 +6705,11 @@ fn emit_expr<'a, 'c>(
                 // Phase 2.6c-tag-locals-fn (ADR 0074): inline
                 // `tostring(f())` where `f` returns TaggedValue.
                 if let HirExprKind::Call {
-                    callee: Callee::User(FuncId(fid)),
+                    callee:
+                        Callee::User {
+                            fid: FuncId(fid),
+                            holding_local,
+                        },
                     args: call_args,
                 } = &args[0].kind
                     && matches!(
@@ -6600,8 +6718,17 @@ fn emit_expr<'a, 'c>(
                     )
                 {
                     let tmp = emit_call_user_into_tagged_tmp(
-                        context, block, *fid, call_args, slots, locals, functions, types,
-                        params_len, loc,
+                        context,
+                        block,
+                        *fid,
+                        *holding_local,
+                        call_args,
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        loc,
                     )?;
                     return Ok(emit_tostring_tagged_local(context, block, tmp, types, loc));
                 }
@@ -6695,7 +6822,11 @@ fn emit_expr<'a, 'c>(
                 // Phase 2.6c-tag-locals-fn (ADR 0074): inline
                 // `type(f())` where `f` returns TaggedValue.
                 if let HirExprKind::Call {
-                    callee: Callee::User(FuncId(fid)),
+                    callee:
+                        Callee::User {
+                            fid: FuncId(fid),
+                            holding_local,
+                        },
                     args: call_args,
                 } = &args[0].kind
                     && matches!(
@@ -6704,8 +6835,17 @@ fn emit_expr<'a, 'c>(
                     )
                 {
                     let tmp = emit_call_user_into_tagged_tmp(
-                        context, block, *fid, call_args, slots, locals, functions, types,
-                        params_len, loc,
+                        context,
+                        block,
+                        *fid,
+                        *holding_local,
+                        call_args,
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        loc,
                     )?;
                     return Ok(emit_type_tagged_local(context, block, tmp, types, loc));
                 }
@@ -6749,7 +6889,10 @@ fn emit_expr<'a, 'c>(
                         .to_owned(),
                 ))
             }
-            Callee::User(FuncId(fid)) => {
+            Callee::User {
+                fid: FuncId(fid),
+                holding_local: _,
+            } => {
                 let target = &functions[*fid];
                 let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
                 for a in args {

@@ -292,7 +292,22 @@ pub enum HirExprKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Callee {
     Builtin(Builtin),
-    User(FuncId),
+    /// Phase 2.5c-full Commit 3b (ADR 0083): user fn dispatch.
+    /// `holding_local` carries the lexical binding through which
+    /// this user fn was reached, when one exists. Codegen uses it
+    /// to load the closure cell ptr from the right local slot —
+    /// for capturing closures the cell ptr is stored in that slot
+    /// (LocalInit storage rule). `None` only when the call
+    /// resolved through `function_names` fallback (top-level
+    /// forward reference / self-call inside a capturing fn body
+    /// where the body's `lookup_or_capture_upvalue` rejects the
+    /// Function-kind upvalue and falls through to the function-
+    /// name table); codegen then uses the entry `cell_ptr`
+    /// block-arg as the recursion shortcut.
+    User {
+        fid: FuncId,
+        holding_local: Option<LocalId>,
+    },
     /// Function-kind local whose statically-known arity (from
     /// `LocalInfo::kind`) reconstructs an `(...) → f64` signature.
     /// Today only function parameters reach this arm — every other
