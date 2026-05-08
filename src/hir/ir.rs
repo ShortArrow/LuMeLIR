@@ -13,11 +13,20 @@ pub struct LocalId(pub usize);
 /// `FuncId`; for function parameters whose value is only known at
 /// runtime, it is `None` and the call site uses `Callee::Indirect`
 /// (ADR 0018).
+///
+/// Phase 2.5c-full Commit 3 (ADR 0083) adds `is_captured`: set to
+/// true when this local is referenced as `outer_local_id` of any
+/// inner closure's `UpvalueInfo`. Codegen uses the flag to allocate
+/// the slot as a heap upvalue box (so writes through the box are
+/// visible to every closure sharing the same outer local). The
+/// flag is filled by a post-pass after every function body has
+/// been lowered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalInfo {
     pub name: String,
     pub kind: ValueKind,
     pub func_id: Option<FuncId>,
+    pub is_captured: bool,
 }
 
 /// A name-resolved program — the input to codegen.
@@ -40,7 +49,10 @@ pub struct FuncId(pub usize);
 /// sequence with its own private `locals` table. Phase 2.5d (ADR
 /// 0021) generalises the return type from `Option<ValueKind>` to a
 /// `Vec<ValueKind>`. Phase 2.5c-min (ADR 0037) adds upvalues for
-/// capture-by-value closures.
+/// capture-by-value closures. Phase 2.5c-full Commit 3 (ADR 0083)
+/// adds `parent_scope` so the post-pass that flips
+/// `LocalInfo::is_captured` can resolve each upvalue's
+/// `outer_local_id` to the right `locals` table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirFunction {
     /// Source-level Lua name.
@@ -63,6 +75,21 @@ pub struct HirFunction {
     pub body: Vec<HirStmt>,
     /// Empty ⇒ void; length N ⇒ N return values, in source order.
     pub ret_kinds: Vec<ValueKind>,
+    /// Phase 2.5c-full Commit 3 (ADR 0083): the lexical parent
+    /// scope this function was declared in. `Chunk` for top-level
+    /// functions and chunk-level anonymous functions; `Function(p)`
+    /// for nested functions. Used by the `is_captured` post-pass to
+    /// resolve each upvalue's `outer_local_id` to the correct
+    /// scope's `locals` table.
+    pub parent_scope: ParentScope,
+}
+
+/// Phase 2.5c-full Commit 3 (ADR 0083): identifies the lexical
+/// parent of a [`HirFunction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentScope {
+    Chunk,
+    Function(FuncId),
 }
 
 /// One captured value for a closure (Phase 2.5c-min, ADR 0037).

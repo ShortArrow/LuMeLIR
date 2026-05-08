@@ -89,7 +89,7 @@
 use melior::{
     Context,
     dialect::{
-        llvm,
+        arith, llvm,
         ods::llvm::{AddressOfOperationBuilder, GlobalOperationBuilder},
     },
     ir::{
@@ -102,7 +102,7 @@ use melior::{
 use crate::hir::ValueKind;
 
 use super::callabi::emit_pack_struct;
-use super::primitive::{Types, emit_byte_offset_ptr, emit_load, emit_store};
+use super::primitive::{Types, emit_byte_offset_ptr, emit_libc_call_ptr, emit_load, emit_store};
 
 // ============================================================
 // Layout constants — referenced from `closure.rs` helpers; ADR
@@ -149,19 +149,31 @@ pub(crate) const UPVALUE_BOX_SIZE: i64 = 8;
 // Closure cell helpers (Commit 2 will fill these in)
 // ============================================================
 
-/// Phase 2.5c-full (ADR 0083): allocate a heap closure cell of
+/// Phase 2.5c-full (ADR 0083) Commit 3: allocate a heap closure cell of
 /// size `CLOSURE_OFF_BOXES_BASE + upvalue_count * 8` via `malloc`.
 /// Caller must populate `fn_ptr`, `upvalue_count`, and each
-/// `upvalue_box` slot via the helpers below.
+/// `upvalue_box` slot via the helpers below. The cell is never
+/// freed (intentional leak; GC deferred — see ADR 0083 Commit 3
+/// risk #6).
 #[allow(dead_code)]
 pub(crate) fn emit_allocate_closure_cell<'a, 'c>(
-    _context: &'c Context,
-    _block: &'a Block<'c>,
-    _upvalue_count: usize,
-    _types: &Types<'c>,
-    _loc: Location<'c>,
+    context: &'c Context,
+    block: &'a Block<'c>,
+    upvalue_count: usize,
+    types: &Types<'c>,
+    loc: Location<'c>,
 ) -> Value<'c, 'a> {
-    unimplemented!("ADR 0083 commit 2 ships emit_allocate_closure_cell")
+    let total_size = CLOSURE_OFF_BOXES_BASE + (upvalue_count as i64) * 8;
+    let size_const: Value<'c, '_> = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, total_size).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_libc_call_ptr(context, block, "malloc", &[size_const], types, loc)
 }
 
 /// Phase 2.5c-full (ADR 0083) Commit 2b: load `cell.fn_ptr` (offset
@@ -201,83 +213,151 @@ pub(crate) fn emit_store_closure_fn_ptr<'a, 'c>(
     emit_store(block, fn_ptr, fn_ptr_slot, loc);
 }
 
-/// Phase 2.5c-full (ADR 0083): load the i-th upvalue box pointer
-/// from a closure cell. Used by `emit_dispatch_chain_recursive`'s
-/// match-then branch to forward upvalue boxes to the direct call.
+/// Phase 2.5c-full (ADR 0083) Commit 3: load the i-th upvalue box
+/// pointer from a closure cell. Used at function entry to populate
+/// `slots[uv.inner_local_id.0]` with the heap box ptr, after which
+/// reads / writes of the captured local flow through the box.
 #[allow(dead_code)]
 pub(crate) fn emit_load_closure_upvalue_box<'a, 'c>(
-    _context: &'c Context,
-    _block: &'a Block<'c>,
-    _cell_ptr: Value<'c, 'a>,
-    _index: usize,
-    _types: &Types<'c>,
-    _loc: Location<'c>,
+    context: &'c Context,
+    block: &'a Block<'c>,
+    cell_ptr: Value<'c, 'a>,
+    index: usize,
+    types: &Types<'c>,
+    loc: Location<'c>,
 ) -> Value<'c, 'a> {
-    unimplemented!("ADR 0083 commit 3 ships emit_load_closure_upvalue_box")
+    let offset = CLOSURE_OFF_BOXES_BASE + (index as i64) * 8;
+    let box_slot = emit_byte_offset_ptr(context, block, cell_ptr, offset, types, loc);
+    emit_load(block, box_slot, types.ptr, loc)
 }
 
-/// Phase 2.5c-full (ADR 0083): store an upvalue box pointer at
-/// the i-th slot of a closure cell. Called for every captured
-/// upvalue at closure creation time.
+/// Phase 2.5c-full (ADR 0083) Commit 3: store an upvalue box
+/// pointer at the i-th slot of a closure cell. Called once per
+/// captured upvalue at closure-creation time.
 #[allow(dead_code)]
 pub(crate) fn emit_store_closure_upvalue_box<'a, 'c>(
-    _context: &'c Context,
-    _block: &'a Block<'c>,
-    _cell_ptr: Value<'c, 'a>,
-    _index: usize,
-    _box_ptr: Value<'c, 'a>,
-    _types: &Types<'c>,
-    _loc: Location<'c>,
+    context: &'c Context,
+    block: &'a Block<'c>,
+    cell_ptr: Value<'c, 'a>,
+    index: usize,
+    box_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
 ) {
-    unimplemented!("ADR 0083 commit 3 ships emit_store_closure_upvalue_box")
+    let offset = CLOSURE_OFF_BOXES_BASE + (index as i64) * 8;
+    let box_slot = emit_byte_offset_ptr(context, block, cell_ptr, offset, types, loc);
+    emit_store(block, box_ptr, box_slot, loc);
 }
 
 // ============================================================
 // Upvalue box helpers (Commit 3 will fill these in)
 // ============================================================
 
-/// Phase 2.5c-full (ADR 0083): allocate a heap upvalue box via
-/// `malloc(UPVALUE_BOX_SIZE)`. Captured-local LocalInit emits
-/// this once per scope-entry of the captured local.
+/// Phase 2.5c-full (ADR 0083) Commit 3: allocate a heap upvalue box
+/// via `malloc(UPVALUE_BOX_SIZE)`. Captured-local LocalInit emits
+/// this once per scope-entry of the captured local. Like the
+/// closure cell, the box is never freed (intentional leak — GC
+/// deferred per ADR 0083 Commit 3 risk #6).
 #[allow(dead_code)]
 pub(crate) fn emit_allocate_upvalue_box<'a, 'c>(
-    _context: &'c Context,
-    _block: &'a Block<'c>,
-    _types: &Types<'c>,
-    _loc: Location<'c>,
+    context: &'c Context,
+    block: &'a Block<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
 ) -> Value<'c, 'a> {
-    unimplemented!("ADR 0083 commit 3 ships emit_allocate_upvalue_box")
+    let size_const: Value<'c, '_> = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, UPVALUE_BOX_SIZE).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_libc_call_ptr(context, block, "malloc", &[size_const], types, loc)
 }
 
-/// Phase 2.5c-full (ADR 0083): load the value stored in an upvalue
-/// box, kind-typed by the captured local's static `ValueKind`.
-/// Number is f64 via bitcast i64 → f64; ptr kinds are loaded as
-/// `!llvm.ptr` directly; Bool is i1 via i64 → i1 truncation.
+/// Phase 2.5c-full (ADR 0083) Commit 3: load the value stored in an
+/// upvalue box, kind-typed by the captured local's static
+/// `ValueKind`. Box layout is a single 8-byte storage slot; the MLIR
+/// load type follows the kind directly (Number → f64, Bool/Nil → i1
+/// via trunci through i64, String/Table → !llvm.ptr).
+///
+/// Function-kind upvalues are out of scope (ADR 0083 Commit 3 keeps
+/// `lookup_or_capture_upvalue`'s Function reject) and TaggedValue
+/// would need a 16-byte box (tag + payload); both panic.
 #[allow(dead_code)]
 pub(crate) fn emit_load_upvalue_box_value<'a, 'c>(
-    _context: &'c Context,
-    _block: &'a Block<'c>,
-    _box_ptr: Value<'c, 'a>,
-    _kind: ValueKind,
-    _types: &Types<'c>,
-    _loc: Location<'c>,
+    context: &'c Context,
+    block: &'a Block<'c>,
+    box_ptr: Value<'c, 'a>,
+    kind: ValueKind,
+    types: &Types<'c>,
+    loc: Location<'c>,
 ) -> Value<'c, 'a> {
-    unimplemented!("ADR 0083 commit 3 ships emit_load_upvalue_box_value")
+    let value_slot =
+        emit_byte_offset_ptr(context, block, box_ptr, UPVALUE_BOX_OFF_VALUE, types, loc);
+    match kind {
+        ValueKind::Number => emit_load(block, value_slot, types.f64, loc),
+        ValueKind::Bool | ValueKind::Nil => {
+            // Stored as i64 (extended at store time); truncate back to i1 on read.
+            let raw = emit_load(block, value_slot, types.i64, loc);
+            block
+                .append_operation(arith::trunci(raw, types.i1, loc))
+                .result(0)
+                .unwrap()
+                .into()
+        }
+        ValueKind::String | ValueKind::Table => emit_load(block, value_slot, types.ptr, loc),
+        ValueKind::Function(_) => unreachable!(
+            "Function-kind upvalue capture is HIR-rejected by lookup_or_capture_upvalue \
+             until a future ADR widens box storage"
+        ),
+        ValueKind::TaggedValue => unreachable!(
+            "TaggedValue upvalue capture would need a 16-byte box; ADR 0083 Commit 3 \
+             keeps the storage at 8 bytes — caller should reject upstream"
+        ),
+    }
 }
 
-/// Phase 2.5c-full (ADR 0083): store a value into an upvalue
-/// box, kind-typed mirror of [`emit_load_upvalue_box_value`].
+/// Phase 2.5c-full (ADR 0083) Commit 3: store a value into an upvalue
+/// box, kind-typed mirror of [`emit_load_upvalue_box_value`]. Bool /
+/// Nil values are widened to i64 storage so the read can truncate
+/// back to i1; ptr / f64 kinds round-trip directly.
 #[allow(dead_code)]
 pub(crate) fn emit_store_upvalue_box_value<'a, 'c>(
-    _context: &'c Context,
-    _block: &'a Block<'c>,
-    _box_ptr: Value<'c, 'a>,
-    _value: Value<'c, 'a>,
-    _kind: ValueKind,
-    _types: &Types<'c>,
-    _loc: Location<'c>,
+    context: &'c Context,
+    block: &'a Block<'c>,
+    box_ptr: Value<'c, 'a>,
+    value: Value<'c, 'a>,
+    kind: ValueKind,
+    types: &Types<'c>,
+    loc: Location<'c>,
 ) {
-    unimplemented!("ADR 0083 commit 3 ships emit_store_upvalue_box_value")
+    let value_slot =
+        emit_byte_offset_ptr(context, block, box_ptr, UPVALUE_BOX_OFF_VALUE, types, loc);
+    match kind {
+        ValueKind::Number | ValueKind::String | ValueKind::Table => {
+            emit_store(block, value, value_slot, loc);
+        }
+        ValueKind::Bool | ValueKind::Nil => {
+            // Widen i1 → i64 for uniform 8-byte storage.
+            let widened: Value<'c, '_> = block
+                .append_operation(arith::extui(value, types.i64, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            emit_store(block, widened, value_slot, loc);
+        }
+        ValueKind::Function(_) => unreachable!(
+            "Function-kind upvalue capture is HIR-rejected by lookup_or_capture_upvalue \
+             until a future ADR widens box storage"
+        ),
+        ValueKind::TaggedValue => unreachable!(
+            "TaggedValue upvalue capture would need a 16-byte box; ADR 0083 Commit 3 \
+             keeps the storage at 8 bytes — caller should reject upstream"
+        ),
+    }
 }
 
 // ============================================================

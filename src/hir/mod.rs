@@ -11,7 +11,7 @@ mod ir;
 pub use error::HirError;
 pub use ir::{
     Builtin, Callee, FuncId, HirChunk, HirExpr, HirExprKind, HirFunction, HirStmt, HirStmtKind,
-    IndirectSig, LocalId, LocalInfo, UpvalueInfo,
+    IndirectSig, LocalId, LocalInfo, ParentScope, UpvalueInfo,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -829,6 +829,7 @@ fn register_function_signature(
     params: &[String],
     function_names: &mut HashMap<String, FuncId>,
     functions: &mut Vec<HirFunction>,
+    parent_scope: ParentScope,
 ) -> FuncId {
     let id = FuncId(functions.len());
     functions.push(HirFunction {
@@ -840,12 +841,14 @@ fn register_function_signature(
                 name: p.clone(),
                 kind: ValueKind::Number,
                 func_id: None,
+                is_captured: false,
             })
             .collect(),
         upvalues: Vec::new(),
         locals: Vec::new(),
         body: Vec::new(),
         ret_kinds: Vec::new(),
+        parent_scope,
     });
     function_names.insert(name.to_owned(), id);
     id
@@ -873,6 +876,7 @@ fn lower_into_function(
         body,
         &external_kinds,
         outer_visible,
+        fid,
     );
     let body_hir = sub_ctx.lower_function_body(body)?;
     let ret_kinds = sub_ctx.in_function_ret_kinds.unwrap_or_default();
@@ -894,7 +898,13 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
     let mut function_names: HashMap<String, FuncId> = HashMap::new();
     for stmt in chunk {
         if let StmtKind::FunctionDef { name, params, .. } = &stmt.kind {
-            register_function_signature(name, params, &mut function_names, &mut functions);
+            register_function_signature(
+                name,
+                params,
+                &mut function_names,
+                &mut functions,
+                ParentScope::Chunk,
+            );
         }
     }
     // Phase 2.5e (ADR 0020): pre-scan all call sites for top-level
@@ -939,10 +949,46 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
     }
     // ctx.functions accumulates anonymous functions registered during
     // lowering of `local f = function() ... end` (Phase 2.5b, ADR 0017).
+    let mut chunk_locals = ctx.locals;
+    let mut all_functions = ctx.functions;
+    // Phase 2.5c-full Commit 3 (ADR 0083): post-pass that flips
+    // `LocalInfo::is_captured = true` on every outer local that is
+    // referenced as `outer_local_id` of any closure's `UpvalueInfo`.
+    // The flag drives codegen's choice between a stack alloca slot
+    // and a heap upvalue box (so writes through the box are visible
+    // across closures sharing the same outer local). Resolved via
+    // `HirFunction::parent_scope` since `LocalId` is scope-relative.
+    let upvalue_records: Vec<(ParentScope, Vec<LocalId>)> = all_functions
+        .iter()
+        .map(|f| {
+            (
+                f.parent_scope,
+                f.upvalues.iter().map(|uv| uv.outer_local_id).collect(),
+            )
+        })
+        .collect();
+    for (parent_scope, outer_ids) in upvalue_records {
+        for outer_id in outer_ids {
+            match parent_scope {
+                ParentScope::Chunk => {
+                    chunk_locals[outer_id.0].is_captured = true;
+                }
+                ParentScope::Function(fid) => {
+                    all_functions[fid.0].locals[outer_id.0].is_captured = true;
+                    // The params slice is a prefix of locals, so mirror
+                    // the flag onto the matching params entry to keep
+                    // the two views consistent.
+                    if outer_id.0 < all_functions[fid.0].params.len() {
+                        all_functions[fid.0].params[outer_id.0].is_captured = true;
+                    }
+                }
+            }
+        }
+    }
     Ok(HirChunk {
-        locals: ctx.locals,
+        locals: chunk_locals,
         stmts,
-        functions: ctx.functions,
+        functions: all_functions,
     })
 }
 
@@ -991,6 +1037,13 @@ struct LowerCtx {
     /// k2, ...])` for multi-return. Subsequent returns must agree on
     /// arity and per-position kind.
     in_function_ret_kinds: Option<Vec<ValueKind>>,
+    /// Phase 2.5c-full Commit 3 (ADR 0083): the FuncId of the
+    /// function whose body this ctx is lowering, or `None` at
+    /// chunk level. Used by [`Self::current_parent_scope`] to
+    /// stamp `parent_scope` on every new HirFunction this ctx
+    /// registers, so the post-pass can resolve each upvalue's
+    /// `outer_local_id` to the right `locals` table.
+    containing_fn: Option<FuncId>,
 }
 
 impl LowerCtx {
@@ -1006,6 +1059,16 @@ impl LowerCtx {
             functions,
             in_function: None,
             in_function_ret_kinds: None,
+            containing_fn: None,
+        }
+    }
+
+    /// Phase 2.5c-full Commit 3 (ADR 0083): the lexical parent
+    /// scope of any new `HirFunction` registered via this ctx.
+    fn current_parent_scope(&self) -> ParentScope {
+        match self.containing_fn {
+            None => ParentScope::Chunk,
+            Some(fid) => ParentScope::Function(fid),
         }
     }
 
@@ -1027,9 +1090,11 @@ impl LowerCtx {
         body: &[Stmt],
         external_kinds: &[ValueKind],
         outer_visible: HashMap<String, (LocalId, ValueKind)>,
+        containing_fn: FuncId,
     ) -> Self {
         let mut ctx = Self::new(function_names.clone(), functions.to_vec());
         ctx.outer_visible = outer_visible;
+        ctx.containing_fn = Some(containing_fn);
         let body_kinds = infer_param_kinds(body, params);
         for (i, p) in params.iter().enumerate() {
             let kind = match body_kinds[i] {
@@ -1146,6 +1211,7 @@ impl LowerCtx {
         // (`g` calling `h` declared later in the same body) work.
         // Mirrors the pass-1 / pass-2 split that `lower()` already
         // does for top-level FunctionDefs.
+        let parent_scope = self.current_parent_scope();
         for s in stmts {
             if let StmtKind::FunctionDef { name, params, .. } = &s.kind {
                 register_function_signature(
@@ -1153,6 +1219,7 @@ impl LowerCtx {
                     params,
                     &mut self.function_names,
                     &mut self.functions,
+                    parent_scope,
                 );
             }
         }
@@ -1277,6 +1344,7 @@ impl LowerCtx {
             name: name.clone(),
             kind,
             func_id,
+            is_captured: false,
         });
         self.scopes
             .last_mut()
@@ -2386,6 +2454,7 @@ impl LowerCtx {
                     name: name.to_owned(),
                     kind: expected_kind,
                     func_id,
+                    is_captured: false,
                 });
                 self.scopes[0].insert(name.to_owned(), id);
                 Ok((id, true))
@@ -3061,6 +3130,7 @@ impl LowerCtx {
                 // scope/locals/break-stack.
                 let id = FuncId(self.functions.len());
                 let mangled = format!("user_anon_{}", id.0);
+                let parent_scope = self.current_parent_scope();
                 self.functions.push(HirFunction {
                     name: String::new(),
                     mangled_name: mangled,
@@ -3070,12 +3140,14 @@ impl LowerCtx {
                             name: p.clone(),
                             kind: ValueKind::Number,
                             func_id: None,
+                            is_captured: false,
                         })
                         .collect(),
                     upvalues: Vec::new(),
                     locals: Vec::new(),
                     body: Vec::new(),
                     ret_kinds: Vec::new(),
+                    parent_scope,
                 });
                 // Anonymous functions have no caller-name to scan
                 // for call-site arg kinds; default to Number for all
@@ -3092,6 +3164,7 @@ impl LowerCtx {
                     body,
                     &external_kinds,
                     outer_visible,
+                    id,
                 );
                 let body_hir = fn_ctx.lower_function_body(body)?;
                 let ret_kinds = fn_ctx.in_function_ret_kinds.unwrap_or_default();
