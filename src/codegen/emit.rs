@@ -1081,25 +1081,36 @@ fn emit_call_user_unpacked<'a, 'c>(
 /// sites still use the legacy `emit_call_user_unpacked` until the
 /// atomic ABI cutover lands. `#[allow(dead_code)]` hides the warning
 /// for the prep window only.
-#[allow(dead_code)]
 ///
-/// `cell_ptr` selection follows ADR 0083 §3:
+/// `cell_ptr` selection follows ADR 0083 §3, with the HIR-level
+/// invariants established by Commit 3b prep fix
+/// (synthetic FunctionDef-locals + mutual-capturing-recursion reject):
 /// 1. non-capturing target → `addressof @<callee_name>_closure`
 ///    (the static singleton; identity-stable across aliases)
 /// 2. capturing + `holding_local = Some(idx)` → load the cell ptr
-///    from `slots[idx]`. The LocalInit storage rule guarantees the
-///    slot was populated with the right cell ptr (fresh malloc at
-///    closure-creation site, or alias copy for `local g = f`).
+///    from `slots[idx]`. After the prep fix, every chunk-level and
+///    nested forward call to a capturing fn resolves to the
+///    synthetic FunctionDef-local in scope, so this arm covers
+///    Test A (`tests/phase2_5c1_top_level_capture.rs`) and Test B
+///    (`tests/phase2_5f_nested_function.rs`). The LocalInit storage
+///    rule guarantees the slot was populated with the right cell
+///    ptr (fresh malloc at closure-creation site, or alias copy
+///    for `local g = f`).
 /// 3. capturing + `holding_local = None` → use `in_function_cell_ptr`
-///    (the entry block's `block.argument(0)`). Reachable only when
-///    the call resolved through `function_names` fallback inside
-///    the capturing fn's own body — i.e. self-recursion. The entry
-///    cell_ptr is exactly the caller-supplied "current self
-///    instance".
+///    (the entry block's `block.argument(0)`). After the prep fix
+///    the only way to land here is **self-recursion** inside the
+///    capturing fn's own body (Function-kind upvalues are still
+///    rejected, so `lookup_or_capture_upvalue` falls through to
+///    `function_names` which sees the fn's own name). The HIR
+///    post-pass `check_mutual_capturing_recursion_in_stmts`
+///    rejects every other case before reaching codegen, so
+///    `in_function_cell_ptr` here is exactly the caller-supplied
+///    "current self instance".
 /// 4. capturing + `holding_local = None` + `in_function_cell_ptr =
 ///    None` → unreachable (would mean a top-level capturing fn,
 ///    which has no enclosing scope to capture from; the HIR upvalue
 ///    pass cannot construct such a function).
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn emit_call_user_with_cell<'a, 'c>(
     context: &'c Context,

@@ -110,6 +110,24 @@ pub enum HirError {
         ret_kinds: Vec<crate::hir::ValueKind>,
         offset: usize,
     },
+
+    /// Phase 2.5c-full Commit 3b prep fix (ADR 0083): a `local
+    /// function f() ... end` whose body captures upvalues cannot
+    /// be called from outside its body via the `function_names`
+    /// fallback (= without resolving through a visible local
+    /// binding) when the call site is **not** the capturing fn's
+    /// own self-recursion. Mutual recursion of two capturing fns
+    /// at the same scope hits this path because Function-kind
+    /// upvalues are still rejected (`lookup_or_capture_upvalue`)
+    /// and the synthetic FunctionDef-backing local isn't in the
+    /// caller body's scopes. ADR 0087 (candidate) lifts this
+    /// restriction once Function-kind upvalues are allowed.
+    #[error(
+        "mutual recursion between capturing functions is not supported \
+         (ADR 0083 / future ADR 0087): '{local_name}' calls a capturing fn \
+         from outside its body"
+    )]
+    MutualCapturingRecursion { local_name: String, offset: usize },
 }
 
 impl HirError {
@@ -128,7 +146,8 @@ impl HirError {
             | HirError::ClosureEscapes { offset, .. }
             | HirError::IndirectCallThroughTaggedLocal { offset, .. }
             | HirError::IndirectCallNoCandidates { offset, .. }
-            | HirError::IndirectCallNonNumberReturn { offset, .. } => *offset,
+            | HirError::IndirectCallNonNumberReturn { offset, .. }
+            | HirError::MutualCapturingRecursion { offset, .. } => *offset,
         }
     }
 }

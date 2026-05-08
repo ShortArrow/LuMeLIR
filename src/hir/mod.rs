@@ -928,10 +928,30 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
     // captures statically unreachable; ADR 0037 documented that
     // gap, ADR 0042 closes it.
     let mut ctx = LowerCtx::new(function_names.clone(), functions);
+    // Phase 2.5c-full Commit 3b prep fix (ADR 0083): pass 1.5 — declare
+    // a synthetic chunk local for every top-level `local function f`.
+    // This is the same shape `local f = function() end` already
+    // produces and makes `self.resolve(name)` succeed for every
+    // forward / chunk-level call site, so the upcoming
+    // `emit_call_user_with_cell` cutover can load the closure cell
+    // ptr from the local's slot instead of guessing whether a
+    // `function_names` fallback was self-recursion or not. The
+    // declaration must precede the source-order walk so forward
+    // references resolve.
+    for stmt in chunk {
+        if let StmtKind::FunctionDef { name, params, .. } = &stmt.kind {
+            let arity = params.len();
+            let fid = ctx.function_names[name];
+            ctx.declare_local_with_func_id(name.clone(), ValueKind::Function(arity), Some(fid));
+        }
+    }
     let mut stmts = Vec::new();
     let mut funcdef_seq: usize = 0;
     for s in chunk {
-        if let StmtKind::FunctionDef { params, body, .. } = &s.kind {
+        if let StmtKind::FunctionDef {
+            name, params, body, ..
+        } = &s.kind
+        {
             let fid = FuncId(funcdef_seq);
             funcdef_seq += 1;
             let outer_visible = ctx.outer_visible_snapshot();
@@ -943,6 +963,26 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
                 &mut ctx.functions,
                 outer_visible,
             )?;
+            // Phase 2.5c-full Commit 3b prep fix (ADR 0083): emit a
+            // synthetic LocalInit at the FunctionDef's source position
+            // so the closure cell ptr is materialised into the
+            // synthetic local's slot. For non-capturing fns this is
+            // an alias-skip (LocalInit Function-kind storage rule);
+            // capturing fns will store the malloc'd cell ptr once
+            // Commit 3b body lands the storage rule update.
+            let local_id = ctx
+                .resolve(name)
+                .expect("synthetic local declared in pass 1.5 above");
+            stmts.push(HirStmt {
+                kind: HirStmtKind::LocalInit {
+                    id: local_id,
+                    value: HirExpr {
+                        kind: HirExprKind::FunctionRef(fid),
+                        span: s.span,
+                    },
+                },
+                span: s.span,
+            });
             continue;
         }
         stmts.push(ctx.lower_stmt(s)?);
@@ -985,11 +1025,183 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
             }
         }
     }
+    // Phase 2.5c-full Commit 3b prep fix (ADR 0083): post-pass to
+    // reject mutual capturing recursion. After every body is
+    // lowered, walk all `Callee::User { fid, holding_local: None }`
+    // call sites: if the target is capturing and the call isn't
+    // self-recursion (target.fid != enclosing fn), reject. The
+    // check has to be a post-pass because `target.upvalues` is
+    // populated only after `lower_into_function` for that target
+    // returns, which can be later in source order than the call
+    // site.
+    let func_upvalue_count: Vec<usize> = all_functions.iter().map(|f| f.upvalues.len()).collect();
+    for (caller_fid, hir_fn) in all_functions.iter().enumerate() {
+        check_mutual_capturing_recursion_in_stmts(
+            &hir_fn.body,
+            Some(FuncId(caller_fid)),
+            &func_upvalue_count,
+        )?;
+    }
+    check_mutual_capturing_recursion_in_stmts(&stmts, None, &func_upvalue_count)?;
     Ok(HirChunk {
         locals: chunk_locals,
         stmts,
         functions: all_functions,
     })
+}
+
+/// Phase 2.5c-full Commit 3b prep fix (ADR 0083): walk a stmt slice
+/// for `Callee::User { holding_local: None }` and reject mutual
+/// capturing recursion. Used by the `lower()` post-pass.
+fn check_mutual_capturing_recursion_in_stmts(
+    stmts: &[HirStmt],
+    enclosing_fid: Option<FuncId>,
+    func_upvalue_count: &[usize],
+) -> Result<(), HirError> {
+    for stmt in stmts {
+        check_mutual_in_stmt(stmt, enclosing_fid, func_upvalue_count)?;
+    }
+    Ok(())
+}
+
+fn check_mutual_in_stmt(
+    stmt: &HirStmt,
+    enclosing_fid: Option<FuncId>,
+    func_upvalue_count: &[usize],
+) -> Result<(), HirError> {
+    match &stmt.kind {
+        HirStmtKind::LocalInit { value, .. } | HirStmtKind::Assign { value, .. } => {
+            check_mutual_in_expr(value, enclosing_fid, func_upvalue_count, stmt.span.start)
+        }
+        HirStmtKind::ExprStmt(e) => {
+            check_mutual_in_expr(e, enclosing_fid, func_upvalue_count, stmt.span.start)
+        }
+        HirStmtKind::Block { stmts } => {
+            check_mutual_capturing_recursion_in_stmts(stmts, enclosing_fid, func_upvalue_count)
+        }
+        HirStmtKind::If {
+            cond,
+            then_body,
+            elifs,
+            else_body,
+        } => {
+            check_mutual_in_expr(cond, enclosing_fid, func_upvalue_count, stmt.span.start)?;
+            check_mutual_capturing_recursion_in_stmts(
+                then_body,
+                enclosing_fid,
+                func_upvalue_count,
+            )?;
+            for (c, b) in elifs {
+                check_mutual_in_expr(c, enclosing_fid, func_upvalue_count, stmt.span.start)?;
+                check_mutual_capturing_recursion_in_stmts(b, enclosing_fid, func_upvalue_count)?;
+            }
+            if let Some(else_body) = else_body {
+                check_mutual_capturing_recursion_in_stmts(
+                    else_body,
+                    enclosing_fid,
+                    func_upvalue_count,
+                )?;
+            }
+            Ok(())
+        }
+        HirStmtKind::While { cond, body, .. } => {
+            check_mutual_in_expr(cond, enclosing_fid, func_upvalue_count, stmt.span.start)?;
+            check_mutual_capturing_recursion_in_stmts(body, enclosing_fid, func_upvalue_count)
+        }
+        HirStmtKind::Repeat { body, cond, .. } => {
+            check_mutual_capturing_recursion_in_stmts(body, enclosing_fid, func_upvalue_count)?;
+            check_mutual_in_expr(cond, enclosing_fid, func_upvalue_count, stmt.span.start)
+        }
+        HirStmtKind::ForNumeric {
+            start,
+            stop,
+            step,
+            body,
+            ..
+        } => {
+            check_mutual_in_expr(start, enclosing_fid, func_upvalue_count, stmt.span.start)?;
+            check_mutual_in_expr(stop, enclosing_fid, func_upvalue_count, stmt.span.start)?;
+            check_mutual_in_expr(step, enclosing_fid, func_upvalue_count, stmt.span.start)?;
+            check_mutual_capturing_recursion_in_stmts(body, enclosing_fid, func_upvalue_count)
+        }
+        HirStmtKind::MultiAssignFromCall { callee, args, .. } => {
+            check_mutual_in_callee(callee, enclosing_fid, func_upvalue_count, stmt.span.start)?;
+            for a in args {
+                check_mutual_in_expr(a, enclosing_fid, func_upvalue_count, stmt.span.start)?;
+            }
+            Ok(())
+        }
+        HirStmtKind::IndexAssign { target, key, value } => {
+            check_mutual_in_expr(target, enclosing_fid, func_upvalue_count, stmt.span.start)?;
+            check_mutual_in_expr(key, enclosing_fid, func_upvalue_count, stmt.span.start)?;
+            check_mutual_in_expr(value, enclosing_fid, func_upvalue_count, stmt.span.start)
+        }
+    }
+}
+
+fn check_mutual_in_expr(
+    expr: &HirExpr,
+    enclosing_fid: Option<FuncId>,
+    func_upvalue_count: &[usize],
+    fallback_offset: usize,
+) -> Result<(), HirError> {
+    match &expr.kind {
+        HirExprKind::Call { callee, args } => {
+            check_mutual_in_callee(callee, enclosing_fid, func_upvalue_count, fallback_offset)?;
+            for a in args {
+                check_mutual_in_expr(a, enclosing_fid, func_upvalue_count, fallback_offset)?;
+            }
+            Ok(())
+        }
+        HirExprKind::BinOp { lhs, rhs, .. } => {
+            check_mutual_in_expr(lhs, enclosing_fid, func_upvalue_count, fallback_offset)?;
+            check_mutual_in_expr(rhs, enclosing_fid, func_upvalue_count, fallback_offset)
+        }
+        HirExprKind::UnaryOp { operand, .. } => {
+            check_mutual_in_expr(operand, enclosing_fid, func_upvalue_count, fallback_offset)
+        }
+        HirExprKind::Index { target, key } => {
+            check_mutual_in_expr(target, enclosing_fid, func_upvalue_count, fallback_offset)?;
+            check_mutual_in_expr(key, enclosing_fid, func_upvalue_count, fallback_offset)
+        }
+        HirExprKind::IndexTagged { target, key } => {
+            check_mutual_in_expr(target, enclosing_fid, func_upvalue_count, fallback_offset)?;
+            check_mutual_in_expr(key, enclosing_fid, func_upvalue_count, fallback_offset)
+        }
+        HirExprKind::IsNil(operand) | HirExprKind::ArithStringCoerce(operand) => {
+            check_mutual_in_expr(operand, enclosing_fid, func_upvalue_count, fallback_offset)
+        }
+        HirExprKind::Table(elems) => {
+            for elem in elems {
+                check_mutual_in_expr(elem, enclosing_fid, func_upvalue_count, fallback_offset)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn check_mutual_in_callee(
+    callee: &Callee,
+    enclosing_fid: Option<FuncId>,
+    func_upvalue_count: &[usize],
+    fallback_offset: usize,
+) -> Result<(), HirError> {
+    if let Callee::User {
+        fid,
+        holding_local: None,
+    } = callee
+    {
+        let target_capturing = func_upvalue_count[fid.0] > 0;
+        let is_self_call = enclosing_fid == Some(*fid);
+        if target_capturing && !is_self_call {
+            return Err(HirError::MutualCapturingRecursion {
+                local_name: format!("user_fn_{}", fid.0),
+                offset: fallback_offset,
+            });
+        }
+    }
+    Ok(())
 }
 
 struct LowerCtx {
@@ -1220,6 +1432,25 @@ impl LowerCtx {
                     &mut self.function_names,
                     &mut self.functions,
                     parent_scope,
+                );
+            }
+        }
+        // Phase 2.5c-full Commit 3b prep fix (ADR 0083): pass 1.5 —
+        // declare a synthetic body-local for each `local function f`
+        // declared in this body. Aligned with the chunk-level
+        // synthetic local in `lower()`, this makes
+        // `self.resolve(name)` succeed for all forward / nested
+        // call sites and lets the upcoming
+        // `emit_call_user_with_cell` cutover load the closure cell
+        // ptr from the local's slot.
+        for s in stmts {
+            if let StmtKind::FunctionDef { name, params, .. } = &s.kind {
+                let arity = params.len();
+                let fid = self.function_names[name];
+                self.declare_local_with_func_id(
+                    name.clone(),
+                    ValueKind::Function(arity),
+                    Some(fid),
                 );
             }
         }
@@ -1508,8 +1739,22 @@ impl LowerCtx {
                     &mut self.functions,
                     outer_visible,
                 )?;
+                // Phase 2.5c-full Commit 3b prep fix (ADR 0083): the
+                // synthetic body-local for `name` was declared in
+                // `lower_function_body`'s pass 1.5; emit a
+                // LocalInit at the FunctionDef's source position so
+                // the closure cell ptr lands in its slot.
+                let local_id = self
+                    .resolve(name)
+                    .expect("synthetic local declared in lower_function_body's pass 1.5");
                 Ok(HirStmt {
-                    kind: HirStmtKind::Block { stmts: Vec::new() },
+                    kind: HirStmtKind::LocalInit {
+                        id: local_id,
+                        value: HirExpr {
+                            kind: HirExprKind::FunctionRef(fid),
+                            span: stmt.span,
+                        },
+                    },
                     span: stmt.span,
                 })
             }
@@ -3367,20 +3612,55 @@ impl LowerCtx {
                     .iter()
                     .map(|a| self.lower_expr(a))
                     .collect::<Result<Vec<_>, _>>()?;
-                for arg in &lowered_args {
-                    let k = infer_kind(arg, &self.locals, &self.functions);
-                    if !matches!(k, ValueKind::Number | ValueKind::Function(_)) {
-                        return Err(HirError::TypeMismatch {
-                            op: format!("call-{name}"),
-                            lhs_kind: "number or function".to_owned(),
-                            rhs_kind: k.name().to_owned(),
-                            offset: arg.span.start,
-                        });
+                // Phase 2.5c-full Commit 3b prep fix (ADR 0083):
+                // when the local resolves to a known user fn (e.g.
+                // synthetic FunctionDef local), check per-arg
+                // Function-kind arity compatibility against the
+                // target's params. This matches the function_names
+                // fallback path's check and was previously
+                // unreachable when `local function f` had no local
+                // slot (function_names path always handled it).
+                if let Some(target_fid) = self.locals[local_id.0].func_id {
+                    let target_param_kinds: Vec<ValueKind> = self.functions[target_fid.0]
+                        .params
+                        .iter()
+                        .map(|p| p.kind)
+                        .collect();
+                    for (i, arg) in lowered_args.iter().enumerate() {
+                        let arg_kind = infer_kind(arg, &self.locals, &self.functions);
+                        if let Some(expected) = target_param_kinds.get(i) {
+                            let compatible = match (*expected, arg_kind) {
+                                (ValueKind::Number, ValueKind::Number) => true,
+                                (ValueKind::Bool, ValueKind::Bool) => true,
+                                (ValueKind::Nil, ValueKind::Nil) => true,
+                                (ValueKind::String, ValueKind::String) => true,
+                                (ValueKind::Table, ValueKind::Table) => true,
+                                (ValueKind::Function(a), ValueKind::Function(b)) => a == b,
+                                _ => false,
+                            };
+                            if !compatible {
+                                return Err(HirError::TypeMismatch {
+                                    op: format!("call-{name}"),
+                                    lhs_kind: expected.name().to_owned(),
+                                    rhs_kind: arg_kind.name().to_owned(),
+                                    offset: arg.span.start,
+                                });
+                            }
+                        }
                     }
-                    // Phase 2.5c.3 (ADR 0044): a closure carrying
-                    // upvalues passed as a value reaches its eventual
-                    // call site via Callee::Indirect, which has no
-                    // path to thread upvalues. Reject statically.
+                }
+                // Phase 2.5c.3 (ADR 0044): a closure carrying
+                // upvalues passed as a value reaches its eventual
+                // call site via Callee::Indirect, which has no
+                // path to thread upvalues. Reject statically.
+                // (Phase 2.5c-full Commit 3b prep fix: the narrow
+                // `Number | Function` arg-kind check that lived
+                // here before E1 has been replaced by the
+                // per-target compatibility check above; the latter
+                // matches the function_names path's check exactly
+                // and now correctly accepts Bool/Nil/String/Table
+                // args when the target's params expect those kinds.)
+                for arg in &lowered_args {
                     if self.closure_with_upvalues(arg).is_some() {
                         return Err(HirError::ClosureEscapes {
                             position: "call argument".to_owned(),
@@ -3595,11 +3875,23 @@ impl LowerCtx {
             //
             // Phase 2.5c-full Commit 3b prep (ADR 0083): record
             // `holding_local` on the Callee::User so the upcoming
-            // codegen cutover can locate the binding's slot. None
-            // when only `function_names` knows about the name
-            // (top-level forward-ref / self-recursion inside the
-            // capturing fn body) — codegen will fall back to the
-            // entry `cell_ptr` block-arg.
+            // codegen cutover can locate the binding's slot. After
+            // the prep-fix (synthetic FunctionDef-locals), the
+            // function_names fallback only fires when the name
+            // isn't visible in any outer scope as a local —
+            // typically self-recursion (Function-kind upvalue
+            // rejection forces fall-through here for the
+            // capturing fn's own body) or a sibling/forward call
+            // that crossed a fn boundary.
+            //
+            // Phase 2.5c-full Commit 3b prep fix (ADR 0083): the
+            // mutual-capturing-recursion check happens in a
+            // post-pass after every body is lowered (because the
+            // target's `upvalues` field isn't fully populated at
+            // call-site lowering time when the target's body is
+            // processed later in source order). Rejection lives
+            // in `lower()` post-pass; here we just record
+            // `holding_local` for codegen consumption.
             let holding_local = self.resolve(name);
             let upvalue_args: Vec<HirExpr> = self.functions[fid.0]
                 .upvalues
@@ -4519,11 +4811,117 @@ local f = function() return b end";
     }
 
     #[test]
+    fn lower_chunk_top_level_call_carries_holding_local_some() {
+        // Phase 2.5c-full Commit 3b prep fix (ADR 0083):
+        // `local function f` declares a synthetic chunk local for `f`,
+        // so the chunk-level `print(f())` call resolves through the
+        // local-resolve path with `holding_local = Some(_)`.
+        let hir = lower_src("local function f() return 1 end\nprint(f())").expect("must lower");
+        // stmts[0] = synthetic LocalInit for f
+        // stmts[1] = print(f()) ExprStmt
+        let HirStmtKind::ExprStmt(call) = &hir.stmts[1].kind else {
+            panic!("expected ExprStmt at idx 1, got {:?}", &hir.stmts[1].kind);
+        };
+        let HirExprKind::Call { args, .. } = &call.kind else {
+            panic!("expected Call");
+        };
+        let HirExprKind::Call { callee: inner, .. } = &args[0].kind else {
+            panic!("expected nested Call");
+        };
+        match inner {
+            Callee::User {
+                fid: FuncId(0),
+                holding_local,
+            } => {
+                assert!(
+                    holding_local.is_some(),
+                    "chunk top-level call to local function should carry holding_local Some, \
+                     got None"
+                );
+            }
+            other => panic!("expected Callee::User, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_self_recursion_carries_holding_local_none() {
+        // Phase 2.5c-full Commit 3b prep fix (ADR 0083): inside the
+        // capturing fn's own body, `self.resolve(name)` returns None
+        // (the body's locals don't include the fn's own name) and
+        // the call falls through to `function_names`, yielding
+        // `holding_local = None`. Codegen's `emit_call_user_with_cell`
+        // recognises this as the recursion shortcut.
+        let hir = lower_src(
+            "local function fact(n) if n == 0 then return 1 end
+return fact(n - 1) end
+print(fact(3))",
+        )
+        .expect("must lower");
+        // Walk fact's body to find the self-call.
+        let fact = &hir.functions[0];
+        let mut found = false;
+        fn scan(stmts: &[HirStmt], found: &mut bool) {
+            for stmt in stmts {
+                match &stmt.kind {
+                    HirStmtKind::Assign { value, .. } | HirStmtKind::LocalInit { value, .. } => {
+                        scan_expr(value, found);
+                    }
+                    HirStmtKind::ExprStmt(e) => scan_expr(e, found),
+                    HirStmtKind::Block { stmts } => scan(stmts, found),
+                    HirStmtKind::If {
+                        then_body,
+                        elifs,
+                        else_body,
+                        ..
+                    } => {
+                        scan(then_body, found);
+                        for (_, b) in elifs {
+                            scan(b, found);
+                        }
+                        if let Some(eb) = else_body {
+                            scan(eb, found);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        fn scan_expr(e: &HirExpr, found: &mut bool) {
+            if let HirExprKind::Call { callee, args } = &e.kind {
+                if let Callee::User {
+                    fid: FuncId(0),
+                    holding_local,
+                } = callee
+                    && holding_local.is_none()
+                {
+                    *found = true;
+                }
+                for a in args {
+                    scan_expr(a, found);
+                }
+            }
+            if let HirExprKind::BinOp { lhs, rhs, .. } = &e.kind {
+                scan_expr(lhs, found);
+                scan_expr(rhs, found);
+            }
+        }
+        scan(&fact.body, &mut found);
+        assert!(
+            found,
+            "self-recursion `fact(n - 1)` inside fact's body should carry \
+             holding_local = None (function_names fallback for the fn's own name)"
+        );
+    }
+
+    #[test]
     fn lower_function_call_resolves_to_user_func_id() {
         let hir = lower_src("local function f() return 1 end\nprint(f())").expect("must lower");
-        // The print arg is a Call to user f.
-        let HirStmtKind::ExprStmt(call) = &hir.stmts[0].kind else {
-            panic!("expected ExprStmt");
+        // Phase 2.5c-full Commit 3b prep fix (ADR 0083): chunk now
+        // begins with a synthetic `LocalInit { id, FunctionRef(0) }`
+        // for `local function f` (idx 0), so the print ExprStmt is
+        // at idx 1.
+        let HirStmtKind::ExprStmt(call) = &hir.stmts[1].kind else {
+            panic!("expected ExprStmt at idx 1");
         };
         let HirExprKind::Call { callee, args } = &call.kind else {
             panic!("expected Call");
@@ -4579,9 +4977,18 @@ local f = function() return b end";
         // the outer x at all.
         let hir = lower_src("local x = 1\nlocal function f(x) return x end\nprint(f(2))")
             .expect("must lower");
-        // Outer chunk has one local (`x`).
-        assert_eq!(hir.locals.len(), 1);
-        assert_eq!(hir.locals[0].name, "x");
+        // Phase 2.5c-full Commit 3b prep fix (ADR 0083): chunk now
+        // declares a synthetic local "f" alongside the explicit `x`,
+        // so the chunk has two locals. Synthetic FunctionDef locals
+        // are declared in pass 1.5 (before pass 2 lowering of
+        // explicit `local x`), so "f" lands at idx 0 and "x" at
+        // idx 1. Local IDs are scope-relative slot indices; the
+        // numeric order is irrelevant for correctness as long as
+        // pass 2's HirStmt construction references the right ID.
+        assert_eq!(hir.locals.len(), 2);
+        let names: Vec<&str> = hir.locals.iter().map(|l| l.name.as_str()).collect();
+        assert!(names.contains(&"x"));
+        assert!(names.contains(&"f"));
         // Function f has its own params and locals (independent).
         assert_eq!(hir.functions[0].params.len(), 1);
     }
@@ -4856,12 +5263,15 @@ local f = function() return b end";
     fn lower_local_multi_from_call_emits_multi_assign() {
         let src = "local function pair() return 1, 2 end\nlocal a, b = pair()";
         let hir = lower_src(src).expect("Phase 2.5d: local a,b = pair() must lower");
-        // The multi-assign statement is the second top-level stmt.
-        match &hir.stmts[0].kind {
+        // Phase 2.5c-full Commit 3b prep fix (ADR 0083): chunk now
+        // begins with a synthetic `LocalInit` for `local function pair`
+        // (idx 0); the `local a, b = pair()` MultiAssignFromCall
+        // shifts to idx 1.
+        match &hir.stmts[1].kind {
             HirStmtKind::MultiAssignFromCall { dst_ids, .. } => {
                 assert_eq!(dst_ids.len(), 2);
             }
-            other => panic!("expected MultiAssignFromCall, got {other:?}"),
+            other => panic!("expected MultiAssignFromCall at idx 1, got {other:?}"),
         }
     }
 
