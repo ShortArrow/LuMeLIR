@@ -1034,15 +1034,16 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
     // populated only after `lower_into_function` for that target
     // returns, which can be later in source order than the call
     // site.
-    let func_upvalue_count: Vec<usize> = all_functions.iter().map(|f| f.upvalues.len()).collect();
-    for (caller_fid, hir_fn) in all_functions.iter().enumerate() {
-        check_mutual_capturing_recursion_in_stmts(
-            &hir_fn.body,
-            Some(FuncId(caller_fid)),
-            &func_upvalue_count,
-        )?;
+    for caller_fid in 0..all_functions.len() {
+        // Take the body out of `all_functions[caller_fid]` so the
+        // loop iterates an owned `Vec<HirStmt>` while still being
+        // able to immutably borrow the rest of `all_functions` for
+        // diagnostic name lookup. Restore it after the check.
+        let body = std::mem::take(&mut all_functions[caller_fid].body);
+        check_mutual_capturing_recursion_in_stmts(&body, Some(FuncId(caller_fid)), &all_functions)?;
+        all_functions[caller_fid].body = body;
     }
-    check_mutual_capturing_recursion_in_stmts(&stmts, None, &func_upvalue_count)?;
+    check_mutual_capturing_recursion_in_stmts(&stmts, None, &all_functions)?;
     Ok(HirChunk {
         locals: chunk_locals,
         stmts,
@@ -1056,10 +1057,10 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
 fn check_mutual_capturing_recursion_in_stmts(
     stmts: &[HirStmt],
     enclosing_fid: Option<FuncId>,
-    func_upvalue_count: &[usize],
+    functions: &[HirFunction],
 ) -> Result<(), HirError> {
     for stmt in stmts {
-        check_mutual_in_stmt(stmt, enclosing_fid, func_upvalue_count)?;
+        check_mutual_in_stmt(stmt, enclosing_fid, functions)?;
     }
     Ok(())
 }
@@ -1067,17 +1068,17 @@ fn check_mutual_capturing_recursion_in_stmts(
 fn check_mutual_in_stmt(
     stmt: &HirStmt,
     enclosing_fid: Option<FuncId>,
-    func_upvalue_count: &[usize],
+    functions: &[HirFunction],
 ) -> Result<(), HirError> {
     match &stmt.kind {
         HirStmtKind::LocalInit { value, .. } | HirStmtKind::Assign { value, .. } => {
-            check_mutual_in_expr(value, enclosing_fid, func_upvalue_count, stmt.span.start)
+            check_mutual_in_expr(value, enclosing_fid, functions, stmt.span.start)
         }
         HirStmtKind::ExprStmt(e) => {
-            check_mutual_in_expr(e, enclosing_fid, func_upvalue_count, stmt.span.start)
+            check_mutual_in_expr(e, enclosing_fid, functions, stmt.span.start)
         }
         HirStmtKind::Block { stmts } => {
-            check_mutual_capturing_recursion_in_stmts(stmts, enclosing_fid, func_upvalue_count)
+            check_mutual_capturing_recursion_in_stmts(stmts, enclosing_fid, functions)
         }
         HirStmtKind::If {
             cond,
@@ -1085,32 +1086,24 @@ fn check_mutual_in_stmt(
             elifs,
             else_body,
         } => {
-            check_mutual_in_expr(cond, enclosing_fid, func_upvalue_count, stmt.span.start)?;
-            check_mutual_capturing_recursion_in_stmts(
-                then_body,
-                enclosing_fid,
-                func_upvalue_count,
-            )?;
+            check_mutual_in_expr(cond, enclosing_fid, functions, stmt.span.start)?;
+            check_mutual_capturing_recursion_in_stmts(then_body, enclosing_fid, functions)?;
             for (c, b) in elifs {
-                check_mutual_in_expr(c, enclosing_fid, func_upvalue_count, stmt.span.start)?;
-                check_mutual_capturing_recursion_in_stmts(b, enclosing_fid, func_upvalue_count)?;
+                check_mutual_in_expr(c, enclosing_fid, functions, stmt.span.start)?;
+                check_mutual_capturing_recursion_in_stmts(b, enclosing_fid, functions)?;
             }
             if let Some(else_body) = else_body {
-                check_mutual_capturing_recursion_in_stmts(
-                    else_body,
-                    enclosing_fid,
-                    func_upvalue_count,
-                )?;
+                check_mutual_capturing_recursion_in_stmts(else_body, enclosing_fid, functions)?;
             }
             Ok(())
         }
         HirStmtKind::While { cond, body, .. } => {
-            check_mutual_in_expr(cond, enclosing_fid, func_upvalue_count, stmt.span.start)?;
-            check_mutual_capturing_recursion_in_stmts(body, enclosing_fid, func_upvalue_count)
+            check_mutual_in_expr(cond, enclosing_fid, functions, stmt.span.start)?;
+            check_mutual_capturing_recursion_in_stmts(body, enclosing_fid, functions)
         }
         HirStmtKind::Repeat { body, cond, .. } => {
-            check_mutual_capturing_recursion_in_stmts(body, enclosing_fid, func_upvalue_count)?;
-            check_mutual_in_expr(cond, enclosing_fid, func_upvalue_count, stmt.span.start)
+            check_mutual_capturing_recursion_in_stmts(body, enclosing_fid, functions)?;
+            check_mutual_in_expr(cond, enclosing_fid, functions, stmt.span.start)
         }
         HirStmtKind::ForNumeric {
             start,
@@ -1119,22 +1112,22 @@ fn check_mutual_in_stmt(
             body,
             ..
         } => {
-            check_mutual_in_expr(start, enclosing_fid, func_upvalue_count, stmt.span.start)?;
-            check_mutual_in_expr(stop, enclosing_fid, func_upvalue_count, stmt.span.start)?;
-            check_mutual_in_expr(step, enclosing_fid, func_upvalue_count, stmt.span.start)?;
-            check_mutual_capturing_recursion_in_stmts(body, enclosing_fid, func_upvalue_count)
+            check_mutual_in_expr(start, enclosing_fid, functions, stmt.span.start)?;
+            check_mutual_in_expr(stop, enclosing_fid, functions, stmt.span.start)?;
+            check_mutual_in_expr(step, enclosing_fid, functions, stmt.span.start)?;
+            check_mutual_capturing_recursion_in_stmts(body, enclosing_fid, functions)
         }
         HirStmtKind::MultiAssignFromCall { callee, args, .. } => {
-            check_mutual_in_callee(callee, enclosing_fid, func_upvalue_count, stmt.span.start)?;
+            check_mutual_in_callee(callee, enclosing_fid, functions, stmt.span.start)?;
             for a in args {
-                check_mutual_in_expr(a, enclosing_fid, func_upvalue_count, stmt.span.start)?;
+                check_mutual_in_expr(a, enclosing_fid, functions, stmt.span.start)?;
             }
             Ok(())
         }
         HirStmtKind::IndexAssign { target, key, value } => {
-            check_mutual_in_expr(target, enclosing_fid, func_upvalue_count, stmt.span.start)?;
-            check_mutual_in_expr(key, enclosing_fid, func_upvalue_count, stmt.span.start)?;
-            check_mutual_in_expr(value, enclosing_fid, func_upvalue_count, stmt.span.start)
+            check_mutual_in_expr(target, enclosing_fid, functions, stmt.span.start)?;
+            check_mutual_in_expr(key, enclosing_fid, functions, stmt.span.start)?;
+            check_mutual_in_expr(value, enclosing_fid, functions, stmt.span.start)
         }
     }
 }
@@ -1142,38 +1135,38 @@ fn check_mutual_in_stmt(
 fn check_mutual_in_expr(
     expr: &HirExpr,
     enclosing_fid: Option<FuncId>,
-    func_upvalue_count: &[usize],
+    functions: &[HirFunction],
     fallback_offset: usize,
 ) -> Result<(), HirError> {
     match &expr.kind {
         HirExprKind::Call { callee, args } => {
-            check_mutual_in_callee(callee, enclosing_fid, func_upvalue_count, fallback_offset)?;
+            check_mutual_in_callee(callee, enclosing_fid, functions, fallback_offset)?;
             for a in args {
-                check_mutual_in_expr(a, enclosing_fid, func_upvalue_count, fallback_offset)?;
+                check_mutual_in_expr(a, enclosing_fid, functions, fallback_offset)?;
             }
             Ok(())
         }
         HirExprKind::BinOp { lhs, rhs, .. } => {
-            check_mutual_in_expr(lhs, enclosing_fid, func_upvalue_count, fallback_offset)?;
-            check_mutual_in_expr(rhs, enclosing_fid, func_upvalue_count, fallback_offset)
+            check_mutual_in_expr(lhs, enclosing_fid, functions, fallback_offset)?;
+            check_mutual_in_expr(rhs, enclosing_fid, functions, fallback_offset)
         }
         HirExprKind::UnaryOp { operand, .. } => {
-            check_mutual_in_expr(operand, enclosing_fid, func_upvalue_count, fallback_offset)
+            check_mutual_in_expr(operand, enclosing_fid, functions, fallback_offset)
         }
         HirExprKind::Index { target, key } => {
-            check_mutual_in_expr(target, enclosing_fid, func_upvalue_count, fallback_offset)?;
-            check_mutual_in_expr(key, enclosing_fid, func_upvalue_count, fallback_offset)
+            check_mutual_in_expr(target, enclosing_fid, functions, fallback_offset)?;
+            check_mutual_in_expr(key, enclosing_fid, functions, fallback_offset)
         }
         HirExprKind::IndexTagged { target, key } => {
-            check_mutual_in_expr(target, enclosing_fid, func_upvalue_count, fallback_offset)?;
-            check_mutual_in_expr(key, enclosing_fid, func_upvalue_count, fallback_offset)
+            check_mutual_in_expr(target, enclosing_fid, functions, fallback_offset)?;
+            check_mutual_in_expr(key, enclosing_fid, functions, fallback_offset)
         }
         HirExprKind::IsNil(operand) | HirExprKind::ArithStringCoerce(operand) => {
-            check_mutual_in_expr(operand, enclosing_fid, func_upvalue_count, fallback_offset)
+            check_mutual_in_expr(operand, enclosing_fid, functions, fallback_offset)
         }
         HirExprKind::Table(elems) => {
             for elem in elems {
-                check_mutual_in_expr(elem, enclosing_fid, func_upvalue_count, fallback_offset)?;
+                check_mutual_in_expr(elem, enclosing_fid, functions, fallback_offset)?;
             }
             Ok(())
         }
@@ -1184,7 +1177,7 @@ fn check_mutual_in_expr(
 fn check_mutual_in_callee(
     callee: &Callee,
     enclosing_fid: Option<FuncId>,
-    func_upvalue_count: &[usize],
+    functions: &[HirFunction],
     fallback_offset: usize,
 ) -> Result<(), HirError> {
     if let Callee::User {
@@ -1192,11 +1185,22 @@ fn check_mutual_in_callee(
         holding_local: None,
     } = callee
     {
-        let target_capturing = func_upvalue_count[fid.0] > 0;
+        let target = &functions[fid.0];
+        let target_capturing = !target.upvalues.is_empty();
         let is_self_call = enclosing_fid == Some(*fid);
         if target_capturing && !is_self_call {
+            // Phase 2.5c-full Commit 3b prep fix v2 (Codex P2):
+            // surface the Lua-level name so diagnostics point at
+            // the function the user wrote. Anonymous functions
+            // (no source name) fall back to the mangled `user_anon_N`
+            // tag.
+            let local_name = if target.name.is_empty() {
+                target.mangled_name.clone()
+            } else {
+                target.name.clone()
+            };
             return Err(HirError::MutualCapturingRecursion {
-                local_name: format!("user_fn_{}", fid.0),
+                local_name,
                 offset: fallback_offset,
             });
         }

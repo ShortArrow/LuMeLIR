@@ -59,9 +59,27 @@
 //!   compares ptrs which, for non-capturing singletons, retain
 //!   identity equality automatically.
 //!
-//! Capturing function ABIs will accept upvalue box pointers as
-//! trailing parameters (`(lua_params..., uv_box_0,
-//! uv_box_1, ...)`); that surface arrives with Commit 3.
+//! ## Capturing function ABI (planned, lands with Commit 3b body atomic)
+//!
+//! Every user fn — capturing or not — receives the closure cell
+//! ptr as **`block.argument(0)`** (a `!llvm.ptr`); Lua params shift
+//! to block_args 1..N. Inside the body, each `uv` in
+//! `hir_fn.upvalues` reads its heap upvalue box from
+//! `cell.upvalue_box[i]` (offset `CLOSURE_OFF_BOXES_BASE + i*8`) at
+//! function entry; the box ptr replaces `slots[uv.inner_local_id.0]`
+//! so subsequent reads/writes flow through the heap box (Lua spec
+//! §3.4.4 reference semantics for upvalues).
+//!
+//! Direct user calls (Callee::User) prepend the cell ptr as the
+//! first argument; the cell ptr source follows ADR 0083 §3:
+//! 1. non-capturing target → `addressof @<sym>_closure` singleton
+//! 2. capturing + holding_local Some → `emit_load(slots[idx], ptr)`
+//! 3. capturing + holding_local None → entry `cell_ptr` (recursion
+//!    shortcut; the HIR post-pass guarantees self-recursion only)
+//!
+//! Indirect calls (Callee::Indirect / IndirectDispatch) reuse the
+//! same cell-ptr-first ABI; `cell.fn_ptr` is `emit_load`'d for the
+//! actual `llvm.call` target.
 //!
 //! Closure equality (`f == g`) compares cell pointers — for
 //! non-capturing closures the static `@user_fn_NN_closure`
@@ -83,8 +101,25 @@
 //! [`emit_load_closure_fn_ptr`] / [`emit_store_closure_fn_ptr`]
 //! and the new [`emit_user_fn_closure_global`], and flipped
 //! TAG_FUNCTION producer / consumer paths to closure cell ptrs.
-//! Commit 3 ships captured-local boxes plus the e2e suite that
-//! resolves LIC-2.6c-tag-hetero-closure-escape-1.
+//! Commit 3a (2026-05-08) shipped the 6 capturing helpers in this
+//! file plus `LocalInfo::is_captured`, `HirFunction::parent_scope`,
+//! and the post-pass that flips the flag. Commit 3b prep
+//! (`e8db350`) made `Callee::User` a struct variant carrying
+//! `holding_local: Option<LocalId>` and added
+//! `emit_call_user_with_cell` (`#[allow(dead_code)]` until 3b
+//! body wires the 4 direct-call sites). Commit 3b prep fix
+//! (`f2ffcb9`, post-Codex-review) declares synthetic locals for
+//! every `local function f` so the call-site resolution
+//! distinguishes self-recursion from forward / sibling refs;
+//! a post-pass rejects mutual capturing recursion that the
+//! Function-kind upvalue restriction can't otherwise block.
+//! Commit 3b body atomic (pending) wires the 4 direct-call
+//! sites, the `emit_function` ABI cutover, capturing closure
+//! creation, the LocalInit storage rule, and outer-scope
+//! `is_captured` box allocation in a single atomic landing.
+//! Commit 3c (post-3b) lifts the `HirError::ClosureEscapes`
+//! reject set and ships e2e tests for capturing closures,
+//! resolving LIC-2.6c-tag-hetero-closure-escape-1.
 
 use melior::{
     Context,
