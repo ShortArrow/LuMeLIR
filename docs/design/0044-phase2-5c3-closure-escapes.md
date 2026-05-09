@@ -1,8 +1,28 @@
 # 0044. Phase 2.5c.3: Static Rejection of Closure Escape
 
-- **Status:** Accepted
+- **Status:** **Superseded by ADR 0083 Commit 3c** (2026-05-10)
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
+
+## Supersede note
+
+ADR 0083 Commit 3c (full-closures cell-ptr-first ABI) replaced
+this static rejection with a runtime-sound implementation:
+heap-allocated closure cells + heap-allocated upvalue boxes
+survive any frame teardown, so a closure value can pass through
+`Callee::Indirect`, return values, table slots, and arguments
+without losing access to its captured bindings. The variant
+`HirError::ClosureEscapes` and the helper `closure_with_upvalues`
+have been removed; `LIC-2.6c-tag-hetero-closure-escape-1` is
+resolved.
+
+The remaining backstop is `HirError::MutualCapturingRecursion`
+(post-pass walking call sites), which catches the narrow case
+two capturing siblings calling each other from their respective
+bodies — codegen still has no path to reach a sibling's per-
+instance cell from inside the caller's body. That backstop is
+expected to retire under ADR 0087 (TaggedValue arith coerce or
+its successor on Function-kind upvalue support).
 
 ## Context
 

@@ -133,11 +133,11 @@ print(t[2])";
 }
 
 #[test]
-fn hash_value_closure_with_upvalue_still_rejects_post_2_6c_tag_fn_tbl() {
-    // ADR 0071 (Phase 2.6c-tag-fn-tbl) accepts closure-less
-    // Function and Table hash values alongside Number / Bool /
-    // String / Nil-delete. Closures with upvalues still reject
-    // (LIC-2.6c-tag-hetero-closure-escape-1).
+fn hash_value_closure_with_upvalue_now_lowers_post_3c() {
+    // Phase 2.5c-full Commit 3c (ADR 0083 supersedes 0044/0071):
+    // closure-with-upvalues lowers in hash-value position now
+    // that the cell-ptr-first ABI keeps captured-binding reads
+    // sound across table escapes.
     let chunk = lumelir::parser::parse(
         "local x = 1
 local f = function() return x end
@@ -145,7 +145,7 @@ local t = {}
 t.k = f",
     )
     .unwrap();
-    assert!(lumelir::hir::lower(&chunk).is_err());
+    assert!(lumelir::hir::lower(&chunk).is_ok());
 }
 
 #[test]

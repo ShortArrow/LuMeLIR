@@ -139,35 +139,34 @@ print(\"after\")";
 }
 
 #[test]
-fn generic_for_closure_with_upvalues_rejected() {
-    // ADR 0083 deferred — a closure that captures upvalues cannot
-    // currently flow through the iter slot because its env isn't
-    // threaded into the dispatched call. Phase 1 of ADR 0085
-    // filters these out at HIR.
+fn generic_for_capturing_iter_via_inline_anonymous_now_runs() {
+    // ADR 0083 Commit 3c: a capturing iter assigned to a
+    // Function-kind local with a known func_id (anonymous
+    // FunctionExpr literal) flows through the generic-for
+    // dispatch with the cell-ptr-first ABI. The captured `n`
+    // and `i` are reachable on each step.
     //
-    // The `make_iter` factory captures `n` (upvalue) and returns
-    // a closure capturing `i` (upvalue). The closure escape via
-    // `return` is itself rejected by ADR 0044/0071's existing
-    // backstop; the test pins that the rejection still fires
-    // before reaching any generic-for codegen surface.
+    // The factory-return form (`local iter = make_factory(3)`)
+    // remains rejected for an unrelated reason: ret_kinds for
+    // a Function-kind local without func_id defaults to single
+    // Number, so the iter type-check fails before reaching the
+    // closure layer. That gap is out of scope for 3c.
     let chunk = lumelir::parser::parse(
-        "local function make_iter(n)
-  local i = 0
-  return function(s, c)
-    i = i + 1
-    if i <= n then return i, i * 10 end
-    return nil, nil
-  end
+        "local n = 3
+local i = 0
+local iter = function(s, c)
+  i = i + 1
+  if i <= n then return i, i * 10 end
+  return nil, nil
 end
-local iter = make_iter(3)
 for k, v in iter, 0, 0 do
   print(k, v)
 end",
     )
     .unwrap();
     assert!(
-        lumelir::hir::lower(&chunk).is_err(),
-        "closure-as-iter must be HIR-rejected until ADR 0083 lands the env-threading ABI"
+        lumelir::hir::lower(&chunk).is_ok(),
+        "inline anonymous capturing iter must lower post-3c"
     );
 }
 

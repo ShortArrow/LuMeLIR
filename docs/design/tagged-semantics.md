@@ -91,7 +91,7 @@ a tagged slot, or whose result **carries** a tagged value.
 | Hard-tombstone delete (`t.k = nil`)         | `hash_buf` entry: key tag → `TAG_DELETED`, value tag → Nil (ADR 0079 retired the prior `HASH_DELETED_KEY=1` ptr sentinel) | ADR 0062, 0079 |
 | Function-return widening (`Callee::User`)   | `_ret_value_N` slot widens to TaggedValue when same return position sees mixed kinds; ABI returns 2 MLIR results `(i64 tag, i64 payload_raw)` per TaggedValue position | ADR 0074 |
 | **(future)** iterator (`pairs` / `ipairs`)  | Pending — depends on widening                        | —          |
-| **(future)** closure with upvalues          | HIR-rejects today — LIC-2.6c-tag-hetero-closure-escape-1 | —      |
+| Closure with upvalues                       | Stored as cell ptr in tagged slot (`TAG_FUNCTION` payload). Heap-allocated cell + heap-allocated upvalue boxes survive any escape. Dispatch chain compares `cell.fn_ptr == @user_fn_X` and threads the cell ptr into the call's first arg | ADR 0083 Commit 3c |
 
 `HirExprKind::IndexTagged` is **statement-context only**:
 calling `emit_expr` on it is `unreachable!()`. It exists purely
@@ -262,11 +262,10 @@ the introduction, when still open).
 
 | ID                                          | Behaviour                                                             | Notes                          |
 |---------------------------------------------|-----------------------------------------------------------------------|--------------------------------|
-| LIC-2.6c-tag-hetero-closure-escape-1        | Closure with upvalues stored in tables                                | HIR-rejects today (ADR 0044 + ADR 0071); needs escape-analysis relaxation. ADR 0085 also rejects closure-as-iter via the same backstop until ADR 0083 (Full closures) lands |
 | LIC-2.7p-arith-coerce-tagged-1              | TaggedValue operand arith coerce (`local x = t[1]; print(x + 1)` when x is runtime String) | HIR can't statically resolve the kind; current TaggedValue-arith path traps on non-Number tag (ADR 0063). Unlocking needs runtime tag dispatch in arith codegen |
 | LIC-2.6b-hash-key-nil-runtime-1             | Dynamic `nil` hash key via TaggedValue local — runtime probe currently fires the generic missing-key trap; Lua spec wants a specific "table index is nil" diagnostic. ADR 0084 surfaces this for IndexAssign / Index via `s_table_index_nil`; remaining gap is the trap surface for hash-keyed reads through other producers | 0079 / 0084 (partial) |
 
-**Total:** 27 LIC entries — 26 resolved, 0 partial, 2 pending core + 1 pending runtime-diag.
+**Total:** 27 LIC entries — 27 resolved, 0 partial, 1 pending core + 1 pending runtime-diag (LIC-2.6c-tag-hetero-closure-escape-1 resolved by ADR 0083 Commit 3c, 2026-05-10).
 
 ---
 
@@ -538,14 +537,12 @@ resolves to:
 | `FunctionRef(fid)`                                | `User(fid)`                         |
 | `Local(idx)` / `Function(arity=2)` with FuncId    | `User(fid)`                         |
 | `Local(idx)` / `Function(arity=2)` parameter      | rejected (single-Number ret ABI)    |
-| `Local(idx)` / `TaggedValue`                      | `IndirectDispatch { sig, candidates }` filtered by `f.upvalues.is_empty()` |
+| `Local(idx)` / `TaggedValue`                      | `IndirectDispatch { sig, candidates }` (post-ADR 0083 Commit 3c: candidate set includes capturing closures because the dispatch chain threads each candidate's cell ptr through the cell-ptr-first ABI) |
 
-The filter `f.upvalues.is_empty()` keeps closure-as-iter behind
-the existing closure-escape backstop until ADR 0083's env-threading
-ABI lands; lifting it then is a one-line change. The iter must
-return `(TaggedValue|Nil, _)` so the loop can receive `nil` as the
-termination sentinel — Number-only or Bool-only first ret_kind is
-rejected at HIR (would loop forever).
+ADR 0083 Commit 3c (2026-05-10) removed the `f.upvalues.is_empty()`
+filter. The iter must return `(TaggedValue|Nil, _)` so the loop
+can receive `nil` as the termination sentinel — Number-only or
+Bool-only first ret_kind is rejected at HIR (would loop forever).
 
 ### Hash key NaN trap (ADR 0086)
 
@@ -603,14 +600,35 @@ Listed in Codex review priority order (post-ADR-0082):
      Singleton property (1 fn = 1 global) preserves Lua spec
      §3.4.4 closure equality without extra work. 3 new
      IR-shape tests, 973/0.
-   - **Commit 3** (pending): captured-local boxes, ADR 0044
-     reject relaxation, closure-with-upvalues e2e — resolves
-     LIC-2.6c-tag-hetero-closure-escape-1.
-2. **Closure-with-upvalues in tables**
-   (LIC-2.6c-tag-hetero-closure-escape-1). HIR rejects today
-   via the existing escape analysis (ADR 0044 + ADR 0071).
-   Best tackled after #1 because it's a special case of the
-   same underlying GC/escape design.
+   - **Commit 3a** (`20e563e`): `closure.rs` 6 capturing
+     helpers (`emit_allocate_closure_cell`,
+     `emit_allocate_upvalue_box`, `emit_load/store_closure_upvalue_box`,
+     `emit_load/store_upvalue_box_value`); `LocalInfo::is_captured`
+     + post-pass; `HirFunction::parent_scope`. 978/0.
+   - **Commit 3b prep / prep fix** (`e8db350` / `f2ffcb9`):
+     `Callee::User` struct variant `{ fid, holding_local }`,
+     `emit_call_user_with_cell` helper, synthetic
+     FunctionDef-locals, post-pass `MutualCapturingRecursion`
+     reject. 980/0.
+   - **Commit 3b body atomic** (`18bee17`): cell-ptr-first
+     ABI on every user `llvm.func`; 4 direct-call sites
+     unified through `emit_call_user_with_cell`; FunctionRef
+     allocates capturing cells; LocalInit storage rule for
+     capturing targets; outer-scope `is_captured` heap boxes
+     pre-allocated at function entry. 984/0.
+   - **Commit 3c**: removed all 5 `HirError::ClosureEscapes`
+     reject sites + `closure_with_upvalues` helper +
+     `f.upvalues.is_empty()` generic-for filter; threaded
+     loaded cell ptr (not `cell.fn_ptr`) as
+     `in_function_cell_ptr` through `Callee::Indirect` and
+     dispatch chain so capturing closures reach their boxes
+     when reached via tagged-slot escape paths; 7 e2e tests
+     pin box_sharing / make_adder / closure_return /
+     table_capture / closure_identity / generic_for_capturing /
+     IR-shape; 7 negative escape tests across 6 files
+     inverted to positive lowering pins. 990/0. Resolves
+     LIC-2.6c-tag-hetero-closure-escape-1; ADR 0044 fully
+     superseded.
 3. **TaggedValue arith coerce** (LIC-2.7p-arith-coerce-tagged-1).
    ADR 0077's String → Number arith coerce only fires when the
    String operand is statically typed; a TaggedValue local that

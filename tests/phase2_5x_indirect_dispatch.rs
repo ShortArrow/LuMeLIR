@@ -33,23 +33,20 @@ print(x, y)";
 }
 
 #[test]
-fn closure_with_upvalues_via_indirect_still_rejected() {
-    // ADR 0044 / 0071's closure-escape rejection must remain in
-    // force after ADR 0082 reopens the dispatch path. The reject
-    // happens at the table-constructor site (storing a closure
-    // value in a table escapes the upvalue).
-    let chunk = lumelir::parser::parse(
-        "local outer = 5
+fn closure_with_upvalues_via_indirect_table_now_runs() {
+    // ADR 0083 Commit 3c (supersedes 0044/0071's closure-escape
+    // reject for table values): a capturing closure can now flow
+    // into a table-element slot, then back out via `t[i]` /
+    // `local g = t[1]`, and the dispatch chain through the
+    // tagged-slot loaded ptr still finds the closure's user fn
+    // — but goes through the cell-ptr-first ABI path so the
+    // captured `outer` upvalue is reached via the cell.
+    let src = "local outer = 5
 local function clo(x) return x + outer end
 local t = {clo}
 local g = t[1]
-print(g(10))",
-    )
-    .unwrap();
-    assert!(
-        lumelir::hir::lower(&chunk).is_err(),
-        "closure-with-upvalues escape via tagged-slot indirect call must remain HIR-rejected"
-    );
+print(g(10))";
+    assert_eq!(run(src, "lumelir_dispatch_clo_in_tbl").trim(), "15");
 }
 
 #[test]

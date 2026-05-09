@@ -11,25 +11,25 @@
 //! consumers don't yet handle.
 
 #[test]
-fn closure_with_upvalue_in_array_rejected_at_hir() {
-    // ADR 0071's `function_ref_id` + upvalues check rejects
-    // closures-with-upvalues at HIR-time so the underlying
-    // function pointer never enters a tagged slot. This is
-    // the gate that keeps the closure-escape risk out of the
-    // runtime tag dispatch path.
+fn closure_with_upvalue_in_array_now_lowers_post_3c() {
+    // Phase 2.5c-full Commit 3c (ADR 0083 supersedes 0044/0071):
+    // closure-with-upvalues stores into the tagged slot via the
+    // cell-ptr-first ABI. The runtime tag check + dispatch chain
+    // (offset 0 / 8 → cell.fn_ptr) still gate non-Function
+    // payloads via the s_call_non_function trap.
     let chunk =
         lumelir::parser::parse("local x = 1\nlocal f = function() return x end\nlocal t = {f}")
             .unwrap();
-    assert!(lumelir::hir::lower(&chunk).is_err());
+    assert!(lumelir::hir::lower(&chunk).is_ok());
 }
 
 #[test]
-fn closure_with_upvalue_in_hash_rejected_at_hir() {
+fn closure_with_upvalue_in_hash_now_lowers_post_3c() {
     let chunk = lumelir::parser::parse(
         "local x = 1\nlocal f = function() return x end\nlocal t = {}\nt.k = f",
     )
     .unwrap();
-    assert!(lumelir::hir::lower(&chunk).is_err());
+    assert!(lumelir::hir::lower(&chunk).is_ok());
 }
 
 #[test]

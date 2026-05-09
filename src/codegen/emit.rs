@@ -3740,6 +3740,7 @@ fn emit_indirect_dispatch_chain_in_block<'a, 'c>(
         context,
         block,
         loaded_ptr,
+        cell_ptr,
         candidates,
         &arg_vals,
         functions,
@@ -3761,6 +3762,7 @@ fn emit_dispatch_chain_recursive<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     loaded_ptr: Value<'c, 'a>,
+    cell_ptr: Value<'c, 'a>,
     candidates: &[FuncId],
     arg_vals: &[Value<'c, 'a>],
     functions: &[HirFunction],
@@ -3835,12 +3837,16 @@ fn emit_dispatch_chain_recursive<'a, 'c>(
         let then_region = Region::new();
         let then_blk = Block::new(&[]);
         {
-            // Re-borrow loaded_ptr / arg_vals at the inner block's
-            // lifetime — the dispatch chain manually transmutes
-            // them into the surrounding scf.if regions and we
-            // mirror that for the new cell_ptr arg.
-            let inner_loaded_ptr =
-                unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(loaded_ptr) };
+            // Re-borrow loaded_ptr / cell_ptr / arg_vals at the
+            // inner block's lifetime. Phase 2.5c-full Commit 3c
+            // (ADR 0083): the call needs the *cell* ptr (heap-
+            // allocated for capturing fns, singleton for non-
+            // capturing) as `in_function_cell_ptr`, not the
+            // raw `cell.fn_ptr` we used pre-3c — that crashed
+            // when the entry block tried to unpack upvalues
+            // off the wrong base.
+            let inner_cell_ptr =
+                unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(cell_ptr) };
             let inner_arg_vals =
                 unsafe { std::mem::transmute::<&[Value<'c, 'a>], &[Value<'c, '_>]>(arg_vals) };
             let yields = emit_call_user_with_cell(
@@ -3852,7 +3858,7 @@ fn emit_dispatch_chain_recursive<'a, 'c>(
                 result_types,
                 &[],
                 types,
-                Some(inner_loaded_ptr),
+                Some(inner_cell_ptr),
                 loc,
             );
             then_blk.append_operation(scf::r#yield(&yields, loc));
@@ -3867,6 +3873,7 @@ fn emit_dispatch_chain_recursive<'a, 'c>(
                 context,
                 &else_blk,
                 unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(loaded_ptr) },
+                unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(cell_ptr) },
                 rest,
                 unsafe { std::mem::transmute::<&[Value<'c, 'a>], &[Value<'c, '_>]>(arg_vals) },
                 functions,
@@ -7662,7 +7669,14 @@ fn emit_expr<'a, 'c>(
                 };
                 let callee_ptr =
                     super::closure::emit_load_closure_fn_ptr(context, block, cell_ptr, types, loc);
-                let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
+                // Phase 2.5c-full Commit 3c (ADR 0083): the cell-ptr
+                // first arg ABI applies to indirect callees too. The
+                // callee may be a non-capturing user fn (singleton
+                // cell) or a capturing one (heap cell); both expect
+                // the cell ptr in arg 0 so the entry block can
+                // unpack upvalues uniformly.
+                let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len() + 1);
+                arg_vals.push(cell_ptr);
                 for a in args {
                     arg_vals.push(emit_expr(
                         context,

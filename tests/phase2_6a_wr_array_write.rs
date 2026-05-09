@@ -100,12 +100,11 @@ print(a[1])";
 }
 
 #[test]
-fn write_closure_with_upvalue_still_rejects_post_2_6c_tag_fn_tbl() {
-    // ADR 0071 (Phase 2.6c-tag-fn-tbl) accepts Number / Bool /
-    // String / Function (closure-less) / Table values for
-    // `t[i] = v`. Closures with upvalues still reject
-    // (LIC-2.6c-tag-hetero-closure-escape-1) via the existing
-    // ClosureEscapes analysis (ADR 0044, extended in ADR 0071).
+fn write_closure_with_upvalue_now_lowers_post_3c() {
+    // Phase 2.5c-full Commit 3c (ADR 0083 supersedes 0044/0071):
+    // closure-with-upvalues stores into `t[i]` cleanly because
+    // the heap cell + heap upvalue boxes survive any aliasing
+    // path the table introduces.
     let chunk = lumelir::parser::parse(
         "local x = 1
 local f = function() return x end
@@ -113,7 +112,7 @@ local t = {1, 2, 3}
 t[1] = f",
     )
     .unwrap();
-    assert!(lumelir::hir::lower(&chunk).is_err());
+    assert!(lumelir::hir::lower(&chunk).is_ok());
 }
 
 #[test]

@@ -40,14 +40,11 @@ pub enum HirError {
     #[error("function value '{name}' can only be called, not used as a value")]
     FunctionUsedAsValue { name: String, offset: usize },
 
-    /// A closure value carrying upvalues was used in a position that
-    /// would route it through `Callee::Indirect` (call argument or
-    /// return value). Indirect dispatch cannot thread upvalues, so
-    /// the closure must be reached via a direct call (Phase 2.5c.3,
-    /// ADR 0044).
-    #[error("closure with upvalues cannot escape via {position} — direct call only")]
-    ClosureEscapes { position: String, offset: usize },
-
+    // Phase 2.5c-full Commit 3c (ADR 0083 supersedes 0044): the
+    // `ClosureEscapes` variant is retired. Closure-with-upvalues
+    // values are now sound in any position because the cell-ptr-
+    // first ABI (heap cell + heap upvalue boxes) keeps captured-
+    // binding reads alive across frame teardown.
     /// Phase 2.6c-tag-callee-arity (ADR 0075): an indirect call
     /// through a TaggedValue local cannot prove the callee's
     /// arity at HIR time — the slot's payload is a bare function
@@ -143,7 +140,6 @@ impl HirError {
             | HirError::ReturnOutsideFunction { offset }
             | HirError::UnknownFunction { offset, .. }
             | HirError::FunctionUsedAsValue { offset, .. }
-            | HirError::ClosureEscapes { offset, .. }
             | HirError::IndirectCallThroughTaggedLocal { offset, .. }
             | HirError::IndirectCallNoCandidates { offset, .. }
             | HirError::IndirectCallNonNumberReturn { offset, .. }

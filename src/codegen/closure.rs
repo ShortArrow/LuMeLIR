@@ -128,10 +128,23 @@
 //! LocalInit storage rule unconditionally stores the cell ptr
 //! when the target captures, and outer-scope `is_captured`
 //! locals (params + body locals) get heap upvalue boxes
-//! allocated at function entry. Commit 3c (post-3b) lifts the
-//! `HirError::ClosureEscapes` reject set and ships e2e tests for
-//! capturing closures, resolving
-//! LIC-2.6c-tag-hetero-closure-escape-1.
+//! allocated at function entry. Commit 3c (post-3b, 2026-05-10)
+//! lifts the `HirError::ClosureEscapes` reject set, removes the
+//! `f.upvalues.is_empty()` generic-for filter, and threads the
+//! loaded cell ptr (not `cell.fn_ptr`) through `Callee::Indirect`
+//! and the dispatch chain so capturing closures reach their
+//! upvalue boxes when reached via tagged-slot escape paths
+//! (table values, return values, args).
+//!
+//! **Leak surface (deliberate, ADR 0083 scope):** every closure
+//! creation `malloc`s a fresh cell (16 + 8N bytes) per evaluation
+//! of a capturing FunctionRef and an `8N`-byte boxes-array for
+//! its upvalues — none are freed in this phase. Now that escape
+//! is allowed in any direction (table store, return, indirect
+//! arg), short-running programs may accumulate cells without
+//! bound. A garbage collector or arena strategy is out of scope
+//! for ADR 0083 and tracked under future `Phase 3 — Domain
+//! Features` GC work.
 
 use melior::{
     Context,

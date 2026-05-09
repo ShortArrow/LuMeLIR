@@ -1385,27 +1385,6 @@ impl LowerCtx {
         Ok(Some(inner_local_id))
     }
 
-    /// Phase 2.5c.3 (ADR 0044): does this lowered HIR expression
-    /// evaluate to a closure carrying upvalues? Returns the closure's
-    /// `FuncId` on hit so callers can incorporate it into diagnostics
-    /// or future analysis. A "closure with upvalues" is a Function
-    /// value whose target FuncId records a non-empty `upvalues` list;
-    /// such values can only be reached via direct calls
-    /// (`Callee::User`) since the call-site arg-extension that
-    /// threads upvalues lives only on that path.
-    fn closure_with_upvalues(&self, expr: &HirExpr) -> Option<FuncId> {
-        let fid = match &expr.kind {
-            HirExprKind::FunctionRef(fid) => *fid,
-            HirExprKind::Local(LocalId(idx)) => self.locals[*idx].func_id?,
-            _ => return None,
-        };
-        if self.functions[fid.0].upvalues.is_empty() {
-            None
-        } else {
-            Some(fid)
-        }
-    }
-
     /// Lower a function body. Allocates the synthetic `_returned` and
     /// `_ret_value_N` slots, sets `in_function`, and applies the same
     /// body-guard wrap pattern used by `break` (ADR 0015) so that
@@ -2378,10 +2357,12 @@ impl LowerCtx {
                             }
                         }
                         ValueKind::TaggedValue => {
-                            // Filter compatible candidates AND drop
-                            // any with non-empty upvalues (closure-
-                            // as-iter is deferred until ADR 0083
-                            // lands the env-threading ABI).
+                            // Phase 2.5c-full Commit 3c (ADR 0083):
+                            // closure-as-iter is supported now. The
+                            // dispatch chain threads each candidate's
+                            // cell ptr via the cell-ptr-first ABI,
+                            // so capturing iters reach their captured
+                            // bindings through the entry-block unpack.
                             let sig = IndirectSig {
                                 param_kinds: vec![state_kind, ctl_kind],
                                 ret_kinds: vec![ValueKind::TaggedValue, ValueKind::TaggedValue],
@@ -2393,10 +2374,7 @@ impl LowerCtx {
                                 .filter_map(|(i, f)| {
                                     let pk: Vec<ValueKind> =
                                         f.params.iter().map(|p| p.kind).collect();
-                                    if pk == sig.param_kinds
-                                        && f.ret_kinds == sig.ret_kinds
-                                        && f.upvalues.is_empty()
-                                    {
+                                    if pk == sig.param_kinds && f.ret_kinds == sig.ret_kinds {
                                         Some(FuncId(i))
                                     } else {
                                         None
@@ -2600,27 +2578,20 @@ impl LowerCtx {
                         offset: value.span.start,
                     });
                 }
-                // Phase 2.6c-tag-fn-tbl (ADR 0071): closure with
-                // upvalues escapes through the table — reject
-                // the same way ADR 0044 already rejects argument
-                // / return escape. Plain `function() ... end`
-                // (no upvalues) and top-level `local function f`
-                // references pass through.
+                // Phase 2.5c-full Commit 3c (ADR 0083 supersede 0044):
+                // closure-with-upvalues no longer escape-rejects on
+                // table store. Heap cell + heap upvalue boxes (3b
+                // body Steps 6-7) keep reads sound after the table
+                // outlives the closure's creation scope.
                 //
-                // Phase 2.6c-tag-locals-fn (ADR 0074): also
-                // reject functions whose ret_kinds widen to
-                // TaggedValue — the tagged-slot Function payload
-                // is a bare ptr with no signature info, and the
-                // call-site arity reconstruction (ADR 0072)
-                // cannot rebuild the `(...)→(i64,i64)` shape.
+                // Phase 2.6c-tag-locals-fn (ADR 0074): functions
+                // whose ret_kinds widen to TaggedValue are still
+                // rejected — the tagged-slot Function payload is
+                // a bare ptr with no signature info, and the
+                // call-site arity reconstruction (ADR 0072) cannot
+                // rebuild the `(...)→(i64,i64)` shape.
                 // LIC-2.6c-tag-locals-fn-indirect-1.
                 if let Some(fid) = function_ref_id(&value_hir, &self.locals) {
-                    if !self.functions[fid.0].upvalues.is_empty() {
-                        return Err(HirError::ClosureEscapes {
-                            position: "table value".to_owned(),
-                            offset: value.span.start,
-                        });
-                    }
                     if self.functions[fid.0]
                         .ret_kinds
                         .iter()
@@ -2954,17 +2925,13 @@ impl LowerCtx {
             .as_ref()
             .map(|(r, ids)| (*r, ids.clone()))
             .ok_or(HirError::ReturnOutsideFunction { offset: span.start })?;
-        // Phase 2.5c.3 (ADR 0044): a closure carrying upvalues
-        // returned from its creation scope would outlive the slots
-        // it observes. Reject statically.
-        for value in &lowered {
-            if self.closure_with_upvalues(value).is_some() {
-                return Err(HirError::ClosureEscapes {
-                    position: "return value".to_owned(),
-                    offset: value.span.start,
-                });
-            }
-        }
+        // Phase 2.5c-full Commit 3c (ADR 0083 supersede 0044):
+        // ADR 0044's `ClosureEscapes` reject for return values is
+        // gone. Heap-allocated upvalue boxes (3b body Step 6) and
+        // a heap-allocated closure cell (3b body Step 7) survive
+        // the frame teardown, so a returned closure's reads stay
+        // sound. The caller receives the cell ptr through the
+        // standard `Function(_)`-kind multi-return slot.
         let kinds: Vec<ValueKind> = lowered
             .iter()
             .map(|e| infer_kind(e, &self.locals, &self.functions))
@@ -3459,18 +3426,13 @@ impl LowerCtx {
                             offset: elem.span.start,
                         });
                     }
-                    // Phase 2.6c-tag-fn-tbl (ADR 0071): closure
-                    // with upvalues escapes through the table.
-                    // Phase 2.6c-tag-locals-fn (ADR 0074): same
-                    // rejection for tagged-return functions
-                    // (LIC-2.6c-tag-locals-fn-indirect-1).
+                    // Phase 2.5c-full Commit 3c (ADR 0083 supersede 0044):
+                    // closure-with-upvalues no longer escape-rejects
+                    // on table-element insertion. ADR 0074's tagged-
+                    // return rejection stays — its rationale (signature
+                    // erasure on TaggedValue Function payload) is
+                    // independent of the escape concern.
                     if let Some(fid) = function_ref_id(elem, &self.locals) {
-                        if !self.functions[fid.0].upvalues.is_empty() {
-                            return Err(HirError::ClosureEscapes {
-                                position: "table element".to_owned(),
-                                offset: elem.span.start,
-                            });
-                        }
                         if self.functions[fid.0]
                             .ret_kinds
                             .iter()
@@ -3664,14 +3626,12 @@ impl LowerCtx {
                 // matches the function_names path's check exactly
                 // and now correctly accepts Bool/Nil/String/Table
                 // args when the target's params expect those kinds.)
-                for arg in &lowered_args {
-                    if self.closure_with_upvalues(arg).is_some() {
-                        return Err(HirError::ClosureEscapes {
-                            position: "call argument".to_owned(),
-                            offset: arg.span.start,
-                        });
-                    }
-                }
+                //
+                // Phase 2.5c-full Commit 3c (ADR 0083 supersede 0044):
+                // closure-with-upvalues args no longer escape-reject.
+                // The cell-ptr-first ABI (3b body) means a Function
+                // arg is a heap cell ptr that survives any frame
+                // teardown the callee performs.
                 // Phase 2.5c-full Commit 3b (ADR 0083): the local
                 // resolved here IS the holding binding for the
                 // closure cell. Codegen will load the cell ptr
@@ -3843,15 +3803,10 @@ impl LowerCtx {
                         offset: arg.span.start,
                     });
                 }
-                // Phase 2.5c.3 (ADR 0044): same escape check as the
-                // local-Function-kind path — a closure carrying
-                // upvalues cannot survive routing through Indirect.
-                if self.closure_with_upvalues(arg).is_some() {
-                    return Err(HirError::ClosureEscapes {
-                        position: "call argument".to_owned(),
-                        offset: arg.span.start,
-                    });
-                }
+                // Phase 2.5c-full Commit 3c (ADR 0083 supersede 0044):
+                // closure-with-upvalues args no longer escape-reject
+                // on the function_names path either — see local-resolve
+                // path above for the reasoning.
             }
             // Phase 2.5c-min (ADR 0037): if the callee captured
             // upvalues, append them as extra arguments. The

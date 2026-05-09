@@ -161,16 +161,18 @@ if a == b then print(\"same\") else print(\"diff\") end";
 }
 
 // ============================================================
-// Closure-with-upvalues escape rejection (LIC-2.6c-tag-hetero-
-// closure-escape-1, separate phase to relax)
+// Closure-with-upvalues escape — LIC-2.6c-tag-hetero-closure-
+// escape-1 retired by ADR 0083 Commit 3c. The cell-ptr-first
+// ABI (heap cell + heap upvalue boxes) makes table escapes
+// sound, so the historical reject becomes a positive lower.
 // ============================================================
 
 #[test]
-fn closure_with_upvalue_in_table_rejected_at_hir() {
+fn closure_with_upvalue_in_table_now_lowers_post_3c() {
     let chunk =
         lumelir::parser::parse("local x = 1\nlocal f = function() return x end\nlocal t = {f}")
             .unwrap();
-    assert!(lumelir::hir::lower(&chunk).is_err());
+    assert!(lumelir::hir::lower(&chunk).is_ok());
 }
 
 // ============================================================

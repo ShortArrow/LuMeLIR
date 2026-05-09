@@ -1,10 +1,19 @@
-//! Integration test: Phase 2.5c.3 — static rejection of closure
-//! escape (ADR 0044). A Function value carrying upvalues can only
-//! reach a *direct* call site (`Callee::User`); passing it as an
-//! argument or returning it would route through `Callee::Indirect`
-//! which has no path for upvalue threading. We catch this in HIR
-//! rather than letting MLIR verification produce a cryptic
-//! signature-mismatch error.
+//! Phase 2.5c-full Commit 3c (ADR 0083 supersedes 0044) —
+//! the legacy `HirError::ClosureEscapes` reject is gone now
+//! that the cell-ptr-first ABI (3b body) makes capturing
+//! closures heap-rooted (heap cell + heap upvalue boxes).
+//!
+//! What this file pins now:
+//! - Positive: the patterns that ADR 0044 historically
+//!   rejected (closure as arg / via alias / inline anonymous
+//!   arg) all run end-to-end.
+//! - Regressions: closure-less Function-kind args / returns
+//!   still work (those never went through the closure path).
+//!
+//! The `phase2_5c3_capturing_e2e.rs` file owns the broader
+//! Commit 3c TDD suite (box_sharing / make_adder / ...). This
+//! file remains as a focused regression around the original
+//! ADR 0044 surface.
 
 use std::process::Command;
 
@@ -23,48 +32,33 @@ fn run(src: &str, output_name: &str) -> String {
 }
 
 #[test]
-fn passing_closure_with_upvalue_as_arg_is_static_error() {
-    let chunk = lumelir::parser::parse(
-        "local m = 10
+fn passing_closure_with_upvalue_as_arg_now_runs() {
+    // ADR 0044 historically rejected this; ADR 0083 Commit 3c
+    // accepts it because the cell-ptr-first ABI threads the
+    // heap cell through the call.
+    let src = "local m = 10
 local f = function(x) return x + m end
 local function apply(g, x) return g(x) end
-print(apply(f, 5))",
-    )
-    .unwrap();
-    assert!(lumelir::hir::lower(&chunk).is_err());
+print(apply(f, 5))";
+    assert_eq!(run(src, "lumelir_25c3_arg_pass").trim(), "15");
 }
 
 #[test]
-fn returning_closure_with_upvalue_is_static_error() {
-    // The closure value would need to outlive its creation scope —
-    // disallowed because the inner reads from the outer slot at
-    // every call.
-    let chunk = lumelir::parser::parse(
-        "local function make()
-  local m = 10
-  local f = function(x) return x + m end
-  return f
-end
-print(make()(5))",
-    )
-    .unwrap();
-    assert!(lumelir::hir::lower(&chunk).is_err());
-}
-
-#[test]
-fn aliasing_closure_then_passing_as_arg_is_static_error() {
-    // Even via an alias, the outer slot is still the upvalue
-    // source, and the alias inherits the func_id, so the check
-    // fires at the call site.
-    let chunk = lumelir::parser::parse(
-        "local m = 10
+fn aliasing_closure_then_passing_as_arg_now_runs() {
+    let src = "local m = 10
 local f = function(x) return x + m end
 local g = f
 local function apply(h, x) return h(x) end
-print(apply(g, 5))",
-    )
-    .unwrap();
-    assert!(lumelir::hir::lower(&chunk).is_err());
+print(apply(g, 5))";
+    assert_eq!(run(src, "lumelir_25c3_alias_arg").trim(), "15");
+}
+
+#[test]
+fn anonymous_closure_with_upvalue_inline_passed_now_runs() {
+    let src = "local m = 10
+local function apply(g, x) return g(x) end
+print(apply(function(x) return x + m end, 5))";
+    assert_eq!(run(src, "lumelir_25c3_inline_arg").trim(), "15");
 }
 
 #[test]
@@ -89,8 +83,6 @@ print(g(5))";
 
 #[test]
 fn passing_function_without_upvalues_as_arg_still_works() {
-    // Regression: 2.5b.2 first-class function args path unaffected
-    // when the function has no upvalues.
     let src = "local f = function(x) return x * 2 end
 local function apply(g, x) return g(x) end
 print(apply(f, 5))";
@@ -99,28 +91,9 @@ print(apply(f, 5))";
 
 #[test]
 fn returning_function_without_upvalues_still_works() {
-    // Regression: 2.5b.3 function return path unaffected when no
-    // upvalues are involved. Uses the `local function` form so
-    // the callee is reached via function_names rather than via
-    // the outer-scope capture path (which would itself reject
-    // Function-kind captures per ADR 0043).
     let src = "local function d(x) return x * 2 end
 local function get() return d end
 local f = get()
 print(f(5))";
     assert_eq!(run(src, "lumelir_25c3_no_upv_ret").trim(), "10");
-}
-
-#[test]
-fn anonymous_closure_with_upvalue_inline_passed_is_static_error() {
-    // Inline anonymous closure literal that captures — same
-    // rejection applies because the lowered FunctionRef points to
-    // a function with upvalues.
-    let chunk = lumelir::parser::parse(
-        "local m = 10
-local function apply(g, x) return g(x) end
-print(apply(function(x) return x + m end, 5))",
-    )
-    .unwrap();
-    assert!(lumelir::hir::lower(&chunk).is_err());
 }

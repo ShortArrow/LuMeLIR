@@ -130,16 +130,16 @@ print(x + 1)";
 }
 
 #[test]
-fn closure_with_upvalue_element_is_static_error_post_2_6c_tag_fn_tbl() {
-    // ADR 0071 (Phase 2.6c-tag-fn-tbl) opened closure-less
-    // Function values as valid table elements. Closures with
-    // upvalues still reject (LIC-2.6c-tag-hetero-closure-
-    // escape-1) — the escape-analysis relaxation is a follow-
-    // up sub-phase. This test pins the boundary.
+fn closure_with_upvalue_element_now_lowers_post_3c() {
+    // Phase 2.5c-full Commit 3c (ADR 0083 supersedes 0044/0071):
+    // closure-with-upvalues no longer rejects in table-element
+    // position. The cell-ptr-first ABI threads the heap cell
+    // through dispatch, so reads off the captured `x` survive.
+    // (LIC-2.6c-tag-hetero-closure-escape-1 retired.)
     let chunk =
         lumelir::parser::parse("local x = 1\nlocal f = function() return x end\nlocal t = {f}")
             .unwrap();
-    assert!(lumelir::hir::lower(&chunk).is_err());
+    assert!(lumelir::hir::lower(&chunk).is_ok());
 }
 
 #[test]
