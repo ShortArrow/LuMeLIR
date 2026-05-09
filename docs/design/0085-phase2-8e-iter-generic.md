@@ -165,7 +165,7 @@ explicit `return nil, nil`.
 - **Source LOC**: AST `+10`, parser `+30`, HIR `+200` (4 visitor
   companions + the desugar), tests `+200`.
 
-## Refactor path (ADR 0083 follow-up, ADR 0088 candidate)
+## Refactor path (ADR 0083 follow-up, future-ADR candidate — Function-kind upvalue support)
 
 When ADR 0083 ships full closures (heap-allocated closure object +
 shared upvalue boxes), the closure-as-iter filter in
@@ -197,7 +197,7 @@ change to ADR 0085's shape is needed.
       dispatch table.
 - [x] §7 open questions — `iter-generic-1` removed; ADR 0083 (Full
       closures, deferred) remains #1; closure-as-iter / closure-with-
-      upvalues lift will be ADR 0088 follow-up.
+      upvalues lift will be a future-ADR follow-up (Function-kind upvalue support).
 - [x] §8 ADR index — ADR 0085 row added; "Last updated" stamp
       bumped.
 

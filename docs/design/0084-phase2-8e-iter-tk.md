@@ -1,8 +1,19 @@
 # 0084. Phase 2.8e-iter-tk: TaggedValue-Key IndexAssign + Index Read
 
-- **Status:** Accepted
+- **Status:** Accepted (read-side arms partially superseded by ADR 0087 / 0088)
 - **Date:** 2026-05-06
 - **Deciders:** ShortArrow
+
+> **ADR 0087 / 0088 supersede note (2026-05-10):** the inline
+> nil/missing-key traps that this ADR introduced in the Index
+> TaggedValue arm have been restructured. ADR 0087 (`cc231a2`)
+> moved the nil/NaN tag-validity gate to the probe chokepoint.
+> ADR 0088 reified missing-key reads as a Nil-tagged TaggedValue
+> slot (consumer chains its own contract downstream); the Index
+> arm's diagnostic on missing-key arith now surfaces as
+> `s_table_type_mismatch` ("table value type mismatch") instead
+> of `s_table_missing_key`. The IndexAssign arm and the
+> `pairs`-body idiom (`t[k] = v + 100`) are unchanged.
 
 ## Context
 

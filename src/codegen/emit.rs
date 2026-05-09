@@ -280,7 +280,12 @@ fn emit_fmt_global<'c>(
         loc,
     );
     // Phase 2.6b-hash (ADR 0058): missing-key diagnostic for
-    // `t.k` / `t["k"]` reads.
+    // `t.k` / `t["k"]` reads. ADR 0088 narrowed the user-reachable
+    // surface — Index hash arms now route through
+    // `emit_hash_lookup_into_tagged_slot` which materialises Nil on
+    // missing instead of trapping; this global is reserved for the
+    // future `HashLookupOutcome::TrapMissing` consumer (`next()`-
+    // strict-key style).
     emit_string_global(
         context,
         module,
@@ -4419,10 +4424,13 @@ fn emit_local_init_tagged<'a, 'c>(
             else_region.append_block(else_blk);
             block.append_operation(scf::r#if(oob, &[], then_region, else_region, loc));
         }
-        // Phase 2.6b-hash-keys (ADR 0079): every non-Number
-        // hash-eligible kind shares the read path. The key value
-        // is materialised into a 16-byte tagged search slot for
-        // tag-aware probe.
+        // Phase 2.6b-hash-keys (ADR 0079) / 2.6b-hash-lookup-miss
+        // (ADR 0088): every non-Number hash-eligible kind shares the
+        // read path. The key value is materialised into a 16-byte
+        // tagged search slot, then the chokepoint helper resolves
+        // `null_buf + probe + key_at_null + outcome` and writes the
+        // 16-byte result (Nil on missing, copy on found) into
+        // `dst_slot`.
         ValueKind::String | ValueKind::Bool | ValueKind::Function(_) | ValueKind::Table => {
             let key_value = emit_expr(
                 context,
@@ -4438,169 +4446,16 @@ fn emit_local_init_tagged<'a, 'c>(
             )?;
             let key_slot =
                 emit_build_search_key_slot(context, block, key_kind, key_value, types, loc);
-            let hash_buf_slot =
-                emit_byte_offset_ptr(context, block, target_ptr, TABLE_OFF_HASH_BUF, types, loc);
-            let hash_buf = emit_load(block, hash_buf_slot, types.ptr, loc);
-            let hash_buf_i: Value<'c, 'a> = block
-                .append_operation(
-                    OperationBuilder::new("llvm.ptrtoint", loc)
-                        .add_operands(&[hash_buf])
-                        .add_results(&[types.i64])
-                        .build()
-                        .expect("llvm.ptrtoint"),
-                )
-                .result(0)
-                .unwrap()
-                .into();
-            let zero_i64 = block
-                .append_operation(arith::constant(
-                    context,
-                    IntegerAttribute::new(types.i64, 0).into(),
-                    loc,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            let hash_buf_null: Value<'c, 'a> = block
-                .append_operation(arith::cmpi(
-                    context,
-                    arith::CmpiPredicate::Eq,
-                    hash_buf_i,
-                    zero_i64,
-                    loc,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            let then_region = Region::new();
-            let then_blk = Block::new(&[]);
-            emit_value_slot_store_nil(context, &then_blk, dst_slot, types, loc);
-            then_blk.append_operation(scf::r#yield(&[], loc));
-            then_region.append_block(then_blk);
-            let else_region = Region::new();
-            let else_blk = Block::new(&[]);
-            {
-                let cap_slot =
-                    emit_byte_offset_ptr(context, &else_blk, hash_buf, HASH_OFF_CAP, types, loc);
-                let cap = emit_load(&else_blk, cap_slot, types.i64, loc);
-                let bucket = emit_hash_probe_for_insert(
-                    context, &else_blk, hash_buf, cap, key_slot, types, loc,
-                );
-                let entry_size = else_blk
-                    .append_operation(arith::constant(
-                        context,
-                        IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
-                        loc,
-                    ))
-                    .result(0)
-                    .unwrap()
-                    .into();
-                let bucket_off: Value<'c, '_> = else_blk
-                    .append_operation(arith::muli(bucket, entry_size, loc))
-                    .result(0)
-                    .unwrap()
-                    .into();
-                let entries_base = else_blk
-                    .append_operation(arith::constant(
-                        context,
-                        IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
-                        loc,
-                    ))
-                    .result(0)
-                    .unwrap()
-                    .into();
-                let entry_total_off: Value<'c, '_> = else_blk
-                    .append_operation(arith::addi(bucket_off, entries_base, loc))
-                    .result(0)
-                    .unwrap()
-                    .into();
-                let entry_ptr = emit_byte_offset_ptr_dynamic(
-                    context,
-                    &else_blk,
-                    hash_buf,
-                    entry_total_off,
-                    types,
-                    loc,
-                );
-                let key_at = emit_load(&else_blk, entry_ptr, types.ptr, loc);
-                let key_at_i: Value<'c, '_> = else_blk
-                    .append_operation(
-                        OperationBuilder::new("llvm.ptrtoint", loc)
-                            .add_operands(&[key_at])
-                            .add_results(&[types.i64])
-                            .build()
-                            .expect("llvm.ptrtoint"),
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
-                let zero_inner = else_blk
-                    .append_operation(arith::constant(
-                        context,
-                        IntegerAttribute::new(types.i64, 0).into(),
-                        loc,
-                    ))
-                    .result(0)
-                    .unwrap()
-                    .into();
-                let key_at_null: Value<'c, '_> = else_blk
-                    .append_operation(arith::cmpi(
-                        context,
-                        arith::CmpiPredicate::Eq,
-                        key_at_i,
-                        zero_inner,
-                        loc,
-                    ))
-                    .result(0)
-                    .unwrap()
-                    .into();
-                // Inner scf.if: missing key → store Nil; else
-                // copy the 16-byte tagged value slot.
-                let inner_then = Region::new();
-                let inner_then_blk = Block::new(&[]);
-                emit_value_slot_store_nil(context, &inner_then_blk, dst_slot, types, loc);
-                inner_then_blk.append_operation(scf::r#yield(&[], loc));
-                inner_then.append_block(inner_then_blk);
-                let inner_else = Region::new();
-                let inner_else_blk = Block::new(&[]);
-                {
-                    let value_slot_ptr = emit_byte_offset_ptr(
-                        context,
-                        &inner_else_blk,
-                        entry_ptr,
-                        HASH_ENTRY_OFF_VALUE_SLOT,
-                        types,
-                        loc,
-                    );
-                    let tag = emit_load(&inner_else_blk, value_slot_ptr, types.i64, loc);
-                    emit_store(&inner_else_blk, tag, dst_slot, loc);
-                    let src_value_ptr = emit_byte_offset_ptr(
-                        context,
-                        &inner_else_blk,
-                        value_slot_ptr,
-                        ARRAY_ELEM_OFF_VALUE,
-                        types,
-                        loc,
-                    );
-                    let dst_value_ptr = emit_byte_offset_ptr(
-                        context,
-                        &inner_else_blk,
-                        dst_slot,
-                        ARRAY_ELEM_OFF_VALUE,
-                        types,
-                        loc,
-                    );
-                    // Phase 2.6c-tag-hetero (ADR 0064): raw i64 copy.
-                    let payload = emit_load(&inner_else_blk, src_value_ptr, types.i64, loc);
-                    emit_store(&inner_else_blk, payload, dst_value_ptr, loc);
-                    inner_else_blk.append_operation(scf::r#yield(&[], loc));
-                }
-                inner_else.append_block(inner_else_blk);
-                else_blk.append_operation(scf::r#if(key_at_null, &[], inner_then, inner_else, loc));
-                else_blk.append_operation(scf::r#yield(&[], loc));
-            }
-            else_region.append_block(else_blk);
-            block.append_operation(scf::r#if(hash_buf_null, &[], then_region, else_region, loc));
+            emit_hash_lookup_into_tagged_slot(
+                context,
+                block,
+                target_ptr,
+                key_slot,
+                dst_slot,
+                HashLookupOutcome::NilOnMissing,
+                types,
+                loc,
+            );
         }
         _ => unreachable!("IndexTagged key must be Number or String"),
     }
@@ -5227,19 +5082,17 @@ fn emit_hash_ensure_buf<'a, 'c>(
 }
 
 /// Phase 2.6c-tag-hash-tidy (Tidy First): the unified scf.while
-/// skeleton shared by `emit_hash_probe_lookup` and
-/// `emit_hash_probe_for_insert`. Walks `hash_buf` from
-/// `hash(key_str) & mask` forward, skipping deleted-tombstone
-/// buckets (`HASH_DELETED_KEY`), until a stop condition fires.
+/// skeleton wrapped by `emit_hash_probe_for_insert`. Walks
+/// `hash_buf` from `hash(key_str) & mask` forward, skipping
+/// deleted-tombstone buckets (`HASH_DELETED_KEY`), until a stop
+/// condition fires.
 ///
-/// `trap_on_null = true` (lookup):
-///   - empty bucket (key == null) traps with `s_table_missing_key`
+/// Termination (post-ADR-0088 unified semantics):
+///   - empty bucket (key == null) terminates the loop (caller
+///     treats as "missing-or-insert-here"; the `key_at_null` test
+///     after the probe lets caller dispatch via `HashLookupOutcome`
+///     for read-side or insert-overwrite semantics for write-side)
 ///   - matching key terminates the loop and the bucket is returned
-///
-/// `trap_on_null = false` (insert / rehash placement):
-///   - empty bucket terminates the loop (caller treats as
-///     "insert here", `was_empty == true`)
-///   - matching key terminates the loop (caller overwrites)
 ///
 /// Phase 2.6b-hash-keys (ADR 0079): allocate and fill a 16-byte
 /// tagged search-key slot. Caller passes the key's static
@@ -5520,14 +5373,12 @@ fn emit_hash_key_eq_dispatched<'a, 'c>(
 /// caller-supplied 16-byte tagged search key slot. Hash and
 /// equality dispatch on the slot's tag, supporting Number /
 /// String / Bool / Function / Table keys.
-#[allow(clippy::too_many_arguments)]
 fn emit_hash_probe_loop<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     hash_buf: Value<'c, 'a>,
     cap: Value<'c, 'a>,
     search_key_slot: Value<'c, 'a>,
-    trap_on_null: bool,
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
@@ -5643,28 +5494,6 @@ fn emit_hash_probe_loop<'a, 'c>(
             .result(0)
             .unwrap()
             .into();
-        // Lookup-only: trap on empty bucket before strcmp. Insert
-        // mode treats empty as a successful terminator instead.
-        if trap_on_null {
-            let null_trap_then = Region::new();
-            let null_trap_blk = Block::new(&[]);
-            let msg_ptr =
-                emit_addressof(context, &null_trap_blk, "s_table_missing_key", types, loc);
-            emit_exit_with_message(context, &null_trap_blk, msg_ptr, types, loc);
-            null_trap_blk.append_operation(scf::r#yield(&[], loc));
-            null_trap_then.append_block(null_trap_blk);
-            let null_trap_else = Region::new();
-            let null_trap_else_blk = Block::new(&[]);
-            null_trap_else_blk.append_operation(scf::r#yield(&[], loc));
-            null_trap_else.append_block(null_trap_else_blk);
-            before_blk.append_operation(scf::r#if(
-                is_null,
-                &[],
-                null_trap_then,
-                null_trap_else,
-                loc,
-            ));
-        }
         // Phase 2.6b-hash-keys (ADR 0079): tag-aware key equality
         // gated on `is_skip`. Empty / tombstone buckets yield
         // `false` immediately so the probe walks past them; live
@@ -5702,16 +5531,15 @@ fn emit_hash_probe_loop<'a, 'c>(
         eq_else.append_block(eq_else_blk);
         let eq_op = scf::r#if(is_skip, &[types.i1], eq_then, eq_else, loc);
         let eq: Value<'c, '_> = before_blk.append_operation(eq_op).result(0).unwrap().into();
-        // Lookup: terminate on eq. Insert: terminate on (is_null OR eq).
-        let terminate: Value<'c, '_> = if trap_on_null {
-            eq
-        } else {
-            before_blk
-                .append_operation(arith::ori(is_null, eq, loc))
-                .result(0)
-                .unwrap()
-                .into()
-        };
+        // Terminate on (is_null OR eq): empty bucket is a successful
+        // terminator (the caller's `key_at_null` check decides
+        // missing-key materialization via `HashLookupOutcome`,
+        // ADR 0088).
+        let terminate: Value<'c, '_> = before_blk
+            .append_operation(arith::ori(is_null, eq, loc))
+            .result(0)
+            .unwrap()
+            .into();
         let i1_one = before_blk
             .append_operation(arith::constant(
                 context,
@@ -5765,41 +5593,25 @@ fn emit_hash_probe_loop<'a, 'c>(
     block.append_operation(while_op).result(0).unwrap().into()
 }
 
-/// Phase 2.6b-hash (ADR 0058): probe `hash_buf` for the bucket
-/// matching `key_str`. Returns the i64 bucket index on success
-/// or traps with `s_table_missing_key` if the probe walks into
-/// an empty bucket (= key not present). Sentinel buckets (ADR
-/// 0062) are skipped.
-///
-/// Caller must guarantee the buffer is non-null; for lookup that
-/// means `header.hash_buf != null` (else trap before calling).
-///
-/// ADR 0087: runtime tag-validity (nil/NaN) is enforced inside
-/// `emit_hash_probe_loop` via `emit_hash_key_runtime_validity_gate`.
-/// Callers must NOT add inline nil/NaN checks before this entry —
-/// the chokepoint owns the policy.
-fn emit_hash_probe_lookup<'a, 'c>(
-    context: &'c Context,
-    block: &'a Block<'c>,
-    hash_buf: Value<'c, 'a>,
-    cap: Value<'c, 'a>,
-    key_str: Value<'c, 'a>,
-    types: &Types<'c>,
-    loc: Location<'c>,
-) -> Value<'c, 'a> {
-    emit_hash_probe_loop(context, block, hash_buf, cap, key_str, true, types, loc)
-}
-
 /// Phase 2.6b-hash (ADR 0058): walk `hash_buf` from a starting
 /// bucket until either an empty slot OR a slot whose key equals
 /// `key_str` is found, and return that bucket. Sentinel buckets
 /// (ADR 0062) are skipped — no reuse. Used by the insert path,
-/// the rehash placement path, and the IsNilQuery hash arm.
+/// the rehash placement path, the IsNilQuery hash arm, and (via
+/// `emit_hash_lookup_into_tagged_slot`, ADR 0088) read-side
+/// callers.
 ///
 /// ADR 0087: runtime tag-validity (nil/NaN) is enforced inside
 /// `emit_hash_probe_loop` via `emit_hash_key_runtime_validity_gate`.
 /// Callers must NOT add inline nil/NaN checks before this entry —
 /// the chokepoint owns the policy.
+///
+/// ADR 0088: empty-bucket termination is **not** a trap — the
+/// helper / direct caller decides what missing means via
+/// `HashLookupOutcome` or by checking `key_at_null` after the probe.
+/// The previous `emit_hash_probe_lookup` wrapper that traps on
+/// missing was retired with this ADR; lookup-side callers should
+/// use `emit_hash_lookup_into_tagged_slot` instead.
 fn emit_hash_probe_for_insert<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
@@ -5809,7 +5621,241 @@ fn emit_hash_probe_for_insert<'a, 'c>(
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
-    emit_hash_probe_loop(context, block, hash_buf, cap, key_str, false, types, loc)
+    emit_hash_probe_loop(context, block, hash_buf, cap, key_str, types, loc)
+}
+
+/// Phase 2.6b-hash-lookup-miss (ADR 0088): consumer contract for what
+/// happens when a hash lookup walks into an empty bucket (= key not
+/// present). The chokepoint helper `emit_hash_lookup_into_tagged_slot`
+/// owns the policy; call sites pass an outcome value rather than
+/// duplicating the missing-branch trap or store inline. Replaces the
+/// awkward `trap_on_null: bool` flag previously parameterising
+/// `emit_hash_probe_loop` (codex review v3 critical issue).
+///
+/// `NilOnMissing` materialises a Nil-tagged value into the dst slot —
+/// the consumer (caller) chains its own contract downstream
+/// (e.g. `emit_value_slot_check_number` for arith Number, the
+/// `IsNil` non-trapping path for nil-checks).
+/// `TrapMissing` exits with `s_table_missing_key` and is reserved
+/// for future strict-key consumers (`next()` style, not in scope here).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // TrapMissing reserved for next() / strict-key consumers
+enum HashLookupOutcome {
+    NilOnMissing,
+    TrapMissing,
+}
+
+/// Phase 2.6b-hash-lookup-miss (ADR 0088): chokepoint helper for hash
+/// table reads that materialise the lookup result into a 16-byte
+/// TaggedValue dst slot. Consolidates the
+/// `null_buf check → emit_hash_probe_for_insert → key_at_null check →
+/// outcome dispatch` shape that ADR 0084 had duplicated across
+/// `emit_local_init_tagged` and Index hash arms.
+///
+/// Lookup miss policy is owned at this chokepoint; callers must NOT
+/// add inline missing-key traps. The probe-loop runtime-validity gate
+/// (ADR 0087) fires inside `emit_hash_probe_for_insert` regardless of
+/// `HashLookupOutcome`, so nil/NaN keys still trap with their dedicated
+/// diagnostics.
+///
+/// On *found*, the helper raw-copies the entry's 16-byte value slot
+/// `{tag, payload}` into `dst_slot`. The dst slot is always a 16-byte
+/// TaggedValue layout; the helper is value-kind agnostic.
+#[allow(clippy::too_many_arguments)]
+fn emit_hash_lookup_into_tagged_slot<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    target_ptr: Value<'c, 'a>,
+    search_key_slot: Value<'c, 'a>,
+    dst_slot: Value<'c, 'a>,
+    outcome: HashLookupOutcome,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let hash_buf_slot =
+        emit_byte_offset_ptr(context, block, target_ptr, TABLE_OFF_HASH_BUF, types, loc);
+    let hash_buf = emit_load(block, hash_buf_slot, types.ptr, loc);
+    let hash_buf_i: Value<'c, 'a> = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[hash_buf])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let hash_buf_null: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            hash_buf_i,
+            zero_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    emit_lookup_miss_dispatch(context, &then_blk, dst_slot, outcome, types, loc);
+    then_blk.append_operation(scf::r#yield(&[], loc));
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    {
+        let cap_slot = emit_byte_offset_ptr(context, &else_blk, hash_buf, HASH_OFF_CAP, types, loc);
+        let cap = emit_load(&else_blk, cap_slot, types.i64, loc);
+        let bucket = emit_hash_probe_for_insert(
+            context,
+            &else_blk,
+            hash_buf,
+            cap,
+            search_key_slot,
+            types,
+            loc,
+        );
+        let entry_size = else_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let bucket_off: Value<'c, '_> = else_blk
+            .append_operation(arith::muli(bucket, entry_size, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let entries_base = else_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let entry_total_off: Value<'c, '_> = else_blk
+            .append_operation(arith::addi(bucket_off, entries_base, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let entry_ptr =
+            emit_byte_offset_ptr_dynamic(context, &else_blk, hash_buf, entry_total_off, types, loc);
+        let key_at = emit_load(&else_blk, entry_ptr, types.ptr, loc);
+        let key_at_i: Value<'c, '_> = else_blk
+            .append_operation(
+                OperationBuilder::new("llvm.ptrtoint", loc)
+                    .add_operands(&[key_at])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.ptrtoint"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let zero_inner = else_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let key_at_null: Value<'c, '_> = else_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                key_at_i,
+                zero_inner,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let inner_then = Region::new();
+        let inner_then_blk = Block::new(&[]);
+        emit_lookup_miss_dispatch(context, &inner_then_blk, dst_slot, outcome, types, loc);
+        inner_then_blk.append_operation(scf::r#yield(&[], loc));
+        inner_then.append_block(inner_then_blk);
+        let inner_else = Region::new();
+        let inner_else_blk = Block::new(&[]);
+        {
+            // Found: raw 16-byte tagged copy from entry value slot
+            // to dst slot (tag at +0, payload at +8).
+            let value_slot_ptr = emit_byte_offset_ptr(
+                context,
+                &inner_else_blk,
+                entry_ptr,
+                HASH_ENTRY_OFF_VALUE_SLOT,
+                types,
+                loc,
+            );
+            let tag = emit_load(&inner_else_blk, value_slot_ptr, types.i64, loc);
+            emit_store(&inner_else_blk, tag, dst_slot, loc);
+            let src_value_ptr = emit_byte_offset_ptr(
+                context,
+                &inner_else_blk,
+                value_slot_ptr,
+                ARRAY_ELEM_OFF_VALUE,
+                types,
+                loc,
+            );
+            let dst_value_ptr = emit_byte_offset_ptr(
+                context,
+                &inner_else_blk,
+                dst_slot,
+                ARRAY_ELEM_OFF_VALUE,
+                types,
+                loc,
+            );
+            let payload = emit_load(&inner_else_blk, src_value_ptr, types.i64, loc);
+            emit_store(&inner_else_blk, payload, dst_value_ptr, loc);
+            inner_else_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        inner_else.append_block(inner_else_blk);
+        else_blk.append_operation(scf::r#if(key_at_null, &[], inner_then, inner_else, loc));
+        else_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(hash_buf_null, &[], then_region, else_region, loc));
+}
+
+/// Phase 2.6b-hash-lookup-miss (ADR 0088): per-outcome dispatch for
+/// the missing-key branches of `emit_hash_lookup_into_tagged_slot`.
+/// Same shape fires on both `hash_buf == null` and `key_at_null`
+/// branches.
+fn emit_lookup_miss_dispatch<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    dst_slot: Value<'c, 'a>,
+    outcome: HashLookupOutcome,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    match outcome {
+        HashLookupOutcome::NilOnMissing => {
+            emit_value_slot_store_nil(context, block, dst_slot, types, loc);
+        }
+        HashLookupOutcome::TrapMissing => {
+            let msg = emit_addressof(context, block, "s_table_missing_key", types, loc);
+            emit_exit_with_message(context, block, msg, types, loc);
+        }
+    }
 }
 
 /// Phase 2.6b-hash (ADR 0058): if load factor ≥ 0.75, double the
@@ -6587,6 +6633,13 @@ fn emit_expr<'a, 'c>(
                 // Phase 2.6b-hash-keys (ADR 0079): every non-Number
                 // hash-eligible kind shares the lookup path; build
                 // a tagged search-key slot for tag-aware probe.
+                // Phase 2.6b-hash-keys (ADR 0079) / 2.6b-hash-lookup-
+                // miss (ADR 0088): static hash-eligible key kinds
+                // route through the chokepoint helper into a tmp
+                // TaggedValue slot. Missing key → Nil-tagged tmp →
+                // `emit_value_slot_check_number` traps with
+                // `s_table_type_mismatch`; consumer-correct contract
+                // since the Index value-side is f64-typed (Number).
                 ValueKind::String | ValueKind::Bool | ValueKind::Function(_) | ValueKind::Table => {
                     let key_value = emit_expr(
                         context,
@@ -6602,128 +6655,42 @@ fn emit_expr<'a, 'c>(
                     )?;
                     let key_slot =
                         emit_build_search_key_slot(context, block, key_kind, key_value, types, loc);
-                    let hash_buf_slot = emit_byte_offset_ptr(
+                    let tmp_slot = emit_alloca_slot_for_kind(
                         context,
                         block,
-                        target_ptr,
-                        TABLE_OFF_HASH_BUF,
+                        ValueKind::TaggedValue,
                         types,
                         loc,
                     );
-                    let hash_buf = emit_load(block, hash_buf_slot, types.ptr, loc);
-                    // Trap if hash_buf is null (no string keys ever
-                    // inserted).
-                    let hash_buf_i = block
-                        .append_operation(
-                            OperationBuilder::new("llvm.ptrtoint", loc)
-                                .add_operands(&[hash_buf])
-                                .add_results(&[types.i64])
-                                .build()
-                                .expect("llvm.ptrtoint"),
-                        )
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let zero_i64 = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(types.i64, 0).into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let null_buf: Value<'c, 'a> = block
-                        .append_operation(arith::cmpi(
-                            context,
-                            arith::CmpiPredicate::Eq,
-                            hash_buf_i,
-                            zero_i64,
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let null_then = Region::new();
-                    let null_then_blk = Block::new(&[]);
-                    {
-                        let msg = emit_addressof(
-                            context,
-                            &null_then_blk,
-                            "s_table_missing_key",
-                            types,
-                            loc,
-                        );
-                        emit_exit_with_message(context, &null_then_blk, msg, types, loc);
-                        null_then_blk.append_operation(scf::r#yield(&[], loc));
-                    }
-                    null_then.append_block(null_then_blk);
-                    let null_else = Region::new();
-                    let null_else_blk = Block::new(&[]);
-                    null_else_blk.append_operation(scf::r#yield(&[], loc));
-                    null_else.append_block(null_else_blk);
-                    block.append_operation(scf::r#if(null_buf, &[], null_then, null_else, loc));
-                    let cap_slot =
-                        emit_byte_offset_ptr(context, block, hash_buf, HASH_OFF_CAP, types, loc);
-                    let cap = emit_load(block, cap_slot, types.i64, loc);
-                    let bucket =
-                        emit_hash_probe_lookup(context, block, hash_buf, cap, key_slot, types, loc);
-                    // Phase 2.6c-tag-hash (ADR 0060): tag-checked
-                    // value load. value slot starts at
-                    // HASH_OFF_ENTRIES + bucket*HASH_ENTRY_SIZE +
-                    // HASH_ENTRY_OFF_VALUE_SLOT.
-                    let entry_size = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let bucket_off: Value<'c, 'a> = block
-                        .append_operation(arith::muli(bucket, entry_size, loc))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let value_slot_total_off = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(
-                                types.i64,
-                                HASH_OFF_ENTRIES + HASH_ENTRY_OFF_VALUE_SLOT,
-                            )
-                            .into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let total_off: Value<'c, 'a> = block
-                        .append_operation(arith::addi(bucket_off, value_slot_total_off, loc))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let value_slot_ptr = emit_byte_offset_ptr_dynamic(
-                        context, block, hash_buf, total_off, types, loc,
+                    emit_hash_lookup_into_tagged_slot(
+                        context,
+                        block,
+                        target_ptr,
+                        key_slot,
+                        tmp_slot,
+                        HashLookupOutcome::NilOnMissing,
+                        types,
+                        loc,
                     );
-                    emit_value_slot_check_number(context, block, value_slot_ptr, types, loc);
+                    emit_value_slot_check_number(context, block, tmp_slot, types, loc);
                     let value_ptr = emit_byte_offset_ptr(
                         context,
                         block,
-                        value_slot_ptr,
+                        tmp_slot,
                         ARRAY_ELEM_OFF_VALUE,
                         types,
                         loc,
                     );
                     Ok(emit_load(block, value_ptr, types.f64, loc))
                 }
-                // Phase 2.8e-iter-tk (ADR 0084): TaggedValue key —
-                // `local x = t[k]` where `k` is the iterator binding
-                // from `for k, v in pairs(t)`. The local's slot is
-                // already a 16-byte tagged search-key slot; tag
-                // check + hash probe lookup + trapping value load
-                // mirror the static-kind arm above.
+                // Phase 2.8e-iter-tk (ADR 0084) / 2.6b-hash-lookup-
+                // miss (ADR 0088): TaggedValue key — `t[k]` where
+                // `k` is the iterator binding from
+                // `for k, v in pairs(t)`. The local's slot is
+                // already a 16-byte tagged search-key slot; flow
+                // through the same chokepoint helper as static-key
+                // arms. ADR 0087 nil/NaN validity gate fires inside
+                // the helper's probe.
                 ValueKind::TaggedValue => {
                     let search_key_slot = match &key.kind {
                         HirExprKind::Local(LocalId(idx)) => slots[*idx],
@@ -6735,121 +6702,28 @@ fn emit_expr<'a, 'c>(
                             ));
                         }
                     };
-                    // ADR 0087: nil/NaN tag validity is enforced at
-                    // the probe chokepoint (`emit_hash_probe_loop`);
-                    // no inline trap here.
-
-                    let hash_buf_slot = emit_byte_offset_ptr(
+                    let tmp_slot = emit_alloca_slot_for_kind(
+                        context,
+                        block,
+                        ValueKind::TaggedValue,
+                        types,
+                        loc,
+                    );
+                    emit_hash_lookup_into_tagged_slot(
                         context,
                         block,
                         target_ptr,
-                        TABLE_OFF_HASH_BUF,
-                        types,
-                        loc,
-                    );
-                    let hash_buf = emit_load(block, hash_buf_slot, types.ptr, loc);
-                    let hash_buf_i = block
-                        .append_operation(
-                            OperationBuilder::new("llvm.ptrtoint", loc)
-                                .add_operands(&[hash_buf])
-                                .add_results(&[types.i64])
-                                .build()
-                                .expect("llvm.ptrtoint"),
-                        )
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let zero_i64 = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(types.i64, 0).into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let null_buf: Value<'c, 'a> = block
-                        .append_operation(arith::cmpi(
-                            context,
-                            arith::CmpiPredicate::Eq,
-                            hash_buf_i,
-                            zero_i64,
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let null_then = Region::new();
-                    let null_then_blk = Block::new(&[]);
-                    {
-                        let msg = emit_addressof(
-                            context,
-                            &null_then_blk,
-                            "s_table_missing_key",
-                            types,
-                            loc,
-                        );
-                        emit_exit_with_message(context, &null_then_blk, msg, types, loc);
-                        null_then_blk.append_operation(scf::r#yield(&[], loc));
-                    }
-                    null_then.append_block(null_then_blk);
-                    let null_else = Region::new();
-                    let null_else_blk = Block::new(&[]);
-                    null_else_blk.append_operation(scf::r#yield(&[], loc));
-                    null_else.append_block(null_else_blk);
-                    block.append_operation(scf::r#if(null_buf, &[], null_then, null_else, loc));
-                    let cap_slot =
-                        emit_byte_offset_ptr(context, block, hash_buf, HASH_OFF_CAP, types, loc);
-                    let cap = emit_load(block, cap_slot, types.i64, loc);
-                    let bucket = emit_hash_probe_lookup(
-                        context,
-                        block,
-                        hash_buf,
-                        cap,
                         search_key_slot,
+                        tmp_slot,
+                        HashLookupOutcome::NilOnMissing,
                         types,
                         loc,
                     );
-                    let entry_size = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let bucket_off: Value<'c, 'a> = block
-                        .append_operation(arith::muli(bucket, entry_size, loc))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let value_slot_total_off = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(
-                                types.i64,
-                                HASH_OFF_ENTRIES + HASH_ENTRY_OFF_VALUE_SLOT,
-                            )
-                            .into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let total_off: Value<'c, 'a> = block
-                        .append_operation(arith::addi(bucket_off, value_slot_total_off, loc))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let value_slot_ptr = emit_byte_offset_ptr_dynamic(
-                        context, block, hash_buf, total_off, types, loc,
-                    );
-                    emit_value_slot_check_number(context, block, value_slot_ptr, types, loc);
+                    emit_value_slot_check_number(context, block, tmp_slot, types, loc);
                     let value_ptr = emit_byte_offset_ptr(
                         context,
                         block,
-                        value_slot_ptr,
+                        tmp_slot,
                         ARRAY_ELEM_OFF_VALUE,
                         types,
                         loc,

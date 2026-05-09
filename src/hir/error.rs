@@ -94,13 +94,14 @@ pub enum HirError {
     /// result types). The `!llvm.ptr` Function-value erasure
     /// landed in Commit 2a removed the verifier-level safety net
     /// that previously catch'd this mismatch, so we reject it at
-    /// HIR until ADR 0088 routes parameter-routed indirect calls
-    /// through `Callee::IndirectDispatch` (which carries the full
-    /// `ret_kinds`).
+    /// HIR until a future ADR (Function-kind upvalue support /
+    /// TaggedValue arith coerce) routes parameter-routed indirect
+    /// calls through `Callee::IndirectDispatch` (which carries the
+    /// full `ret_kinds`).
     #[error(
         "function '{source_name}' returning {ret_kinds:?} cannot be passed as a \
          Function-kind argument — only ret_kinds=[Number] is supported here (ADR 0075 \
-         amend / ADR 0083 Commit 2a-fix; lifts when ADR 0088 ships)"
+         amend / ADR 0083 Commit 2a-fix; lifts in future ADR — Function-kind upvalue support)"
     )]
     IndirectCallNonNumberReturn {
         source_name: String,
@@ -117,12 +118,13 @@ pub enum HirError {
     /// at the same scope hits this path because Function-kind
     /// upvalues are still rejected (`lookup_or_capture_upvalue`)
     /// and the synthetic FunctionDef-backing local isn't in the
-    /// caller body's scopes. ADR 0088 (candidate) lifts this
-    /// restriction once Function-kind upvalues are allowed.
+    /// caller body's scopes. A future ADR (Function-kind upvalue
+    /// support) lifts this restriction once Function-kind upvalues
+    /// are allowed.
     #[error(
         "mutual recursion between capturing functions is not supported \
-         (ADR 0083 / future ADR 0088): '{local_name}' calls a capturing fn \
-         from outside its body"
+         (ADR 0083 / future ADR — Function-kind upvalue support): \
+         '{local_name}' calls a capturing fn from outside its body"
     )]
     MutualCapturingRecursion { local_name: String, offset: usize },
 }

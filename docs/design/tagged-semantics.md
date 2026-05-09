@@ -254,6 +254,7 @@ the introduction, when still open).
 | LIC-2.8e-iter-generic-1           | `for k, v in iter, state, ctl do … end` — Phase 1 scope: non-capturing user fn, builtin `next`, function alias. Closure-as-iter rejected via the existing `f.upvalues.is_empty()` filter; lifts automatically when ADR 0083 ships | 0085 |
 | LIC-2.6b-hash-key-nan-runtime-1   | NaN cannot be used as a table index (Lua spec §3.4.5). Static Number-key array path (`t[0/0]`) and TaggedValue-key hash probe entry both gated on `cmpf Une` self-self preflight; trap surface is the dedicated `s_table_index_nan` global | 0086 |
 | LIC-2.6b-hash-key-nil-runtime-1   | Dynamic `nil` hash key via TaggedValue local — runtime trap `s_table_index_nil` enforced at the `emit_hash_probe_loop` chokepoint via `emit_hash_key_runtime_validity_gate` (consults `tagged.rs::policy_for_tag`); inline traps at IndexAssign / Index TaggedValue arms retired in favour of the chokepoint | 0079 / 0084 / 0087 |
+| LIC-2.6b-hash-missing-key-read-1  | Hash read lookup miss reified as Nil-tagged TaggedValue slot via the `emit_hash_lookup_into_tagged_slot` chokepoint helper. Index hash arms restructured to tmp-slot + helper(NilOnMissing) + `emit_value_slot_check_number` + load f64; consumer-correct trap surface (`s_table_type_mismatch` on arith of missing-key, instead of the previous spec-violating `s_table_missing_key` exit). `emit_hash_probe_lookup` wrapper retired; `trap_on_null: bool` parameter on `emit_hash_probe_loop` retired | 0084 / 0088 |
 
 ### Partial
 
@@ -264,9 +265,8 @@ the introduction, when still open).
 | ID                                          | Behaviour                                                             | Notes                          |
 |---------------------------------------------|-----------------------------------------------------------------------|--------------------------------|
 | LIC-2.7p-arith-coerce-tagged-1              | TaggedValue operand arith coerce (`local x = t[1]; print(x + 1)` when x is runtime String) | HIR can't statically resolve the kind; current TaggedValue-arith path traps on non-Number tag (ADR 0063). Unlocking needs runtime tag dispatch in arith codegen |
-| LIC-2.6b-hash-missing-key-read-1            | Index TaggedValue arm at `emit.rs:6700-6800` uses `emit_hash_probe_lookup` (trap_on_null=true); a missing key fires `s_table_missing_key` instead of returning nil per Lua §3.4.5. Symmetrical to the IndexAssign arm which uses `emit_hash_probe_for_insert`. Discovered during ADR 0087 review; out of scope for that ADR | 0084 (introduced) |
 
-**Total:** 28 LIC entries — 27 resolved, 0 partial, 2 pending (LIC-2.7p-arith-coerce-tagged-1 + LIC-2.6b-hash-missing-key-read-1).
+**Total:** 28 LIC entries — 28 resolved, 0 partial, 1 pending (LIC-2.7p-arith-coerce-tagged-1).
 
 ---
 
@@ -601,6 +601,52 @@ Future tag kinds (e.g. `WeakKey`, `ThreadKey`) extend coverage
 by adding entries to `policy_for_tag` and the gate's
 `POLICED_TAGS` list. Call sites stay frozen.
 
+### Hash read lookup miss (ADR 0088)
+
+The Index hash arms (`Index { target: Table, key: String/Bool/
+Function/Table/TaggedValue }`) and `emit_local_init_tagged`'s 4
+hash-key arms now share a single chokepoint helper:
+
+```text
+emit_hash_lookup_into_tagged_slot(target_ptr, search_key_slot,
+                                  dst_slot, outcome)
+```
+
+The helper performs `null_buf check → emit_hash_probe_for_insert →
+key_at_null check → outcome dispatch`, materialising the lookup
+result into a 16-byte TaggedValue dst slot. The dst slot's layout
+is invariant; the helper is value-kind agnostic.
+
+| Component                              | Module    | Role                                                                                                |
+|----------------------------------------|-----------|-----------------------------------------------------------------------------------------------------|
+| `enum HashLookupOutcome`               | `emit.rs` private | Consumer-contract config: `NilOnMissing`, `TrapMissing` (reserved for future `next()`-strict-key) |
+| `emit_hash_lookup_into_tagged_slot`    | `emit.rs` | Effectful chokepoint                                                                                |
+| `emit_lookup_miss_dispatch`            | `emit.rs` | Per-outcome dispatch on missing branches                                                            |
+| `emit_hash_probe_for_insert`           | `emit.rs` | Sole probe wrapper (post-ADR-0088); empty bucket terminates loop, caller decides via `key_at_null` |
+
+The `HashLookupOutcome` enum lives in `emit.rs` rather than
+`tagged.rs` because lookup miss is a consumer-contract concern, not
+a tag-layer concept (codex review v3 critical issue, ADR 0088
+plan v2 fix). `tagged.rs` stays focused on slot layout / tag
+constants / pure store-check helpers (per the ADR 0073 boundary).
+
+**Index value-side contract**: Index hash arms return f64 (Number).
+Missing key materialises Nil into the tmp slot →
+`emit_value_slot_check_number` traps with `s_table_type_mismatch`.
+LocalInit / Assign / print contexts widen via
+`widen_index_for_local_init` and reach the helper through
+`emit_local_init_tagged` directly, returning Nil-tagged into the
+local's slot (no trap). This consumer-decides-downstream pattern
+mirrors ADR 0087's split: probe-time policy is owned at the
+chokepoint, materialisation policy at the helper, downstream
+trap policy at the consumer.
+
+**Retired surfaces**: `emit_hash_probe_lookup` wrapper deleted;
+`trap_on_null: bool` parameter on `emit_hash_probe_loop` removed;
+the inner `if trap_on_null { trap }` block gone. The probe loop's
+`is_skip = is_null OR is_sentinel` continues to walk past
+tombstones (sentinel-bucket invariant preserved).
+
 ---
 
 ## 7. Open Questions / Known Gaps
@@ -717,3 +763,4 @@ Listed in Codex review priority order (post-ADR-0082):
 | 0085 | 2.8e-iter-generic            | Full Lua 5.4 §3.3.5 generic-for parser sugar — `for k, v in ITER, STATE, CTL do BODY end`. New `StmtKind::ForGeneric { names, iter, state, ctl, body }` parser variant + `IterMatch::Generic` discriminator; HIR synthetic-block desugar pins state / ctl / iter to fresh locals and dispatches the per-iteration call through `Callee::Builtin(Next)` / `User(fid)` / `IndirectDispatch` based on iter's resolved shape. Phase 1 scope filters closure-as-iter via `f.upvalues.is_empty()` (carries over to ADR 0083 follow-up). Iter must return `(TaggedValue\|Nil, _)` so a `nil` first result can terminate. 8 new e2e in `tests/phase2_8e_generic_for.rs`, 951 → 959 green. LIC-2.8e-iter-generic-1 resolved (Phase 1). 25/0/3 |
 | 0086 | 2.6b-hash-key-nan            | Hash key NaN runtime diagnostic (Codex pivot from ADR 0083 deferral) — Lua spec §3.4.5 forbids NaN as a table index. New `s_table_index_nan` global + `emit_table_index_nan_trap_if` / `emit_hash_key_nan_preflight` helpers. NaN preflight inserted at 4 sites: static Number-key IndexAssign / Index arms (before `f2i`), inline `emit_local_init_tagged` Number-key arm (covers `print(t[0/0])`), and `emit_hash_probe_loop` entry (single chokepoint for every TaggedValue-key call). `cmpf Une self-self` reused from ADR 0077's `emit_tonumber_for_arith` — qNaN/sNaN/±NaN agnostic. 6 new e2e in `tests/phase2_6b_hash_key_nan.rs`, 959 → 965 green. LIC-2.6b-hash-key-nan-runtime-1 resolved. 26/0/2 |
 | 0087 | 2.6b-hash-key-validity       | Hash-key runtime validity policy chokepoint (Codex post-3c review v2) — pure decision (`enum HashKeyValidityPolicy { TrapNil, CheckNaN }` + `policy_for_tag(tag) -> &'static [...]` in `tagged.rs`) split from effectful executor (`emit_hash_key_runtime_validity_gate` in `emit.rs`). The new gate replaces `emit_hash_key_nan_preflight` at the `emit_hash_probe_loop` chokepoint (`emit.rs:5535`) and folds in the ADR 0084 inline nil traps at IndexAssign (`emit.rs:3160-3195`) and Index (`emit.rs:6723-6757`) TaggedValue arms. 3 raw-f64 NaN preflight sites (`emit.rs:2766` / `:6554` / `:4339`) using `emit_table_index_nan_trap_if` are unaffected — they consume f64 directly, not a tagged slot. 3 new pure unit tests in `tagged.rs` + 2 new e2e in `tests/phase2_6b_hash_key_nil.rs`, 990 → 995 green. LIC-2.6b-hash-key-nil-runtime-1 resolved (was partial); new pending LIC-2.6b-hash-missing-key-read-1 (Index TaggedValue arm uses `emit_hash_probe_lookup` with `trap_on_null=true`, traps on missing key instead of returning nil per Lua §3.4.5). 27/0/2 |
+| 0088 | 2.6b-hash-lookup-miss        | Hash read lookup miss reified as Nil-tagged TaggedValue (Codex post-0087 review v3 Refactor verdict on plan v1). New private `enum HashLookupOutcome { NilOnMissing, TrapMissing }` in `emit.rs` (codex critical: lookup miss policy is consumer contract, not tag layer; `tagged.rs` placement was "abstraction without owner"). New chokepoint helper `emit_hash_lookup_into_tagged_slot` consolidates the `null_buf check + for_insert probe + key_at_null check + outcome dispatch` shape duplicated across 9 sites: `emit_local_init_tagged` 4 hash arms (`emit.rs:4426-4604`, ~120 LOC dedupe) + Index 5 hash arms (4 static-key at `:6589-6720` + 1 TaggedValue at `:6720-6857`, restructured to tmp slot + helper(NilOnMissing) + `emit_value_slot_check_number` + load f64). `emit_hash_probe_lookup` wrapper deleted; `trap_on_null: bool` parameter on `emit_hash_probe_loop` retired (codex non-ad-hoc: bool was "粗い abstraction"). User-visible diagnostic shift in arith/cmp contexts: missing key was `s_table_missing_key`, now `s_table_type_mismatch` (consumer-correct). Widening contexts (LocalInit/Assign/print) unchanged. ADR 0084 read-side arms partially superseded; IndexAssign + `pairs`-body idiom unchanged. 4 new e2e in `tests/phase2_6b_hash_missing_key_read.rs` (2 behaviour-change pins + 2 regression-pins inc. explicit `hash_buf == null` branch coverage), 995 → 999 green. LIC-2.6b-hash-missing-key-read-1 resolved. 28/0/1 |
