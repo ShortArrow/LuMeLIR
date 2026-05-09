@@ -222,9 +222,10 @@ routed through a `Function`-kind parameter started silently
 miscompiling as f64.
 
 This ADR's reject set is therefore **extended** to cover one
-more case until ADR 0087 routes parameter-routed indirect
+more case until ADR 0088 routes parameter-routed indirect
 calls through `Callee::IndirectDispatch` (which carries the
-full `IndirectSig::ret_kinds`):
+full `IndirectSig::ret_kinds`); ADR 0087 was reassigned to
+hash-key runtime validity policy on 2026-05-10:
 
 - A function value whose source `HirFunction` declares
   `ret_kinds != [Number]` cannot flow as an argument into a

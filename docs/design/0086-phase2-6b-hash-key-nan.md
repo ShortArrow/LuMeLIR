@@ -1,8 +1,16 @@
 # 0086. Phase 2.6b-hash-key-nan: Hash Key NaN Runtime Diagnostic
 
-- **Status:** Accepted
+- **Status:** Accepted (helper portion superseded by ADR 0087)
 - **Date:** 2026-05-07
 - **Deciders:** ShortArrow
+
+> **ADR 0087 supersede note (2026-05-10):** the
+> `emit_hash_key_nan_preflight` helper described below has been
+> folded into the new `emit_hash_key_runtime_validity_gate` along
+> with ADR 0084's nil trap. The 3 raw-f64 NaN preflight call sites
+> (`emit.rs:2766` / `:6554` / `:4339`) using
+> `emit_table_index_nan_trap_if` are unaffected. User-visible
+> behaviour ("table index is NaN") is preserved.
 
 ## Context
 

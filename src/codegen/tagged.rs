@@ -68,6 +68,49 @@ pub(crate) const TAG_TABLE: i64 = 5;
 // `HASH_DELETED_KEY=1` (retired by ADR 0079).
 pub(crate) const TAG_DELETED: i64 = 6;
 
+// =============================================================
+// Phase 2.6b-hash-key-validity (ADR 0087): runtime validity
+// policy for a hash search-key tag.
+//
+// Pure decision: maps a tag value to the set of validity
+// policies that must run before the key reaches the probe.
+// The effectful emitter `emit_hash_key_runtime_validity_gate`
+// in `emit.rs` consults this matrix and emits the actual
+// MLIR scf.if + trap structure. Trap message globals
+// (`s_table_index_nil` / `s_table_index_nan`) are owned by
+// `emit.rs`; this module owns the policy decision only.
+//
+// Splitting decision from emission lets us unit-test the
+// policy table with no MLIR Context, and lets future tag
+// kinds (WeakKey / ThreadKey) extend coverage by editing the
+// table alone — call sites need no change.
+// =============================================================
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HashKeyValidityPolicy {
+    /// Tag is TAG_NIL: Lua §3.4.5 forbids nil as a table key.
+    /// Emitter exits with `s_table_index_nil`.
+    TrapNil,
+    /// Tag is TAG_NUMBER: payload is f64 — must be tested for
+    /// NaN (Lua §3.4.5 forbids NaN as a key). Emitter loads
+    /// the f64 payload and exits with `s_table_index_nan` on
+    /// `cmpf Une self self`.
+    CheckNaN,
+}
+
+/// Pure: which validity policies apply to a hash-key tag.
+/// Returns a static slice; future tag kinds (WeakKey /
+/// ThreadKey) extend this matrix without changing call sites.
+/// Tags with no entry (String / Bool / Function / Table /
+/// Deleted) are pass-through — the probe handles them
+/// directly.
+pub(crate) fn policy_for_tag(tag: i64) -> &'static [HashKeyValidityPolicy] {
+    match tag {
+        TAG_NIL => &[HashKeyValidityPolicy::TrapNil],
+        TAG_NUMBER => &[HashKeyValidityPolicy::CheckNaN],
+        _ => &[],
+    }
+}
+
 /// Allocate a stack slot whose layout matches `kind`. TaggedValue
 /// uses 2 × i64 (16 bytes, naturally 8-byte-aligned for the f64
 /// payload at offset 8); every other kind is a single element of
@@ -1330,4 +1373,36 @@ pub(crate) fn emit_type_tagged_local<'a, 'c>(
     nil_else.append_block(nil_else_blk);
     let if_op = scf::r#if(is_nil, &[types.ptr], nil_then, nil_else, loc);
     block.append_operation(if_op).result(0).unwrap().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_for_tag_nil_returns_trap_nil() {
+        assert_eq!(
+            policy_for_tag(TAG_NIL),
+            &[HashKeyValidityPolicy::TrapNil][..],
+        );
+    }
+
+    #[test]
+    fn policy_for_tag_number_returns_check_nan() {
+        assert_eq!(
+            policy_for_tag(TAG_NUMBER),
+            &[HashKeyValidityPolicy::CheckNaN][..],
+        );
+    }
+
+    #[test]
+    fn policy_for_tag_other_tags_pass_through() {
+        for tag in [TAG_BOOL, TAG_STRING, TAG_FUNCTION, TAG_TABLE, TAG_DELETED] {
+            assert_eq!(
+                policy_for_tag(tag),
+                &[][..],
+                "tag {tag} should have no policy"
+            );
+        }
+    }
 }

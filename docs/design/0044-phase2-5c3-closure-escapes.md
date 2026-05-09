@@ -21,8 +21,9 @@ The remaining backstop is `HirError::MutualCapturingRecursion`
 two capturing siblings calling each other from their respective
 bodies — codegen still has no path to reach a sibling's per-
 instance cell from inside the caller's body. That backstop is
-expected to retire under ADR 0087 (TaggedValue arith coerce or
-its successor on Function-kind upvalue support).
+expected to retire under ADR 0088 (Function-kind upvalue support
+or TaggedValue arith coerce; ADR 0087 was reassigned to hash-key
+runtime validity policy on 2026-05-10).
 
 ## Context
 

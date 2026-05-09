@@ -42,11 +42,11 @@ use super::primitive::{
     emit_libc_call_void, emit_load, emit_printf, emit_store,
 };
 use super::tagged::{
-    ARRAY_ELEM_OFF_VALUE, ARRAY_ELEM_SIZE, TAG_BOOL, TAG_DELETED, TAG_FUNCTION, TAG_NIL,
-    TAG_NUMBER, TAG_STRING, TAG_TABLE, emit_alloca_slot_for_kind, emit_print_tagged_local,
-    emit_tag_and_payload_ptr, emit_tagged_eq_local_local, emit_tagged_unknown_tag_trap,
-    emit_type_tagged_local, emit_value_slot_check_number, emit_value_slot_store_dispatched,
-    emit_value_slot_store_nil,
+    ARRAY_ELEM_OFF_VALUE, ARRAY_ELEM_SIZE, HashKeyValidityPolicy, TAG_BOOL, TAG_DELETED,
+    TAG_FUNCTION, TAG_NIL, TAG_NUMBER, TAG_STRING, TAG_TABLE, emit_alloca_slot_for_kind,
+    emit_print_tagged_local, emit_tag_and_payload_ptr, emit_tagged_eq_local_local,
+    emit_tagged_unknown_tag_trap, emit_type_tagged_local, emit_value_slot_check_number,
+    emit_value_slot_store_dispatched, emit_value_slot_store_nil, policy_for_tag,
 };
 
 // =============================================================
@@ -339,7 +339,8 @@ fn emit_fmt_global<'c>(
     // Phase 2.8e-iter-tk (ADR 0084): runtime trap for `t[k] = v`
     // when `k` is a TaggedValue local whose dynamic tag is
     // TAG_NIL. Lua spec §3.4.5 — `nil` values cannot be used as
-    // table keys.
+    // table keys. ADR 0087: this global is fired by the probe
+    // chokepoint's validity gate, not by the call sites.
     emit_string_global(
         context,
         module,
@@ -352,6 +353,9 @@ fn emit_fmt_global<'c>(
     // when `k` is NaN. Lua spec §3.4.5 forbids NaN as a table
     // index. Surface is wider than ADR 0084's nil case: NaN can
     // arrive via the static Number-key array path (`t[0/0]`) too.
+    // Trap message globals are owned by emit.rs; the validity
+    // policy that decides which globals fire on which tag lives
+    // in `tagged.rs::policy_for_tag` (ADR 0087).
     emit_string_global(
         context,
         module,
@@ -411,69 +415,103 @@ fn emit_table_index_nan_trap_if<'a, 'c>(
     block.append_operation(scf::r#if(cond_i1, &[], then_region, else_region, loc));
 }
 
-/// Phase 2.6b-hash-key-nan (ADR 0086): NaN preflight at the
-/// hash probe entry. The search-key slot is a 16-byte tagged
-/// `{i64 tag, 8-byte payload}` value; only the TAG_NUMBER branch
-/// reads the payload as an f64 and tests it with `cmpf Une self
-/// self` (true iff payload is NaN, agnostic to qNaN/sNaN/±NaN).
-/// Other tags (String/Bool/Function/Table) skip the check.
+/// Phase 2.6b-hash-key-validity (ADR 0087): runtime tag-validity
+/// gate at the hash probe entry. Replaces the ADR 0086
+/// `emit_hash_key_nan_preflight` and folds in ADR 0084's per-call
+/// inline `s_table_index_nil` traps so every hash search-key
+/// carrier — `IndexAssign`, `Index`, and the iterator-internal
+/// probes that `pairs` / `next` use — converges on a single
+/// chokepoint.
 ///
-/// Called once at the top of `emit_hash_probe_loop`; covers every
-/// TaggedValue-key carrier (`IndexAssign`, `Index`, the iterator-
-/// internal probes that `pairs` and friends use).
-fn emit_hash_key_nan_preflight<'a, 'c>(
+/// The decision matrix (which tags need which checks) lives in
+/// `tagged.rs::policy_for_tag` as a pure function; this helper
+/// is the effectful emitter that consults that matrix and lays
+/// down the MLIR scf.if + trap structure. Trap message globals
+/// (`s_table_index_nil`, `s_table_index_nan`) and the underlying
+/// `emit_table_index_nan_trap_if` shape stay owned here in
+/// emit.rs.
+///
+/// TAG_NIL must be tested before TAG_NUMBER — the nil slot has
+/// no f64 payload, so the NaN load must not run on it. Other
+/// tags (Bool / String / Function / Table / Deleted) are
+/// pass-through; the probe handles them directly.
+fn emit_hash_key_runtime_validity_gate<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     search_key_slot: Value<'c, 'a>,
     types: &Types<'c>,
     loc: Location<'c>,
 ) {
+    // Tags whose payloads or values trigger a runtime-validity
+    // check. Order is load-bearing — see doc-comment.
+    const POLICED_TAGS: &[i64] = &[TAG_NIL, TAG_NUMBER];
     let tag = emit_load(block, search_key_slot, types.i64, loc);
-    let tag_number_const = block
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(types.i64, TAG_NUMBER).into(),
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    let tag_is_number: Value<'c, 'a> = block
-        .append_operation(arith::cmpi(
-            context,
-            arith::CmpiPredicate::Eq,
-            tag,
-            tag_number_const,
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    let then_region = Region::new();
-    let then_blk = Block::new(&[]);
-    {
-        let payload_ptr = emit_byte_offset_ptr(context, &then_blk, search_key_slot, 8, types, loc);
-        let payload = emit_load(&then_blk, payload_ptr, types.f64, loc);
-        let is_nan: Value<'c, '_> = then_blk
-            .append_operation(arith::cmpf(
+    for &policed_tag in POLICED_TAGS {
+        let policies = policy_for_tag(policed_tag);
+        if policies.is_empty() {
+            continue;
+        }
+        let tag_const = block
+            .append_operation(arith::constant(
                 context,
-                CmpfPredicate::Une,
-                payload,
-                payload,
+                IntegerAttribute::new(types.i64, policed_tag).into(),
                 loc,
             ))
             .result(0)
             .unwrap()
             .into();
-        emit_table_index_nan_trap_if(context, &then_blk, is_nan, types, loc);
+        let is_match: Value<'c, 'a> = block
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                tag,
+                tag_const,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let then_region = Region::new();
+        let then_blk = Block::new(&[]);
+        for policy in policies {
+            match policy {
+                HashKeyValidityPolicy::TrapNil => {
+                    let msg = emit_addressof(context, &then_blk, "s_table_index_nil", types, loc);
+                    emit_exit_with_message(context, &then_blk, msg, types, loc);
+                }
+                HashKeyValidityPolicy::CheckNaN => {
+                    let payload_ptr = emit_byte_offset_ptr(
+                        context,
+                        &then_blk,
+                        search_key_slot,
+                        ARRAY_ELEM_OFF_VALUE,
+                        types,
+                        loc,
+                    );
+                    let payload = emit_load(&then_blk, payload_ptr, types.f64, loc);
+                    let is_nan: Value<'c, '_> = then_blk
+                        .append_operation(arith::cmpf(
+                            context,
+                            CmpfPredicate::Une,
+                            payload,
+                            payload,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    emit_table_index_nan_trap_if(context, &then_blk, is_nan, types, loc);
+                }
+            }
+        }
         then_blk.append_operation(scf::r#yield(&[], loc));
+        then_region.append_block(then_blk);
+        let else_region = Region::new();
+        let else_blk = Block::new(&[]);
+        else_blk.append_operation(scf::r#yield(&[], loc));
+        else_region.append_block(else_blk);
+        block.append_operation(scf::r#if(is_match, &[], then_region, else_region, loc));
     }
-    then_region.append_block(then_blk);
-    let else_region = Region::new();
-    let else_blk = Block::new(&[]);
-    else_blk.append_operation(scf::r#yield(&[], loc));
-    else_region.append_block(else_blk);
-    block.append_operation(scf::r#if(tag_is_number, &[], then_region, else_region, loc));
 }
 
 fn emit_printf_decl<'c>(
@@ -3157,43 +3195,6 @@ fn emit_stmt<'a, 'c>(
                             ));
                         }
                     };
-                    // Tag check: TAG_NIL → trap with s_table_index_nil.
-                    let tag = emit_load(block, search_key_slot, types.i64, loc);
-                    let tag_nil_const = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(types.i64, TAG_NIL).into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let is_nil: Value<'c, 'a> = block
-                        .append_operation(arith::cmpi(
-                            context,
-                            arith::CmpiPredicate::Eq,
-                            tag,
-                            tag_nil_const,
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let nil_then = Region::new();
-                    let nil_then_blk = Block::new(&[]);
-                    {
-                        let msg =
-                            emit_addressof(context, &nil_then_blk, "s_table_index_nil", types, loc);
-                        emit_exit_with_message(context, &nil_then_blk, msg, types, loc);
-                        nil_then_blk.append_operation(scf::r#yield(&[], loc));
-                    }
-                    nil_then.append_block(nil_then_blk);
-                    let nil_else = Region::new();
-                    let nil_else_blk = Block::new(&[]);
-                    nil_else_blk.append_operation(scf::r#yield(&[], loc));
-                    nil_else.append_block(nil_else_blk);
-                    block.append_operation(scf::r#if(is_nil, &[], nil_then, nil_else, loc));
-
                     // Hash path — same structure as the static-key
                     // arm above, but: (a) the search-key slot is the
                     // TaggedValue local's slot rather than a freshly
@@ -3201,7 +3202,9 @@ fn emit_stmt<'a, 'c>(
                     // copies the slot's 16 bytes (tag at +0, payload
                     // at +8) into entry+0 raw rather than calling
                     // `emit_value_slot_store_dispatched` with a
-                    // static kind.
+                    // static kind. ADR 0087: nil/NaN tag validity
+                    // is enforced at the probe chokepoint
+                    // (`emit_hash_probe_loop`); no inline trap here.
                     emit_hash_ensure_buf(context, block, target_ptr, types, loc);
                     emit_hash_grow_if_needed(context, block, target_ptr, types, loc);
                     let hash_buf_slot = emit_byte_offset_ptr(
@@ -5528,11 +5531,13 @@ fn emit_hash_probe_loop<'a, 'c>(
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
-    // Phase 2.6b-hash-key-nan (ADR 0086): every TaggedValue-key
-    // probe routes through this helper; a single preflight here
-    // covers the IndexAssign / Index / iterator-internal callers
-    // without per-call repetition. No-op for non-Number tags.
-    emit_hash_key_nan_preflight(context, block, search_key_slot, types, loc);
+    // Phase 2.6b-hash-key-validity (ADR 0087): every TaggedValue-
+    // key probe routes through this gate. It folds the ADR 0086
+    // NaN preflight and ADR 0084 nil trap into one chokepoint, so
+    // IndexAssign / Index / iterator-internal callers no longer
+    // need per-call repetition. Pass-through for non-Nil/Number
+    // tags.
+    emit_hash_key_runtime_validity_gate(context, block, search_key_slot, types, loc);
     let one = block
         .append_operation(arith::constant(
             context,
@@ -5768,6 +5773,11 @@ fn emit_hash_probe_loop<'a, 'c>(
 ///
 /// Caller must guarantee the buffer is non-null; for lookup that
 /// means `header.hash_buf != null` (else trap before calling).
+///
+/// ADR 0087: runtime tag-validity (nil/NaN) is enforced inside
+/// `emit_hash_probe_loop` via `emit_hash_key_runtime_validity_gate`.
+/// Callers must NOT add inline nil/NaN checks before this entry —
+/// the chokepoint owns the policy.
 fn emit_hash_probe_lookup<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
@@ -5785,6 +5795,11 @@ fn emit_hash_probe_lookup<'a, 'c>(
 /// `key_str` is found, and return that bucket. Sentinel buckets
 /// (ADR 0062) are skipped — no reuse. Used by the insert path,
 /// the rehash placement path, and the IsNilQuery hash arm.
+///
+/// ADR 0087: runtime tag-validity (nil/NaN) is enforced inside
+/// `emit_hash_probe_loop` via `emit_hash_key_runtime_validity_gate`.
+/// Callers must NOT add inline nil/NaN checks before this entry —
+/// the chokepoint owns the policy.
 fn emit_hash_probe_for_insert<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
@@ -6720,41 +6735,9 @@ fn emit_expr<'a, 'c>(
                             ));
                         }
                     };
-                    let tag = emit_load(block, search_key_slot, types.i64, loc);
-                    let tag_nil_const = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(types.i64, TAG_NIL).into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let is_nil: Value<'c, 'a> = block
-                        .append_operation(arith::cmpi(
-                            context,
-                            arith::CmpiPredicate::Eq,
-                            tag,
-                            tag_nil_const,
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let nil_then = Region::new();
-                    let nil_then_blk = Block::new(&[]);
-                    {
-                        let msg =
-                            emit_addressof(context, &nil_then_blk, "s_table_index_nil", types, loc);
-                        emit_exit_with_message(context, &nil_then_blk, msg, types, loc);
-                        nil_then_blk.append_operation(scf::r#yield(&[], loc));
-                    }
-                    nil_then.append_block(nil_then_blk);
-                    let nil_else = Region::new();
-                    let nil_else_blk = Block::new(&[]);
-                    nil_else_blk.append_operation(scf::r#yield(&[], loc));
-                    nil_else.append_block(nil_else_blk);
-                    block.append_operation(scf::r#if(is_nil, &[], nil_then, nil_else, loc));
+                    // ADR 0087: nil/NaN tag validity is enforced at
+                    // the probe chokepoint (`emit_hash_probe_loop`);
+                    // no inline trap here.
 
                     let hash_buf_slot = emit_byte_offset_ptr(
                         context,

@@ -253,6 +253,7 @@ the introduction, when still open).
 | LIC-2.8e-pairs-tagged-key-write-1 | `t[k] = …` inside a `pairs` body where `k` is the iterator-bound TaggedValue local — codegen runtime tag dispatch (`TAG_NIL` trap, hash probe via the existing tag-aware helpers), Index read on the same shape | 0084 |
 | LIC-2.8e-iter-generic-1           | `for k, v in iter, state, ctl do … end` — Phase 1 scope: non-capturing user fn, builtin `next`, function alias. Closure-as-iter rejected via the existing `f.upvalues.is_empty()` filter; lifts automatically when ADR 0083 ships | 0085 |
 | LIC-2.6b-hash-key-nan-runtime-1   | NaN cannot be used as a table index (Lua spec §3.4.5). Static Number-key array path (`t[0/0]`) and TaggedValue-key hash probe entry both gated on `cmpf Une` self-self preflight; trap surface is the dedicated `s_table_index_nan` global | 0086 |
+| LIC-2.6b-hash-key-nil-runtime-1   | Dynamic `nil` hash key via TaggedValue local — runtime trap `s_table_index_nil` enforced at the `emit_hash_probe_loop` chokepoint via `emit_hash_key_runtime_validity_gate` (consults `tagged.rs::policy_for_tag`); inline traps at IndexAssign / Index TaggedValue arms retired in favour of the chokepoint | 0079 / 0084 / 0087 |
 
 ### Partial
 
@@ -263,9 +264,9 @@ the introduction, when still open).
 | ID                                          | Behaviour                                                             | Notes                          |
 |---------------------------------------------|-----------------------------------------------------------------------|--------------------------------|
 | LIC-2.7p-arith-coerce-tagged-1              | TaggedValue operand arith coerce (`local x = t[1]; print(x + 1)` when x is runtime String) | HIR can't statically resolve the kind; current TaggedValue-arith path traps on non-Number tag (ADR 0063). Unlocking needs runtime tag dispatch in arith codegen |
-| LIC-2.6b-hash-key-nil-runtime-1             | Dynamic `nil` hash key via TaggedValue local — runtime probe currently fires the generic missing-key trap; Lua spec wants a specific "table index is nil" diagnostic. ADR 0084 surfaces this for IndexAssign / Index via `s_table_index_nil`; remaining gap is the trap surface for hash-keyed reads through other producers | 0079 / 0084 (partial) |
+| LIC-2.6b-hash-missing-key-read-1            | Index TaggedValue arm at `emit.rs:6700-6800` uses `emit_hash_probe_lookup` (trap_on_null=true); a missing key fires `s_table_missing_key` instead of returning nil per Lua §3.4.5. Symmetrical to the IndexAssign arm which uses `emit_hash_probe_for_insert`. Discovered during ADR 0087 review; out of scope for that ADR | 0084 (introduced) |
 
-**Total:** 27 LIC entries — 27 resolved, 0 partial, 1 pending core + 1 pending runtime-diag (LIC-2.6c-tag-hetero-closure-escape-1 resolved by ADR 0083 Commit 3c, 2026-05-10).
+**Total:** 28 LIC entries — 27 resolved, 0 partial, 2 pending (LIC-2.7p-arith-coerce-tagged-1 + LIC-2.6b-hash-missing-key-read-1).
 
 ---
 
@@ -556,7 +557,7 @@ NaN, agnostic to qNaN / sNaN / ±NaN) and exits with the dedicated
 | `IndexAssign` Number-key arm             | static Number key, before `f2i` / bounds-check |
 | `Index` Number-key arm                   | static Number key, before `f2i` / bounds-check |
 | `emit_local_init_tagged` Number-key arm  | inline `print(t[expr])` / `tostring(t[expr])`  |
-| `emit_hash_probe_loop` entry             | TaggedValue keys, only when tag == TAG_NUMBER  |
+| `emit_hash_probe_loop` entry             | TaggedValue keys — handled by ADR 0087's `emit_hash_key_runtime_validity_gate` (subsumes the standalone `emit_hash_key_nan_preflight` helper) |
 
 The fourth site (probe loop entry) is the single chokepoint for
 both `emit_hash_probe_for_insert` and `emit_hash_probe_lookup`;
@@ -566,6 +567,39 @@ duplicating the check. `cmpf Une self-self` was reused from
 `emit_tonumber_for_arith` (ADR 0077). Diagnostic stays distinct
 from `s_table_index_nil` (ADR 0084) and `s_table_missing_key`
 (ADR 0079) — three layered traps for three layered failure modes.
+
+### Hash-key runtime validity policy (ADR 0087)
+
+Generalises ADR 0086's chokepoint and ADR 0084's per-site nil
+trap into a single tag-validity gate at the probe entry. Splits
+**decision** (pure, in `tagged.rs`) from **emission** (effectful,
+in `emit.rs`):
+
+| Component                                  | Module      | Role                                                                       |
+|--------------------------------------------|-------------|----------------------------------------------------------------------------|
+| `enum HashKeyValidityPolicy`               | `tagged.rs` | Policy values: `TrapNil`, `CheckNaN` (extension point for future tags)     |
+| `policy_for_tag(tag) -> &'static [...]`    | `tagged.rs` | Pure decision matrix: `TAG_NIL → [TrapNil]`, `TAG_NUMBER → [CheckNaN]`, others pass-through |
+| `emit_hash_key_runtime_validity_gate(...)` | `emit.rs`   | Effectful executor; consults `policy_for_tag` and emits scf.if + trap chain |
+| `s_table_index_nil` / `s_table_index_nan`  | `emit.rs`   | Trap message globals fired by the gate                                     |
+
+Order is load-bearing inside the gate: TAG_NIL must be tested
+before TAG_NUMBER because the nil slot has no f64 payload, so
+the NaN load must not run on it. The chokepoint sits at
+`emit_hash_probe_loop` entry, so every probe wrapper
+(`emit_hash_probe_lookup`, `emit_hash_probe_for_insert`)
+inherits the gate transparently. The IndexAssign / Index
+TaggedValue arms no longer carry their own inline nil traps —
+the gate is the single owner.
+
+The 3 raw-f64 NaN preflight sites (`emit.rs:2766` / `:6554` /
+`:4339`) using `emit_table_index_nan_trap_if` are **outside**
+the gate's surface — they consume an `f64` directly, not a
+tagged slot, so they share the trap message global but not the
+emitter.
+
+Future tag kinds (e.g. `WeakKey`, `ThreadKey`) extend coverage
+by adding entries to `policy_for_tag` and the gate's
+`POLICED_TAGS` list. Call sites stay frozen.
 
 ---
 
@@ -682,3 +716,4 @@ Listed in Codex review priority order (post-ADR-0082):
 | 0084 | 2.8e-iter-tk                 | TaggedValue-key IndexAssign + Index read (Codex pivot to (C), ADR 0083 deferred). HIR `is_hash_key_eligible` accepts `ValueKind::TaggedValue`; codegen runtime tag dispatch in IndexAssign / Index passes the local's slot directly to the ADR 0079 hash probe with a `TAG_NIL` trap (`s_table_index_nil`, Lua spec §3.4.5). New-key commit copies the 16-byte search slot into `entry+0` raw. Resolves the natural `for k, v in pairs(t) do t[k] = v + 100 end` idiom; ADR 0080's `pairs_body_writes_separate_table_safely` workaround reframed to `pairs_body_mutates_existing_value_safely`. 7 new e2e + 1 reframe, 944 → 951 green. LIC-2.8e-pairs-tagged-key-write-1 resolved; LIC-2.6b-hash-key-nil-runtime-1 noted as partial via the new trap surface. 24/0/3 |
 | 0085 | 2.8e-iter-generic            | Full Lua 5.4 §3.3.5 generic-for parser sugar — `for k, v in ITER, STATE, CTL do BODY end`. New `StmtKind::ForGeneric { names, iter, state, ctl, body }` parser variant + `IterMatch::Generic` discriminator; HIR synthetic-block desugar pins state / ctl / iter to fresh locals and dispatches the per-iteration call through `Callee::Builtin(Next)` / `User(fid)` / `IndirectDispatch` based on iter's resolved shape. Phase 1 scope filters closure-as-iter via `f.upvalues.is_empty()` (carries over to ADR 0083 follow-up). Iter must return `(TaggedValue\|Nil, _)` so a `nil` first result can terminate. 8 new e2e in `tests/phase2_8e_generic_for.rs`, 951 → 959 green. LIC-2.8e-iter-generic-1 resolved (Phase 1). 25/0/3 |
 | 0086 | 2.6b-hash-key-nan            | Hash key NaN runtime diagnostic (Codex pivot from ADR 0083 deferral) — Lua spec §3.4.5 forbids NaN as a table index. New `s_table_index_nan` global + `emit_table_index_nan_trap_if` / `emit_hash_key_nan_preflight` helpers. NaN preflight inserted at 4 sites: static Number-key IndexAssign / Index arms (before `f2i`), inline `emit_local_init_tagged` Number-key arm (covers `print(t[0/0])`), and `emit_hash_probe_loop` entry (single chokepoint for every TaggedValue-key call). `cmpf Une self-self` reused from ADR 0077's `emit_tonumber_for_arith` — qNaN/sNaN/±NaN agnostic. 6 new e2e in `tests/phase2_6b_hash_key_nan.rs`, 959 → 965 green. LIC-2.6b-hash-key-nan-runtime-1 resolved. 26/0/2 |
+| 0087 | 2.6b-hash-key-validity       | Hash-key runtime validity policy chokepoint (Codex post-3c review v2) — pure decision (`enum HashKeyValidityPolicy { TrapNil, CheckNaN }` + `policy_for_tag(tag) -> &'static [...]` in `tagged.rs`) split from effectful executor (`emit_hash_key_runtime_validity_gate` in `emit.rs`). The new gate replaces `emit_hash_key_nan_preflight` at the `emit_hash_probe_loop` chokepoint (`emit.rs:5535`) and folds in the ADR 0084 inline nil traps at IndexAssign (`emit.rs:3160-3195`) and Index (`emit.rs:6723-6757`) TaggedValue arms. 3 raw-f64 NaN preflight sites (`emit.rs:2766` / `:6554` / `:4339`) using `emit_table_index_nan_trap_if` are unaffected — they consume f64 directly, not a tagged slot. 3 new pure unit tests in `tagged.rs` + 2 new e2e in `tests/phase2_6b_hash_key_nil.rs`, 990 → 995 green. LIC-2.6b-hash-key-nil-runtime-1 resolved (was partial); new pending LIC-2.6b-hash-missing-key-read-1 (Index TaggedValue arm uses `emit_hash_probe_lookup` with `trap_on_null=true`, traps on missing key instead of returning nil per Lua §3.4.5). 27/0/2 |
