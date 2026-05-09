@@ -3703,28 +3703,15 @@ impl LowerCtx {
                         &self.functions,
                     )?;
                 }
-                // Phase 2.5c-min (ADR 0037): direct calls to a
-                // closure with upvalues append the captured values
-                // as extra arguments, mirroring the matching code
-                // in the function_names dispatch path below.
-                // Phase 2.5c-full Commit 3b (ADR 0083) will retire
-                // this trailing-uv ABI in favour of cell-ptr-first;
-                // kept for now so the prep commit is behavior-neutral.
-                let mut all_args = lowered_args;
-                if let Callee::User { fid, .. } = callee {
-                    let upvalue_args: Vec<HirExpr> = self.functions[fid.0]
-                        .upvalues
-                        .iter()
-                        .map(|uv| HirExpr {
-                            kind: HirExprKind::Local(uv.outer_local_id),
-                            span: whole.span,
-                        })
-                        .collect();
-                    all_args.extend(upvalue_args);
-                }
+                // Phase 2.5c-full Commit 3b body atomic Step 2 (ADR
+                // 0083): trailing-uv append removed. cell ptr now
+                // flows through the call's first argument from
+                // codegen, sourced via `Callee::User::holding_local`
+                // when the binding is in scope or via the entry
+                // `cell_ptr` block-arg for self-recursion.
                 return Ok(HirExprKind::Call {
                     callee,
-                    args: all_args,
+                    args: lowered_args,
                 });
             }
             // Phase 2.5x-callee-dispatch (ADR 0082, part-supersedes
@@ -3896,20 +3883,15 @@ impl LowerCtx {
             // processed later in source order). Rejection lives
             // in `lower()` post-pass; here we just record
             // `holding_local` for codegen consumption.
+            // Phase 2.5c-full Commit 3b body atomic Step 2 (ADR 0083):
+            // the legacy ADR 0037 trailing-upvalue ABI is gone.
+            // codegen prepends the closure cell ptr (loaded via
+            // `holding_local` or the recursion shortcut) and the
+            // body unpacks `cell.upvalue_box[i]` at entry.
             let holding_local = self.resolve(name);
-            let upvalue_args: Vec<HirExpr> = self.functions[fid.0]
-                .upvalues
-                .iter()
-                .map(|uv| HirExpr {
-                    kind: HirExprKind::Local(uv.outer_local_id),
-                    span: whole.span,
-                })
-                .collect();
-            let mut all_args = lowered_args;
-            all_args.extend(upvalue_args);
             return Ok(HirExprKind::Call {
                 callee: Callee::User { fid, holding_local },
-                args: all_args,
+                args: lowered_args,
             });
         }
         let builtin = match Builtin::from_name(name) {

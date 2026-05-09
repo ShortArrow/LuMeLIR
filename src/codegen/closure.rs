@@ -113,13 +113,25 @@
 //! distinguishes self-recursion from forward / sibling refs;
 //! a post-pass rejects mutual capturing recursion that the
 //! Function-kind upvalue restriction can't otherwise block.
-//! Commit 3b body atomic (pending) wires the 4 direct-call
-//! sites, the `emit_function` ABI cutover, capturing closure
-//! creation, the LocalInit storage rule, and outer-scope
-//! `is_captured` box allocation in a single atomic landing.
-//! Commit 3c (post-3b) lifts the `HirError::ClosureEscapes`
-//! reject set and ships e2e tests for capturing closures,
-//! resolving LIC-2.6c-tag-hetero-closure-escape-1.
+//! Commit 3b body atomic (2026-05-10) shipped the cell-ptr-first
+//! ABI: `emit_function` now prepends a `!llvm.ptr` cell ptr to
+//! every user fn's signature, the entry block unpacks
+//! `cell.upvalue_box[i]` for each captured upvalue, the 4
+//! direct-call sites (Call expr arm, multi-assign, dispatch chain
+//! then-branch, TaggedValue pack helper) all route through
+//! `emit_call_user_with_cell`, the FunctionRef arm allocates a
+//! fresh capturing cell and populates fn_ptr / upvalue_count /
+//! upvalue_box[i] from the outer scope's box ptrs, the
+//! `Local`-known-FuncId arm branches on `target.upvalues.is_empty()`
+//! to load a per-instance cell from the binding's slot for
+//! capturing closures (singleton stays for non-capturing), the
+//! LocalInit storage rule unconditionally stores the cell ptr
+//! when the target captures, and outer-scope `is_captured`
+//! locals (params + body locals) get heap upvalue boxes
+//! allocated at function entry. Commit 3c (post-3b) lifts the
+//! `HirError::ClosureEscapes` reject set and ships e2e tests for
+//! capturing closures, resolving
+//! LIC-2.6c-tag-hetero-closure-escape-1.
 
 use melior::{
     Context,

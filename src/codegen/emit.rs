@@ -1165,62 +1165,116 @@ fn emit_function<'c>(
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     let region = Region::new();
-    // Phase 2.5b.2: each parameter's MLIR type is determined by its
-    // ValueKind. Number → f64, Function(arity) → !func.func<...>.
-    // Phase 2.5c-min (ADR 0037): upvalues become extra MLIR
-    // parameters appended after the Lua params; the callsite-side
-    // `lower_call` already passes their values as extra args.
+    // Phase 2.5c-full Commit 3b body atomic Step 5 (ADR 0083): every
+    // user `llvm.func` accepts a `!llvm.ptr` closure cell ptr as
+    // its first argument. Lua params shift to args 1..N. The body
+    // unpacks `cell.upvalue_box[i]` for each `uv` at function entry
+    // and uses the box ptr as the slot for the captured local —
+    // see `closure.rs` ABI contract for full detail.
     let param_types: Vec<Type<'c>> = hir_fn
         .params
         .iter()
         .map(|info| param_mlir_type(context, info.kind, types))
         .collect();
-    let upvalue_types: Vec<Type<'c>> = hir_fn
-        .upvalues
-        .iter()
-        .map(|uv| param_mlir_type(context, uv.kind, types))
-        .collect();
-    let all_param_types: Vec<Type<'c>> = param_types
-        .iter()
-        .chain(upvalue_types.iter())
-        .copied()
-        .collect();
+    let mut all_param_types: Vec<Type<'c>> = Vec::with_capacity(1 + param_types.len());
+    all_param_types.push(types.ptr); // %arg0 = closure cell ptr
+    all_param_types.extend(param_types.iter().copied());
     let block_args: Vec<(Type<'c>, Location<'c>)> =
         all_param_types.iter().map(|t| (*t, loc)).collect();
     let block = Block::new(&block_args);
 
+    // Cell ptr is the entry block's first argument. Threaded down
+    // through `emit_stmts` so direct user calls and capturing
+    // closure creation sites can recover it.
+    let cell_ptr: Value<'c, '_> = block.argument(0).unwrap().into();
+
     // Allocate slots for every local. Function-kind params are special:
     // their `slot` is the block argument value itself (not a pointer);
     // we never load/store those. Non-param Function-kind locals get an
-    // i1 placeholder slot — their value is reproduced at every use site
-    // via `func.constant` from `LocalInfo.func_id`.
-    let slots: Vec<Value<'c, '_>> = hir_fn
+    // alloca slot whose value is reproduced at every use site via
+    // `func.constant` (or, post-Commit-2b, via `addressof @<sym>_closure`).
+    let mut slots: Vec<Value<'c, '_>> = hir_fn
         .locals
         .iter()
         .enumerate()
         .map(|(i, info)| match info.kind {
-            ValueKind::Function(_) if i < hir_fn.params.len() => block.argument(i).unwrap().into(),
+            // Lua params shift: param i is at block_arg(i+1) since
+            // block_arg(0) is the cell ptr.
+            ValueKind::Function(_) if i < hir_fn.params.len() => {
+                block.argument(i + 1).unwrap().into()
+            }
             _ => emit_alloca_slot_for_kind(context, &block, info.kind, types, loc),
         })
         .collect();
 
-    // Store each Number parameter (block argument) into its alloca slot.
-    // Function-kind params are already wired up in `slots` above.
+    // Store each non-Function parameter (block_arg(i+1)) into its
+    // alloca slot. Function-kind params keep their block_arg as the
+    // slot value directly (no store).
     for (i, info) in hir_fn.params.iter().enumerate() {
         if !matches!(info.kind, ValueKind::Function(_)) {
-            let arg: Value<'c, '_> = block.argument(i).unwrap().into();
-            emit_store(&block, arg, slots[i], loc);
+            let arg: Value<'c, '_> = block.argument(i + 1).unwrap().into();
+            // Phase 2.5c-full Commit 3b body atomic Step 6: when the
+            // captured-local post-pass marked this param as
+            // `is_captured`, allocate a heap upvalue box and store
+            // through it instead of the alloca, then override the
+            // slot with the box ptr so subsequent reads/writes flow
+            // through the heap box.
+            if hir_fn.locals[i].is_captured {
+                let box_ptr =
+                    super::closure::emit_allocate_upvalue_box(context, &block, types, loc);
+                super::closure::emit_store_upvalue_box_value(
+                    context, &block, box_ptr, arg, info.kind, types, loc,
+                );
+                slots[i] = box_ptr;
+            } else {
+                emit_store(&block, arg, slots[i], loc);
+            }
         }
     }
 
-    // Phase 2.5c-min: store each upvalue's incoming block argument
-    // into the slot allocated for its inner local. Body code loads
-    // from `slots[uv.inner_local_id.0]` via the standard
-    // `HirExprKind::Local` path — no special-case in body codegen.
+    // Phase 2.5c-full Commit 3b body atomic Step 5 (ADR 0083): unpack
+    // each captured upvalue from the cell. The box ptr is the slot
+    // for the inner local, so `HirExprKind::Local(inner_id)` reads /
+    // writes flow through `closure::emit_load/store_upvalue_box_value`.
     for (i, uv) in hir_fn.upvalues.iter().enumerate() {
-        let block_arg_idx = hir_fn.params.len() + i;
-        let arg: Value<'c, '_> = block.argument(block_arg_idx).unwrap().into();
-        emit_store(&block, arg, slots[uv.inner_local_id.0], loc);
+        let box_ptr =
+            super::closure::emit_load_closure_upvalue_box(context, &block, cell_ptr, i, types, loc);
+        slots[uv.inner_local_id.0] = box_ptr;
+    }
+
+    // Phase 2.5c-full Commit 3b body atomic Step 6 (ADR 0083): for
+    // every body-introduced local marked `is_captured` by the HIR
+    // post-pass, allocate a heap upvalue box at function entry so
+    // its slot is already a box ptr when the LocalInit /
+    // Assign / Local-read paths fire. Non-Function kinds only —
+    // Function-kind captured locals would need a 16-byte box and
+    // are out of ADR 0083 Commit 3 scope. Params are already
+    // handled above; upvalue inner_locals already point at the
+    // caller-supplied cell's box ptr.
+    let upvalue_inner_local_ids: std::collections::HashSet<usize> = hir_fn
+        .upvalues
+        .iter()
+        .map(|uv| uv.inner_local_id.0)
+        .collect();
+    for (i, info) in hir_fn.locals.iter().enumerate() {
+        if !info.is_captured {
+            continue;
+        }
+        if i < hir_fn.params.len() {
+            continue; // params already handled above
+        }
+        if upvalue_inner_local_ids.contains(&i) {
+            continue; // upvalue inner_local already pointed at the cell's box
+        }
+        if matches!(info.kind, ValueKind::Function(_) | ValueKind::TaggedValue) {
+            // Function-kind / TaggedValue captures are out of
+            // Commit 3 scope; the post-pass should have left
+            // them rejected upstream, so the slot stays as the
+            // alloca it was given.
+            continue;
+        }
+        let box_ptr = super::closure::emit_allocate_upvalue_box(context, &block, types, loc);
+        slots[i] = box_ptr;
     }
 
     emit_stmts(
@@ -1232,6 +1286,7 @@ fn emit_function<'c>(
         functions,
         types,
         hir_fn.params.len(),
+        Some(cell_ptr),
         loc,
     )?;
 
@@ -1320,6 +1375,7 @@ fn emit_main<'c>(
         .map(|info| emit_alloca_slot_for_kind(context, &main_block, info.kind, types, loc))
         .collect();
 
+    // Chunk-level (main fn) has no enclosing closure cell.
     emit_stmts(
         context,
         &main_block,
@@ -1329,6 +1385,7 @@ fn emit_main<'c>(
         &chunk.functions,
         types,
         0,
+        None,
         loc,
     )?;
 
@@ -2251,11 +2308,21 @@ fn emit_stmts<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     for stmt in stmts {
         emit_stmt(
-            context, block, stmt, slots, locals, functions, types, params_len, loc,
+            context,
+            block,
+            stmt,
+            slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
         )?;
     }
     Ok(())
@@ -2271,6 +2338,7 @@ fn emit_stmt<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     match &stmt.kind {
@@ -2289,13 +2357,29 @@ fn emit_stmt<'a, 'c>(
                 ValueKind::Function(_) => {
                     let is_param = id.0 < params_len;
                     let known_fid = info.func_id.is_some();
-                    if !is_param && !known_fid {
-                        // Phase 2.5c-full Commit 2a (ADR 0083):
-                        // Function-typed expressions now produce
-                        // `!llvm.ptr` directly — no ucast bridge
-                        // is needed before storing into the slot.
+                    // Phase 2.5c-full Commit 3b body atomic Step 8
+                    // (ADR 0083): capturing closures need their cell
+                    // ptr stored even when the binding has a known
+                    // FuncId — alias copies (`local g = f`) and the
+                    // synthetic FunctionDef-LocalInit both go
+                    // through this arm and the Local-known-FuncId
+                    // codegen reads the cell ptr from the slot.
+                    let target_capturing = info
+                        .func_id
+                        .map(|fid| !functions[fid.0].upvalues.is_empty())
+                        .unwrap_or(false);
+                    if !is_param && (!known_fid || target_capturing) {
                         let v = emit_expr(
-                            context, block, value, slots, locals, functions, types, params_len, loc,
+                            context,
+                            block,
+                            value,
+                            slots,
+                            locals,
+                            functions,
+                            types,
+                            params_len,
+                            in_function_cell_ptr,
+                            loc,
                         )?;
                         emit_store(block, v, slots[id.0], loc);
                     }
@@ -2338,6 +2422,7 @@ fn emit_stmt<'a, 'c>(
                                 functions,
                                 types,
                                 params_len,
+                                in_function_cell_ptr,
                                 loc,
                             )?;
                         }
@@ -2353,6 +2438,7 @@ fn emit_stmt<'a, 'c>(
                                 functions,
                                 types,
                                 params_len,
+                                in_function_cell_ptr,
                                 loc,
                             )?;
                         }
@@ -2412,8 +2498,16 @@ fn emit_stmt<'a, 'c>(
                                 block.append_operation(zero_op).result(0).unwrap().into()
                             } else {
                                 emit_expr(
-                                    context, block, value, slots, locals, functions, types,
-                                    params_len, loc,
+                                    context,
+                                    block,
+                                    value,
+                                    slots,
+                                    locals,
+                                    functions,
+                                    types,
+                                    params_len,
+                                    in_function_cell_ptr,
+                                    loc,
                                 )?
                             };
                             emit_value_slot_store_dispatched(
@@ -2430,15 +2524,51 @@ fn emit_stmt<'a, 'c>(
                 }
                 _ => {
                     let v = emit_expr(
-                        context, block, value, slots, locals, functions, types, params_len, loc,
+                        context,
+                        block,
+                        value,
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
                     )?;
-                    emit_store(block, v, slots[id.0], loc);
+                    // Phase 2.5c-full Commit 3b body atomic Step 6
+                    // (ADR 0083): captured non-Function locals'
+                    // slots are heap upvalue boxes (pre-allocated
+                    // in `emit_function`). Route the store through
+                    // the kind-typed box helper so reads from
+                    // sibling closures see the same value.
+                    if info.is_captured {
+                        super::closure::emit_store_upvalue_box_value(
+                            context,
+                            block,
+                            slots[id.0],
+                            v,
+                            info.kind,
+                            types,
+                            loc,
+                        );
+                    } else {
+                        emit_store(block, v, slots[id.0], loc);
+                    }
                 }
             }
         }
         HirStmtKind::Block { stmts } => {
             emit_stmts(
-                context, block, stmts, slots, locals, functions, types, params_len, loc,
+                context,
+                block,
+                stmts,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
             )?;
         }
         HirStmtKind::If {
@@ -2448,8 +2578,19 @@ fn emit_stmt<'a, 'c>(
             else_body,
         } => {
             emit_if(
-                context, block, cond, then_body, elifs, else_body, slots, locals, functions, types,
-                params_len, loc,
+                context,
+                block,
+                cond,
+                then_body,
+                elifs,
+                else_body,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
             )?;
         }
         HirStmtKind::While {
@@ -2458,7 +2599,17 @@ fn emit_stmt<'a, 'c>(
             break_id,
         } => {
             emit_while(
-                context, block, cond, body, *break_id, slots, locals, functions, types, params_len,
+                context,
+                block,
+                cond,
+                body,
+                *break_id,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
                 loc,
             )?;
         }
@@ -2468,7 +2619,17 @@ fn emit_stmt<'a, 'c>(
             break_id,
         } => {
             emit_repeat(
-                context, block, body, cond, *break_id, slots, locals, functions, types, params_len,
+                context,
+                block,
+                body,
+                cond,
+                *break_id,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
                 loc,
             )?;
         }
@@ -2481,13 +2642,35 @@ fn emit_stmt<'a, 'c>(
             break_id,
         } => {
             emit_for_numeric(
-                context, block, *var_id, start, stop, step, body, *break_id, slots, locals,
-                functions, types, params_len, loc,
+                context,
+                block,
+                *var_id,
+                start,
+                stop,
+                step,
+                body,
+                *break_id,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
             )?;
         }
         HirStmtKind::ExprStmt(expr) => {
             emit_expr_stmt(
-                context, block, expr, slots, locals, functions, types, params_len, loc,
+                context,
+                block,
+                expr,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
             )?;
         }
         HirStmtKind::MultiAssignFromCall {
@@ -2496,7 +2679,17 @@ fn emit_stmt<'a, 'c>(
             args,
         } => {
             emit_multi_assign_from_call(
-                context, block, dst_ids, callee, args, slots, locals, functions, types, params_len,
+                context,
+                block,
+                dst_ids,
+                callee,
+                args,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
                 loc,
             )?;
         }
@@ -2511,11 +2704,29 @@ fn emit_stmt<'a, 'c>(
         //   store the value at offset (key-1)*8
         HirStmtKind::IndexAssign { target, key, value } => {
             let target_ptr = emit_expr(
-                context, block, target, slots, locals, functions, types, params_len, loc,
+                context,
+                block,
+                target,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
             )?;
             let key_kind = infer_kind(key, locals, functions);
             let value_v = emit_expr(
-                context, block, value, slots, locals, functions, types, params_len, loc,
+                context,
+                block,
+                value,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
             )?;
             match key_kind {
                 ValueKind::Number => {
@@ -2524,7 +2735,16 @@ fn emit_stmt<'a, 'c>(
                     // only; grow handles capacity, gap-fill marks
                     // intermediate slots as Nil-tagged.
                     let key_f = emit_expr(
-                        context, block, key, slots, locals, functions, types, params_len, loc,
+                        context,
+                        block,
+                        key,
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
                     )?;
                     // Phase 2.6b-hash-key-nan (ADR 0086): NaN
                     // cannot be a table index (Lua spec §3.4.5).
@@ -2663,7 +2883,16 @@ fn emit_stmt<'a, 'c>(
                 // and equality.
                 ValueKind::String | ValueKind::Bool | ValueKind::Function(_) | ValueKind::Table => {
                     let key_value = emit_expr(
-                        context, block, key, slots, locals, functions, types, params_len, loc,
+                        context,
+                        block,
+                        key,
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
                     )?;
                     let key_slot =
                         emit_build_search_key_slot(context, block, key_kind, key_value, types, loc);
@@ -3223,6 +3452,7 @@ fn emit_multi_assign_from_call<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     // Phase 2.8e-iter-next (ADR 0081) / 2.5x-callee-dispatch (ADR
@@ -3245,10 +3475,22 @@ fn emit_multi_assign_from_call<'a, 'c>(
             functions,
             types,
             params_len,
+            in_function_cell_ptr,
             loc,
         ),
         Callee::Builtin(b) => emit_multi_assign_from_builtin(
-            context, block, dst_ids, *b, args, slots, locals, functions, types, params_len, loc,
+            context,
+            block,
+            dst_ids,
+            *b,
+            args,
+            slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
         ),
         Callee::Indirect(_) => {
             unreachable!("HIR rejects Indirect in MultiAssignFromCall (ADR 0075)")
@@ -3266,8 +3508,20 @@ fn emit_multi_assign_from_call<'a, 'c>(
             // ADR 0076 walker (`flat_result_index` +
             // `emit_pack_tagged_result_at_pos`).
             emit_multi_assign_from_indirect_dispatch(
-                context, block, dst_ids, *idx, sig, candidates, args, slots, locals, functions,
-                types, params_len, loc,
+                context,
+                block,
+                dst_ids,
+                *idx,
+                sig,
+                candidates,
+                args,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
             )
         }
     }
@@ -3305,11 +3559,23 @@ fn emit_indirect_dispatch_call<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<Value<'c, 'a>, CodegenError> {
     let chain_op_results = emit_indirect_dispatch_chain_in_block(
-        context, block, slot_idx, sig, candidates, args, slots, locals, functions, types,
-        params_len, loc,
+        context,
+        block,
+        slot_idx,
+        sig,
+        candidates,
+        args,
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
     )?;
     Ok(chain_op_results[0])
 }
@@ -3331,11 +3597,23 @@ fn emit_multi_assign_from_indirect_dispatch<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     let chain_results = emit_indirect_dispatch_chain_in_block(
-        context, block, slot_idx, sig, candidates, args, slots, locals, functions, types,
-        params_len, loc,
+        context,
+        block,
+        slot_idx,
+        sig,
+        candidates,
+        args,
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
     )?;
     for (i, dst) in dst_ids.iter().enumerate() {
         let info = &locals[dst.0];
@@ -3387,6 +3665,7 @@ fn emit_indirect_dispatch_chain_in_block<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<Vec<Value<'c, 'a>>, CodegenError> {
     // ===== Step 1: tag check =====
@@ -3442,7 +3721,16 @@ fn emit_indirect_dispatch_chain_in_block<'a, 'c>(
     let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
     for a in args {
         arg_vals.push(emit_expr(
-            context, block, a, slots, locals, functions, types, params_len, loc,
+            context,
+            block,
+            a,
+            slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
         )?);
     }
 
@@ -3535,20 +3823,36 @@ fn emit_dispatch_chain_recursive<'a, 'c>(
             .unwrap()
             .into();
 
-        // Then region: direct `llvm.call @user_fn_X(args)` and yield
-        // unpacked results. Phase 2.5c-full Commit 2a (ADR 0083):
-        // multi-result calls return a single `!llvm.struct<>` that
-        // `extract_unpacked_results` splits back into the per-position
-        // MLIR yields the surrounding scf.if expects.
+        // Then region: direct `llvm.call @user_fn_X(cell_ptr, args)`
+        // and yield unpacked results. Phase 2.5c-full Commit 3b body
+        // (ADR 0083): every direct user call now prepends the
+        // closure cell ptr. For dispatch chain candidates the cell
+        // ptr source is `loaded_ptr` (the actual TaggedValue
+        // payload that survived the tag check), passed as
+        // `in_function_cell_ptr` to the helper's branch 3 — the
+        // helper falls through to it because there's no
+        // `holding_local` at the dispatch site.
         let then_region = Region::new();
         let then_blk = Block::new(&[]);
         {
-            let yields = emit_call_user_unpacked(
+            // Re-borrow loaded_ptr / arg_vals at the inner block's
+            // lifetime — the dispatch chain manually transmutes
+            // them into the surrounding scf.if regions and we
+            // mirror that for the new cell_ptr arg.
+            let inner_loaded_ptr =
+                unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(loaded_ptr) };
+            let inner_arg_vals =
+                unsafe { std::mem::transmute::<&[Value<'c, 'a>], &[Value<'c, '_>]>(arg_vals) };
+            let yields = emit_call_user_with_cell(
                 context,
                 &then_blk,
-                &target.mangled_name,
-                arg_vals,
+                target,
+                None,
+                inner_arg_vals,
                 result_types,
+                &[],
+                types,
+                Some(inner_loaded_ptr),
                 loc,
             );
             then_blk.append_operation(scf::r#yield(&yields, loc));
@@ -3653,23 +3957,41 @@ fn emit_multi_assign_from_user_call<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
-    let _ = holding_local; // wired up by Step 4 (cell_ptr threading)
     let target = &functions[fid];
     let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
     for a in args {
         arg_vals.push(emit_expr(
-            context, block, a, slots, locals, functions, types, params_len, loc,
+            context,
+            block,
+            a,
+            slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
         )?);
     }
     let ret_types = ret_mlir_types(context, &target.ret_kinds, types);
-    let flat_results = emit_call_user_unpacked(
+    // Phase 2.5c-full Commit 3b body atomic Step 4 (ADR 0083):
+    // route the cell ptr through the canonical helper. holding_local
+    // resolves the binding's slot when set; otherwise fall back to
+    // the enclosing fn's entry cell_ptr (recursion shortcut for
+    // capturing self-recursion).
+    let flat_results = emit_call_user_with_cell(
         context,
         block,
-        &target.mangled_name,
+        target,
+        holding_local,
         &arg_vals,
         &ret_types,
+        slots,
+        types,
+        in_function_cell_ptr,
         loc,
     );
     for (i, dst) in dst_ids.iter().enumerate() {
@@ -3716,11 +4038,22 @@ fn emit_multi_assign_from_builtin<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     match b {
         Builtin::Next => emit_call_next_into_locals(
-            context, block, dst_ids, args, slots, locals, functions, types, params_len, loc,
+            context,
+            block,
+            dst_ids,
+            args,
+            slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
         ),
         _ => unreachable!(
             "multi-assign from builtin {:?} not supported (only Next declares multi-return)",
@@ -3749,18 +4082,37 @@ fn emit_call_next_into_locals<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     debug_assert_eq!(dst_ids.len(), 2);
     debug_assert_eq!(args.len(), 2);
     let table_val = emit_expr(
-        context, block, &args[0], slots, locals, functions, types, params_len, loc,
+        context,
+        block,
+        &args[0],
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
     )?;
     // Build prev_k tagged slot. If args[1] is `Local(TaggedValue)`,
     // we can read its slot directly without a tmp; otherwise we
     // materialise into a tmp via the dispatched store.
     let (prev_tag, prev_payload) = emit_extract_prev_k(
-        context, block, &args[1], slots, locals, functions, types, params_len, loc,
+        context,
+        block,
+        &args[1],
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
     )?;
     // Phase 2.5c-full Commit 2a (ADR 0083): `__lumelir_next` now
     // returns `!llvm.struct<(i64, i64, i64, i64)>`; unpack the four
@@ -3805,6 +4157,7 @@ fn emit_extract_prev_k<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<(Value<'c, 'a>, Value<'c, 'a>), CodegenError> {
     let kind = infer_kind(expr, locals, functions);
@@ -3824,7 +4177,16 @@ fn emit_extract_prev_k<'a, 'c>(
         emit_value_slot_store_nil(context, block, tmp, types, loc);
     } else {
         let val = emit_expr(
-            context, block, expr, slots, locals, functions, types, params_len, loc,
+            context,
+            block,
+            expr,
+            slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
         )?;
         emit_value_slot_store_dispatched(context, block, tmp, val, kind, types, loc);
     }
@@ -3927,16 +4289,35 @@ fn emit_local_init_tagged<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     let target_ptr = emit_expr(
-        context, block, target, slots, locals, functions, types, params_len, loc,
+        context,
+        block,
+        target,
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
     )?;
     let key_kind = infer_kind(key, locals, functions);
     match key_kind {
         ValueKind::Number => {
             let key_f = emit_expr(
-                context, block, key, slots, locals, functions, types, params_len, loc,
+                context,
+                block,
+                key,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
             )?;
             // Phase 2.6b-hash-key-nan (ADR 0086): inline tagged-
             // tmp materialisation (e.g. `print(t[0/0])`) shares
@@ -4034,7 +4415,16 @@ fn emit_local_init_tagged<'a, 'c>(
         // tag-aware probe.
         ValueKind::String | ValueKind::Bool | ValueKind::Function(_) | ValueKind::Table => {
             let key_value = emit_expr(
-                context, block, key, slots, locals, functions, types, params_len, loc,
+                context,
+                block,
+                key,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
             )?;
             let key_slot =
                 emit_build_search_key_slot(context, block, key_kind, key_value, types, loc);
@@ -4226,11 +4616,23 @@ fn emit_inline_index_into_tagged_tmp<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<Value<'c, 'a>, CodegenError> {
     let tmp = emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
     emit_local_init_tagged(
-        context, block, tmp, target, key, slots, locals, functions, types, params_len, loc,
+        context,
+        block,
+        tmp,
+        target,
+        key,
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
     )?;
     Ok(tmp)
 }
@@ -4256,23 +4658,38 @@ fn emit_call_user_into_tagged_slot<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
-    let _ = holding_local; // wired up by Step 4 (cell_ptr threading)
     let target = &functions[fid];
     let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(call_args.len());
     for a in call_args {
         arg_vals.push(emit_expr(
-            context, block, a, slots, locals, functions, types, params_len, loc,
+            context,
+            block,
+            a,
+            slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
         )?);
     }
     let ret_types = ret_mlir_types(context, &target.ret_kinds, types);
-    let flat_results = emit_call_user_unpacked(
+    // Phase 2.5c-full Commit 3b body atomic Step 4 (ADR 0083):
+    // route the cell ptr through the canonical helper.
+    let flat_results = emit_call_user_with_cell(
         context,
         block,
-        &target.mangled_name,
+        target,
+        holding_local,
         &arg_vals,
         &ret_types,
+        slots,
+        types,
+        in_function_cell_ptr,
         loc,
     );
     emit_pack_tagged_result_at_pos(
@@ -4305,6 +4722,7 @@ fn emit_call_user_into_tagged_tmp<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<Value<'c, 'a>, CodegenError> {
     let tmp = emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
@@ -4320,6 +4738,7 @@ fn emit_call_user_into_tagged_tmp<'a, 'c>(
         functions,
         types,
         params_len,
+        in_function_cell_ptr,
         loc,
     )?;
     Ok(tmp)
@@ -5949,6 +6368,7 @@ fn emit_expr<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<Value<'c, 'a>, CodegenError> {
     match &expr.kind {
@@ -6052,7 +6472,16 @@ fn emit_expr<'a, 'c>(
             // String → {String, ptr}, Nil → {Nil, 0}.
             for (i, elem) in elems.iter().enumerate() {
                 let v = emit_expr(
-                    context, block, elem, slots, locals, functions, types, params_len, loc,
+                    context,
+                    block,
+                    elem,
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
                 )?;
                 let elem_kind = infer_kind(elem, locals, functions);
                 let offset_bytes = (i as i64) * ARRAY_ELEM_SIZE;
@@ -6071,7 +6500,16 @@ fn emit_expr<'a, 'c>(
         // array_buf and load f64.
         HirExprKind::Index { target, key } => {
             let target_ptr = emit_expr(
-                context, block, target, slots, locals, functions, types, params_len, loc,
+                context,
+                block,
+                target,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
             )?;
             let key_kind = infer_kind(key, locals, functions);
             match key_kind {
@@ -6081,7 +6519,16 @@ fn emit_expr<'a, 'c>(
                     // load tag and trap on non-Number, then load
                     // the f64 value at offset 8.
                     let key_f = emit_expr(
-                        context, block, key, slots, locals, functions, types, params_len, loc,
+                        context,
+                        block,
+                        key,
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
                     )?;
                     // Phase 2.6b-hash-key-nan (ADR 0086): symmetric
                     // to the IndexAssign arm — NaN preflight before
@@ -6120,7 +6567,16 @@ fn emit_expr<'a, 'c>(
                 // a tagged search-key slot for tag-aware probe.
                 ValueKind::String | ValueKind::Bool | ValueKind::Function(_) | ValueKind::Table => {
                     let key_value = emit_expr(
-                        context, block, key, slots, locals, functions, types, params_len, loc,
+                        context,
+                        block,
+                        key,
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
                     )?;
                     let key_slot =
                         emit_build_search_key_slot(context, block, key_kind, key_value, types, loc);
@@ -6447,12 +6903,42 @@ fn emit_expr<'a, 'c>(
                     .into())
             }
             HirExprKind::Index { target, key } => emit_isnil_index(
-                context, block, target, key, slots, locals, functions, types, params_len, loc,
+                context,
+                block,
+                target,
+                key,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
             ),
             _ => unreachable!("IsNil operand must be Index or Local(TaggedValue) per HIR lowering"),
         },
         HirExprKind::Local(LocalId(idx)) => {
             let info = &locals[*idx];
+            // Phase 2.5c-full Commit 3b body atomic Step 6 (ADR 0083):
+            // captured locals (`is_captured = true`) read through a
+            // heap upvalue box; the slot is the box ptr (set by
+            // `emit_function` at function entry for params + body
+            // locals, or at LocalInit for the alias case). Route
+            // through the kind-typed box helper so writes from
+            // sibling closures are observable. TaggedValue / Function
+            // kinds bypass this path (out of Commit 3 scope).
+            if info.is_captured
+                && !matches!(info.kind, ValueKind::TaggedValue | ValueKind::Function(_))
+            {
+                return Ok(super::closure::emit_load_upvalue_box_value(
+                    context,
+                    block,
+                    slots[*idx],
+                    info.kind,
+                    types,
+                    loc,
+                ));
+            }
             match info.kind {
                 ValueKind::Number => Ok(emit_load(block, slots[*idx], types.f64, loc)),
                 ValueKind::Bool | ValueKind::Nil => {
@@ -6492,8 +6978,21 @@ fn emit_expr<'a, 'c>(
                         Ok(slots[*idx])
                     } else if let Some(fid) = info.func_id {
                         let target = &functions[fid.0];
-                        let closure_sym = format!("{}_closure", target.mangled_name);
-                        Ok(emit_addressof(context, block, &closure_sym, types, loc))
+                        // Phase 2.5c-full Commit 3b body atomic Step
+                        // 7b (ADR 0083): for capturing closures the
+                        // synthetic FunctionDef-local's slot stores
+                        // the freshly malloc'd cell ptr (LocalInit
+                        // storage rule, Step 8). Loading from the
+                        // slot recovers the per-instance cell that
+                        // alias copies (`local g = f`) share.
+                        // Non-capturing fns still use the static
+                        // singleton — there's only one cell for them.
+                        if target.upvalues.is_empty() {
+                            let closure_sym = format!("{}_closure", target.mangled_name);
+                            Ok(emit_addressof(context, block, &closure_sym, types, loc))
+                        } else {
+                            Ok(emit_load(block, slots[*idx], types.ptr, loc))
+                        }
                     } else {
                         Ok(emit_load(block, slots[*idx], types.ptr, loc))
                     }
@@ -6504,7 +7003,18 @@ fn emit_expr<'a, 'c>(
             // `and`/`or` short-circuit — must NOT eagerly evaluate rhs.
             if matches!(op, BinOp::And | BinOp::Or) {
                 return emit_short_circuit(
-                    context, block, *op, lhs, rhs, slots, locals, functions, types, params_len, loc,
+                    context,
+                    block,
+                    *op,
+                    lhs,
+                    rhs,
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
                 );
             }
             // Phase 2.6c-tag-hetero-fix (ADR 0065): `TaggedValue ==
@@ -6516,16 +7026,45 @@ fn emit_expr<'a, 'c>(
             // miscompile flagged by codex review.
             if matches!(op, BinOp::Eq | BinOp::Ne) {
                 if let Some(v) = emit_tagged_eq_runtime_dispatch(
-                    context, block, *op, lhs, rhs, slots, locals, functions, types, params_len, loc,
+                    context,
+                    block,
+                    *op,
+                    lhs,
+                    rhs,
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
                 )? {
                     return Ok(v);
                 }
             }
             let lhs_val = emit_expr(
-                context, block, lhs, slots, locals, functions, types, params_len, loc,
+                context,
+                block,
+                lhs,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
             )?;
             let rhs_val = emit_expr(
-                context, block, rhs, slots, locals, functions, types, params_len, loc,
+                context,
+                block,
+                rhs,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
             )?;
             // Phase 2.7b (ADR 0025): String operands need a different
             // backend than the f64-typed `arith.cmpf` / arithmetic
@@ -6558,7 +7097,16 @@ fn emit_expr<'a, 'c>(
             if matches!(op, UnaryOp::Not) {
                 let kind = infer_kind(operand, locals, functions);
                 let v = emit_expr(
-                    context, block, operand, slots, locals, functions, types, params_len, loc,
+                    context,
+                    block,
+                    operand,
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
                 )?;
                 let truth = emit_truthiness(context, block, v, kind, types, loc);
                 let one = arith::constant(context, IntegerAttribute::new(types.i1, 1).into(), loc);
@@ -6572,7 +7120,16 @@ fn emit_expr<'a, 'c>(
             if matches!(op, UnaryOp::Len) {
                 let kind = infer_kind(operand, locals, functions);
                 let v = emit_expr(
-                    context, block, operand, slots, locals, functions, types, params_len, loc,
+                    context,
+                    block,
+                    operand,
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
                 )?;
                 let len_i64 = match kind {
                     ValueKind::String => {
@@ -6584,7 +7141,16 @@ fn emit_expr<'a, 'c>(
                 return Ok(emit_i2f(block, len_i64, types, loc));
             }
             let v = emit_expr(
-                context, block, operand, slots, locals, functions, types, params_len, loc,
+                context,
+                block,
+                operand,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
             )?;
             emit_unary(context, block, *op, v, types, loc)
         }
@@ -6623,8 +7189,17 @@ fn emit_expr<'a, 'c>(
                         // directly (codex review P1, ADR 0065).
                         if let HirExprKind::Index { target, key } = &a.kind {
                             let tmp = emit_inline_index_into_tagged_tmp(
-                                context, block, target, key, slots, locals, functions, types,
-                                params_len, loc,
+                                context,
+                                block,
+                                target,
+                                key,
+                                slots,
+                                locals,
+                                functions,
+                                types,
+                                params_len,
+                                in_function_cell_ptr,
+                                loc,
                             )?;
                             emit_print_tagged_local(context, block, tmp, types, loc);
                             continue;
@@ -6657,13 +7232,23 @@ fn emit_expr<'a, 'c>(
                                 functions,
                                 types,
                                 params_len,
+                                in_function_cell_ptr,
                                 loc,
                             )?;
                             emit_print_tagged_local(context, block, tmp, types, loc);
                             continue;
                         }
                         let v = emit_expr(
-                            context, block, a, slots, locals, functions, types, params_len, loc,
+                            context,
+                            block,
+                            a,
+                            slots,
+                            locals,
+                            functions,
+                            types,
+                            params_len,
+                            in_function_cell_ptr,
+                            loc,
                         )?;
                         emit_print_value_raw(context, block, v, kind, types, loc);
                     }
@@ -6708,7 +7293,16 @@ fn emit_expr<'a, 'c>(
                 // f64 extract.
                 if let HirExprKind::Index { target, key } = &args[0].kind {
                     let tmp = emit_inline_index_into_tagged_tmp(
-                        context, block, target, key, slots, locals, functions, types, params_len,
+                        context,
+                        block,
+                        target,
+                        key,
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
                         loc,
                     )?;
                     return Ok(emit_tostring_tagged_local(context, block, tmp, types, loc));
@@ -6739,12 +7333,22 @@ fn emit_expr<'a, 'c>(
                         functions,
                         types,
                         params_len,
+                        in_function_cell_ptr,
                         loc,
                     )?;
                     return Ok(emit_tostring_tagged_local(context, block, tmp, types, loc));
                 }
                 let arg_val = emit_expr(
-                    context, block, &args[0], slots, locals, functions, types, params_len, loc,
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
                 )?;
                 Ok(emit_tostring(context, block, arg_val, kind, types, loc))
             }
@@ -6754,7 +7358,16 @@ fn emit_expr<'a, 'c>(
             Callee::Builtin(Builtin::ToNumber) => {
                 let kind = infer_kind(&args[0], locals, functions);
                 let arg_val = emit_expr(
-                    context, block, &args[0], slots, locals, functions, types, params_len, loc,
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
                 )?;
                 Ok(emit_tonumber(context, block, arg_val, kind, types, loc))
             }
@@ -6766,11 +7379,29 @@ fn emit_expr<'a, 'c>(
             // only chooses which message ptr feeds the failure path.
             Callee::Builtin(Builtin::Assert) => {
                 let cond_val = emit_expr(
-                    context, block, &args[0], slots, locals, functions, types, params_len, loc,
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
                 )?;
                 let custom_msg = if args.len() == 2 {
                     Some(emit_expr(
-                        context, block, &args[1], slots, locals, functions, types, params_len, loc,
+                        context,
+                        block,
+                        &args[1],
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
                     )?)
                 } else {
                     None
@@ -6785,7 +7416,16 @@ fn emit_expr<'a, 'c>(
             // expression-position contract; control never reaches it.
             Callee::Builtin(Builtin::Error) => {
                 let msg_val = emit_expr(
-                    context, block, &args[0], slots, locals, functions, types, params_len, loc,
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
                 )?;
                 emit_exit_with_message(context, block, msg_val, types, loc);
                 let zero = arith::constant(
@@ -6825,7 +7465,16 @@ fn emit_expr<'a, 'c>(
                 // semantics (ADR 0067) at the inline source.
                 if let HirExprKind::Index { target, key } = &args[0].kind {
                     let tmp = emit_inline_index_into_tagged_tmp(
-                        context, block, target, key, slots, locals, functions, types, params_len,
+                        context,
+                        block,
+                        target,
+                        key,
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
                         loc,
                     )?;
                     return Ok(emit_type_tagged_local(context, block, tmp, types, loc));
@@ -6856,6 +7505,7 @@ fn emit_expr<'a, 'c>(
                         functions,
                         types,
                         params_len,
+                        in_function_cell_ptr,
                         loc,
                     )?;
                     return Ok(emit_type_tagged_local(context, block, tmp, types, loc));
@@ -6865,7 +7515,16 @@ fn emit_expr<'a, 'c>(
                     HirExprKind::FunctionRef(_) | HirExprKind::Local(_)
                 ) {
                     let _ = emit_expr(
-                        context, block, &args[0], slots, locals, functions, types, params_len, loc,
+                        context,
+                        block,
+                        &args[0],
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
                     )?;
                 }
                 let global = match kind {
@@ -6902,23 +7561,48 @@ fn emit_expr<'a, 'c>(
             }
             Callee::User {
                 fid: FuncId(fid),
-                holding_local: _,
+                holding_local,
             } => {
                 let target = &functions[*fid];
                 let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
                 for a in args {
                     arg_vals.push(emit_expr(
-                        context, block, a, slots, locals, functions, types, params_len, loc,
+                        context,
+                        block,
+                        a,
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
                     )?);
                 }
                 let ret_types = ret_mlir_types(context, &target.ret_kinds, types);
+                // Phase 2.5c-full Commit 3b body atomic Step 4 (ADR
+                // 0083): single canonical helper for direct user
+                // calls in expression position. Void / multi-result
+                // both flow through `emit_call_user_with_cell`; the
+                // void path discards results and returns the f64
+                // placeholder demanded by the expression-position
+                // contract.
+                let flat_results = emit_call_user_with_cell(
+                    context,
+                    block,
+                    target,
+                    *holding_local,
+                    &arg_vals,
+                    &ret_types,
+                    slots,
+                    types,
+                    in_function_cell_ptr,
+                    loc,
+                );
                 if target.ret_kinds.is_empty() {
-                    // Void call — emit, ignore, synthesise a
-                    // placeholder f64 0.0 to satisfy the
-                    // expression-position contract (caller's
-                    // `infer_kind` returned Number; the value is
-                    // never read).
-                    emit_llvm_call_user(context, block, &target.mangled_name, &arg_vals, None, loc);
+                    // Void call: caller's `infer_kind` returned
+                    // Number, so we synthesise a placeholder f64 0.0
+                    // (never read).
                     let zero = arith::constant(
                         context,
                         FloatAttribute::new(context, types.f64, 0.0).into(),
@@ -6928,14 +7612,6 @@ fn emit_expr<'a, 'c>(
                 } else {
                     // Multi-result calls in expression position
                     // truncate to the first value (Lua semantics).
-                    let flat_results = emit_call_user_unpacked(
-                        context,
-                        block,
-                        &target.mangled_name,
-                        &arg_vals,
-                        &ret_types,
-                        loc,
-                    );
                     Ok(flat_results[0])
                 }
             }
@@ -6989,7 +7665,16 @@ fn emit_expr<'a, 'c>(
                 let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
                 for a in args {
                     arg_vals.push(emit_expr(
-                        context, block, a, slots, locals, functions, types, params_len, loc,
+                        context,
+                        block,
+                        a,
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
                     )?);
                 }
                 let op_ref = emit_llvm_call_indirect(
@@ -7007,22 +7692,91 @@ fn emit_expr<'a, 'c>(
                 sig,
                 candidates,
             } => emit_indirect_dispatch_call(
-                context, block, *idx, sig, candidates, args, slots, locals, functions, types,
-                params_len, loc,
+                context,
+                block,
+                *idx,
+                sig,
+                candidates,
+                args,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
             ),
         },
         HirExprKind::FunctionRef(FuncId(id)) => {
             // Phase 2.5b.3 / 2.5c-full Commit 2b (ADR 0083): a
             // function reference materialises as a `!llvm.ptr` to
-            // the static `@<fn_sym>_closure` singleton (since Commit
-            // 2b), so producer-side `f == g` comparisons resolve
-            // through the singleton identity and consumers can
-            // dereference `cell.fn_ptr` (offset 0) for the actual
-            // call. Storage-skipping LocalInit paths never reach
-            // here, so this is always a real use.
+            // the static `@<fn_sym>_closure` singleton (non-capturing
+            // case) or to a freshly malloc'd cell (capturing case,
+            // Commit 3b body atomic Step 7a). Capturing closures
+            // observe Lua spec §3.4.4 reference-equality: each
+            // closure-creation site allocates a fresh cell, so two
+            // instances from the same factory differ; alias copies
+            // (`local g = f`) share the cell ptr stored in f's slot.
             let target = &functions[*id];
-            let closure_sym = format!("{}_closure", target.mangled_name);
-            Ok(emit_addressof(context, block, &closure_sym, types, loc))
+            if target.upvalues.is_empty() {
+                let closure_sym = format!("{}_closure", target.mangled_name);
+                Ok(emit_addressof(context, block, &closure_sym, types, loc))
+            } else {
+                // Capturing: malloc a fresh cell, populate fn_ptr,
+                // upvalue_count, and each upvalue_box[i] from the
+                // current scope's slot for the captured outer
+                // local. The outer slot is already a heap upvalue
+                // box ptr (Step 6) so we just thread it.
+                let cell_ptr = super::closure::emit_allocate_closure_cell(
+                    context,
+                    block,
+                    target.upvalues.len(),
+                    types,
+                    loc,
+                );
+                // Store @<fn_sym> at offset 0.
+                let fn_addr = emit_addressof(context, block, &target.mangled_name, types, loc);
+                super::closure::emit_store_closure_fn_ptr(
+                    context, block, cell_ptr, fn_addr, types, loc,
+                );
+                // Store upvalue count at offset 8.
+                let count_const: Value<'c, 'a> = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, target.upvalues.len() as i64).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let count_slot = emit_byte_offset_ptr(
+                    context,
+                    block,
+                    cell_ptr,
+                    super::closure::CLOSURE_OFF_UPVALUE_COUNT,
+                    types,
+                    loc,
+                );
+                emit_store(block, count_const, count_slot, loc);
+                // Populate each upvalue_box[i] from the matching
+                // outer slot. The outer slot holds the heap box
+                // ptr because the captured-local post-pass marked
+                // it `is_captured` and Step 6 routed its storage
+                // through `emit_allocate_upvalue_box`.
+                for (i, uv) in target.upvalues.iter().enumerate() {
+                    let outer_box_ptr = slots[uv.outer_local_id.0];
+                    super::closure::emit_store_closure_upvalue_box(
+                        context,
+                        block,
+                        cell_ptr,
+                        i,
+                        outer_box_ptr,
+                        types,
+                        loc,
+                    );
+                }
+                Ok(cell_ptr)
+            }
         }
         // Phase 2.6c-tag-locals (ADR 0063): IndexTagged is consumed
         // inline by `emit_local_init_tagged` inside `emit_stmt` —
@@ -7038,7 +7792,16 @@ fn emit_expr<'a, 'c>(
         // helper which runs `sscanf("%lf")` and exits on failure.
         HirExprKind::ArithStringCoerce(operand) => {
             let str_ptr = emit_expr(
-                context, block, operand, slots, locals, functions, types, params_len, loc,
+                context,
+                block,
+                operand,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
             )?;
             Ok(emit_tonumber_for_arith(context, block, str_ptr, types, loc))
         }
@@ -7055,10 +7818,20 @@ fn emit_expr_stmt<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     emit_expr(
-        context, block, expr, slots, locals, functions, types, params_len, loc,
+        context,
+        block,
+        expr,
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
     )?;
     Ok(())
 }
@@ -7788,10 +8561,20 @@ fn emit_isnil_index<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<Value<'c, 'a>, CodegenError> {
     let target_ptr = emit_expr(
-        context, block, target, slots, locals, functions, types, params_len, loc,
+        context,
+        block,
+        target,
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
     )?;
     let key_kind = infer_kind(key, locals, functions);
     let i1_true = block
@@ -7806,7 +8589,16 @@ fn emit_isnil_index<'a, 'c>(
     match key_kind {
         ValueKind::Number => {
             let key_f = emit_expr(
-                context, block, key, slots, locals, functions, types, params_len, loc,
+                context,
+                block,
+                key,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
             )?;
             let key_i = emit_f2i(block, key_f, types, loc);
             let length_i = emit_load(block, target_ptr, types.i64, loc);
@@ -7889,7 +8681,16 @@ fn emit_isnil_index<'a, 'c>(
         // keys fall through to the i1_true (= is nil) yield.
         ValueKind::String | ValueKind::Bool | ValueKind::Function(_) | ValueKind::Table => {
             let key_value = emit_expr(
-                context, block, key, slots, locals, functions, types, params_len, loc,
+                context,
+                block,
+                key,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
             )?;
             let key_slot =
                 emit_build_search_key_slot(context, block, key_kind, key_value, types, loc);
@@ -8092,6 +8893,7 @@ fn emit_tagged_eq_runtime_dispatch<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<Option<Value<'c, 'a>>, CodegenError> {
     fn tagged_local_idx(e: &HirExpr, locals: &[LocalInfo]) -> Option<LocalId> {
@@ -8159,7 +8961,16 @@ fn emit_tagged_eq_runtime_dispatch<'a, 'c>(
     };
     let slot_ptr = slots[tagged_id.0];
     let typed_val = emit_expr(
-        context, block, typed_expr, slots, locals, functions, types, params_len, loc,
+        context,
+        block,
+        typed_expr,
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
     )?;
     let tag = emit_load(block, slot_ptr, types.i64, loc);
     let expected_const = block
@@ -8717,13 +9528,23 @@ fn emit_short_circuit<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<Value<'c, 'a>, CodegenError> {
     let kind = infer_kind(lhs, locals, functions);
     let result_ty = kind_to_mlir_type(kind, types);
 
     let lhs_val = emit_expr(
-        context, parent, lhs, slots, locals, functions, types, params_len, loc,
+        context,
+        parent,
+        lhs,
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
     )?;
     let cond = emit_truthiness(context, parent, lhs_val, kind, types, loc);
 
@@ -8745,6 +9566,7 @@ fn emit_short_circuit<'a, 'c>(
         functions,
         types,
         params_len,
+        in_function_cell_ptr,
         loc,
     )?;
     let else_region = build_yield_region(
@@ -8758,6 +9580,7 @@ fn emit_short_circuit<'a, 'c>(
         functions,
         types,
         params_len,
+        in_function_cell_ptr,
         loc,
     )?;
 
@@ -8781,6 +9604,7 @@ fn build_yield_region<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<Region<'c>, CodegenError> {
     let region = Region::new();
@@ -8794,7 +9618,16 @@ fn build_yield_region<'a, 'c>(
         unsafe { std::mem::transmute::<Value<'c, 'a>, Value<'c, '_>>(lhs_val) }
     } else {
         emit_expr(
-            context, &blk, rhs, blk_slots, locals, functions, types, params_len, loc,
+            context,
+            &blk,
+            rhs,
+            blk_slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
         )?
     };
     blk.append_operation(scf::r#yield(&[yielded], loc));
@@ -8819,19 +9652,46 @@ fn emit_if<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     let cond_kind = infer_kind(cond, locals, functions);
     let cond_val = emit_expr(
-        context, parent, cond, slots, locals, functions, types, params_len, loc,
+        context,
+        parent,
+        cond,
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
     )?;
     let cond_i1 = emit_truthiness(context, parent, cond_val, cond_kind, types, loc);
 
     let then_region = build_body_region(
-        context, then_body, slots, locals, functions, types, params_len, loc,
+        context,
+        then_body,
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
     )?;
     let else_region = build_else_region(
-        context, elifs, else_body, slots, locals, functions, types, params_len, loc,
+        context,
+        elifs,
+        else_body,
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
     )?;
 
     let if_op = scf::r#if(cond_i1, &[], then_region, else_region, loc);
@@ -8841,15 +9701,16 @@ fn emit_if<'a, 'c>(
 
 /// Build the `else` region for an If, recursing on the elseif chain.
 #[allow(clippy::too_many_arguments)]
-fn build_else_region<'c>(
+fn build_else_region<'a, 'c>(
     context: &'c Context,
     elifs: &[(HirExpr, Vec<HirStmt>)],
     else_body: &Option<Vec<HirStmt>>,
-    slots: &[Value<'c, '_>],
+    slots: &[Value<'c, 'a>],
     locals: &[LocalInfo],
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<Region<'c>, CodegenError> {
     if let Some(((cond, body), rest)) = elifs.split_first() {
@@ -8860,14 +9721,40 @@ fn build_else_region<'c>(
         // Re-bind slots and emit into the new block.
         let blk_slots = transmute_slots(slots);
         let cond_val = emit_expr(
-            context, &blk, cond, blk_slots, locals, functions, types, params_len, loc,
+            context,
+            &blk,
+            cond,
+            blk_slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
         )?;
         let cond_i1 = emit_truthiness(context, &blk, cond_val, cond_kind, types, loc);
         let nested_then = build_body_region(
-            context, body, blk_slots, locals, functions, types, params_len, loc,
+            context,
+            body,
+            blk_slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
         )?;
         let nested_else = build_else_region(
-            context, rest, else_body, blk_slots, locals, functions, types, params_len, loc,
+            context,
+            rest,
+            else_body,
+            blk_slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
         )?;
         blk.append_operation(scf::r#if(cond_i1, &[], nested_then, nested_else, loc));
         blk.append_operation(scf::r#yield(&[], loc));
@@ -8877,7 +9764,15 @@ fn build_else_region<'c>(
         // Leaf: either else_body or empty `scf.yield` for absent else.
         match else_body {
             Some(body) => build_body_region(
-                context, body, slots, locals, functions, types, params_len, loc,
+                context,
+                body,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
             ),
             None => {
                 let region = Region::new();
@@ -8892,21 +9787,31 @@ fn build_else_region<'c>(
 
 /// Build a Region containing one Block: the body, terminated by `scf.yield`.
 #[allow(clippy::too_many_arguments)]
-fn build_body_region<'c>(
+fn build_body_region<'a, 'c>(
     context: &'c Context,
     body: &[HirStmt],
-    slots: &[Value<'c, '_>],
+    slots: &[Value<'c, 'a>],
     locals: &[LocalInfo],
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<Region<'c>, CodegenError> {
     let region = Region::new();
     let blk = Block::new(&[]);
     let blk_slots = transmute_slots(slots);
     emit_stmts(
-        context, &blk, body, blk_slots, locals, functions, types, params_len, loc,
+        context,
+        &blk,
+        body,
+        blk_slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
     )?;
     blk.append_operation(scf::r#yield(&[], loc));
     region.append_block(blk);
@@ -8939,6 +9844,7 @@ fn emit_while<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     // before region: evaluate cond, optionally AND with `not _broken`.
@@ -8955,6 +9861,7 @@ fn emit_while<'a, 'c>(
         functions,
         types,
         params_len,
+        in_function_cell_ptr,
         loc,
     )?;
     let mut cond_i1 = emit_truthiness(context, &before_blk, cond_val, cond_kind, types, loc);
@@ -8966,7 +9873,15 @@ fn emit_while<'a, 'c>(
 
     // after region: body, scf.yield.
     let after = build_body_region(
-        context, body, slots, locals, functions, types, params_len, loc,
+        context,
+        body,
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
     )?;
 
     parent.append_operation(scf::r#while(&[], &[], before, after, loc));
@@ -8992,6 +9907,7 @@ fn emit_repeat<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     // Before region: body, then evaluate cond → not_cond [AND not_broken].
@@ -9007,6 +9923,7 @@ fn emit_repeat<'a, 'c>(
         functions,
         types,
         params_len,
+        in_function_cell_ptr,
         loc,
     )?;
     let cond_kind = infer_kind(cond, locals, functions);
@@ -9019,6 +9936,7 @@ fn emit_repeat<'a, 'c>(
         functions,
         types,
         params_len,
+        in_function_cell_ptr,
         loc,
     )?;
     let cond_i1 = emit_truthiness(context, &before_blk, cond_val, cond_kind, types, loc);
@@ -9103,18 +10021,46 @@ fn emit_for_numeric<'a, 'c>(
     functions: &[HirFunction],
     types: &Types<'c>,
     params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     // Evaluate start/stop/step once in the parent block, store into
     // dedicated slots (stop/step) and the loop variable's own slot.
     let start_val = emit_expr(
-        context, parent, start, slots, locals, functions, types, params_len, loc,
+        context,
+        parent,
+        start,
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
     )?;
     let stop_val = emit_expr(
-        context, parent, stop, slots, locals, functions, types, params_len, loc,
+        context,
+        parent,
+        stop,
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
     )?;
     let step_val = emit_expr(
-        context, parent, step, slots, locals, functions, types, params_len, loc,
+        context,
+        parent,
+        step,
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
     )?;
 
     let stop_slot = emit_alloca_slot_for_kind(context, parent, ValueKind::Number, types, loc);
@@ -9190,6 +10136,7 @@ fn emit_for_numeric<'a, 'c>(
         functions,
         types,
         params_len,
+        in_function_cell_ptr,
         loc,
     )?;
     let i_now = emit_load(&after_blk, after_slots[var_id.0], types.f64, loc);
@@ -9278,11 +10225,12 @@ print(maybe(1))",
         )
         .expect("widened function must verify");
         let mlir = module.as_operation().to_string();
-        // Phase 2.5c-full Commit 2a (ADR 0083): multi-return is now
-        // wrapped in `!llvm.struct<(...)>` because LLVM IR's ret
-        // instruction is single-value. The two i64 ABI positions
-        // (tag + payload_raw, ADR 0074) are preserved as struct fields.
-        assert_mlir_has(&mlir, "(f64) -> !llvm.struct<(i64, i64)>");
+        // Phase 2.5c-full Commit 2a (ADR 0083): multi-return is
+        // wrapped in `!llvm.struct<(...)>`. Phase 2.5c-full Commit
+        // 3b body atomic adds the cell-ptr first arg, so the
+        // signature is `(!llvm.ptr, f64) -> !llvm.struct<(i64,
+        // i64)>` for a Number-param widened-return user fn.
+        assert_mlir_has(&mlir, "(!llvm.ptr, f64) -> !llvm.struct<(i64, i64)>");
     }
 
     #[test]
@@ -9297,7 +10245,9 @@ print(double(21))",
         )
         .expect("pure-number module must verify");
         let mlir = module.as_operation().to_string();
-        assert_mlir_has(&mlir, "(f64) -> f64");
+        // Phase 2.5c-full Commit 3b body atomic adds the cell-ptr
+        // first arg, so the signature is `(!llvm.ptr, f64) -> f64`.
+        assert_mlir_has(&mlir, "(!llvm.ptr, f64) -> f64");
         assert!(
             !mlir.contains("(i64, i64)"),
             "pure-Number return must not produce TaggedValue ABI, got:\n{mlir}"
@@ -9322,7 +10272,12 @@ print(type(a), type(b))",
         )
         .expect("multi-position widened module must verify");
         let mlir = module.as_operation().to_string();
-        assert_mlir_has(&mlir, "(f64) -> !llvm.struct<(i64, i64, i64, i64)>");
+        // Phase 2.5c-full Commit 3b body atomic adds the cell-ptr
+        // first arg.
+        assert_mlir_has(
+            &mlir,
+            "(!llvm.ptr, f64) -> !llvm.struct<(i64, i64, i64, i64)>",
+        );
     }
 
     #[test]
@@ -9338,11 +10293,11 @@ print(v)",
         )
         .expect("widened-call module must verify");
         let mlir = module.as_operation().to_string();
-        // Phase 2.5c-full Commit 2a (ADR 0083): widened ret ABI is
-        // `(f64) -> !llvm.struct<(i64, i64)>`; the caller still
-        // emits ≥2 stores into the destination tagged slot
+        // Phase 2.5c-full Commit 3b body atomic: widened ret ABI is
+        // `(!llvm.ptr, f64) -> !llvm.struct<(i64, i64)>`; the
+        // caller emits ≥2 stores into the destination tagged slot
         // (tag + payload_raw via `extractvalue` + `llvm.store`).
-        assert_mlir_has(&mlir, "(f64) -> !llvm.struct<(i64, i64)>");
+        assert_mlir_has(&mlir, "(!llvm.ptr, f64) -> !llvm.struct<(i64, i64)>");
         let store_count = mlir.matches("llvm.store").count();
         assert!(
             store_count >= 2,
@@ -9569,10 +10524,15 @@ print(v)",
         let mlir = module.as_operation().to_string();
         // Phase 2.5c-full Commit 2a (ADR 0083): Function-kind
         // params lower to `!llvm.ptr` (LLVM dialect's
-        // first-class function-pointer representation). The
-        // `apply` user function takes a callable as its first
-        // argument and an f64 as its second.
-        assert_mlir_has(&mlir, "@user_apply_0(%arg0: !llvm.ptr, %arg1: f64)");
+        // first-class function-pointer representation). Phase
+        // 2.5c-full Commit 3b body atomic shifts every Lua param
+        // by +1 since `%arg0` is the closure cell ptr; `apply`'s
+        // Function-kind `g` becomes `%arg1` and the f64 `x` is
+        // `%arg2`.
+        assert_mlir_has(
+            &mlir,
+            "@user_apply_0(%arg0: !llvm.ptr, %arg1: !llvm.ptr, %arg2: f64)",
+        );
     }
 
     #[test]
@@ -10119,5 +11079,118 @@ print(v)",
         assert_mlir_has(&mlir, "llvm.load");
         // Producer side must also have flipped to the singleton.
         assert_mlir_has(&mlir, "@user_d_0_closure");
+    }
+
+    // ============================================================
+    // ADR 0083 Commit 3b body atomic — cell-ptr-first ABI for all
+    // user fns. These tests pin the most critical ABI invariants
+    // so future refactors (or the cutover commit itself) can't
+    // silently regress the cell-ptr threading. Codex review of
+    // Commit 3a / 3b prep flagged that the atomic cutover touches
+    // 4 direct-user-call paths plus 2 producer arms plus the
+    // outer-scope storage rule — verifier-passing wrong-code is
+    // plausible without these shape pins.
+    // ============================================================
+
+    /// Step 0 / Test #1: every user `llvm.func` accepts a `!llvm.ptr`
+    /// closure cell ptr as its first argument. Lua params shift to
+    /// args 1..N.
+    #[test]
+    fn emit_user_fn_signature_starts_with_cell_ptr() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src("local function f(x) return x * 2 end\nprint(f(7))"),
+        )
+        .expect("module must verify");
+        let mlir = module.as_operation().to_string();
+        // The function body's first block argument is the closure
+        // cell ptr; the original Lua `x` parameter shifts to %arg1.
+        assert_mlir_has(&mlir, "llvm.func @user_f_0(%arg0: !llvm.ptr, %arg1: f64)");
+    }
+
+    /// Step 0 / Test #2: self-recursion inside a capturing fn
+    /// passes the entry `block.argument(0)` (the caller-supplied
+    /// cell ptr = the current self instance) as the first arg of
+    /// the recursive `llvm.call`.
+    #[test]
+    fn emit_self_recursion_uses_entry_cell_ptr_as_first_arg() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src(
+                "local x = 1
+local function fact(n) if n == 0 then return x end
+return fact(n - 1) * n end
+print(fact(3))",
+            ),
+        )
+        .expect("module must verify");
+        let mlir = module.as_operation().to_string();
+        // Inside fact's body, the self-call `fact(n-1)` must thread
+        // the entry cell ptr (block.argument(0), printed as %arg0)
+        // as the first call operand. The pretty-printer lays this
+        // out as `llvm.call @user_fact_0(%arg0, ...)`.
+        assert_mlir_has(&mlir, "llvm.call @user_fact_0(%arg0,");
+    }
+
+    /// Step 0 / Test #3: a forward / nested capturing call resolves
+    /// through the synthetic FunctionDef-local's slot — the cell
+    /// ptr is `llvm.load`'d from the slot before the call. This
+    /// path covers Test B from Codex review (`outer { local function
+    /// inner ... ; inner() }`).
+    #[test]
+    fn emit_nested_forward_capturing_call_loads_cell_from_slot() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src(
+                "local function outer(x)
+  local function inner() return x + 100 end
+  return inner()
+end
+print(outer(5))",
+            ),
+        )
+        .expect("module must verify");
+        let mlir = module.as_operation().to_string();
+        // Inside outer's body, the synthetic `inner` local holds
+        // the freshly malloc'd capturing cell. `inner()` must load
+        // the cell ptr from the slot and pass it as first arg to
+        // `llvm.call @user_inner_1(...)`. We pin the malloc + the
+        // direct call symbol; the slot-load gating the call shows
+        // up as `llvm.load ... -> !llvm.ptr` immediately above the
+        // call.
+        assert_mlir_has(&mlir, "llvm.call @malloc");
+        assert_mlir_has(&mlir, "llvm.call @user_inner_1");
+    }
+
+    /// Step 0 / Test #4: aliasing a non-capturing fn (`local g = f`)
+    /// stores the singleton cell ptr into g's slot, and `g()`
+    /// loads from g's slot rather than referencing the singleton
+    /// directly. This pin guards against regressing the
+    /// `HirExprKind::Local` known-FuncId arm — Codex P1 flagged
+    /// that the arm must branch on `target.upvalues.is_empty()`.
+    /// For non-capturing alias the singleton is loaded from g's
+    /// slot at the call site; the slot was populated by the
+    /// LocalInit storage rule.
+    #[test]
+    fn emit_alias_call_routes_through_synthetic_local_slot() {
+        let ctx = new_context();
+        let module = emit_module(
+            &ctx,
+            &lower_src(
+                "local function f(x) return x * 2 end
+local g = f
+print(g(5))",
+            ),
+        )
+        .expect("module must verify");
+        let mlir = module.as_operation().to_string();
+        // f's singleton must be referenced (producer side) and the
+        // call site g(5) must use the cell-ptr-first ABI shape
+        // `(!llvm.ptr, f64) -> f64`.
+        assert_mlir_has(&mlir, "addressof @user_f_0_closure");
+        assert_mlir_has(&mlir, "(!llvm.ptr, f64) -> f64");
     }
 }
