@@ -39,6 +39,11 @@ Lua独自の動的セマンティクス（Table、Metatable、Upvalue、Coroutin
 
 - **コンパイラ本体**: Rust + Melior (MLIR binding) による実装。
 - **CLI**: `lumelir compile`, `lumelir run` 形式のモダンなインターフェース。
+  ADR 0090 で追加された `--emit <stage>` フラグでパイプライン途中
+  成果物 (HIR / MLIR text / LLVM IR text) を inspect 可能 (例:
+  `lumelir compile hello.lua --emit mlir` は MLIR テキストを stdout に
+  書き出す、`--emit llvm -o app.ll` は LLVM IR をファイルへ)。
+  `--emit` なしの既存挙動 (native binary 生成) は不変。
 
 ## 5. 技術スタック
 

@@ -4,6 +4,16 @@
 - **Date:** 2026-04-19
 - **Deciders:** ShortArrow
 
+> **Status note (2026-05-10, ADR 0090):** Container-based reproducibility
+> for the build environment remains **deferred** under this ADR's
+> existing reject reasoning ("Dockerised Linux build on Windows host
+> rejected. Adds Docker Desktop as a dependency for a box that
+> already has WSL2"). ADR 0090 noted that the lighter-weight
+> observability investment (`--emit` dump flags) lands first.
+> Container e2e re-evaluation trigger: post-CI introduction or
+> multi-contributor onboarding pressure. ADR 0005's decision is
+> **not overturned** by this note.
+
 ## Context
 
 Phase 1 PoC requires linking against MLIR / LLVM 22 via the `melior` crate. AGENTS.md §11 listed "Windows vs WSL2/Linux for MLIR builds" as TBD. We ran a Windows native spike (`V:/melior-spike/`) to find out how much work it would take.
