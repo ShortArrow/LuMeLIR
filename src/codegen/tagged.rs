@@ -111,6 +111,50 @@ pub(crate) fn policy_for_tag(tag: i64) -> &'static [HashKeyValidityPolicy] {
     }
 }
 
+// =============================================================
+// Phase 2.7p-tagged-arith-coerce (ADR 0089): operand coercion
+// plan for a TaggedValue arith / bitwise / unary consumer.
+//
+// Pure decision: maps a runtime tag to the action the chokepoint
+// (`emit_load_tagged_operand_as_number` in `emit.rs`) must take
+// to materialise an `f64` for downstream Number-consuming ops.
+//
+// Lua spec §3.4.3 / §3.4.2 allow String → Number coercion in
+// arithmetic and bitwise contexts; this module owns the policy,
+// the effectful emitter owns the MLIR scf.if + sscanf + trap
+// structure. Trap message globals
+// (`s_arith_on_non_numeric` / `s_arith_coerce_failed`) live in
+// `emit.rs`. Call sites pick the plan via tag dispatch; the
+// chokepoint is `emit_tagged_arith_runtime_dispatch` (BinOp) and
+// `emit_tagged_unary_arith_runtime_dispatch` (UnaryOp).
+// =============================================================
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TaggedArithOperandPlan {
+    /// Tag is TAG_NUMBER: load f64 payload at slot+8.
+    UseNumberPayload,
+    /// Tag is TAG_STRING: load ptr payload at slot+8 and coerce
+    /// via `emit_tonumber_for_arith` (ADR 0077). Parse failure
+    /// internally traps with `s_arith_coerce_failed`.
+    CoerceStringToNumber,
+    /// Tag is Bool / Nil / Function / Table / Deleted: emit exit
+    /// with `s_arith_on_non_numeric`. Lua spec §3.4.3:
+    /// "attempt to perform arithmetic on a {type} value".
+    TrapNonNumeric,
+}
+
+/// Pure: which operand plan applies to a TaggedValue arith
+/// consumer's runtime tag. Total over the i64 tag space —
+/// unknown tags fall through to `TrapNonNumeric` (defensive).
+/// Future tag kinds extend coverage here without touching the
+/// chokepoint shape.
+pub(crate) fn policy_for_tagged_arith_operand(tag: i64) -> TaggedArithOperandPlan {
+    match tag {
+        TAG_NUMBER => TaggedArithOperandPlan::UseNumberPayload,
+        TAG_STRING => TaggedArithOperandPlan::CoerceStringToNumber,
+        _ => TaggedArithOperandPlan::TrapNonNumeric,
+    }
+}
+
 /// Allocate a stack slot whose layout matches `kind`. TaggedValue
 /// uses 2 × i64 (16 bytes, naturally 8-byte-aligned for the f64
 /// payload at offset 8); every other kind is a single element of
@@ -1402,6 +1446,33 @@ mod tests {
                 policy_for_tag(tag),
                 &[][..],
                 "tag {tag} should have no policy"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_for_tagged_arith_operand_number_returns_use_payload() {
+        assert_eq!(
+            policy_for_tagged_arith_operand(TAG_NUMBER),
+            TaggedArithOperandPlan::UseNumberPayload,
+        );
+    }
+
+    #[test]
+    fn policy_for_tagged_arith_operand_string_returns_coerce() {
+        assert_eq!(
+            policy_for_tagged_arith_operand(TAG_STRING),
+            TaggedArithOperandPlan::CoerceStringToNumber,
+        );
+    }
+
+    #[test]
+    fn policy_for_tagged_arith_operand_other_traps() {
+        for tag in [TAG_NIL, TAG_BOOL, TAG_FUNCTION, TAG_TABLE, TAG_DELETED] {
+            assert_eq!(
+                policy_for_tagged_arith_operand(tag),
+                TaggedArithOperandPlan::TrapNonNumeric,
+                "tag {tag} should trap as non-numeric"
             );
         }
     }

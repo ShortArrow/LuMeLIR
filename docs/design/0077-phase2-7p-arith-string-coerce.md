@@ -1,8 +1,25 @@
 # 0077. Phase 2.7p-arith-string-coerce: String → Number Arithmetic Coercion
 
-- **Status:** Accepted
+- **Status:** Accepted (extended by ADR 0089 to runtime TaggedValue operands)
 - **Date:** 2026-05-04
 - **Deciders:** ShortArrow
+
+> **ADR 0089 extension note (2026-05-10):** ADR 0077 covers the
+> **static String** operand path (`HirExprKind::ArithStringCoerce`
+> wrapping at HIR via `coerce_arith_operand_if_string`). ADR 0089
+> extends the same Lua-spec §3.4.3 contract to **runtime String**
+> operands held in `Local(TaggedValue)` slots, via the chokepoint
+> `emit_load_tagged_operand_as_number` (consults
+> `tagged.rs::policy_for_tagged_arith_operand`). The
+> `emit_tonumber_for_arith` helper introduced here is reused
+> (drop-in) by ADR 0089's chokepoint for the
+> `CoerceStringToNumber` plan branch. The
+> `s_arith_coerce_failed` global is reused for parse failures on
+> both static and runtime paths; ADR 0089 adds a new
+> `s_arith_on_non_numeric` global for the non-coercible
+> tags (Bool/Nil/Function/Table/Deleted) which ADR 0077 did not
+> cover (HIR rejects those at type-check time for static-kind
+> operands).
 
 ## Context
 

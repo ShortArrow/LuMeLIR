@@ -195,24 +195,36 @@ phase.
 
 ### Arith / ordering on tagged operand
 
-| Operator                            | TAG_NUMBER       | TAG_BOOL  | TAG_STRING  | TAG_NIL    | Lua spec             |
-|-------------------------------------|------------------|-----------|-------------|------------|----------------------|
-| `+ - * / % ^ // & \| ~ << >>`       | extract f64; arith | trap     | trap        | trap       | `nil + 1` errors     |
-| `< <= > >=`                         | extract f64; cmpf | trap     | trap        | trap       | mixed kinds error    |
+| Operator                            | TAG_NUMBER       | TAG_STRING                                  | TAG_BOOL / NIL / FUNCTION / TABLE | Lua spec             |
+|-------------------------------------|------------------|---------------------------------------------|-----------------------------------|----------------------|
+| `+ - * / % ^ //` (arith)            | extract f64; arith | sscanf-coerce via `emit_tonumber_for_arith`; parse fail → `s_arith_coerce_failed` | trap with `s_arith_on_non_numeric` | `nil + 1` errors     |
+| `& \| ~ << >>` (bitwise)            | extract f64 → i64; bitwise | sscanf-coerce → f64 → i64; parse fail → `s_arith_coerce_failed`            | trap with `s_arith_on_non_numeric` | bitwise on non-int errors |
+| `- ~` (unary Neg / BitNot)          | extract f64; negf or f64→i64→xori | sscanf-coerce; parse fail → `s_arith_coerce_failed`                     | trap with `s_arith_on_non_numeric` | unary on non-numeric errors |
+| `< <= > >=` (ordering)              | extract f64; cmpf | trap (Lua §3.4.4 mixed-kind error)         | trap                              | mixed kinds error    |
 
-These traps are **Lua-spec correct** for the current tag set —
-no LIC entry.
+The arith / bitwise / unary rows reflect the **runtime tag-dispatch
+chokepoint** introduced by ADR 0089 (`emit_load_tagged_operand_as_number`,
+driven by `tagged.rs::policy_for_tagged_arith_operand`). Eq/Ne are
+not shown here — they have their own runtime dispatch via
+`emit_tagged_eq_runtime_dispatch` (ADR 0066).
 
-**String operand coercion (ADR 0077):** when a static-`String`
-expression appears as an arithmetic / bitwise BinOp operand,
-HIR wraps it in `HirExprKind::ArithStringCoerce` and codegen
-runs `sscanf("%lf")` at runtime. Successful parse → arith
-proceeds; failed parse → exit with
-`s_arith_coerce_failed` (Lua-spec runtime error). Distinct
-from the `Builtin::ToNumber` builtin path (ADR 0028) whose
-failure returns the NaN sentinel — the arith path needs the
-trap because Lua spec §3.4.1 disallows silent NaN
-propagation from a non-numeric string.
+**String operand coercion (ADR 0077 + ADR 0089):**
+- **Static String** (HIR kind `ValueKind::String`): HIR wraps in
+  `HirExprKind::ArithStringCoerce` via `coerce_arith_operand_if_string`;
+  codegen runs `sscanf("%lf")` at runtime via `emit_tonumber_for_arith`.
+- **Runtime String** (TaggedValue local with TAG_STRING at runtime):
+  the BinOp / UnaryOp dispatcher routes the operand through
+  `emit_load_tagged_operand_as_number`, which calls the same
+  `emit_tonumber_for_arith` for the `CoerceStringToNumber` plan
+  branch.
+
+Both paths share the `s_arith_coerce_failed` trap message
+("attempt to perform arithmetic on a string value"). The Lua spec
+§3.4.1 / §3.4.3 contract is identical; the codegen path differs
+only in how the String operand is identified (HIR-static vs
+runtime-tag-dispatch). The `Builtin::ToNumber` builtin path (ADR
+0028) keeps the NaN sentinel contract — distinct from the arith
+trap path.
 
 ---
 
@@ -255,6 +267,7 @@ the introduction, when still open).
 | LIC-2.6b-hash-key-nan-runtime-1   | NaN cannot be used as a table index (Lua spec §3.4.5). Static Number-key array path (`t[0/0]`) and TaggedValue-key hash probe entry both gated on `cmpf Une` self-self preflight; trap surface is the dedicated `s_table_index_nan` global | 0086 |
 | LIC-2.6b-hash-key-nil-runtime-1   | Dynamic `nil` hash key via TaggedValue local — runtime trap `s_table_index_nil` enforced at the `emit_hash_probe_loop` chokepoint via `emit_hash_key_runtime_validity_gate` (consults `tagged.rs::policy_for_tag`); inline traps at IndexAssign / Index TaggedValue arms retired in favour of the chokepoint | 0079 / 0084 / 0087 |
 | LIC-2.6b-hash-missing-key-read-1  | Hash read lookup miss reified as Nil-tagged TaggedValue slot via the `emit_hash_lookup_into_tagged_slot` chokepoint helper. Index hash arms restructured to tmp-slot + helper(NilOnMissing) + `emit_value_slot_check_number` + load f64; consumer-correct trap surface (`s_table_type_mismatch` on arith of missing-key, instead of the previous spec-violating `s_table_missing_key` exit). `emit_hash_probe_lookup` wrapper retired; `trap_on_null: bool` parameter on `emit_hash_probe_loop` retired | 0084 / 0088 |
+| LIC-2.7p-arith-coerce-tagged-1    | TaggedValue operand arith coerce. Runtime tag-dispatch chokepoint `emit_load_tagged_operand_as_number` consults `tagged.rs::policy_for_tagged_arith_operand`: TAG_NUMBER → use payload; TAG_STRING → sscanf-coerce via `emit_tonumber_for_arith` (ADR 0077 reuse); Bool/Nil/Function/Table → trap with new `s_arith_on_non_numeric`. BinOp dispatcher (`emit_tagged_arith_runtime_dispatch`) covers Add/Sub/Mul/Div/Mod/Pow/FloorDiv + BitAnd/BitOr/BitXor/Shl/Shr; UnaryOp dispatcher covers Neg/BitNot. Ordering / Eq/Ne / Concat are out of scope (separate dispatchers / Lua spec disallows coerce). Static-String path (ADR 0077 ArithStringCoerce) unchanged | 0063 / 0077 / 0089 |
 
 ### Partial
 
@@ -262,11 +275,12 @@ the introduction, when still open).
 
 ### Pending
 
-| ID                                          | Behaviour                                                             | Notes                          |
-|---------------------------------------------|-----------------------------------------------------------------------|--------------------------------|
-| LIC-2.7p-arith-coerce-tagged-1              | TaggedValue operand arith coerce (`local x = t[1]; print(x + 1)` when x is runtime String) | HIR can't statically resolve the kind; current TaggedValue-arith path traps on non-Number tag (ADR 0063). Unlocking needs runtime tag dispatch in arith codegen |
+(none — Phase 2 tagged-semantics consumer coverage complete as of ADR 0089, 2026-05-10)
 
-**Total:** 28 LIC entries — 28 resolved, 0 partial, 1 pending (LIC-2.7p-arith-coerce-tagged-1).
+**Total:** 28 LIC entries — 28 resolved, 0 partial, 0 pending. Phase 2
+tagged-semantics has reached **consumer coverage complete**: every
+TaggedValue consumer (print / type / tostring / eq / arith / hash
+read / hash write / iter) now has a runtime tag-dispatch chokepoint.
 
 ---
 
@@ -647,6 +661,52 @@ the inner `if trap_on_null { trap }` block gone. The probe loop's
 `is_skip = is_null OR is_sentinel` continues to walk past
 tombstones (sentinel-bucket invariant preserved).
 
+### TaggedValue arith operand coercion (ADR 0089)
+
+The BinOp / UnaryOp dispatchers now route runtime String / Number
+operands through a chokepoint. When `Local(TaggedValue)` is detected
+on either side of a `+ - * / % ^ // & | ~ << >>` op (BinOp) or
+under a `- ~` (UnaryOp::Neg / BitNot), the operand passes through
+`emit_load_tagged_operand_as_number` instead of the trap-on-non-Number
+`emit_value_slot_check_number` path used for non-arith consumers.
+
+| Component                                  | Module      | Role                                                                                                |
+|--------------------------------------------|-------------|-----------------------------------------------------------------------------------------------------|
+| `enum TaggedArithOperandPlan`              | `tagged.rs` | Pure decision: variants `UseNumberPayload`, `CoerceStringToNumber`, `TrapNonNumeric`               |
+| `policy_for_tagged_arith_operand(tag)`     | `tagged.rs` | Pure mapping: `TAG_NUMBER → UseNumberPayload`, `TAG_STRING → CoerceStringToNumber`, else `TrapNonNumeric` |
+| `emit_load_tagged_operand_as_number`       | `emit.rs`   | Effectful chokepoint; recursive scf.if dispatch over `[TAG_NUMBER, TAG_STRING]` driven by the policy enum, trailing else = TrapNonNumeric |
+| `emit_arith_operand_plan(plan)`            | `emit.rs`   | Per-policy emission (`UseNumberPayload` → load f64, `CoerceStringToNumber` → emit_tonumber_for_arith, `TrapNonNumeric` → exit + placeholder) |
+| `emit_tagged_arith_runtime_dispatch`       | `emit.rs`   | BinOp dispatcher route — short-circuits when op is in eligible class AND any operand is Local(TaggedValue) |
+| Inline UnaryOp guard                       | `emit.rs`   | UnaryOp dispatcher — same chokepoint for Neg / BitNot                                              |
+
+**Op class scope**:
+- **In scope** (14 ops): Add, Sub, Mul, Div, Mod, Pow, FloorDiv,
+  BitAnd, BitOr, BitXor, Shl, Shr, UnaryOp::Neg, UnaryOp::BitNot.
+- **Out of scope**:
+  - **Eq / Ne** — handled by `emit_tagged_eq_runtime_dispatch` (ADR 0066).
+  - **Lt / Le / Gt / Ge** — Lua §3.4.4: mixed-kind ordering is an
+    error, not coercion. Existing trap behavior is correct.
+  - **Concat (..)** — auto-coerces via `tostring` (ADR 0026).
+
+**Trap surfaces**:
+- `s_arith_on_non_numeric` (NEW, ADR 0089) — TaggedValue with tag
+  Bool / Nil / Function / Table / Deleted. Lua §3.4.3:
+  "attempt to perform arithmetic on a {type} value".
+- `s_arith_coerce_failed` (ADR 0077, reused) — sscanf parse failure
+  on String coerce. Both static-String and TaggedValue-String paths
+  share this diagnostic.
+
+**Static-vs-runtime String paths**:
+- ADR 0077: HIR-static String → wrapped in
+  `HirExprKind::ArithStringCoerce` at HIR; codegen via
+  `emit_tonumber_for_arith` (no tag dispatch).
+- ADR 0089: TaggedValue-runtime String → routed via the chokepoint;
+  internally calls the same `emit_tonumber_for_arith` for the
+  `CoerceStringToNumber` plan branch.
+
+The two paths converge at `emit_tonumber_for_arith`, ensuring the
+sscanf format / parse-fail trap message stay consistent.
+
 ---
 
 ## 7. Open Questions / Known Gaps
@@ -764,3 +824,4 @@ Listed in Codex review priority order (post-ADR-0082):
 | 0086 | 2.6b-hash-key-nan            | Hash key NaN runtime diagnostic (Codex pivot from ADR 0083 deferral) — Lua spec §3.4.5 forbids NaN as a table index. New `s_table_index_nan` global + `emit_table_index_nan_trap_if` / `emit_hash_key_nan_preflight` helpers. NaN preflight inserted at 4 sites: static Number-key IndexAssign / Index arms (before `f2i`), inline `emit_local_init_tagged` Number-key arm (covers `print(t[0/0])`), and `emit_hash_probe_loop` entry (single chokepoint for every TaggedValue-key call). `cmpf Une self-self` reused from ADR 0077's `emit_tonumber_for_arith` — qNaN/sNaN/±NaN agnostic. 6 new e2e in `tests/phase2_6b_hash_key_nan.rs`, 959 → 965 green. LIC-2.6b-hash-key-nan-runtime-1 resolved. 26/0/2 |
 | 0087 | 2.6b-hash-key-validity       | Hash-key runtime validity policy chokepoint (Codex post-3c review v2) — pure decision (`enum HashKeyValidityPolicy { TrapNil, CheckNaN }` + `policy_for_tag(tag) -> &'static [...]` in `tagged.rs`) split from effectful executor (`emit_hash_key_runtime_validity_gate` in `emit.rs`). The new gate replaces `emit_hash_key_nan_preflight` at the `emit_hash_probe_loop` chokepoint (`emit.rs:5535`) and folds in the ADR 0084 inline nil traps at IndexAssign (`emit.rs:3160-3195`) and Index (`emit.rs:6723-6757`) TaggedValue arms. 3 raw-f64 NaN preflight sites (`emit.rs:2766` / `:6554` / `:4339`) using `emit_table_index_nan_trap_if` are unaffected — they consume f64 directly, not a tagged slot. 3 new pure unit tests in `tagged.rs` + 2 new e2e in `tests/phase2_6b_hash_key_nil.rs`, 990 → 995 green. LIC-2.6b-hash-key-nil-runtime-1 resolved (was partial); new pending LIC-2.6b-hash-missing-key-read-1 (Index TaggedValue arm uses `emit_hash_probe_lookup` with `trap_on_null=true`, traps on missing key instead of returning nil per Lua §3.4.5). 27/0/2 |
 | 0088 | 2.6b-hash-lookup-miss        | Hash read lookup miss reified as Nil-tagged TaggedValue (Codex post-0087 review v3 Refactor verdict on plan v1). New private `enum HashLookupOutcome { NilOnMissing, TrapMissing }` in `emit.rs` (codex critical: lookup miss policy is consumer contract, not tag layer; `tagged.rs` placement was "abstraction without owner"). New chokepoint helper `emit_hash_lookup_into_tagged_slot` consolidates the `null_buf check + for_insert probe + key_at_null check + outcome dispatch` shape duplicated across 9 sites: `emit_local_init_tagged` 4 hash arms (`emit.rs:4426-4604`, ~120 LOC dedupe) + Index 5 hash arms (4 static-key at `:6589-6720` + 1 TaggedValue at `:6720-6857`, restructured to tmp slot + helper(NilOnMissing) + `emit_value_slot_check_number` + load f64). `emit_hash_probe_lookup` wrapper deleted; `trap_on_null: bool` parameter on `emit_hash_probe_loop` retired (codex non-ad-hoc: bool was "粗い abstraction"). User-visible diagnostic shift in arith/cmp contexts: missing key was `s_table_missing_key`, now `s_table_type_mismatch` (consumer-correct). Widening contexts (LocalInit/Assign/print) unchanged. ADR 0084 read-side arms partially superseded; IndexAssign + `pairs`-body idiom unchanged. 4 new e2e in `tests/phase2_6b_hash_missing_key_read.rs` (2 behaviour-change pins + 2 regression-pins inc. explicit `hash_buf == null` branch coverage), 995 → 999 green. LIC-2.6b-hash-missing-key-read-1 resolved. 28/0/1 |
+| 0089 | 2.7p-tagged-arith-coerce     | TaggedValue arith operand coercion chokepoint (Codex post-0088 review 6 視点 / 6 Go on candidate A). Pure decision `enum TaggedArithOperandPlan { UseNumberPayload, CoerceStringToNumber, TrapNonNumeric }` + `policy_for_tagged_arith_operand(tag) -> Plan` in `tagged.rs` (mirrors ADR 0087 `policy_for_tag` shape). Effectful chokepoint `emit_load_tagged_operand_as_number` in `emit.rs` recurses over `[TAG_NUMBER, TAG_STRING]` building scf.if dispatch driven by the policy enum, trailing else fires the `TrapNonNumeric` arm. New trap message global `s_arith_on_non_numeric` ("attempt to perform arithmetic on a non-numeric value") for Bool/Nil/Function/Table/Deleted operands; `s_arith_coerce_failed` (ADR 0077) reused for String parse-fail. BinOp dispatcher (`emit_tagged_arith_runtime_dispatch`) covers 12 ops (Add/Sub/Mul/Div/Mod/Pow/FloorDiv + BitAnd/BitOr/BitXor/Shl/Shr); UnaryOp guard covers Neg/BitNot. Eq/Ne / Lt/Le/Gt/Ge / Concat out of scope per Lua §3.4.4 / existing dispatchers. Mirrors `emit_tagged_eq_runtime_dispatch` (ADR 0066) call-site contract. Existing `arith_on_tagged_local_traps_for_string` test flipped to coerce-success; `plain_arith_with_nil_traps` (non-zero exit assertion only) unchanged. 9 new e2e + 3 new unit tests + 2 regression-pins, 999 → 1013 green. LIC-2.7p-arith-coerce-tagged-1 resolved. **Phase 2 tagged-semantics consumer coverage complete** (28/28/0). |

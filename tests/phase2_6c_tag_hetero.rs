@@ -66,14 +66,22 @@ print(s)";
 }
 
 #[test]
-fn arith_on_tagged_local_traps_for_string() {
-    // Lua spec: string + number errors (when not coercible).
-    // Trap is acceptable behaviour for this sub-phase.
-    let src = "local t = {\"hello\"}
+fn arith_on_tagged_local_coerces_parseable_string() {
+    // ADR 0089: Lua spec §3.4.3 "string + number coerces if string
+    // parses as a number". Pre-ADR-0089 this trapped because the
+    // TaggedValue arm of `emit_expr` called
+    // `emit_value_slot_check_number` which rejected non-Number tags
+    // unconditionally. The ADR 0089 chokepoint
+    // (`emit_tagged_arith_runtime_dispatch`) routes runtime String
+    // operands through `emit_tonumber_for_arith` (ADR 0077) for
+    // sscanf-based coercion. Non-coercible tags (Bool/Nil/Function/
+    // Table) trap with `s_arith_on_non_numeric`; unparseable strings
+    // trap with `s_arith_coerce_failed` — covered in
+    // `tests/phase2_7p_tagged_arith_coerce.rs`.
+    let src = "local t = {\"5\"}
 local x = t[1]
 print(x + 1)";
-    let out = compile_and_run(src, "lumelir_het_arith_traps");
-    assert!(!out.status.success(), "string + number must trap");
+    assert_eq!(run(src, "lumelir_het_arith_coerces").trim(), "6");
 }
 
 #[test]

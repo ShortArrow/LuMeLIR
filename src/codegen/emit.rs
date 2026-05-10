@@ -43,10 +43,11 @@ use super::primitive::{
 };
 use super::tagged::{
     ARRAY_ELEM_OFF_VALUE, ARRAY_ELEM_SIZE, HashKeyValidityPolicy, TAG_BOOL, TAG_DELETED,
-    TAG_FUNCTION, TAG_NIL, TAG_NUMBER, TAG_STRING, TAG_TABLE, emit_alloca_slot_for_kind,
-    emit_print_tagged_local, emit_tag_and_payload_ptr, emit_tagged_eq_local_local,
-    emit_tagged_unknown_tag_trap, emit_type_tagged_local, emit_value_slot_check_number,
-    emit_value_slot_store_dispatched, emit_value_slot_store_nil, policy_for_tag,
+    TAG_FUNCTION, TAG_NIL, TAG_NUMBER, TAG_STRING, TAG_TABLE, TaggedArithOperandPlan,
+    emit_alloca_slot_for_kind, emit_print_tagged_local, emit_tag_and_payload_ptr,
+    emit_tagged_eq_local_local, emit_tagged_unknown_tag_trap, emit_type_tagged_local,
+    emit_value_slot_check_number, emit_value_slot_store_dispatched, emit_value_slot_store_nil,
+    policy_for_tag, policy_for_tagged_arith_operand,
 };
 
 // =============================================================
@@ -316,6 +317,21 @@ fn emit_fmt_global<'c>(
         i8_type,
         "s_arith_coerce_failed",
         "attempt to perform arithmetic on a string value\0",
+        loc,
+    );
+    // Phase 2.7p-tagged-arith-coerce (ADR 0089): runtime trap for
+    // arith / bitwise / unary on a TaggedValue whose tag is
+    // Bool / Nil / Function / Table / Deleted (= non-coercible).
+    // Distinct from `s_arith_coerce_failed` (parse-fail on a
+    // String operand): different error condition, different
+    // diagnostic. Lua spec §3.4.3:
+    // "attempt to perform arithmetic on a {type} value".
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_arith_on_non_numeric",
+        "attempt to perform arithmetic on a non-numeric value\0",
         loc,
     );
     // Phase 2.5x-callee-dispatch (ADR 0082): runtime traps for the
@@ -6906,6 +6922,28 @@ fn emit_expr<'a, 'c>(
                     return Ok(v);
                 }
             }
+            // Phase 2.7p-tagged-arith-coerce (ADR 0089): TaggedValue
+            // arith / bitwise BinOp routes through the arith
+            // dispatch chokepoint when at least one operand is
+            // `Local(TaggedValue)`. Fall through to the existing
+            // `emit_expr` path otherwise (typed Number operands or
+            // ADR 0077 static-String coerce wrap).
+            if let Some(v) = emit_tagged_arith_runtime_dispatch(
+                context,
+                block,
+                *op,
+                lhs,
+                rhs,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
+            )? {
+                return Ok(v);
+            }
             let lhs_val = emit_expr(
                 context,
                 block,
@@ -7004,18 +7042,30 @@ fn emit_expr<'a, 'c>(
                 };
                 return Ok(emit_i2f(block, len_i64, types, loc));
             }
-            let v = emit_expr(
-                context,
-                block,
-                operand,
-                slots,
-                locals,
-                functions,
-                types,
-                params_len,
-                in_function_cell_ptr,
-                loc,
-            )?;
+            // Phase 2.7p-tagged-arith-coerce (ADR 0089): TaggedValue
+            // unary arith routes through the same chokepoint as the
+            // BinOp path. When operand is `Local(TaggedValue)` and
+            // op is Neg / BitNot, fetch f64 via
+            // `emit_load_tagged_operand_as_number`; otherwise fall
+            // through to the existing `emit_expr` path.
+            let v = if matches!(op, UnaryOp::Neg | UnaryOp::BitNot)
+                && let Some(LocalId(idx)) = tagged_local_idx(operand, locals)
+            {
+                emit_load_tagged_operand_as_number(context, block, slots[idx], types, loc)
+            } else {
+                emit_expr(
+                    context,
+                    block,
+                    operand,
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?
+            };
             emit_unary(context, block, *op, v, types, loc)
         }
         HirExprKind::Call { callee, args } => match callee {
@@ -8244,6 +8294,153 @@ fn emit_tonumber_for_arith<'a, 'c>(
     parsed
 }
 
+/// Phase 2.7p-tagged-arith-coerce (ADR 0089): chokepoint that
+/// materialises an `f64` operand from a 16-byte TaggedValue slot
+/// for a Number-consuming arith / bitwise / unary site. The
+/// dispatch is **driven by** `tagged.rs::policy_for_tagged_arith_operand`:
+/// for each known tag in `DISPATCH_TAGS`, the helper queries the
+/// policy and lays down an scf.if branch emitting the policy-
+/// specific f64 production. The trailing `else` (no known tag
+/// matched) materialises the `TrapNonNumeric` branch.
+///
+/// Per-policy emission:
+/// - `UseNumberPayload` → load f64 at slot+8
+/// - `CoerceStringToNumber` → load ptr at slot+8 and delegate to
+///   `emit_tonumber_for_arith` (ADR 0077; sscanf-coerce with
+///   internal `s_arith_coerce_failed` trap on parse failure)
+/// - `TrapNonNumeric` → exit with `s_arith_on_non_numeric`
+///   (Lua spec §3.4.3); yields a placeholder f64 to satisfy
+///   scf.if region typing (matches the
+///   `emit_tagged_eq_runtime_dispatch` pattern)
+///
+/// The trap policy is owned at this chokepoint; callers must NOT
+/// add inline tag checks before this entry. Mirrors ADR 0087 /
+/// 0088 pure-policy + effectful-executor split: `tagged.rs` decides;
+/// this function emits.
+fn emit_load_tagged_operand_as_number<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    // Tags whose policy is non-trapping; checked in order. Any
+    // tag not in this list (Bool / Nil / Function / Table /
+    // Deleted) falls through to the policy table's
+    // `TrapNonNumeric` arm via the trailing else.
+    const DISPATCH_TAGS: &[i64] = &[TAG_NUMBER, TAG_STRING];
+    let (tag, payload_ptr) = emit_tag_and_payload_ptr(context, block, slot_ptr, types, loc);
+    emit_tagged_arith_dispatch_chain(context, block, tag, payload_ptr, DISPATCH_TAGS, types, loc)
+}
+
+/// Phase 2.7p-tagged-arith-coerce (ADR 0089): recursive scf.if
+/// chain. Each call consumes one `dispatch_tag`; the head tag's
+/// `then` branch emits the policy's f64 production, the `else`
+/// branch recurses into `rest`. When `rest` is empty, the policy
+/// table's `TrapNonNumeric` arm fires (default fall-through).
+fn emit_tagged_arith_dispatch_chain<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    tag: Value<'c, 'a>,
+    payload_ptr: Value<'c, 'a>,
+    dispatch_tags: &[i64],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let Some((&head_tag, rest)) = dispatch_tags.split_first() else {
+        // No more known tags — policy says TrapNonNumeric.
+        return emit_arith_operand_plan(
+            context,
+            block,
+            payload_ptr,
+            TaggedArithOperandPlan::TrapNonNumeric,
+            types,
+            loc,
+        );
+    };
+    let head_plan = policy_for_tagged_arith_operand(head_tag);
+    let head_const = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, head_tag).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let is_match: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            tag,
+            head_const,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        let f = emit_arith_operand_plan(context, &then_blk, payload_ptr, head_plan, types, loc);
+        then_blk.append_operation(scf::r#yield(&[f], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    {
+        let f = emit_tagged_arith_dispatch_chain(
+            context,
+            &else_blk,
+            tag,
+            payload_ptr,
+            rest,
+            types,
+            loc,
+        );
+        else_blk.append_operation(scf::r#yield(&[f], loc));
+    }
+    else_region.append_block(else_blk);
+    let if_op = scf::r#if(is_match, &[types.f64], then_region, else_region, loc);
+    block.append_operation(if_op).result(0).unwrap().into()
+}
+
+/// Phase 2.7p-tagged-arith-coerce (ADR 0089): per-policy f64
+/// emission in a single block. Pure mapping of policy variant to
+/// the MLIR sequence that yields an f64 (or terminates with a
+/// trap and returns a placeholder f64).
+fn emit_arith_operand_plan<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    payload_ptr: Value<'c, 'a>,
+    plan: TaggedArithOperandPlan,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    match plan {
+        TaggedArithOperandPlan::UseNumberPayload => emit_load(block, payload_ptr, types.f64, loc),
+        TaggedArithOperandPlan::CoerceStringToNumber => {
+            let str_ptr = emit_load(block, payload_ptr, types.ptr, loc);
+            emit_tonumber_for_arith(context, block, str_ptr, types, loc)
+        }
+        TaggedArithOperandPlan::TrapNonNumeric => {
+            let msg_ptr = emit_addressof(context, block, "s_arith_on_non_numeric", types, loc);
+            emit_exit_with_message(context, block, msg_ptr, types, loc);
+            // scf.if region typing requires a yielded f64 even
+            // though `emit_exit_with_message` terminates.
+            block
+                .append_operation(arith::constant(
+                    context,
+                    FloatAttribute::new(context, types.f64, 0.0).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into()
+        }
+    }
+}
+
 /// Phase 2.7b/d (ADRs 0025, 0027): String equality and ordering via
 /// `strcmp`. `strcmp(a, b)` returns negative / zero / positive; the
 /// per-op predicate then projects that to an i1. Lexicographic
@@ -8767,14 +8964,8 @@ fn emit_tagged_eq_runtime_dispatch<'a, 'c>(
     in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<Option<Value<'c, 'a>>, CodegenError> {
-    fn tagged_local_idx(e: &HirExpr, locals: &[LocalInfo]) -> Option<LocalId> {
-        if let HirExprKind::Local(LocalId(idx)) = &e.kind {
-            if matches!(locals[*idx].kind, ValueKind::TaggedValue) {
-                return Some(LocalId(*idx));
-            }
-        }
-        None
-    }
+    // ADR 0089 extracted `tagged_local_idx` to module scope so the
+    // arith dispatcher can reuse it; we use that shared helper here.
     // Identify which side(s) carry the tagged local.
     let (tagged_id, typed_expr, typed_kind) =
         match (tagged_local_idx(lhs, locals), tagged_local_idx(rhs, locals)) {
@@ -8991,6 +9182,126 @@ fn emit_tagged_eq_runtime_dispatch<'a, 'c>(
         _ => unreachable!(),
     };
     Ok(Some(final_val))
+}
+
+/// Phase 2.7p-tagged-arith-coerce (ADR 0089): TaggedValue arith /
+/// bitwise BinOp runtime tag dispatch. When op is in the eligible
+/// numeric-consumer class **and** at least one side is
+/// `Local(TaggedValue)`, route the tagged operand(s) through
+/// `emit_load_tagged_operand_as_number` (the chokepoint that
+/// dispatches per `policy_for_tagged_arith_operand`) and feed the
+/// resulting f64s to `emit_binop`. Returns `Some(f64)` when the
+/// dispatch fires, `None` to fall through to the existing BinOp
+/// path. Mirrors `emit_tagged_eq_runtime_dispatch` (ADR 0066) in
+/// shape and call-site contract.
+///
+/// Out of scope (intentional):
+/// - `Eq / Ne` — already handled by `emit_tagged_eq_runtime_dispatch`.
+/// - `Lt / Le / Gt / Ge` — Lua spec §3.4.4: mixed-kind ordering is
+///   an error, not a coercion. Existing trap behavior is correct.
+/// - `Concat (..)` — already auto-coerces via `tostring`.
+///
+/// Static String operands (whose HIR kind is `ValueKind::String`)
+/// are wrapped by `coerce_arith_operand_if_string` (ADR 0077) into
+/// `HirExprKind::ArithStringCoerce`; those reach the dispatcher
+/// here as Number-kind expressions and pass through `emit_expr`
+/// unchanged. ADR 0089 only adds the runtime path for TaggedValue
+/// operands that HIR cannot statically resolve.
+#[allow(clippy::too_many_arguments)]
+fn emit_tagged_arith_runtime_dispatch<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    op: BinOp,
+    lhs: &HirExpr,
+    rhs: &HirExpr,
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
+    loc: Location<'c>,
+) -> Result<Option<Value<'c, 'a>>, CodegenError> {
+    if !is_tagged_arith_eligible_op(op) {
+        return Ok(None);
+    }
+    let lhs_tagged = tagged_local_idx(lhs, locals);
+    let rhs_tagged = tagged_local_idx(rhs, locals);
+    if lhs_tagged.is_none() && rhs_tagged.is_none() {
+        return Ok(None);
+    }
+    let lhs_val = match lhs_tagged {
+        Some(LocalId(idx)) => {
+            emit_load_tagged_operand_as_number(context, block, slots[idx], types, loc)
+        }
+        None => emit_expr(
+            context,
+            block,
+            lhs,
+            slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
+        )?,
+    };
+    let rhs_val = match rhs_tagged {
+        Some(LocalId(idx)) => {
+            emit_load_tagged_operand_as_number(context, block, slots[idx], types, loc)
+        }
+        None => emit_expr(
+            context,
+            block,
+            rhs,
+            slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
+        )?,
+    };
+    Ok(Some(emit_binop(
+        context, block, op, lhs_val, rhs_val, types, loc,
+    )?))
+}
+
+/// Phase 2.7p-tagged-arith-coerce (ADR 0089): the BinOp set whose
+/// TaggedValue operands route through the arith dispatch chokepoint.
+/// 12 ops total: 7 arith + 5 bitwise. Ordering / Eq-Ne / Concat are
+/// excluded (separate handlers; see `emit_tagged_arith_runtime_dispatch`
+/// doc-comment for rationale).
+fn is_tagged_arith_eligible_op(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Mod
+            | BinOp::Pow
+            | BinOp::FloorDiv
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr
+    )
+}
+
+/// Phase 2.7p-tagged-arith-coerce (ADR 0089): identifier helper.
+/// Returns `Some(LocalId)` if `e` is a `Local(TaggedValue)` —
+/// the only HIR shape that needs the runtime tag-dispatch route.
+fn tagged_local_idx(e: &HirExpr, locals: &[LocalInfo]) -> Option<LocalId> {
+    if let HirExprKind::Local(LocalId(idx)) = &e.kind
+        && matches!(locals[*idx].kind, ValueKind::TaggedValue)
+    {
+        return Some(LocalId(*idx));
+    }
+    None
 }
 
 /// Phase 2.6c-tag-consumers (ADR 0067): runtime tag dispatch for
