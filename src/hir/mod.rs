@@ -1260,6 +1260,24 @@ struct LowerCtx {
     /// registers, so the post-pass can resolve each upvalue's
     /// `outer_local_id` to the right `locals` table.
     containing_fn: Option<FuncId>,
+    /// Phase 2.6+-callee-norm (ADR 0091 v2): HIR pre-stmt hoisting
+    /// buffer. `lower_call`'s Index-callee path pre-binds the Index
+    /// result to a synthetic `__callee_<N>` local; the LocalInit
+    /// stmt pushes here, and `lower_stmt` drains the buffer at every
+    /// stmt boundary, wrapping the inner stmt in a
+    /// `Block { hoists..., inner }` when any hoists accumulated.
+    /// Snapshot/restore at stmt entry keeps each stmt's hoists local
+    /// to its own boundary; nested `lower_stmt` calls drain at THEIR
+    /// own boundaries, not the outer caller's. The mechanism is
+    /// general-purpose — future expression-level desugars (method
+    /// colon sugar, let-binding rewrites, `__call` metamethod) reuse
+    /// it.
+    pending_pre_stmts: Vec<HirStmt>,
+    /// Phase 2.6+-callee-norm (ADR 0091 v2): monotonic counter for
+    /// synthesized `__callee_<N>` local names. Prevents collision
+    /// when multiple Index-callee Calls land in the same surrounding
+    /// scope.
+    callee_seq: usize,
 }
 
 impl LowerCtx {
@@ -1276,6 +1294,8 @@ impl LowerCtx {
             in_function: None,
             in_function_ret_kinds: None,
             containing_fn: None,
+            pending_pre_stmts: Vec::new(),
+            callee_seq: 0,
         }
     }
 
@@ -1567,7 +1587,34 @@ impl LowerCtx {
         id
     }
 
+    /// Phase 2.6+-callee-norm (ADR 0091 v2): drain wrapper around the
+    /// match-arms body (renamed [`Self::lower_stmt_match_arms`]).
+    /// Snapshots the current `pending_pre_stmts`, runs the inner
+    /// lowering (which may push hoisted LocalInit stmts during
+    /// `lower_call`'s Index-callee desugar), then drains. When hoists
+    /// accumulated, wraps the inner stmt in a `Block { hoists...,
+    /// inner }` so the synthetic `__callee_<N>` locals are evaluated
+    /// once in the right surrounding scope. The snapshot/restore
+    /// dance keeps each stmt's hoists local to its own boundary —
+    /// recursive `lower_stmt` calls (e.g. for If-body / While-body /
+    /// inner Block stmts) drain at their own boundaries, not at the
+    /// outer caller's.
     fn lower_stmt(&mut self, stmt: &Stmt) -> Result<HirStmt, HirError> {
+        let outer_pre = std::mem::take(&mut self.pending_pre_stmts);
+        let inner_result = self.lower_stmt_match_arms(stmt);
+        let mut my_pre = std::mem::replace(&mut self.pending_pre_stmts, outer_pre);
+        let inner = inner_result?;
+        if my_pre.is_empty() {
+            return Ok(inner);
+        }
+        my_pre.push(inner);
+        Ok(HirStmt {
+            kind: HirStmtKind::Block { stmts: my_pre },
+            span: stmt.span,
+        })
+    }
+
+    fn lower_stmt_match_arms(&mut self, stmt: &Stmt) -> Result<HirStmt, HirError> {
         match &stmt.kind {
             StmtKind::Local { name, value } => {
                 let value = self.lower_expr(value)?;
@@ -3492,6 +3539,22 @@ impl LowerCtx {
         args: &[Expr],
         whole: &Expr,
     ) -> Result<HirExprKind, HirError> {
+        // Phase 2.6+-callee-norm (ADR 0091 v2): pre-step is to
+        // classify the callee shape. DirectIdent flows through the
+        // existing path; IndexCallee pre-binds the Index result to
+        // a synthetic local (via [`Self::materialize_callee_to_local`])
+        // and recurses with the synthetic as the new callee.
+        // Anything else surfaces as the existing `UnsupportedCall`.
+        match classify_callee_form(callee) {
+            Ok(CalleeForm::DirectIdent) => { /* fall through */ }
+            Ok(CalleeForm::IndexCallee { target, key }) => {
+                let synth_id = self.materialize_callee_to_local(target, key, whole.span)?;
+                let synth_name = self.locals[synth_id.0].name.clone();
+                let synth_callee = Expr::new(ExprKind::Ident(synth_name), whole.span);
+                return self.lower_call(&synth_callee, args, whole);
+            }
+            Err(e) => return Err(e),
+        }
         // Local helper for the ADR 0082 indirect-dispatch path. Pure
         // function over the module's user-function table; no table /
         // local provenance analysis (Codex pre-ADR-0082 review:
@@ -3983,6 +4046,79 @@ impl LowerCtx {
             callee: Callee::Builtin(builtin),
             args: lowered_args,
         })
+    }
+
+    /// Phase 2.6+-callee-norm (ADR 0091 v2): effectful executor that
+    /// materialises an Index-callee Call's callee into a synthetic
+    /// `__callee_<N>` local. Pushes a `LocalInit` pre-stmt into
+    /// `pending_pre_stmts`; the surrounding `lower_stmt` drains it
+    /// at the stmt boundary. Returns the synthetic LocalId so the
+    /// caller can recurse through `lower_call`'s existing
+    /// DirectIdent → IndirectDispatch path with the synthetic
+    /// resolution.
+    fn materialize_callee_to_local(
+        &mut self,
+        target: &Expr,
+        key: &Expr,
+        callee_span: Span,
+    ) -> Result<LocalId, HirError> {
+        // Lower the Index expression once. ADR 0063's
+        // `widen_index_for_local_init` rewrites the resulting
+        // HirExprKind::Index to IndexTagged so the synthetic local
+        // widens to TaggedValue — the same storage rule that
+        // `local g = t.m` already uses for table-fetched values
+        // (ADR 0084 / 0082 dispatch contract).
+        let index_ast = Expr::new(
+            ExprKind::Index {
+                target: Box::new(target.clone()),
+                key: Box::new(key.clone()),
+            },
+            callee_span,
+        );
+        let index_hir = self.lower_expr(&index_ast)?;
+        let widened = widen_index_for_local_init(index_hir);
+        let seq = self.callee_seq;
+        self.callee_seq += 1;
+        let synth_name = format!("__callee_{seq}");
+        let synth_id = self.declare_local(synth_name, ValueKind::TaggedValue);
+        self.pending_pre_stmts.push(HirStmt {
+            kind: HirStmtKind::LocalInit {
+                id: synth_id,
+                value: widened,
+            },
+            span: callee_span,
+        });
+        Ok(synth_id)
+    }
+}
+
+/// Phase 2.6+-callee-norm (ADR 0091 v2): pure classifier for the
+/// callee position of a `Call` AST node. Decides which lowering path
+/// applies — the existing Ident-callee path or the new Index-callee
+/// pre-bind path. Anything else surfaces as the existing
+/// `HirError::UnsupportedCall` (future ADRs can broaden coverage,
+/// e.g. `(expr_returning_fn)()`, but ADR 0091 v2 keeps the MVP tight
+/// per codex post-abort guideline #2).
+enum CalleeForm<'a> {
+    /// `name(args)` — Ident callee. Routed through the existing
+    /// Builtin / User / Indirect / IndirectDispatch resolution.
+    DirectIdent,
+    /// `target[key](args)` or `target.field(args)` — Index callee.
+    /// HIR pre-binds the Index result to a synthetic local and
+    /// recurses with that local as the new callee.
+    IndexCallee { target: &'a Expr, key: &'a Expr },
+}
+
+fn classify_callee_form(callee: &Expr) -> Result<CalleeForm<'_>, HirError> {
+    match &callee.kind {
+        ExprKind::Ident(_) => Ok(CalleeForm::DirectIdent),
+        ExprKind::Index { target, key } => Ok(CalleeForm::IndexCallee {
+            target: target.as_ref(),
+            key: key.as_ref(),
+        }),
+        _ => Err(HirError::UnsupportedCall {
+            offset: callee.span.start,
+        }),
     }
 }
 
