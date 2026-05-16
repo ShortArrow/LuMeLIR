@@ -523,6 +523,7 @@ fn infer_user_function_param_kinds(
     chunk: &[Stmt],
     function_names: &HashMap<String, FuncId>,
     method_funcs: &HashMap<(Vec<String>, String), FuncId>,
+    alias_map: &HashMap<String, FuncId>,
     arities: &[usize],
 ) -> Vec<Vec<ValueKind>> {
     let mut kinds: Vec<Vec<ValueKind>> = arities
@@ -535,19 +536,22 @@ fn infer_user_function_param_kinds(
         s: &Stmt,
         names: &HashMap<String, FuncId>,
         method_funcs: &HashMap<(Vec<String>, String), FuncId>,
+        alias_map: &HashMap<String, FuncId>,
         kinds: &mut Vec<Vec<ValueKind>>,
         seen: &mut Vec<bool>,
     ) {
         match &s.kind {
             StmtKind::Local { value, .. } | StmtKind::Assign { value, .. } => {
-                visit_expr(value, names, method_funcs, kinds, seen);
+                visit_expr(value, names, method_funcs, alias_map, kinds, seen);
             }
-            StmtKind::ExprStmt(e) => visit_expr(e, names, method_funcs, kinds, seen),
-            StmtKind::Return { value: Some(e) } => visit_expr(e, names, method_funcs, kinds, seen),
+            StmtKind::ExprStmt(e) => visit_expr(e, names, method_funcs, alias_map, kinds, seen),
+            StmtKind::Return { value: Some(e) } => {
+                visit_expr(e, names, method_funcs, alias_map, kinds, seen)
+            }
             StmtKind::Return { value: None } => {}
             StmtKind::Block(b) => {
                 for st in b {
-                    visit_stmt(st, names, method_funcs, kinds, seen);
+                    visit_stmt(st, names, method_funcs, alias_map, kinds, seen);
                 }
             }
             StmtKind::If {
@@ -556,26 +560,26 @@ fn infer_user_function_param_kinds(
                 elifs,
                 else_body,
             } => {
-                visit_expr(cond, names, method_funcs, kinds, seen);
+                visit_expr(cond, names, method_funcs, alias_map, kinds, seen);
                 for st in then_body {
-                    visit_stmt(st, names, method_funcs, kinds, seen);
+                    visit_stmt(st, names, method_funcs, alias_map, kinds, seen);
                 }
                 for (c, b) in elifs {
-                    visit_expr(c, names, method_funcs, kinds, seen);
+                    visit_expr(c, names, method_funcs, alias_map, kinds, seen);
                     for st in b {
-                        visit_stmt(st, names, method_funcs, kinds, seen);
+                        visit_stmt(st, names, method_funcs, alias_map, kinds, seen);
                     }
                 }
                 if let Some(b) = else_body {
                     for st in b {
-                        visit_stmt(st, names, method_funcs, kinds, seen);
+                        visit_stmt(st, names, method_funcs, alias_map, kinds, seen);
                     }
                 }
             }
             StmtKind::While { cond, body } => {
-                visit_expr(cond, names, method_funcs, kinds, seen);
+                visit_expr(cond, names, method_funcs, alias_map, kinds, seen);
                 for st in body {
-                    visit_stmt(st, names, method_funcs, kinds, seen);
+                    visit_stmt(st, names, method_funcs, alias_map, kinds, seen);
                 }
             }
             StmtKind::ForNumeric {
@@ -585,25 +589,25 @@ fn infer_user_function_param_kinds(
                 body,
                 ..
             } => {
-                visit_expr(start, names, method_funcs, kinds, seen);
-                visit_expr(stop, names, method_funcs, kinds, seen);
+                visit_expr(start, names, method_funcs, alias_map, kinds, seen);
+                visit_expr(stop, names, method_funcs, alias_map, kinds, seen);
                 if let Some(s) = step {
-                    visit_expr(s, names, method_funcs, kinds, seen);
+                    visit_expr(s, names, method_funcs, alias_map, kinds, seen);
                 }
                 for st in body {
-                    visit_stmt(st, names, method_funcs, kinds, seen);
+                    visit_stmt(st, names, method_funcs, alias_map, kinds, seen);
                 }
             }
             StmtKind::ForIpairs { table, body, .. } => {
-                visit_expr(table, names, method_funcs, kinds, seen);
+                visit_expr(table, names, method_funcs, alias_map, kinds, seen);
                 for st in body {
-                    visit_stmt(st, names, method_funcs, kinds, seen);
+                    visit_stmt(st, names, method_funcs, alias_map, kinds, seen);
                 }
             }
             StmtKind::ForPairs { table, body, .. } => {
-                visit_expr(table, names, method_funcs, kinds, seen);
+                visit_expr(table, names, method_funcs, alias_map, kinds, seen);
                 for st in body {
-                    visit_stmt(st, names, method_funcs, kinds, seen);
+                    visit_stmt(st, names, method_funcs, alias_map, kinds, seen);
                 }
             }
             StmtKind::ForGeneric {
@@ -613,24 +617,24 @@ fn infer_user_function_param_kinds(
                 body,
                 ..
             } => {
-                visit_expr(iter, names, method_funcs, kinds, seen);
-                visit_expr(state, names, method_funcs, kinds, seen);
-                visit_expr(ctl, names, method_funcs, kinds, seen);
+                visit_expr(iter, names, method_funcs, alias_map, kinds, seen);
+                visit_expr(state, names, method_funcs, alias_map, kinds, seen);
+                visit_expr(ctl, names, method_funcs, alias_map, kinds, seen);
                 for st in body {
-                    visit_stmt(st, names, method_funcs, kinds, seen);
+                    visit_stmt(st, names, method_funcs, alias_map, kinds, seen);
                 }
             }
             StmtKind::Repeat { body, cond } => {
                 for st in body {
-                    visit_stmt(st, names, method_funcs, kinds, seen);
+                    visit_stmt(st, names, method_funcs, alias_map, kinds, seen);
                 }
-                visit_expr(cond, names, method_funcs, kinds, seen);
+                visit_expr(cond, names, method_funcs, alias_map, kinds, seen);
             }
             // FunctionDef bodies are also walked — recursive calls and
             // calls into sibling top-level functions count.
             StmtKind::FunctionDef { body, .. } => {
                 for st in body {
-                    visit_stmt(st, names, method_funcs, kinds, seen);
+                    visit_stmt(st, names, method_funcs, alias_map, kinds, seen);
                 }
             }
             // Phase 2.6+-methods (ADR 0092): method-def bodies are
@@ -640,23 +644,23 @@ fn infer_user_function_param_kinds(
             // doesn't extend to Index-callee Calls).
             StmtKind::MethodDef { body, .. } => {
                 for st in body {
-                    visit_stmt(st, names, method_funcs, kinds, seen);
+                    visit_stmt(st, names, method_funcs, alias_map, kinds, seen);
                 }
             }
             StmtKind::LocalMulti { values, .. } | StmtKind::AssignMulti { values, .. } => {
                 for v in values {
-                    visit_expr(v, names, method_funcs, kinds, seen);
+                    visit_expr(v, names, method_funcs, alias_map, kinds, seen);
                 }
             }
             StmtKind::ReturnMulti { values } => {
                 for v in values {
-                    visit_expr(v, names, method_funcs, kinds, seen);
+                    visit_expr(v, names, method_funcs, alias_map, kinds, seen);
                 }
             }
             StmtKind::IndexAssign { target, key, value } => {
-                visit_expr(target, names, method_funcs, kinds, seen);
-                visit_expr(key, names, method_funcs, kinds, seen);
-                visit_expr(value, names, method_funcs, kinds, seen);
+                visit_expr(target, names, method_funcs, alias_map, kinds, seen);
+                visit_expr(key, names, method_funcs, alias_map, kinds, seen);
+                visit_expr(value, names, method_funcs, alias_map, kinds, seen);
             }
             StmtKind::Break => {}
         }
@@ -689,6 +693,7 @@ fn infer_user_function_param_kinds(
         e: &Expr,
         names: &HashMap<String, FuncId>,
         method_funcs: &HashMap<(Vec<String>, String), FuncId>,
+        alias_map: &HashMap<String, FuncId>,
         kinds: &mut Vec<Vec<ValueKind>>,
         seen: &mut Vec<bool>,
     ) {
@@ -696,6 +701,20 @@ fn infer_user_function_param_kinds(
             ExprKind::Call { callee, args } => {
                 if let ExprKind::Ident(name) = &callee.kind
                     && let Some(&FuncId(idx)) = names.get(name)
+                {
+                    try_refine_func_args(idx, 0, args, kinds, seen);
+                }
+                // Phase 2.6+-name-rebind-refine (ADR 0098): top-level
+                // `local g = a.b.method` rebinds make `g` an alias for
+                // the underlying FuncId. When callee is Ident(name) and
+                // `function_names[name]` missed, try `alias_map[name]`
+                // and refine on hit. Lookup priority: function_names
+                // first (existing FunctionDef path), alias_map second
+                // (Local rebind path). No-overlap with `method_funcs`
+                // (chain-keyed) below.
+                if let ExprKind::Ident(name) = &callee.kind
+                    && !names.contains_key(name)
+                    && let Some(&FuncId(idx)) = alias_map.get(name)
                 {
                     try_refine_func_args(idx, 0, args, kinds, seen);
                 }
@@ -719,21 +738,21 @@ fn infer_user_function_param_kinds(
                 {
                     try_refine_func_args(idx, 0, args, kinds, seen);
                 }
-                visit_expr(callee, names, method_funcs, kinds, seen);
+                visit_expr(callee, names, method_funcs, alias_map, kinds, seen);
                 for a in args {
-                    visit_expr(a, names, method_funcs, kinds, seen);
+                    visit_expr(a, names, method_funcs, alias_map, kinds, seen);
                 }
             }
             ExprKind::BinOp { lhs, rhs, .. } => {
-                visit_expr(lhs, names, method_funcs, kinds, seen);
-                visit_expr(rhs, names, method_funcs, kinds, seen);
+                visit_expr(lhs, names, method_funcs, alias_map, kinds, seen);
+                visit_expr(rhs, names, method_funcs, alias_map, kinds, seen);
             }
             ExprKind::UnaryOp { operand, .. } => {
-                visit_expr(operand, names, method_funcs, kinds, seen);
+                visit_expr(operand, names, method_funcs, alias_map, kinds, seen);
             }
             ExprKind::FunctionExpr { body, .. } => {
                 for st in body {
-                    visit_stmt(st, names, method_funcs, kinds, seen);
+                    visit_stmt(st, names, method_funcs, alias_map, kinds, seen);
                 }
             }
             // Phase 2.6+-method-arg-refine (ADR 0093): MethodCall
@@ -756,9 +775,9 @@ fn infer_user_function_param_kinds(
                 {
                     try_refine_func_args(idx, 1, args, kinds, seen);
                 }
-                visit_expr(receiver, names, method_funcs, kinds, seen);
+                visit_expr(receiver, names, method_funcs, alias_map, kinds, seen);
                 for a in args {
-                    visit_expr(a, names, method_funcs, kinds, seen);
+                    visit_expr(a, names, method_funcs, alias_map, kinds, seen);
                 }
             }
             _ => {}
@@ -766,7 +785,14 @@ fn infer_user_function_param_kinds(
     }
 
     for s in chunk {
-        visit_stmt(s, function_names, method_funcs, &mut kinds, &mut seen);
+        visit_stmt(
+            s,
+            function_names,
+            method_funcs,
+            alias_map,
+            &mut kinds,
+            &mut seen,
+        );
     }
     kinds
 }
@@ -1147,13 +1173,52 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
             method_funcs.insert((receiver_chain.clone(), method.clone()), fid);
         }
     }
+    // Phase 2.6+-name-rebind-refine (ADR 0098): pass-1.5 builds an
+    // `alias_map: HashMap<String, FuncId>` from top-level
+    // `StmtKind::Local`/`LocalMulti` whose RHS is an Index chain
+    // pointing to a registered method (`method_funcs` hit via
+    // `extract_index_chain`). This lets `infer_user_function_param_kinds`
+    // refine call sites that go through `local g = a.b.method; g(arg)`.
+    // Last-wins on `g` rebinds (HashMap insert semantics) — same
+    // shadowing carry-over as `function_names` / `method_funcs`.
+    // Pass-1 walk is TOP-LEVEL only (no descent into function bodies);
+    // function-body rebind / re-assignment / multi-step aliasing
+    // remain future work per ADR 0098 Non-goals.
+    let mut alias_map: HashMap<String, FuncId> = HashMap::new();
+    for stmt in chunk {
+        match &stmt.kind {
+            StmtKind::Local { name, value } => {
+                if let Some((chain, method_name)) = extract_index_chain(value)
+                    && let Some(&fid) = method_funcs.get(&(chain, method_name))
+                {
+                    alias_map.insert(name.clone(), fid);
+                }
+            }
+            StmtKind::LocalMulti { names, values } if names.len() == values.len() => {
+                for (n, v) in names.iter().zip(values.iter()) {
+                    if let Some((chain, method_name)) = extract_index_chain(v)
+                        && let Some(&fid) = method_funcs.get(&(chain, method_name))
+                    {
+                        alias_map.insert(n.clone(), fid);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     // Phase 2.5e (ADR 0020): pre-scan all call sites for top-level
     // function names, refining each function's param kinds from
     // literal arg kinds at the first observed call. Without this,
     // every param defaults to Number and Bool/Nil call args get
     // rejected by `lower_call`'s kind check.
     let arities: Vec<usize> = functions.iter().map(|f| f.params.len()).collect();
-    let inferred = infer_user_function_param_kinds(chunk, &function_names, &method_funcs, &arities);
+    let inferred = infer_user_function_param_kinds(
+        chunk,
+        &function_names,
+        &method_funcs,
+        &alias_map,
+        &arities,
+    );
     for (i, kinds) in inferred.iter().enumerate() {
         for (j, k) in kinds.iter().enumerate() {
             functions[i].params[j].kind = *k;
