@@ -960,25 +960,18 @@ fn register_function_signature(
     id
 }
 
-/// Phase 2.6+-method-arg-refine (ADR 0093): pass-1 registration step
-/// for `MethodDef` statements, mirroring `register_function_signature`.
-/// Pre-allocates a `FuncId` and a placeholder `HirFunction` (mangled
-/// `user_anon_<idx>` matching ADR 0092's lowering naming) so the
-/// chunk-walker `infer_user_function_param_kinds` (Pass 1.5) can refine
-/// args by reading the index BEFORE the body is lowered (Pass 2).
-/// `lower_method_def` (ADR 0092) then re-uses this FuncId instead of
-/// freshly allocating one.
+/// Phase 2.6+-method-arg-refine (ADR 0093 / split by ADR 0096):
+/// allocate a FuncId + placeholder `HirFunction` for a `MethodDef`
+/// statement (mangled `user_anon_<idx>` matching ADR 0092's lowering
+/// naming). Does NOT touch the `method_funcs` index — that insertion
+/// is the conditional part now (ADR 0096 splits FuncId allocation
+/// from refinement-index registration so multi-segment method-defs
+/// still get FuncIds but skip the index entry).
 ///
 /// `effective_params` are the post-self-prepend params (caller is
-/// responsible for inserting `"self"` when `is_colon`). The index key
-/// is `(receiver, method)` — last-wins on collision (same semantics
-/// as `function_names`'s `insert` for shadowed FunctionDef names;
-/// future ADR can lift to source-order resolution).
-fn register_method_signature(
-    receiver: &str,
-    method: &str,
+/// responsible for inserting `"self"` when `is_colon`).
+fn alloc_method_signature(
     effective_params: &[String],
-    method_funcs: &mut HashMap<(String, String), FuncId>,
     functions: &mut Vec<HirFunction>,
     parent_scope: ParentScope,
 ) -> FuncId {
@@ -1001,7 +994,6 @@ fn register_method_signature(
         ret_kinds: Vec::new(),
         parent_scope,
     });
-    method_funcs.insert((receiver.to_owned(), method.to_owned()), id);
     id
 }
 
@@ -1010,12 +1002,14 @@ fn register_method_signature(
 /// `lower_function_body`. Lowers `body` into a fresh `LowerCtx`,
 /// fills in `functions[fid.0]`, and hoists any anonymous functions
 /// registered during inner lowering into the outer table.
+#[allow(clippy::too_many_arguments)]
 fn lower_into_function(
     fid: FuncId,
     params: &[String],
     body: &[Stmt],
     function_names: &HashMap<String, FuncId>,
     method_funcs: &HashMap<(String, String), FuncId>,
+    methoddef_func_ids: &[FuncId],
     functions: &mut Vec<HirFunction>,
     outer_visible: HashMap<String, (LocalId, ValueKind)>,
 ) -> Result<(), HirError> {
@@ -1024,6 +1018,7 @@ fn lower_into_function(
     let mut sub_ctx = LowerCtx::for_function(
         function_names,
         method_funcs,
+        methoddef_func_ids,
         functions,
         params,
         body,
@@ -1067,10 +1062,19 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
     // FunctionDef and MethodDef walks are kept sequential (not
     // interleaved) so the `funcdef_seq` counter in Pass 2 still maps
     // 1:1 onto FunctionDef FuncIds in source order.
+    // Phase 2.6+-method-arg-refine (ADR 0093) / multi-segment-method-def
+    // (ADR 0096): FuncId allocation and `method_funcs` index insertion
+    // are split. All MethodDef get FuncIds (pushed to `functions`); the
+    // refinement index keyed by `(receiver, method)` only receives
+    // single-segment entries, matching the call-site walker's
+    // `Index{Ident, Str}` shape boundary. Multi-segment FuncIds are
+    // looked up by source-order seq via `methoddef_func_ids` at
+    // `lower_method_def` time.
     let mut method_funcs: HashMap<(String, String), FuncId> = HashMap::new();
+    let mut methoddef_func_ids: Vec<FuncId> = Vec::new();
     for stmt in chunk {
         if let StmtKind::MethodDef {
-            receiver,
+            receiver_chain,
             method,
             is_colon,
             params,
@@ -1082,14 +1086,11 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
                 effective_params.push("self".to_owned());
             }
             effective_params.extend_from_slice(params);
-            register_method_signature(
-                receiver,
-                method,
-                &effective_params,
-                &mut method_funcs,
-                &mut functions,
-                ParentScope::Chunk,
-            );
+            let fid = alloc_method_signature(&effective_params, &mut functions, ParentScope::Chunk);
+            methoddef_func_ids.push(fid);
+            if receiver_chain.len() == 1 {
+                method_funcs.insert((receiver_chain[0].clone(), method.clone()), fid);
+            }
         }
     }
     // Phase 2.5e (ADR 0020): pre-scan all call sites for top-level
@@ -1112,7 +1113,12 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
     // first with an empty `outer_visible`, which made top-level
     // captures statically unreachable; ADR 0037 documented that
     // gap, ADR 0042 closes it.
-    let mut ctx = LowerCtx::new(function_names.clone(), method_funcs.clone(), functions);
+    let mut ctx = LowerCtx::new(
+        function_names.clone(),
+        method_funcs.clone(),
+        methoddef_func_ids.clone(),
+        functions,
+    );
     // Phase 2.5c-full Commit 3b prep fix (ADR 0083): pass 1.5 — declare
     // a synthetic chunk local for every top-level `local function f`.
     // This is the same shape `local f = function() end` already
@@ -1146,6 +1152,7 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
                 body,
                 &ctx.function_names,
                 &ctx.method_funcs,
+                &ctx.methoddef_func_ids,
                 &mut ctx.functions,
                 outer_visible,
             )?;
@@ -1429,6 +1436,17 @@ struct LowerCtx {
     /// instead of pushing a fresh `HirFunction`. Same last-wins
     /// shadowing semantics as `function_names`.
     method_funcs: HashMap<(String, String), FuncId>,
+    /// Phase 2.6+-multi-segment-method-def (ADR 0096): per-Pass-1
+    /// source-order MethodDef FuncId list. Includes ALL MethodDef
+    /// (any `receiver_chain.len()`), unlike `method_funcs` which is
+    /// limited to length-1 for call-site refinement. `lower_method_def`
+    /// consumes via `methoddef_seq` counter — mirrors the existing
+    /// `funcdef_seq` pattern for FunctionDef.
+    methoddef_func_ids: Vec<FuncId>,
+    /// Phase 2.6+-multi-segment-method-def (ADR 0096): Pass-2
+    /// counter into `methoddef_func_ids`. Incremented on each
+    /// `lower_method_def` call so the order matches the Pass-1 walk.
+    methoddef_seq: usize,
     /// Mirror of [`HirChunk::functions`] — needed by `infer_kind` for
     /// user-call return-type lookup. Phase 2.5a clones it into each
     /// `LowerCtx`; the cost is negligible at this scale.
@@ -1476,6 +1494,7 @@ impl LowerCtx {
     fn new(
         function_names: HashMap<String, FuncId>,
         method_funcs: HashMap<(String, String), FuncId>,
+        methoddef_func_ids: Vec<FuncId>,
         functions: Vec<HirFunction>,
     ) -> Self {
         Self {
@@ -1487,6 +1506,8 @@ impl LowerCtx {
             loop_break_targets: Vec::new(),
             function_names,
             method_funcs,
+            methoddef_func_ids,
+            methoddef_seq: 0,
             functions,
             in_function: None,
             in_function_ret_kinds: None,
@@ -1520,6 +1541,7 @@ impl LowerCtx {
     fn for_function(
         function_names: &HashMap<String, FuncId>,
         method_funcs: &HashMap<(String, String), FuncId>,
+        methoddef_func_ids: &[FuncId],
         functions: &[HirFunction],
         params: &[String],
         body: &[Stmt],
@@ -1530,6 +1552,7 @@ impl LowerCtx {
         let mut ctx = Self::new(
             function_names.clone(),
             method_funcs.clone(),
+            methoddef_func_ids.to_vec(),
             functions.to_vec(),
         );
         ctx.outer_visible = outer_visible;
@@ -1970,6 +1993,7 @@ impl LowerCtx {
                     body,
                     &self.function_names,
                     &self.method_funcs,
+                    &self.methoddef_func_ids,
                     &mut self.functions,
                     outer_visible,
                 )?;
@@ -2882,12 +2906,12 @@ impl LowerCtx {
             // to Function, in which case Function wins — semantically
             // correct since `self` IS being called).
             StmtKind::MethodDef {
-                receiver,
+                receiver_chain,
                 method,
                 is_colon,
                 params,
                 body,
-            } => self.lower_method_def(receiver, method, *is_colon, params, body, stmt.span),
+            } => self.lower_method_def(receiver_chain, method, *is_colon, params, body, stmt.span),
         }
     }
 
@@ -3653,6 +3677,7 @@ impl LowerCtx {
                 let mut fn_ctx = LowerCtx::for_function(
                     &self.function_names,
                     &self.method_funcs,
+                    &self.methoddef_func_ids,
                     &self.functions,
                     params,
                     body,
@@ -4357,7 +4382,7 @@ impl LowerCtx {
     /// non-goal carry-over).
     fn lower_method_def(
         &mut self,
-        receiver: &str,
+        receiver_chain: &[String],
         method: &str,
         is_colon: bool,
         params: &[String],
@@ -4372,12 +4397,19 @@ impl LowerCtx {
         } else {
             params.to_vec()
         };
-        // Phase 2.6+-method-arg-refine (ADR 0093): the FuncId was
-        // pre-allocated in Pass 1 via `register_method_signature` and
-        // the placeholder is already in `self.functions`. Look it up
-        // by `(receiver, method)` so Pass 1.5's refinement of param
-        // kinds carries forward into `external_kinds` below.
-        let id = self.method_funcs[&(receiver.to_owned(), method.to_owned())];
+        // Phase 2.6+-multi-segment-method-def (ADR 0096): FuncId was
+        // pre-allocated in Pass-1 for ALL MethodDef (any segment count)
+        // and pushed into `methoddef_func_ids` in source order. Pass-2
+        // consumes via `methoddef_seq` counter mirroring `funcdef_seq`.
+        // For single-segment ADR 0093 path this matches the prior
+        // `method_funcs[(receiver, method)]` lookup; for multi-segment
+        // the counter is the only valid source.
+        debug_assert!(
+            self.methoddef_seq < self.methoddef_func_ids.len(),
+            "methoddef_seq desync"
+        );
+        let id = self.methoddef_func_ids[self.methoddef_seq];
+        self.methoddef_seq += 1;
         let mut external_kinds: Vec<ValueKind> =
             self.functions[id.0].params.iter().map(|p| p.kind).collect();
         if is_colon {
@@ -4395,6 +4427,7 @@ impl LowerCtx {
         let mut fn_ctx = LowerCtx::for_function(
             &self.function_names,
             &self.method_funcs,
+            &self.methoddef_func_ids,
             &self.functions,
             &effective_params,
             body,
@@ -4409,14 +4442,32 @@ impl LowerCtx {
         self.functions[id.0].locals = fn_ctx.locals;
         self.functions[id.0].body = body_hir;
         self.functions[id.0].ret_kinds = ret_kinds;
-        // Build the IndexAssign at HIR level. Target is the receiver
-        // local (must be Table-kind; the existing IndexAssign target
-        // check at lower_stmt_match_arms enforces this if we route
-        // through synthetic AST, so we synthesize and re-lower).
-        let target_ast = Expr::new(ExprKind::Ident(receiver.to_owned()), stmt_span);
+        // Phase 2.6+-multi-segment-method-def (ADR 0096): fold the
+        // receiver chain into a nested Ident/Index AST. Length-1
+        // produces a plain Ident (single-level path, ADR 0092
+        // backward-compat); length ≥ 2 produces nested Index which
+        // ADR 0095's `widen_index_for_assign_target` rewrites to
+        // IndexTagged → codegen TAG_TABLE narrow at the IndexAssign
+        // target chokepoint.
+        let mut target_ast = Expr::new(ExprKind::Ident(receiver_chain[0].clone()), stmt_span);
+        for seg in &receiver_chain[1..] {
+            let key_ast = Expr::new(ExprKind::Str(seg.clone()), stmt_span);
+            target_ast = Expr::new(
+                ExprKind::Index {
+                    target: Box::new(target_ast),
+                    key: Box::new(key_ast),
+                },
+                stmt_span,
+            );
+        }
         let target_hir = self.lower_expr(&target_ast)?;
+        // ADR 0095 widen: lowered Index targets carry Number kind by
+        // default; apply the same widen used by IndexAssign's normal
+        // path so the kind shifts to TaggedValue and codegen's
+        // TAG_TABLE narrow handles the runtime extraction.
+        let target_hir = widen_index_for_assign_target(target_hir);
         let target_kind = infer_kind(&target_hir, &self.locals, &self.functions);
-        if target_kind != ValueKind::Table {
+        if target_kind != ValueKind::Table && target_kind != ValueKind::TaggedValue {
             return Err(HirError::TypeMismatch {
                 op: "method-def receiver".to_owned(),
                 lhs_kind: "table".to_owned(),

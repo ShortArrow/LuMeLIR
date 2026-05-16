@@ -571,11 +571,12 @@ impl<'t> Parser<'t> {
         Ok(Stmt::new(kind, span))
     }
 
-    /// Phase 2.6+-methods (ADR 0092): top-level `function recv.field(...) end`
-    /// or `function recv:method(...) end`. Single-segment Ident
-    /// receiver only for MVP. Emits `StmtKind::MethodDef` preserving
-    /// `is_colon`; HIR-chokepoint desugar handles the `IndexAssign`
-    /// + `FunctionRef` emission and `self` param plumbing.
+    /// Phase 2.6+-methods (ADR 0092 / extended in ADR 0096): top-level
+    /// `function recv[.field]*.method(...) end` or
+    /// `function recv[.field]*:method(...) end`. Receiver chain is
+    /// composed of dotted Ident segments; the final separator (`.`
+    /// or `:`) determines `is_colon`. ADR 0095's TAG_TABLE narrow
+    /// makes nested table targets safe at codegen.
     ///
     /// Rejects bare top-level `function NAME(...) end` (no receiver
     /// dot/colon) — that form requires globals, which are not yet
@@ -583,66 +584,116 @@ impl<'t> Parser<'t> {
     /// `ParseError::UnexpectedToken { actual: LParen, ... }`.
     fn parse_method_def(&mut self) -> Result<Stmt, ParseError> {
         let fn_tok = self.bump().clone(); // 'function'
-        let recv_tok = self.peek().clone();
-        let receiver = match recv_tok.kind {
+        // Consume the head Ident.
+        let mut segments: Vec<String> = Vec::new();
+        let head_tok = self.peek().clone();
+        match head_tok.kind {
             TokenKind::Ident(ref n) => {
-                let s = n.clone();
+                segments.push(n.clone());
                 self.bump();
-                s
             }
             TokenKind::Eof => {
                 return Err(ParseError::UnexpectedEof {
-                    offset: recv_tok.span.start,
+                    offset: head_tok.span.start,
                 });
             }
             other => {
                 return Err(ParseError::UnexpectedToken {
                     actual: other,
-                    offset: recv_tok.span.start,
+                    offset: head_tok.span.start,
                 });
             }
-        };
-        let sep_tok = self.peek().clone();
-        let is_colon = match sep_tok.kind {
-            TokenKind::Dot => false,
-            TokenKind::Colon => true,
-            TokenKind::Eof => {
-                return Err(ParseError::UnexpectedEof {
-                    offset: sep_tok.span.start,
-                });
+        }
+        // Loop over `.IDENT` segments. The terminating separator is
+        // either `:IDENT` (colon — sets is_colon=true and the next
+        // Ident is the method) or LParen (the last consumed Ident
+        // becomes the method; receiver_chain is everything before it).
+        let mut is_colon = false;
+        loop {
+            let sep_tok = self.peek().clone();
+            match sep_tok.kind {
+                TokenKind::Dot => {
+                    self.bump();
+                    let id_tok = self.peek().clone();
+                    match id_tok.kind {
+                        TokenKind::Ident(ref n) => {
+                            segments.push(n.clone());
+                            self.bump();
+                        }
+                        TokenKind::Eof => {
+                            return Err(ParseError::UnexpectedEof {
+                                offset: id_tok.span.start,
+                            });
+                        }
+                        other => {
+                            return Err(ParseError::UnexpectedToken {
+                                actual: other,
+                                offset: id_tok.span.start,
+                            });
+                        }
+                    }
+                }
+                TokenKind::Colon => {
+                    self.bump();
+                    let id_tok = self.peek().clone();
+                    match id_tok.kind {
+                        TokenKind::Ident(ref n) => {
+                            segments.push(n.clone());
+                            self.bump();
+                        }
+                        TokenKind::Eof => {
+                            return Err(ParseError::UnexpectedEof {
+                                offset: id_tok.span.start,
+                            });
+                        }
+                        other => {
+                            return Err(ParseError::UnexpectedToken {
+                                actual: other,
+                                offset: id_tok.span.start,
+                            });
+                        }
+                    }
+                    is_colon = true;
+                    break;
+                }
+                TokenKind::LParen => break,
+                TokenKind::Eof => {
+                    return Err(ParseError::UnexpectedEof {
+                        offset: sep_tok.span.start,
+                    });
+                }
+                other => {
+                    return Err(ParseError::UnexpectedToken {
+                        actual: other,
+                        offset: sep_tok.span.start,
+                    });
+                }
             }
-            other => {
-                return Err(ParseError::UnexpectedToken {
-                    actual: other,
-                    offset: sep_tok.span.start,
-                });
-            }
-        };
-        self.bump(); // consume `.` or `:`
-        let method_tok = self.peek().clone();
-        let method = match method_tok.kind {
-            TokenKind::Ident(ref n) => {
-                let s = n.clone();
-                self.bump();
-                s
-            }
-            TokenKind::Eof => {
-                return Err(ParseError::UnexpectedEof {
-                    offset: method_tok.span.start,
-                });
-            }
-            other => {
-                return Err(ParseError::UnexpectedToken {
-                    actual: other,
-                    offset: method_tok.span.start,
-                });
-            }
-        };
+        }
+        // After the loop:
+        //   - dotted form: segments holds receiver+method; final Ident is method.
+        //   - colon form: segments holds receiver+method; final Ident (post-colon)
+        //                  is the method, segments before is the receiver chain.
+        //   - if segments.len() == 1: the single Ident IS the method — that's
+        //                  the bare `function NAME()` form which requires
+        //                  globals; reject with UnexpectedToken at the LParen.
+        if segments.len() < 2 {
+            // peek is currently at LParen; report it as the rejection
+            // position (consistent with ADR 0092's
+            // bare_top_level_function_rejected pin).
+            let lparen_tok = self.peek().clone();
+            return Err(ParseError::UnexpectedToken {
+                actual: lparen_tok.kind,
+                offset: lparen_tok.span.start,
+            });
+        }
+        let method = segments.pop().expect("segments has ≥2 entries");
+        let receiver_chain = segments;
         let (params, body, end_tok) = self.parse_function_signature_and_body()?;
         let span = Span::new(fn_tok.span.start, end_tok.span.end);
         Ok(Stmt::new(
             StmtKind::MethodDef {
-                receiver,
+                receiver_chain,
                 method,
                 is_colon,
                 params,
@@ -1383,13 +1434,13 @@ mod tests {
                 body: body.into_iter().map(strip_span_stmt).collect(),
             },
             StmtKind::MethodDef {
-                receiver,
+                receiver_chain,
                 method,
                 is_colon,
                 params,
                 body,
             } => StmtKind::MethodDef {
-                receiver,
+                receiver_chain,
                 method,
                 is_colon,
                 params,

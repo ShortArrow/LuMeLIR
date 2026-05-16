@@ -261,15 +261,20 @@ pub enum StmtKind {
         body: Chunk,
     },
     /// `function recv.field(...) end` (`is_colon=false`) or
-    /// `function recv:method(...) end` (`is_colon=true`)
-    /// (Phase 2.6+-methods, ADR 0092). Single-segment Ident receiver
-    /// only for MVP. Preserved AS-IS through the parser. HIR desugars
-    /// at the chokepoint to `IndexAssign(recv, Str(method), FunctionRef)`,
-    /// with implicit `self` (kind TaggedValue) prepended to `params`
-    /// when `is_colon` is true (plumbed via `for_function`'s
-    /// `external_kinds` seam at `src/hir/mod.rs:1336-1339`).
+    /// `function recv:method(...) end` (`is_colon=true`); also
+    /// supports multi-segment receiver chains since ADR 0096
+    /// (`function a.b.c.method() end` / `function a.b.c:method() end`).
+    /// `receiver_chain` carries the dotted chain head + intermediate
+    /// segments; `method` is the final identifier. For single-segment
+    /// ADR 0092 paths, `receiver_chain.len() == 1`. HIR
+    /// `lower_method_def` folds the chain into a nested `Index` AST
+    /// and emits `IndexAssign(target, Str(method), FunctionRef)`,
+    /// reusing ADR 0095's `widen_index_for_assign_target` + TAG_TABLE
+    /// runtime narrow for nested writes (length ≥ 2). Implicit
+    /// `self` (kind Table per ADR 0092 MVP policy) is prepended to
+    /// `params` when `is_colon`.
     MethodDef {
-        receiver: String,
+        receiver_chain: Vec<String>,
         method: String,
         is_colon: bool,
         params: Vec<String>,
