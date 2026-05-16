@@ -127,6 +127,21 @@ pub enum HirError {
          '{local_name}' calls a capturing fn from outside its body"
     )]
     MutualCapturingRecursion { local_name: String, offset: usize },
+
+    /// Phase 2.6+-methods (ADR 0092): a method-call receiver
+    /// contains an expression shape that the MVP shape-walker
+    /// rejects — `Call`, `MethodCall`, `FunctionExpr`, `BinOp`, or
+    /// `UnaryOp`. The receiver must be a simple form (Ident,
+    /// literal, table constructor, or a chain of `[]` / `.` index
+    /// suffixes built on those) so the receiver-once evaluation
+    /// invariant via `materialize_to_synth_local` stays predictable.
+    /// Future ADRs may relax this once side-effect ordering is
+    /// resolved for compound receivers.
+    #[error(
+        "method-call receiver is too complex for MVP shape walker \
+         (ADR 0092): must be Ident, Index suffixes, or literal"
+    )]
+    ComplexMethodReceiver { offset: usize },
 }
 
 impl HirError {
@@ -145,7 +160,8 @@ impl HirError {
             | HirError::IndirectCallThroughTaggedLocal { offset, .. }
             | HirError::IndirectCallNoCandidates { offset, .. }
             | HirError::IndirectCallNonNumberReturn { offset, .. }
-            | HirError::MutualCapturingRecursion { offset, .. } => *offset,
+            | HirError::MutualCapturingRecursion { offset, .. }
+            | HirError::ComplexMethodReceiver { offset } => *offset,
         }
     }
 }

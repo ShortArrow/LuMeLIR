@@ -89,6 +89,23 @@ impl<'t> Parser<'t> {
                 Ok(Stmt::new(StmtKind::Break, tok.span))
             }
             TokenKind::Keyword(Keyword::Return) => self.parse_return(),
+            // Phase 2.6+-methods (ADR 0092): top-level method-def
+            // takes the `function NAME.field(...) end` or
+            // `function NAME:method(...) end` shape — the
+            // distinguishing lookahead is `Keyword::Function` followed
+            // by `Ident`. A bare `function() ... end` at expression
+            // position must continue to flow through `parse_expr` →
+            // `parse_primary`'s anonymous FunctionExpr arm; the
+            // method-def arm fires only when the receiver Ident is
+            // present. Bare top-level `function NAME(...) end` (no
+            // dot/colon) is still rejected inside `parse_method_def`
+            // with `UnexpectedToken { LParen }`, since globals are
+            // out of MVP scope.
+            TokenKind::Keyword(Keyword::Function)
+                if matches!(self.peek_kind_at(1), Some(TokenKind::Ident(_))) =>
+            {
+                self.parse_method_def()
+            }
             TokenKind::Ident(_) if matches!(self.peek_kind_at(1), Some(TokenKind::Equals)) => {
                 self.parse_assign()
             }
@@ -554,6 +571,87 @@ impl<'t> Parser<'t> {
         Ok(Stmt::new(kind, span))
     }
 
+    /// Phase 2.6+-methods (ADR 0092): top-level `function recv.field(...) end`
+    /// or `function recv:method(...) end`. Single-segment Ident
+    /// receiver only for MVP. Emits `StmtKind::MethodDef` preserving
+    /// `is_colon`; HIR-chokepoint desugar handles the `IndexAssign`
+    /// + `FunctionRef` emission and `self` param plumbing.
+    ///
+    /// Rejects bare top-level `function NAME(...) end` (no receiver
+    /// dot/colon) — that form requires globals, which are not yet
+    /// supported. The rejection surfaces as
+    /// `ParseError::UnexpectedToken { actual: LParen, ... }`.
+    fn parse_method_def(&mut self) -> Result<Stmt, ParseError> {
+        let fn_tok = self.bump().clone(); // 'function'
+        let recv_tok = self.peek().clone();
+        let receiver = match recv_tok.kind {
+            TokenKind::Ident(ref n) => {
+                let s = n.clone();
+                self.bump();
+                s
+            }
+            TokenKind::Eof => {
+                return Err(ParseError::UnexpectedEof {
+                    offset: recv_tok.span.start,
+                });
+            }
+            other => {
+                return Err(ParseError::UnexpectedToken {
+                    actual: other,
+                    offset: recv_tok.span.start,
+                });
+            }
+        };
+        let sep_tok = self.peek().clone();
+        let is_colon = match sep_tok.kind {
+            TokenKind::Dot => false,
+            TokenKind::Colon => true,
+            TokenKind::Eof => {
+                return Err(ParseError::UnexpectedEof {
+                    offset: sep_tok.span.start,
+                });
+            }
+            other => {
+                return Err(ParseError::UnexpectedToken {
+                    actual: other,
+                    offset: sep_tok.span.start,
+                });
+            }
+        };
+        self.bump(); // consume `.` or `:`
+        let method_tok = self.peek().clone();
+        let method = match method_tok.kind {
+            TokenKind::Ident(ref n) => {
+                let s = n.clone();
+                self.bump();
+                s
+            }
+            TokenKind::Eof => {
+                return Err(ParseError::UnexpectedEof {
+                    offset: method_tok.span.start,
+                });
+            }
+            other => {
+                return Err(ParseError::UnexpectedToken {
+                    actual: other,
+                    offset: method_tok.span.start,
+                });
+            }
+        };
+        let (params, body, end_tok) = self.parse_function_signature_and_body()?;
+        let span = Span::new(fn_tok.span.start, end_tok.span.end);
+        Ok(Stmt::new(
+            StmtKind::MethodDef {
+                receiver,
+                method,
+                is_colon,
+                params,
+                body,
+            },
+            span,
+        ))
+    }
+
     fn parse_function_def(&mut self, local_tok: Token) -> Result<Stmt, ParseError> {
         self.bump(); // 'function'
         let name_tok = self.peek().clone();
@@ -922,6 +1020,53 @@ impl<'t> Parser<'t> {
                         span,
                     );
                 }
+                // Phase 2.6+-methods (ADR 0092): `:IDENT(args)` method
+                // call. Lua spec requires the args list to follow
+                // immediately, so we parse `(args)` here as part of
+                // the same suffix step rather than relying on a
+                // subsequent loop iteration. Emits `MethodCall`;
+                // HIR desugars to an Index-callee Call.
+                TokenKind::Colon => {
+                    self.bump();
+                    let name_tok = self.peek().clone();
+                    let method = match name_tok.kind {
+                        TokenKind::Ident(ref n) => {
+                            let s = n.clone();
+                            self.bump();
+                            s
+                        }
+                        TokenKind::Eof => {
+                            return Err(ParseError::UnexpectedEof {
+                                offset: name_tok.span.start,
+                            });
+                        }
+                        other => {
+                            return Err(ParseError::UnexpectedToken {
+                                actual: other,
+                                offset: name_tok.span.start,
+                            });
+                        }
+                    };
+                    self.expect_token(TokenKind::LParen)?;
+                    let mut args = Vec::new();
+                    if !matches!(self.peek().kind, TokenKind::RParen) {
+                        args.push(self.parse_expr(0)?);
+                        while matches!(self.peek().kind, TokenKind::Comma) {
+                            self.bump();
+                            args.push(self.parse_expr(0)?);
+                        }
+                    }
+                    let closing = self.expect_token(TokenKind::RParen)?;
+                    let span = Span::new(callee.span.start, closing.span.end);
+                    callee = Expr::new(
+                        ExprKind::MethodCall {
+                            receiver: Box::new(callee),
+                            method,
+                            args,
+                        },
+                        span,
+                    );
+                }
                 _ => break,
             }
         }
@@ -1130,6 +1275,15 @@ mod tests {
                 target: Box::new(strip_span_expr(*target)),
                 key: Box::new(strip_span_expr(*key)),
             },
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => ExprKind::MethodCall {
+                receiver: Box::new(strip_span_expr(*receiver)),
+                method,
+                args: args.into_iter().map(strip_span_expr).collect(),
+            },
         };
         Expr::new(kind, Span::new(0, 0))
     }
@@ -1225,6 +1379,19 @@ mod tests {
             StmtKind::Break => StmtKind::Break,
             StmtKind::FunctionDef { name, params, body } => StmtKind::FunctionDef {
                 name,
+                params,
+                body: body.into_iter().map(strip_span_stmt).collect(),
+            },
+            StmtKind::MethodDef {
+                receiver,
+                method,
+                is_colon,
+                params,
+                body,
+            } => StmtKind::MethodDef {
+                receiver,
+                method,
+                is_colon,
                 params,
                 body: body.into_iter().map(strip_span_stmt).collect(),
             },

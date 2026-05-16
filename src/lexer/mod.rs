@@ -158,6 +158,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
             '#' => Some(TokenKind::Hash),
             ',' => Some(TokenKind::Comma),
             ';' => Some(TokenKind::Semicolon),
+            // Phase 2.6+-methods (ADR 0092): method-call / method-def
+            // separator. Lua's `::label::` is not supported; double-colon
+            // lexes as two `Colon` tokens and the parser rejects.
+            ':' => Some(TokenKind::Colon),
             // Phase 2.6a-min (ADR 0053): table constructor delimiters.
             '{' => Some(TokenKind::LBrace),
             '}' => Some(TokenKind::RBrace),

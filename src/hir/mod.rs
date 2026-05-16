@@ -566,6 +566,16 @@ fn infer_user_function_param_kinds(
                     visit_stmt(st, names, kinds, seen);
                 }
             }
+            // Phase 2.6+-methods (ADR 0092): method-def bodies are
+            // walked the same as FunctionDef. Receiver-arg refinement
+            // via MethodCall is intentionally NOT done (carry-over
+            // from ADR 0091 Index-callee — call-site refinement
+            // doesn't extend to Index-callee Calls).
+            StmtKind::MethodDef { body, .. } => {
+                for st in body {
+                    visit_stmt(st, names, kinds, seen);
+                }
+            }
             StmtKind::LocalMulti { values, .. } | StmtKind::AssignMulti { values, .. } => {
                 for v in values {
                     visit_expr(v, names, kinds, seen);
@@ -618,6 +628,19 @@ fn infer_user_function_param_kinds(
             ExprKind::FunctionExpr { body, .. } => {
                 for st in body {
                     visit_stmt(st, names, kinds, seen);
+                }
+            }
+            // Phase 2.6+-methods (ADR 0092): MethodCall is an
+            // Index-callee Call after HIR desugar. The chunk-walker
+            // descends into receiver + args but intentionally does
+            // NOT refine first-param kinds at this point — the
+            // same carry-over as ADR 0091 (Index-callee call sites
+            // are invisible to direct-Ident refinement). Receiver-
+            // arg refinement is future work.
+            ExprKind::MethodCall { receiver, args, .. } => {
+                visit_expr(receiver, names, kinds, seen);
+                for a in args {
+                    visit_expr(a, names, kinds, seen);
                 }
             }
             _ => {}
@@ -736,6 +759,10 @@ fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
             }
             StmtKind::Break => {}
             StmtKind::FunctionDef { .. } => {} // nested fn defs not in 2.5b.2
+            // Phase 2.6+-methods (ADR 0092): method-def bodies are
+            // their own scope, mirroring FunctionDef. The outer
+            // scope's param-kind inference does not descend.
+            StmtKind::MethodDef { .. } => {}
             StmtKind::LocalMulti { values, .. } | StmtKind::AssignMulti { values, .. } => {
                 for v in values {
                     visit_expr(v, name_to_idx, kinds);
@@ -775,6 +802,17 @@ fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
                 visit_expr(operand, name_to_idx, kinds);
             }
             ExprKind::FunctionExpr { .. } => {} // not recursed (own scope)
+            // Phase 2.6+-methods (ADR 0092): MethodCall participates
+            // in param-kind inference only via descend into receiver
+            // and args (Function-kind callee-position refinement
+            // intentionally NOT applied — receiver is not a param
+            // name we're refining).
+            ExprKind::MethodCall { receiver, args, .. } => {
+                visit_expr(receiver, name_to_idx, kinds);
+                for a in args {
+                    visit_expr(a, name_to_idx, kinds);
+                }
+            }
             _ => {}
         }
     }
@@ -2661,6 +2699,23 @@ impl LowerCtx {
                     span: stmt.span,
                 })
             }
+            // Phase 2.6+-methods (ADR 0092): MethodDef desugars at
+            // the HIR chokepoint to `IndexAssign(target=Ident(receiver),
+            // key=Str(method), value=FunctionRef(synth_fid))`. For
+            // colon form, `self` (kind TaggedValue) is prepended to
+            // the effective params and `external_kinds[0]` is seeded
+            // with TaggedValue so `for_function`'s body_kinds vs
+            // external_kinds merge at src/hir/mod.rs:1336-1339 picks
+            // the seeded kind (unless body usage explicitly upgrades
+            // to Function, in which case Function wins — semantically
+            // correct since `self` IS being called).
+            StmtKind::MethodDef {
+                receiver,
+                method,
+                is_colon,
+                params,
+                body,
+            } => self.lower_method_def(receiver, method, *is_colon, params, body, stmt.span),
         }
     }
 
@@ -3023,7 +3078,7 @@ impl LowerCtx {
             self.in_function_ret_kinds = Some(kinds.clone());
         }
         let mut block_stmts: Vec<HirStmt> = Vec::with_capacity(lowered.len() + 1);
-        for (slot_id, v) in ret_value_ids.iter().zip(lowered.into_iter()) {
+        for (slot_id, v) in ret_value_ids.iter().zip(lowered) {
             block_stmts.push(HirStmt {
                 kind: HirStmtKind::Assign {
                     id: *slot_id,
@@ -3073,7 +3128,7 @@ impl LowerCtx {
                 .map(|e| self.lower_expr(e))
                 .collect::<Result<_, _>>()?;
             let mut stmts: Vec<HirStmt> = Vec::with_capacity(names.len());
-            for (n, v) in names.iter().zip(lowered.into_iter()) {
+            for (n, v) in names.iter().zip(lowered) {
                 let kind = infer_kind(&v, &self.locals, &self.functions);
                 let func_id = match &v.kind {
                     HirExprKind::FunctionRef(fid) => Some(*fid),
@@ -3526,6 +3581,58 @@ impl LowerCtx {
                     key: Box::new(key_hir),
                 }
             }
+            // Phase 2.6+-methods (ADR 0092): MethodCall desugar at
+            // HIR chokepoint. Steps:
+            //   (i)   Receiver-shape walker rejects ComplexMethodReceiver
+            //         and non-Ident receivers (MVP scope — only Ident
+            //         receivers participate in dispatch param-kind
+            //         matching; future ADR broadens once dispatch
+            //         widening lands).
+            //   (ii)  Receiver consumed via Ident fast-path: the
+            //         caller already stored the Table value in a
+            //         local with kind Table, which matches the
+            //         colon-method's `external_kinds[0] = Table`
+            //         seed (see `lower_method_def`).
+            //   (iii) Synthesise `Call { callee: Index { recv, Str(method) },
+            //         args: [recv, ...args] }` and recurse through
+            //         `lower_call`, which classifies the new shape as
+            //         IndexCallee and routes through ADR 0082's
+            //         IndirectDispatch (LocalId-source invariant
+            //         preserved).
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => {
+                check_method_receiver_shape(receiver)?;
+                let recv_name = match &receiver.kind {
+                    ExprKind::Ident(n) => n.clone(),
+                    _ => {
+                        return Err(HirError::ComplexMethodReceiver {
+                            offset: receiver.span.start,
+                        });
+                    }
+                };
+                let recv_ident_expr = Expr::new(ExprKind::Ident(recv_name), receiver.span);
+                let method_key_expr = Expr::new(ExprKind::Str(method.clone()), expr.span);
+                let synth_callee = Expr::new(
+                    ExprKind::Index {
+                        target: Box::new(recv_ident_expr.clone()),
+                        key: Box::new(method_key_expr),
+                    },
+                    expr.span,
+                );
+                let mut new_args = Vec::with_capacity(args.len() + 1);
+                new_args.push(recv_ident_expr);
+                for a in args {
+                    new_args.push(a.clone());
+                }
+                let call_kind = self.lower_call(&synth_callee, &new_args, expr)?;
+                return Ok(HirExpr {
+                    kind: call_kind,
+                    span: expr.span,
+                });
+            }
         };
         Ok(HirExpr {
             kind,
@@ -3541,14 +3648,23 @@ impl LowerCtx {
     ) -> Result<HirExprKind, HirError> {
         // Phase 2.6+-callee-norm (ADR 0091 v2): pre-step is to
         // classify the callee shape. DirectIdent flows through the
-        // existing path; IndexCallee pre-binds the Index result to
-        // a synthetic local (via [`Self::materialize_callee_to_local`])
-        // and recurses with the synthetic as the new callee.
+        // existing path; IndexCallee reconstructs the Index AST and
+        // pre-binds it to a synthetic local via the shared
+        // `materialize_to_synth_local` helper (renamed by ADR 0092
+        // so MethodCall can reuse it for receiver materialisation),
+        // then recurses with the synthetic as the new callee.
         // Anything else surfaces as the existing `UnsupportedCall`.
         match classify_callee_form(callee) {
             Ok(CalleeForm::DirectIdent) => { /* fall through */ }
             Ok(CalleeForm::IndexCallee { target, key }) => {
-                let synth_id = self.materialize_callee_to_local(target, key, whole.span)?;
+                let index_ast = Expr::new(
+                    ExprKind::Index {
+                        target: Box::new(target.clone()),
+                        key: Box::new(key.clone()),
+                    },
+                    whole.span,
+                );
+                let synth_id = self.materialize_to_synth_local(&index_ast, whole.span)?;
                 let synth_name = self.locals[synth_id.0].name.clone();
                 let synth_callee = Expr::new(ExprKind::Ident(synth_name), whole.span);
                 return self.lower_call(&synth_callee, args, whole);
@@ -4048,35 +4164,153 @@ impl LowerCtx {
         })
     }
 
-    /// Phase 2.6+-callee-norm (ADR 0091 v2): effectful executor that
-    /// materialises an Index-callee Call's callee into a synthetic
-    /// `__callee_<N>` local. Pushes a `LocalInit` pre-stmt into
-    /// `pending_pre_stmts`; the surrounding `lower_stmt` drains it
-    /// at the stmt boundary. Returns the synthetic LocalId so the
-    /// caller can recurse through `lower_call`'s existing
-    /// DirectIdent → IndirectDispatch path with the synthetic
-    /// resolution.
-    fn materialize_callee_to_local(
+    /// Phase 2.6+-methods (ADR 0092): MethodDef chokepoint desugar.
+    /// Builds the effective params (prepending `self` when `is_colon`),
+    /// seeds `external_kinds[0] = TaggedValue` so the body lowers
+    /// `self.field` reads through the TaggedValue Index path, and
+    /// registers the anon function via the FunctionExpr-style flow.
+    /// Emits `IndexAssign(target=Ident(receiver), key=Str(method),
+    /// value=FunctionRef(synth_fid))` — reusing the existing
+    /// LIC-2.6c-tag-locals-fn-indirect-1 check at
+    /// `IndexAssign`'s function-value branch (hetero-return methods
+    /// trip that, surfacing as `TypeMismatch`; documented as ADR 0092
+    /// non-goal carry-over).
+    fn lower_method_def(
         &mut self,
-        target: &Expr,
-        key: &Expr,
-        callee_span: Span,
-    ) -> Result<LocalId, HirError> {
-        // Lower the Index expression once. ADR 0063's
-        // `widen_index_for_local_init` rewrites the resulting
-        // HirExprKind::Index to IndexTagged so the synthetic local
-        // widens to TaggedValue — the same storage rule that
-        // `local g = t.m` already uses for table-fetched values
-        // (ADR 0084 / 0082 dispatch contract).
-        let index_ast = Expr::new(
-            ExprKind::Index {
-                target: Box::new(target.clone()),
-                key: Box::new(key.clone()),
-            },
-            callee_span,
+        receiver: &str,
+        method: &str,
+        is_colon: bool,
+        params: &[String],
+        body: &[Stmt],
+        stmt_span: Span,
+    ) -> Result<HirStmt, HirError> {
+        let effective_params: Vec<String> = if is_colon {
+            let mut p = Vec::with_capacity(params.len() + 1);
+            p.push("self".to_owned());
+            p.extend_from_slice(params);
+            p
+        } else {
+            params.to_vec()
+        };
+        let id = FuncId(self.functions.len());
+        let mangled = format!("user_anon_{}", id.0);
+        let parent_scope = self.current_parent_scope();
+        self.functions.push(HirFunction {
+            name: String::new(),
+            mangled_name: mangled,
+            params: effective_params
+                .iter()
+                .map(|p| LocalInfo {
+                    name: p.clone(),
+                    kind: ValueKind::Number,
+                    func_id: None,
+                    is_captured: false,
+                })
+                .collect(),
+            upvalues: Vec::new(),
+            locals: Vec::new(),
+            body: Vec::new(),
+            ret_kinds: Vec::new(),
+            parent_scope,
+        });
+        let mut external_kinds: Vec<ValueKind> = vec![ValueKind::Number; effective_params.len()];
+        if is_colon {
+            // ADR 0092 MVP: `self` kind = Table so the dispatch
+            // arg-kind matching (ADR 0082 strict-equal) succeeds for
+            // the typical receiver `obj` where `local obj = {}` makes
+            // `obj` a Table-kind local. Future ADR (metatables /
+            // __index) will widen `self` to TaggedValue once dispatch
+            // permits arg widening; until then `self.field` reads use
+            // the existing Index-over-Table path (kind Number).
+            external_kinds[0] = ValueKind::Table;
+        }
+        let outer_visible = self.outer_visible_snapshot();
+        let mut fn_ctx = LowerCtx::for_function(
+            &self.function_names,
+            &self.functions,
+            &effective_params,
+            body,
+            &external_kinds,
+            outer_visible,
+            id,
         );
-        let index_hir = self.lower_expr(&index_ast)?;
-        let widened = widen_index_for_local_init(index_hir);
+        let body_hir = fn_ctx.lower_function_body(body)?;
+        let ret_kinds = fn_ctx.in_function_ret_kinds.unwrap_or_default();
+        self.functions[id.0].params = fn_ctx.locals[..effective_params.len()].to_vec();
+        self.functions[id.0].upvalues = fn_ctx.upvalues;
+        self.functions[id.0].locals = fn_ctx.locals;
+        self.functions[id.0].body = body_hir;
+        self.functions[id.0].ret_kinds = ret_kinds;
+        // Build the IndexAssign at HIR level. Target is the receiver
+        // local (must be Table-kind; the existing IndexAssign target
+        // check at lower_stmt_match_arms enforces this if we route
+        // through synthetic AST, so we synthesize and re-lower).
+        let target_ast = Expr::new(ExprKind::Ident(receiver.to_owned()), stmt_span);
+        let target_hir = self.lower_expr(&target_ast)?;
+        let target_kind = infer_kind(&target_hir, &self.locals, &self.functions);
+        if target_kind != ValueKind::Table {
+            return Err(HirError::TypeMismatch {
+                op: "method-def receiver".to_owned(),
+                lhs_kind: "table".to_owned(),
+                rhs_kind: target_kind.name().to_owned(),
+                offset: stmt_span.start,
+            });
+        }
+        let key_hir = HirExpr {
+            kind: HirExprKind::Str(method.to_owned()),
+            span: stmt_span,
+        };
+        let value_hir = HirExpr {
+            kind: HirExprKind::FunctionRef(id),
+            span: stmt_span,
+        };
+        // Reuse the LIC-2.6c-tag-locals-fn-indirect-1 check at
+        // IndexAssign — hetero-return methods (ret_kinds widening to
+        // TaggedValue) are rejected here, surfacing as TypeMismatch.
+        if self.functions[id.0]
+            .ret_kinds
+            .iter()
+            .any(|k| matches!(k, ValueKind::TaggedValue))
+        {
+            return Err(HirError::TypeMismatch {
+                op: "method-def value (function with tagged return)".to_owned(),
+                lhs_kind: "function with non-tagged return".to_owned(),
+                rhs_kind: "function returning TaggedValue".to_owned(),
+                offset: stmt_span.start,
+            });
+        }
+        Ok(HirStmt {
+            kind: HirStmtKind::IndexAssign {
+                target: target_hir,
+                key: key_hir,
+                value: value_hir,
+            },
+            span: stmt_span,
+        })
+    }
+
+    /// Phase 2.6+-callee-norm (ADR 0091 v2, renamed by ADR 0092):
+    /// effectful executor that lowers an arbitrary expression once
+    /// and binds the result to a synthetic `__callee_<N>` TaggedValue
+    /// local. Pushes a `LocalInit` pre-stmt into `pending_pre_stmts`;
+    /// the surrounding `lower_stmt` drains it at the stmt boundary.
+    /// Returns the synthetic LocalId so the caller can recurse
+    /// through `lower_call`'s DirectIdent → IndirectDispatch path
+    /// (callee materialisation) or thread the local as a method
+    /// receiver argument (ADR 0092 MethodCall desugar).
+    ///
+    /// ADR 0063's `widen_index_for_local_init` is applied so an
+    /// Index value rewrites to `IndexTagged` and the synthetic local
+    /// widens to TaggedValue. The helper is idempotent on every
+    /// other shape, so non-Index expressions (e.g. an `Ident` cell
+    /// already widened upstream) pass through unchanged.
+    fn materialize_to_synth_local(
+        &mut self,
+        expr: &Expr,
+        synth_span: Span,
+    ) -> Result<LocalId, HirError> {
+        let value_hir = self.lower_expr(expr)?;
+        let widened = widen_index_for_local_init(value_hir);
         let seq = self.callee_seq;
         self.callee_seq += 1;
         let synth_name = format!("__callee_{seq}");
@@ -4086,7 +4320,7 @@ impl LowerCtx {
                 id: synth_id,
                 value: widened,
             },
-            span: callee_span,
+            span: synth_span,
         });
         Ok(synth_id)
     }
@@ -4107,6 +4341,38 @@ enum CalleeForm<'a> {
     /// HIR pre-binds the Index result to a synthetic local and
     /// recurses with that local as the new callee.
     IndexCallee { target: &'a Expr, key: &'a Expr },
+}
+
+/// Phase 2.6+-methods (ADR 0092): pure receiver-shape walker.
+/// Methods are sugar at the call site but the receiver-once
+/// evaluation invariant restricts which receiver shapes the MVP
+/// accepts. The walker descends recursively into `Index { target, key }`
+/// and rejects any node carrying side-effects or complex value
+/// production (`Call`, `MethodCall`, `FunctionExpr`, `BinOp`,
+/// `UnaryOp`). Permitted: `Ident`, `Number`, `Str`, `Bool`, `Nil`,
+/// `TableCtor`, plus chained `[]` / `.` over the above. A future
+/// ADR can broaden coverage once side-effect ordering of compound
+/// receivers is reconciled with `pending_pre_stmts`.
+fn check_method_receiver_shape(expr: &Expr) -> Result<(), HirError> {
+    match &expr.kind {
+        ExprKind::Call { .. }
+        | ExprKind::MethodCall { .. }
+        | ExprKind::FunctionExpr { .. }
+        | ExprKind::BinOp { .. }
+        | ExprKind::UnaryOp { .. } => Err(HirError::ComplexMethodReceiver {
+            offset: expr.span.start,
+        }),
+        ExprKind::Index { target, key } => {
+            check_method_receiver_shape(target)?;
+            check_method_receiver_shape(key)
+        }
+        ExprKind::Number(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Nil
+        | ExprKind::Ident(_)
+        | ExprKind::Table(_) => Ok(()),
+    }
 }
 
 fn classify_callee_form(callee: &Expr) -> Result<CalleeForm<'_>, HirError> {

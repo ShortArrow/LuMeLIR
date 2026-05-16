@@ -77,6 +77,12 @@ pub enum TokenKind {
     GtEq,
     Comma,
     Semicolon,
+    /// `:` method-call / method-def separator (Phase 2.6+-methods,
+    /// ADR 0092). `recv:method(args)` desugars at HIR to an
+    /// Index-callee Call with the receiver injected as first arg;
+    /// `function recv:method(...) end` desugars to IndexAssign of
+    /// a FunctionRef with implicit `self` (TaggedValue) param.
+    Colon,
     /// `{` opening brace, used for table constructors
     /// (Phase 2.6a-min, ADR 0053).
     LBrace,

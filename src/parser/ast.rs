@@ -54,6 +54,19 @@ pub enum ExprKind {
         target: Box<Expr>,
         key: Box<Expr>,
     },
+    /// `recv:method(args)` method-call syntax (Phase 2.6+-methods,
+    /// ADR 0092). Preserved AS-IS through the parser. HIR desugars
+    /// at the chokepoint to `Call { callee: Index { recv, Str(method) },
+    /// args: [recv, ...args] }`, materializing the receiver to a
+    /// synthetic TaggedValue local exactly once when non-Ident
+    /// (reuses the ADR 0091 `materialize_to_synth_local` helper).
+    /// Receivers containing Call/MethodCall/FunctionExpr/BinOp/UnaryOp
+    /// are rejected at HIR with `ComplexMethodReceiver`.
+    MethodCall {
+        receiver: Box<Expr>,
+        method: String,
+        args: Vec<Expr>,
+    },
 }
 
 /// Binary operators. Phase 2.2a covers all arithmetic operators
@@ -244,6 +257,21 @@ pub enum StmtKind {
     /// First-class anonymous functions arrive in 2.5b.
     FunctionDef {
         name: String,
+        params: Vec<String>,
+        body: Chunk,
+    },
+    /// `function recv.field(...) end` (`is_colon=false`) or
+    /// `function recv:method(...) end` (`is_colon=true`)
+    /// (Phase 2.6+-methods, ADR 0092). Single-segment Ident receiver
+    /// only for MVP. Preserved AS-IS through the parser. HIR desugars
+    /// at the chokepoint to `IndexAssign(recv, Str(method), FunctionRef)`,
+    /// with implicit `self` (kind TaggedValue) prepended to `params`
+    /// when `is_colon` is true (plumbed via `for_function`'s
+    /// `external_kinds` seam at `src/hir/mod.rs:1336-1339`).
+    MethodDef {
+        receiver: String,
+        method: String,
+        is_colon: bool,
         params: Vec<String>,
         body: Chunk,
     },
