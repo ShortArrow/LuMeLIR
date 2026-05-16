@@ -597,6 +597,29 @@ fn infer_user_function_param_kinds(
         }
     }
 
+    // Phase 2.6+-method-idx-call-refine (ADR 0094): shared kinds/seen
+    // update body for all three refinement arms (Ident-Call, MethodCall,
+    // Index-callee Call). The three sites differ only in (a) FuncId
+    // lookup path and (b) `base` arg index — 0 for Ident/dotted-call
+    // (args map to params 0..N), 1 for MethodCall (self at param 0,
+    // explicit args map to params 1..N). Pure side-effect on the
+    // refinement slices; arity-mismatch and already-seen are
+    // best-effort skips matching the pre-ADR-0093 semantics.
+    fn try_refine_func_args(
+        idx: usize,
+        base: usize,
+        args: &[Expr],
+        kinds: &mut [Vec<ValueKind>],
+        seen: &mut [bool],
+    ) {
+        if !seen[idx] && args.len() + base == kinds[idx].len() {
+            for (i, a) in args.iter().enumerate() {
+                kinds[idx][i + base] = ast_arg_kind(a);
+            }
+            seen[idx] = true;
+        }
+    }
+
     fn visit_expr(
         e: &Expr,
         names: &HashMap<String, FuncId>,
@@ -608,13 +631,25 @@ fn infer_user_function_param_kinds(
             ExprKind::Call { callee, args } => {
                 if let ExprKind::Ident(name) = &callee.kind
                     && let Some(&FuncId(idx)) = names.get(name)
-                    && !seen[idx]
-                    && args.len() == kinds[idx].len()
                 {
-                    for (i, a) in args.iter().enumerate() {
-                        kinds[idx][i] = ast_arg_kind(a);
-                    }
-                    seen[idx] = true;
+                    try_refine_func_args(idx, 0, args, kinds, seen);
+                }
+                // Phase 2.6+-method-idx-call-refine (ADR 0094):
+                // Index-callee Call refinement. `t.helper(arg)` shape —
+                // callee is `Index { target: Ident, key: Str }` and the
+                // (target, key) pair was registered via Pass-1 MethodDef
+                // walk (ADR 0093). Refines with base=0 because no
+                // implicit self is injected (this is the explicit-self
+                // form for colon defs and the only form for dotted
+                // defs). Non-Ident target / non-Str key safely skips
+                // via lookup miss.
+                if let ExprKind::Index { target, key } = &callee.kind
+                    && let ExprKind::Ident(target_name) = &target.kind
+                    && let ExprKind::Str(key_str) = &key.kind
+                    && let Some(&FuncId(idx)) =
+                        method_funcs.get(&(target_name.clone(), key_str.clone()))
+                {
+                    try_refine_func_args(idx, 0, args, kinds, seen);
                 }
                 visit_expr(callee, names, method_funcs, kinds, seen);
                 for a in args {
@@ -650,13 +685,8 @@ fn infer_user_function_param_kinds(
                 if let ExprKind::Ident(recv_name) = &receiver.kind
                     && let Some(&FuncId(idx)) =
                         method_funcs.get(&(recv_name.clone(), method.clone()))
-                    && !seen[idx]
-                    && args.len() + 1 == kinds[idx].len()
                 {
-                    for (i, a) in args.iter().enumerate() {
-                        kinds[idx][i + 1] = ast_arg_kind(a);
-                    }
-                    seen[idx] = true;
+                    try_refine_func_args(idx, 1, args, kinds, seen);
                 }
                 visit_expr(receiver, names, method_funcs, kinds, seen);
                 for a in args {
