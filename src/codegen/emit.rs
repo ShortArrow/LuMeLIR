@@ -38,8 +38,8 @@ use super::callabi::{
 use super::error::CodegenError;
 use super::primitive::{
     Types, emit_addressof, emit_byte_offset_ptr, emit_byte_offset_ptr_dynamic,
-    emit_exit_with_message, emit_libc_call_i32, emit_libc_call_i64, emit_libc_call_ptr,
-    emit_libc_call_void, emit_load, emit_printf, emit_store,
+    emit_exit_with_message, emit_libc_call_f64, emit_libc_call_i32, emit_libc_call_i64,
+    emit_libc_call_ptr, emit_libc_call_void, emit_load, emit_printf, emit_store,
 };
 use super::tagged::{
     ARRAY_ELEM_OFF_VALUE, ARRAY_ELEM_SIZE, HashKeyValidityPolicy, TAG_BOOL, TAG_DELETED,
@@ -878,6 +878,32 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(floor_op.into());
+
+    // Phase 2.7q-stdlib-math (ADR 0101): sqrt(f64) -> f64 for math.sqrt.
+    let sqrt_ty = llvm::r#type::function(types.f64, &[types.f64], false);
+    let sqrt_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "sqrt"))
+        .function_type(TypeAttribute::new(sqrt_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(sqrt_op.into());
+
+    // Phase 2.7q-stdlib-math (ADR 0101): fabs(f64) -> f64 for math.abs.
+    let fabs_ty = llvm::r#type::function(types.f64, &[types.f64], false);
+    let fabs_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "fabs"))
+        .function_type(TypeAttribute::new(fabs_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(fabs_op.into());
 }
 
 /// MLIR type for a function parameter of static [`ValueKind`]. Number
@@ -7641,6 +7667,38 @@ fn emit_expr<'a, 'c>(
                     "next(t, k) in single-value position is not supported (ADR 0081); use \
                      `local k, v = next(t, c)`"
                         .to_owned(),
+                ))
+            }
+            Callee::Builtin(b @ (Builtin::MathSqrt | Builtin::MathFloor | Builtin::MathAbs)) => {
+                // Phase 2.7q-stdlib-math (ADR 0101): emit a libm call
+                // for `math.sqrt(x)` / `math.floor(x)` / `math.abs(x)`.
+                // Arg lowered as f64 (Number-kind); libm extern was
+                // declared in `emit_libm_decls`. Return value is f64.
+                let arg = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let libm_name = match b {
+                    Builtin::MathSqrt => "sqrt",
+                    Builtin::MathFloor => "floor",
+                    Builtin::MathAbs => "fabs",
+                    _ => unreachable!(),
+                };
+                Ok(emit_libc_call_f64(
+                    context,
+                    block,
+                    libm_name,
+                    &[arg],
+                    types,
+                    loc,
                 ))
             }
             Callee::User {

@@ -247,6 +247,20 @@ pub(crate) fn emit_libc_call_i32<'a, 'c>(
     emit_libc_call_with_result(context, block, name, args, types.i32, loc)
 }
 
+/// Generic single-result libc helper — `f64` return type. Used by
+/// libm extern calls (`sqrt`, `floor`, `fabs`, etc.) from ADR 0101's
+/// `math.*` builtin dispatch.
+pub(crate) fn emit_libc_call_f64<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    name: &str,
+    args: &[Value<'c, 'a>],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    emit_libc_call_with_result(context, block, name, args, types.f64, loc)
+}
+
 /// Generic single-result libc helper — `ptr` return type.
 pub(crate) fn emit_libc_call_ptr<'a, 'c>(
     context: &'c Context,

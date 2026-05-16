@@ -374,6 +374,19 @@ pub enum Builtin {
     /// `MultiAssignFromCall` is the only HIR shape that observes
     /// both result positions. Phase 2.8e-iter-next (ADR 0081).
     Next,
+    /// `math.sqrt(x)` — square root via libm `sqrt`. Phase
+    /// 2.7q-stdlib-math (ADR 0101). Dispatched at `lower_call` entry
+    /// when the call shape is `Index{Ident("math"), Str("sqrt")}` AND
+    /// `math` is an UNRESOLVED identifier (user shadowing is
+    /// respected — `local math = ...` falls through to the normal
+    /// Index-callee Call path).
+    MathSqrt,
+    /// `math.floor(x)` — floor (largest integer ≤ x) via libm
+    /// `floor`. Same dispatch shape as `MathSqrt` (ADR 0101).
+    MathFloor,
+    /// `math.abs(x)` — absolute value via libm `fabs`. Same dispatch
+    /// shape as `MathSqrt` (ADR 0101).
+    MathAbs,
 }
 
 impl Builtin {
@@ -390,6 +403,19 @@ impl Builtin {
         }
     }
 
+    /// Phase 2.7q-stdlib-math (ADR 0101): map a `math.<method>` name
+    /// to a Builtin variant. Returns None for unrecognized methods
+    /// so `lower_call` falls through to the normal Index-callee
+    /// path (which surfaces UndefinedName for unresolved `math`).
+    pub fn math_from_method(method: &str) -> Option<Self> {
+        match method {
+            "sqrt" => Some(Builtin::MathSqrt),
+            "floor" => Some(Builtin::MathFloor),
+            "abs" => Some(Builtin::MathAbs),
+            _ => None,
+        }
+    }
+
     pub fn arity(self) -> usize {
         match self {
             Builtin::Print => 1,
@@ -399,6 +425,7 @@ impl Builtin {
             Builtin::Assert => 1,
             Builtin::Error => 1,
             Builtin::Next => 2,
+            Builtin::MathSqrt | Builtin::MathFloor | Builtin::MathAbs => 1,
         }
     }
 
@@ -411,6 +438,9 @@ impl Builtin {
             Builtin::Assert => "assert",
             Builtin::Error => "error",
             Builtin::Next => "next",
+            Builtin::MathSqrt => "math.sqrt",
+            Builtin::MathFloor => "math.floor",
+            Builtin::MathAbs => "math.abs",
         }
     }
 
@@ -430,6 +460,7 @@ impl Builtin {
             Builtin::Assert => &[ValueKind::Bool],
             Builtin::Error => &[ValueKind::Number],
             Builtin::Next => &[ValueKind::TaggedValue, ValueKind::TaggedValue],
+            Builtin::MathSqrt | Builtin::MathFloor | Builtin::MathAbs => &[ValueKind::Number],
         }
     }
 }

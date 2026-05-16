@@ -235,6 +235,11 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // single-value position truncates to the first result —
             // the next key, which is a TaggedValue.
             Callee::Builtin(Builtin::Next) => ValueKind::TaggedValue,
+            // Phase 2.7q-stdlib-math (ADR 0101): all math.* builtins
+            // return Number.
+            Callee::Builtin(Builtin::MathSqrt)
+            | Callee::Builtin(Builtin::MathFloor)
+            | Callee::Builtin(Builtin::MathAbs) => ValueKind::Number,
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.
@@ -4043,6 +4048,23 @@ impl LowerCtx {
         args: &[Expr],
         whole: &Expr,
     ) -> Result<HirExprKind, HirError> {
+        // Phase 2.7q-stdlib-math (ADR 0101): math.* builtin dispatch
+        // chokepoint. Matches the strict shape `Index{Ident("math"),
+        // Str(method)}` only when `math` is an UNRESOLVED identifier
+        // (NOT a declared local / param / upvalue / function name).
+        // User shadowing `local math = ...` makes `self.resolve("math")`
+        // return Some(...), bypassing this builtin path; the call
+        // falls through to the normal Index-callee Call path.
+        if let ExprKind::Index { target, key } = &callee.kind
+            && let ExprKind::Ident(target_name) = &target.kind
+            && let ExprKind::Str(key_str) = &key.kind
+            && target_name == "math"
+            && self.resolve("math").is_none()
+            && !self.function_names.contains_key("math")
+            && let Some(builtin) = Builtin::math_from_method(key_str)
+        {
+            return self.lower_math_builtin_call(builtin, args, whole.span);
+        }
         // Phase 2.6+-callee-norm (ADR 0091 v2): pre-step is to
         // classify the callee shape. DirectIdent flows through the
         // existing path; IndexCallee reconstructs the Index AST and
@@ -4572,6 +4594,36 @@ impl LowerCtx {
     /// `IndexAssign`'s function-value branch (hetero-return methods
     /// trip that, surfacing as `TypeMismatch`; documented as ADR 0092
     /// non-goal carry-over).
+    /// Phase 2.7q-stdlib-math (ADR 0101): emit a `math.<fn>(arg)`
+    /// call as a `Callee::Builtin(...)` call. Validates arity (all
+    /// math.* builtins are unary today) and lowers args; the call
+    /// site arg-kind check at codegen verifies the arg is Number-
+    /// compatible (libm extern signatures are `f64 -> f64`).
+    fn lower_math_builtin_call(
+        &mut self,
+        builtin: Builtin,
+        args: &[Expr],
+        call_span: Span,
+    ) -> Result<HirExprKind, HirError> {
+        let arity = builtin.arity();
+        if args.len() != arity {
+            return Err(HirError::ArityMismatch {
+                builtin: builtin.name().to_owned(),
+                expected: arity,
+                actual: args.len(),
+                offset: call_span.start,
+            });
+        }
+        let lowered_args = args
+            .iter()
+            .map(|a| self.lower_expr(a))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(HirExprKind::Call {
+            callee: Callee::Builtin(builtin),
+            args: lowered_args,
+        })
+    }
+
     fn lower_method_def(
         &mut self,
         receiver_chain: &[String],
