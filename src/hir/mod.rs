@@ -465,6 +465,53 @@ fn ast_arg_kind(expr: &Expr) -> ValueKind {
     }
 }
 
+/// Phase 2.6+-multi-seg-call-refine (ADR 0097): pure walker that
+/// extracts the receiver chain + method name from a callee AST when
+/// the shape is `Index{ ..., Str(method) }` recursively grounded in
+/// an `Ident` head. Returns `None` for any deviation (non-Ident head,
+/// non-Str key, or a non-Index/non-Ident node in the middle).
+///
+/// `Index{Ident("t"), Str("m")}`                       → `Some((["t"], "m"))`
+/// `Index{Index{Ident("a"), Str("b")}, Str("c")}`       → `Some((["a","b"], "c"))`
+/// `Index{Call{...}, Str("m")}`                         → `None`
+/// `Index{Ident("t"), Number(1)}`                       → `None`
+///
+/// The returned chain is the lookup key into `method_funcs` after
+/// the ADR 0097 chain-keyed unification — single-segment is just
+/// the length-1 chain case, so this helper unifies the lookup path
+/// for ADR 0093/0094 single-seg AND ADR 0096 multi-seg method-def
+/// in one call site.
+fn extract_index_chain(callee: &Expr) -> Option<(Vec<String>, String)> {
+    let (mut cur, method) = match &callee.kind {
+        ExprKind::Index { target, key } => {
+            if let ExprKind::Str(m) = &key.kind {
+                (target.as_ref(), m.clone())
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    let mut chain: Vec<String> = Vec::new();
+    loop {
+        match &cur.kind {
+            ExprKind::Ident(head) => {
+                chain.insert(0, head.clone());
+                return Some((chain, method));
+            }
+            ExprKind::Index { target, key } => {
+                if let ExprKind::Str(seg) = &key.kind {
+                    chain.insert(0, seg.clone());
+                    cur = target.as_ref();
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// Phase 2.5e (ADR 0020): walk the chunk AST to discover every call
 /// site whose callee is a top-level `FunctionDef` name, recording the
 /// static literal kind of each argument. The first call site for a
@@ -475,7 +522,7 @@ fn ast_arg_kind(expr: &Expr) -> ValueKind {
 fn infer_user_function_param_kinds(
     chunk: &[Stmt],
     function_names: &HashMap<String, FuncId>,
-    method_funcs: &HashMap<(String, String), FuncId>,
+    method_funcs: &HashMap<(Vec<String>, String), FuncId>,
     arities: &[usize],
 ) -> Vec<Vec<ValueKind>> {
     let mut kinds: Vec<Vec<ValueKind>> = arities
@@ -487,7 +534,7 @@ fn infer_user_function_param_kinds(
     fn visit_stmt(
         s: &Stmt,
         names: &HashMap<String, FuncId>,
-        method_funcs: &HashMap<(String, String), FuncId>,
+        method_funcs: &HashMap<(Vec<String>, String), FuncId>,
         kinds: &mut Vec<Vec<ValueKind>>,
         seen: &mut Vec<bool>,
     ) {
@@ -641,7 +688,7 @@ fn infer_user_function_param_kinds(
     fn visit_expr(
         e: &Expr,
         names: &HashMap<String, FuncId>,
-        method_funcs: &HashMap<(String, String), FuncId>,
+        method_funcs: &HashMap<(Vec<String>, String), FuncId>,
         kinds: &mut Vec<Vec<ValueKind>>,
         seen: &mut Vec<bool>,
     ) {
@@ -661,11 +708,14 @@ fn infer_user_function_param_kinds(
                 // form for colon defs and the only form for dotted
                 // defs). Non-Ident target / non-Str key safely skips
                 // via lookup miss.
-                if let ExprKind::Index { target, key } = &callee.kind
-                    && let ExprKind::Ident(target_name) = &target.kind
-                    && let ExprKind::Str(key_str) = &key.kind
-                    && let Some(&FuncId(idx)) =
-                        method_funcs.get(&(target_name.clone(), key_str.clone()))
+                // Phase 2.6+-multi-seg-call-refine (ADR 0097):
+                // extract the receiver chain via `extract_index_chain`
+                // (pure walker) and look up the chain-keyed
+                // `method_funcs` entry. Length-1 chain handles the
+                // single-segment ADR 0093/0094 path uniformly; longer
+                // chains are the multi-segment ADR 0096 def paths.
+                if let Some((chain, method_name)) = extract_index_chain(callee)
+                    && let Some(&FuncId(idx)) = method_funcs.get(&(chain, method_name))
                 {
                     try_refine_func_args(idx, 0, args, kinds, seen);
                 }
@@ -702,7 +752,7 @@ fn infer_user_function_param_kinds(
             } => {
                 if let ExprKind::Ident(recv_name) = &receiver.kind
                     && let Some(&FuncId(idx)) =
-                        method_funcs.get(&(recv_name.clone(), method.clone()))
+                        method_funcs.get(&(vec![recv_name.clone()], method.clone()))
                 {
                     try_refine_func_args(idx, 1, args, kinds, seen);
                 }
@@ -1008,7 +1058,7 @@ fn lower_into_function(
     params: &[String],
     body: &[Stmt],
     function_names: &HashMap<String, FuncId>,
-    method_funcs: &HashMap<(String, String), FuncId>,
+    method_funcs: &HashMap<(Vec<String>, String), FuncId>,
     methoddef_func_ids: &[FuncId],
     functions: &mut Vec<HirFunction>,
     outer_visible: HashMap<String, (LocalId, ValueKind)>,
@@ -1070,7 +1120,7 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
     // `Index{Ident, Str}` shape boundary. Multi-segment FuncIds are
     // looked up by source-order seq via `methoddef_func_ids` at
     // `lower_method_def` time.
-    let mut method_funcs: HashMap<(String, String), FuncId> = HashMap::new();
+    let mut method_funcs: HashMap<(Vec<String>, String), FuncId> = HashMap::new();
     let mut methoddef_func_ids: Vec<FuncId> = Vec::new();
     for stmt in chunk {
         if let StmtKind::MethodDef {
@@ -1088,9 +1138,13 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
             effective_params.extend_from_slice(params);
             let fid = alloc_method_signature(&effective_params, &mut functions, ParentScope::Chunk);
             methoddef_func_ids.push(fid);
-            if receiver_chain.len() == 1 {
-                method_funcs.insert((receiver_chain[0].clone(), method.clone()), fid);
-            }
+            // Phase 2.6+-multi-seg-call-refine (ADR 0097): the
+            // chain-keyed unification means ALL MethodDef enter
+            // `method_funcs`, indexed by `(receiver_chain, method)`.
+            // Single-segment is just the length-1 chain case. The
+            // call-site walker uses `extract_index_chain` to derive
+            // the same key from nested Index callees.
+            method_funcs.insert((receiver_chain.clone(), method.clone()), fid);
         }
     }
     // Phase 2.5e (ADR 0020): pre-scan all call sites for top-level
@@ -1435,7 +1489,7 @@ struct LowerCtx {
     /// `(receiver, method) -> FuncId` to find its pre-allocated slot
     /// instead of pushing a fresh `HirFunction`. Same last-wins
     /// shadowing semantics as `function_names`.
-    method_funcs: HashMap<(String, String), FuncId>,
+    method_funcs: HashMap<(Vec<String>, String), FuncId>,
     /// Phase 2.6+-multi-segment-method-def (ADR 0096): per-Pass-1
     /// source-order MethodDef FuncId list. Includes ALL MethodDef
     /// (any `receiver_chain.len()`), unlike `method_funcs` which is
@@ -1493,7 +1547,7 @@ struct LowerCtx {
 impl LowerCtx {
     fn new(
         function_names: HashMap<String, FuncId>,
-        method_funcs: HashMap<(String, String), FuncId>,
+        method_funcs: HashMap<(Vec<String>, String), FuncId>,
         methoddef_func_ids: Vec<FuncId>,
         functions: Vec<HirFunction>,
     ) -> Self {
@@ -1540,7 +1594,7 @@ impl LowerCtx {
     #[allow(clippy::too_many_arguments)]
     fn for_function(
         function_names: &HashMap<String, FuncId>,
-        method_funcs: &HashMap<(String, String), FuncId>,
+        method_funcs: &HashMap<(Vec<String>, String), FuncId>,
         methoddef_func_ids: &[FuncId],
         functions: &[HirFunction],
         params: &[String],
