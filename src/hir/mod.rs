@@ -235,11 +235,16 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // single-value position truncates to the first result —
             // the next key, which is a TaggedValue.
             Callee::Builtin(Builtin::Next) => ValueKind::TaggedValue,
-            // Phase 2.7q-stdlib-math (ADR 0101): all math.* builtins
-            // return Number.
+            // Phase 2.7q-stdlib-math (ADR 0101 / ADR 0102): all math.*
+            // builtins return Number.
             Callee::Builtin(Builtin::MathSqrt)
             | Callee::Builtin(Builtin::MathFloor)
-            | Callee::Builtin(Builtin::MathAbs) => ValueKind::Number,
+            | Callee::Builtin(Builtin::MathAbs)
+            | Callee::Builtin(Builtin::MathPow)
+            | Callee::Builtin(Builtin::MathSin)
+            | Callee::Builtin(Builtin::MathCos)
+            | Callee::Builtin(Builtin::MathLog)
+            | Callee::Builtin(Builtin::MathExp) => ValueKind::Number,
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.

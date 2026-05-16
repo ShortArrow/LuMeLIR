@@ -109,3 +109,61 @@ fn math_unknown_method_not_builtin() {
         "expected typed UndefinedName/UnknownFunction error, got: {msg}"
     );
 }
+
+// ============================================================================
+// ADR 0102 — math.* continuation (pow / sin / cos / log / exp)
+// ============================================================================
+
+// --- 5 happy-path tests (Red Day 0, Green after Step 3) ---
+
+#[test]
+fn math_pow_basic() {
+    // Codex critical: pow is BINARY — its own test face separate
+    // from the unary group. 2 ** 10 = 1024.
+    let src = "print(math.pow(2, 10))";
+    assert_eq!(run_ok(src, "lumelir_math_pow").trim(), "1024");
+}
+
+#[test]
+fn math_sin_zero() {
+    // sin(0) = 0 (exact in f64).
+    let src = "print(math.sin(0))";
+    assert_eq!(run_ok(src, "lumelir_math_sin").trim(), "0");
+}
+
+#[test]
+fn math_cos_zero() {
+    // cos(0) = 1 (exact in f64).
+    let src = "print(math.cos(0))";
+    assert_eq!(run_ok(src, "lumelir_math_cos").trim(), "1");
+}
+
+#[test]
+fn math_log_one() {
+    // log(1) = 0 (natural log; exact in f64).
+    let src = "print(math.log(1))";
+    assert_eq!(run_ok(src, "lumelir_math_log").trim(), "0");
+}
+
+#[test]
+fn math_exp_zero() {
+    // exp(0) = 1 (exact in f64).
+    let src = "print(math.exp(0))";
+    assert_eq!(run_ok(src, "lumelir_math_exp").trim(), "1");
+}
+
+// --- 1 binary-arity pin for math.pow (Codex critical) ---
+
+#[test]
+fn math_pow_arity_mismatch() {
+    // Codex critical: pin the binary signature. Calling math.pow
+    // with 1 arg must surface ArityMismatch (lower_math_builtin_call
+    // helper from ADR 0101 enforces builtin.arity()).
+    let chunk = lumelir::parser::parse("print(math.pow(2))").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("math.pow with 1 arg must fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("ArityMismatch"),
+        "expected ArityMismatch, got: {msg}"
+    );
+}

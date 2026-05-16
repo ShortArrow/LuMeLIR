@@ -904,6 +904,23 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(fabs_op.into());
+
+    // ADR 0102 — math.* continuation: sin/cos/log/exp externs.
+    // pow is already declared above (for both Lua `^` operator and
+    // math.pow).
+    for libm_name in ["sin", "cos", "log", "exp"] {
+        let ty = llvm::r#type::function(types.f64, &[types.f64], false);
+        let op = LLVMFuncOperationBuilder::new(context, loc)
+            .body(Region::new())
+            .sym_name(StringAttribute::new(context, libm_name))
+            .function_type(TypeAttribute::new(ty))
+            .linkage(llvm::attributes::linkage(
+                context,
+                llvm::attributes::Linkage::External,
+            ))
+            .build();
+        module.body().append_operation(op.into());
+    }
 }
 
 /// MLIR type for a function parameter of static [`ValueKind`]. Number
@@ -7669,11 +7686,19 @@ fn emit_expr<'a, 'c>(
                         .to_owned(),
                 ))
             }
-            Callee::Builtin(b @ (Builtin::MathSqrt | Builtin::MathFloor | Builtin::MathAbs)) => {
-                // Phase 2.7q-stdlib-math (ADR 0101): emit a libm call
-                // for `math.sqrt(x)` / `math.floor(x)` / `math.abs(x)`.
-                // Arg lowered as f64 (Number-kind); libm extern was
-                // declared in `emit_libm_decls`. Return value is f64.
+            Callee::Builtin(
+                b @ (Builtin::MathSqrt
+                | Builtin::MathFloor
+                | Builtin::MathAbs
+                | Builtin::MathSin
+                | Builtin::MathCos
+                | Builtin::MathLog
+                | Builtin::MathExp),
+            ) => {
+                // Phase 2.7q-stdlib-math (ADR 0101 / ADR 0102): emit a
+                // unary libm call. Arg lowered as f64 (Number-kind);
+                // libm extern was declared in `emit_libm_decls`. Return
+                // value is f64.
                 let arg = emit_expr(
                     context,
                     block,
@@ -7690,6 +7715,10 @@ fn emit_expr<'a, 'c>(
                     Builtin::MathSqrt => "sqrt",
                     Builtin::MathFloor => "floor",
                     Builtin::MathAbs => "fabs",
+                    Builtin::MathSin => "sin",
+                    Builtin::MathCos => "cos",
+                    Builtin::MathLog => "log",
+                    Builtin::MathExp => "exp",
                     _ => unreachable!(),
                 };
                 Ok(emit_libc_call_f64(
@@ -7697,6 +7726,44 @@ fn emit_expr<'a, 'c>(
                     block,
                     libm_name,
                     &[arg],
+                    types,
+                    loc,
+                ))
+            }
+            Callee::Builtin(Builtin::MathPow) => {
+                // ADR 0102 — binary `math.pow(x, y)` via libm `pow`.
+                // The only binary math.* builtin today; explicit
+                // 2-arg slice construction (separated from unary
+                // group per Codex critical).
+                let base = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let exponent = emit_expr(
+                    context,
+                    block,
+                    &args[1],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                Ok(emit_libc_call_f64(
+                    context,
+                    block,
+                    "pow",
+                    &[base, exponent],
                     types,
                     loc,
                 ))

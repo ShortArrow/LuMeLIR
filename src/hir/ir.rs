@@ -387,6 +387,19 @@ pub enum Builtin {
     /// `math.abs(x)` — absolute value via libm `fabs`. Same dispatch
     /// shape as `MathSqrt` (ADR 0101).
     MathAbs,
+    /// `math.pow(x, y)` — exponentiation via libm `pow`. Phase
+    /// 2.7q-stdlib-math (ADR 0102). The only binary math.* builtin
+    /// today; arity=2 vs unary group=1.
+    MathPow,
+    /// `math.sin(x)` — sine via libm `sin` (ADR 0102).
+    MathSin,
+    /// `math.cos(x)` — cosine via libm `cos` (ADR 0102).
+    MathCos,
+    /// `math.log(x)` — natural logarithm via libm `log` (ADR 0102).
+    /// Lua 5.4's optional second `base` arg is out of MVP scope.
+    MathLog,
+    /// `math.exp(x)` — exponential via libm `exp` (ADR 0102).
+    MathExp,
 }
 
 impl Builtin {
@@ -412,6 +425,12 @@ impl Builtin {
             "sqrt" => Some(Builtin::MathSqrt),
             "floor" => Some(Builtin::MathFloor),
             "abs" => Some(Builtin::MathAbs),
+            // ADR 0102 — math.* continuation.
+            "pow" => Some(Builtin::MathPow),
+            "sin" => Some(Builtin::MathSin),
+            "cos" => Some(Builtin::MathCos),
+            "log" => Some(Builtin::MathLog),
+            "exp" => Some(Builtin::MathExp),
             _ => None,
         }
     }
@@ -426,6 +445,8 @@ impl Builtin {
             Builtin::Error => 1,
             Builtin::Next => 2,
             Builtin::MathSqrt | Builtin::MathFloor | Builtin::MathAbs => 1,
+            Builtin::MathPow => 2,
+            Builtin::MathSin | Builtin::MathCos | Builtin::MathLog | Builtin::MathExp => 1,
         }
     }
 
@@ -441,6 +462,11 @@ impl Builtin {
             Builtin::MathSqrt => "math.sqrt",
             Builtin::MathFloor => "math.floor",
             Builtin::MathAbs => "math.abs",
+            Builtin::MathPow => "math.pow",
+            Builtin::MathSin => "math.sin",
+            Builtin::MathCos => "math.cos",
+            Builtin::MathLog => "math.log",
+            Builtin::MathExp => "math.exp",
         }
     }
 
@@ -460,7 +486,14 @@ impl Builtin {
             Builtin::Assert => &[ValueKind::Bool],
             Builtin::Error => &[ValueKind::Number],
             Builtin::Next => &[ValueKind::TaggedValue, ValueKind::TaggedValue],
-            Builtin::MathSqrt | Builtin::MathFloor | Builtin::MathAbs => &[ValueKind::Number],
+            Builtin::MathSqrt
+            | Builtin::MathFloor
+            | Builtin::MathAbs
+            | Builtin::MathPow
+            | Builtin::MathSin
+            | Builtin::MathCos
+            | Builtin::MathLog
+            | Builtin::MathExp => &[ValueKind::Number],
         }
     }
 }
