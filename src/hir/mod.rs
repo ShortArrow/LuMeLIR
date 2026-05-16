@@ -1206,6 +1206,53 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
             _ => {}
         }
     }
+    // Phase 2.6+-multi-step-alias (ADR 0099): fixed-point closure
+    // over multi-step Ident → Ident aliases. After Round 1
+    // (Index-chain) above populates direct aliases like
+    // `local h = a.b.method`, Round 2+ propagates them through
+    // bare-Ident rebinds like `local g = h`.
+    //
+    // INVARIANT: insert-only. The `!alias_map.contains_key(name)`
+    // guard prevents overwriting entries, which guarantees
+    // termination — each iteration either grows `alias_map` by at
+    // least one entry or terminates. Bounded by the count of
+    // top-level Local bindings whose RHS resolves through the
+    // alias chain. Lua scoping forbids forward-reference
+    // (`local a = b` with b not yet declared), so cycles cannot
+    // form at chunk level.
+    //
+    // Round 1's last-wins shadowing (Index-chain) is preserved;
+    // Round 2's insert-only semantics is an acceptable divergence
+    // for the rebind-of-rebind case (documented in ADR 0099).
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for stmt in chunk {
+            match &stmt.kind {
+                StmtKind::Local { name, value } => {
+                    if let ExprKind::Ident(other) = &value.kind
+                        && let Some(&fid) = alias_map.get(other)
+                        && !alias_map.contains_key(name)
+                    {
+                        alias_map.insert(name.clone(), fid);
+                        changed = true;
+                    }
+                }
+                StmtKind::LocalMulti { names, values } if names.len() == values.len() => {
+                    for (n, v) in names.iter().zip(values.iter()) {
+                        if let ExprKind::Ident(other) = &v.kind
+                            && let Some(&fid) = alias_map.get(other)
+                            && !alias_map.contains_key(n)
+                        {
+                            alias_map.insert(n.clone(), fid);
+                            changed = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     // Phase 2.5e (ADR 0020): pre-scan all call sites for top-level
     // function names, refining each function's param kinds from
     // literal arg kinds at the first observed call. Without this,
