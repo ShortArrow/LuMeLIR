@@ -349,6 +349,21 @@ fn emit_fmt_global<'c>(
         "attempt to call a non-function value\0",
         loc,
     );
+    // Phase 2.6+-nested-index-assign-widen (ADR 0095): runtime trap
+    // for nested `Index`/`IndexAssign` whose target widens to
+    // TaggedValue (via `widen_index_for_assign_target`) but whose
+    // runtime tag is not TAG_TABLE. Lua spec §3.4.11: "attempt to
+    // index a {type} value". Fires from the narrowing helper at
+    // both read (`emit_expr` Index arm) and write (`emit_stmt`
+    // IndexAssign arm) chokepoints.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_index_target_not_table",
+        "attempt to index a non-table value\0",
+        loc,
+    );
     emit_string_global(
         context,
         module,
@@ -2762,7 +2777,12 @@ fn emit_stmt<'a, 'c>(
         // - reload array_buf (might have been just swapped) and
         //   store the value at offset (key-1)*8
         HirStmtKind::IndexAssign { target, key, value } => {
-            let target_ptr = emit_expr(
+            // Phase 2.6+-nested-index-assign-widen (ADR 0095):
+            // IndexTagged target → TAG_TABLE narrow; everything else
+            // → existing emit_expr path. Centralised via
+            // emit_resolve_table_target_ptr (idempotent for
+            // single-Ident targets).
+            let target_ptr = emit_resolve_table_target_ptr(
                 context,
                 block,
                 target,
@@ -4302,6 +4322,151 @@ fn emit_array_elem_ptr<'a, 'c>(
     emit_byte_offset_ptr_dynamic(context, block, array_buf, offset, types, loc)
 }
 
+/// Phase 2.6+-nested-index-assign-widen (ADR 0095): dispatch entry
+/// for resolving an arbitrary HIR expression into a Table descriptor
+/// pointer. IndexTagged targets are narrowed via the runtime
+/// TAG_TABLE chokepoint; every other shape falls through to the
+/// existing `emit_expr` path. Used at all four call sites that need
+/// a Table descriptor (Index read, IndexAssign write, and the two
+/// inline-tagged tmp helpers that consume `Index/.k` source).
+#[allow(clippy::too_many_arguments)]
+fn emit_resolve_table_target_ptr<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    target: &HirExpr,
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
+    loc: Location<'c>,
+) -> Result<Value<'c, 'a>, CodegenError> {
+    match &target.kind {
+        HirExprKind::IndexTagged { target: t, key: k } => emit_narrow_indextagged_to_table_ptr(
+            context,
+            block,
+            t,
+            k,
+            slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
+        ),
+        _ => emit_expr(
+            context,
+            block,
+            target,
+            slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
+        ),
+    }
+}
+
+/// Phase 2.6+-nested-index-assign-widen (ADR 0095): the narrowing
+/// chokepoint shared by nested Index read (emit_expr) and nested
+/// IndexAssign write (emit_stmt). Materialises the IndexTagged
+/// result into a stack-allocated TaggedValue tmp slot, then checks
+/// the runtime tag against `TAG_TABLE`. Traps with
+/// `s_index_target_not_table` on mismatch. Returns the table
+/// descriptor pointer (i64 payload reinterpreted as `!llvm.ptr`).
+#[allow(clippy::too_many_arguments)]
+fn emit_narrow_indextagged_to_table_ptr<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    target: &HirExpr,
+    key: &HirExpr,
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
+    loc: Location<'c>,
+) -> Result<Value<'c, 'a>, CodegenError> {
+    let tmp_slot = emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
+    emit_local_init_tagged(
+        context,
+        block,
+        tmp_slot,
+        target,
+        key,
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
+    )?;
+    let tag = emit_load(block, tmp_slot, types.i64, loc);
+    let tag_table_const = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, TAG_TABLE).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let tag_mismatch: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Ne,
+            tag,
+            tag_table_const,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let trap_then = Region::new();
+    let trap_then_blk = Block::new(&[]);
+    {
+        let msg_ptr = emit_addressof(
+            context,
+            &trap_then_blk,
+            "s_index_target_not_table",
+            types,
+            loc,
+        );
+        emit_exit_with_message(context, &trap_then_blk, msg_ptr, types, loc);
+        trap_then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    trap_then.append_block(trap_then_blk);
+    let trap_else = Region::new();
+    let trap_else_blk = Block::new(&[]);
+    trap_else_blk.append_operation(scf::r#yield(&[], loc));
+    trap_else.append_block(trap_else_blk);
+    block.append_operation(scf::r#if(tag_mismatch, &[], trap_then, trap_else, loc));
+    let payload_ptr =
+        emit_byte_offset_ptr(context, block, tmp_slot, ARRAY_ELEM_OFF_VALUE, types, loc);
+    let payload_i64 = emit_load(block, payload_ptr, types.i64, loc);
+    // The payload at offset 8 in a Table-tagged slot is the heap
+    // descriptor pointer encoded as i64. Bitcast back to `!llvm.ptr`
+    // so downstream Index/IndexAssign codegen can use it directly.
+    let table_ptr: Value<'c, 'a> = block
+        .append_operation(
+            OperationBuilder::new("llvm.inttoptr", loc)
+                .add_operands(&[payload_i64])
+                .add_results(&[types.ptr])
+                .build()
+                .expect("llvm.inttoptr"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    Ok(table_ptr)
+}
+
 /// Phase 2.6c-tag-locals (ADR 0063): non-trapping `IndexTagged`
 /// read that writes the resulting `{tag, value}` directly to a
 /// `TaggedValue` local slot. Mirror of the `IsNilQuery`
@@ -4323,7 +4488,9 @@ fn emit_local_init_tagged<'a, 'c>(
     in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
-    let target_ptr = emit_expr(
+    // Phase 2.6+-nested-index-assign-widen (ADR 0095): IndexTagged
+    // target is narrowed via TAG_TABLE check chokepoint.
+    let target_ptr = emit_resolve_table_target_ptr(
         context,
         block,
         target,
@@ -6583,7 +6750,10 @@ fn emit_expr<'a, 'c>(
         // frozen contract), then GEP `(key-1)*8` bytes into
         // array_buf and load f64.
         HirExprKind::Index { target, key } => {
-            let target_ptr = emit_expr(
+            // Phase 2.6+-nested-index-assign-widen (ADR 0095): mirror
+            // of the IndexAssign target dispatch — see helper for
+            // IndexTagged-target narrowing.
+            let target_ptr = emit_resolve_table_target_ptr(
                 context,
                 block,
                 target,

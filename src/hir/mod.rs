@@ -136,6 +136,24 @@ fn widen_index_for_local_init(value: HirExpr) -> HirExpr {
     }
 }
 
+/// Phase 2.6+-nested-index-assign-widen (ADR 0095): when an
+/// `IndexAssign`'s target is itself a `HirExprKind::Index` (the
+/// nested-write pattern `app.utils.field = ...`), rewrite it into
+/// `HirExprKind::IndexTagged` so the target's kind widens to
+/// `TaggedValue`. Codegen's IndexAssign arm handles the runtime
+/// TAG_TABLE narrow + descriptor extraction for the TaggedValue case.
+/// Idempotent on non-Index targets (single-Ident path, ADR 0055,
+/// is preserved without change).
+fn widen_index_for_assign_target(target: HirExpr) -> HirExpr {
+    match target.kind {
+        HirExprKind::Index { target: t, key } => HirExpr {
+            kind: HirExprKind::IndexTagged { target: t, key },
+            span: target.span,
+        },
+        _ => target,
+    }
+}
+
 /// Phase 2.6c-tag-fn-tbl (ADR 0071): identify the underlying
 /// `FuncId` for a Function-kind expression — either a direct
 /// `FunctionRef` or a `Local` whose `func_id` was recorded at
@@ -2753,10 +2771,16 @@ impl LowerCtx {
             // value Number); codegen emits the same bounds check.
             StmtKind::IndexAssign { target, key, value } => {
                 let target_hir = self.lower_expr(target)?;
+                // Phase 2.6+-nested-index-assign-widen (ADR 0095):
+                // when the target is itself an Index (nested write
+                // pattern `app.utils.field = ...`), widen to
+                // IndexTagged so the codegen TAG_TABLE narrow + extract
+                // path applies. Idempotent on single-Ident targets.
+                let target_hir = widen_index_for_assign_target(target_hir);
                 let key_hir = self.lower_expr(key)?;
                 let value_hir = self.lower_expr(value)?;
                 let target_kind = infer_kind(&target_hir, &self.locals, &self.functions);
-                if target_kind != ValueKind::Table {
+                if target_kind != ValueKind::Table && target_kind != ValueKind::TaggedValue {
                     return Err(HirError::TypeMismatch {
                         op: "[]=".to_owned(),
                         lhs_kind: "table".to_owned(),
@@ -3706,9 +3730,16 @@ impl LowerCtx {
             // key's static kind.
             ExprKind::Index { target, key } => {
                 let target_hir = self.lower_expr(target)?;
+                // Phase 2.6+-nested-index-assign-widen (ADR 0095):
+                // when the target is itself an Index (nested read
+                // pattern `app.utils.field`), widen to IndexTagged so
+                // codegen narrows the TaggedValue back to a Table
+                // descriptor at runtime. Idempotent on non-Index
+                // targets (single-level reads unchanged).
+                let target_hir = widen_index_for_assign_target(target_hir);
                 let key_hir = self.lower_expr(key)?;
                 let target_kind = infer_kind(&target_hir, &self.locals, &self.functions);
-                if target_kind != ValueKind::Table {
+                if target_kind != ValueKind::Table && target_kind != ValueKind::TaggedValue {
                     return Err(HirError::TypeMismatch {
                         op: "[]".to_owned(),
                         lhs_kind: "table".to_owned(),
