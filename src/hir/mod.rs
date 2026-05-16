@@ -236,7 +236,8 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // the next key, which is a TaggedValue.
             Callee::Builtin(Builtin::Next) => ValueKind::TaggedValue,
             // Phase 2.7q-stdlib-math (ADR 0101 / ADR 0102): all math.*
-            // builtins return Number.
+            // builtins return Number. ADR 0103: string.len also
+            // returns Number.
             Callee::Builtin(Builtin::MathSqrt)
             | Callee::Builtin(Builtin::MathFloor)
             | Callee::Builtin(Builtin::MathAbs)
@@ -244,7 +245,13 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             | Callee::Builtin(Builtin::MathSin)
             | Callee::Builtin(Builtin::MathCos)
             | Callee::Builtin(Builtin::MathLog)
-            | Callee::Builtin(Builtin::MathExp) => ValueKind::Number,
+            | Callee::Builtin(Builtin::MathExp)
+            | Callee::Builtin(Builtin::StringLen) => ValueKind::Number,
+            // Phase 2.7q-stdlib-string (ADR 0103): string.upper /
+            // string.lower allocate and return a new String.
+            Callee::Builtin(Builtin::StringUpper) | Callee::Builtin(Builtin::StringLower) => {
+                ValueKind::String
+            }
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.
@@ -491,6 +498,25 @@ fn ast_arg_kind(expr: &Expr) -> ValueKind {
 /// the length-1 chain case, so this helper unifies the lookup path
 /// for ADR 0093/0094 single-seg AND ADR 0096 multi-seg method-def
 /// in one call site.
+/// Phase 2.7q-stdlib-string (ADR 0103): pure walker that recognises
+/// the strict shape `Index{Ident(ns), Str(method)}` used by the
+/// namespace builtin dispatch chokepoint. Returns the
+/// `(namespace, method)` pair on match, None otherwise. Reuses the
+/// same shape predicate as ADR 0097's `extract_index_chain` but
+/// restricted to single-segment receivers (math.foo, string.foo,
+/// table.foo …) since multi-segment namespaces (`my.math.foo`) are
+/// out of stdlib scope.
+fn extract_namespace_call(callee: &Expr) -> Option<(String, String)> {
+    if let ExprKind::Index { target, key } = &callee.kind
+        && let ExprKind::Ident(ns) = &target.kind
+        && let ExprKind::Str(method) = &key.kind
+    {
+        Some((ns.clone(), method.clone()))
+    } else {
+        None
+    }
+}
+
 fn extract_index_chain(callee: &Expr) -> Option<(Vec<String>, String)> {
     let (mut cur, method) = match &callee.kind {
         ExprKind::Index { target, key } => {
@@ -4053,22 +4079,22 @@ impl LowerCtx {
         args: &[Expr],
         whole: &Expr,
     ) -> Result<HirExprKind, HirError> {
-        // Phase 2.7q-stdlib-math (ADR 0101): math.* builtin dispatch
-        // chokepoint. Matches the strict shape `Index{Ident("math"),
-        // Str(method)}` only when `math` is an UNRESOLVED identifier
-        // (NOT a declared local / param / upvalue / function name).
-        // User shadowing `local math = ...` makes `self.resolve("math")`
-        // return Some(...), bypassing this builtin path; the call
-        // falls through to the normal Index-callee Call path.
-        if let ExprKind::Index { target, key } = &callee.kind
-            && let ExprKind::Ident(target_name) = &target.kind
-            && let ExprKind::Str(key_str) = &key.kind
-            && target_name == "math"
-            && self.resolve("math").is_none()
-            && !self.function_names.contains_key("math")
-            && let Some(builtin) = Builtin::math_from_method(key_str)
+        // Phase 2.7q-stdlib-math / -string (ADR 0101 / ADR 0102 /
+        // ADR 0103): namespace builtin dispatch chokepoint, now
+        // generic over math.* / string.* / future namespaces. Matches
+        // the strict shape `Index{Ident(ns), Str(method)}` only when
+        // `ns` is an UNRESOLVED identifier (NOT a declared local /
+        // param / upvalue / function name). User shadowing makes
+        // `self.resolve(ns)` return Some(...), bypassing this builtin
+        // path; the call falls through to the normal Index-callee
+        // Call path. ADR 0103 critical: namespace-agnostic dispatch
+        // via `Builtin::from_namespace_method`, NOT hard-coded.
+        if let Some((ns, method)) = extract_namespace_call(callee)
+            && self.resolve(&ns).is_none()
+            && !self.function_names.contains_key(&ns)
+            && let Some(builtin) = Builtin::from_namespace_method(&ns, &method)
         {
-            return self.lower_math_builtin_call(builtin, args, whole.span);
+            return self.lower_namespace_builtin_call(builtin, args, whole.span);
         }
         // Phase 2.6+-callee-norm (ADR 0091 v2): pre-step is to
         // classify the callee shape. DirectIdent flows through the
@@ -4599,12 +4625,12 @@ impl LowerCtx {
     /// `IndexAssign`'s function-value branch (hetero-return methods
     /// trip that, surfacing as `TypeMismatch`; documented as ADR 0092
     /// non-goal carry-over).
-    /// Phase 2.7q-stdlib-math (ADR 0101): emit a `math.<fn>(arg)`
-    /// call as a `Callee::Builtin(...)` call. Validates arity (all
-    /// math.* builtins are unary today) and lowers args; the call
-    /// site arg-kind check at codegen verifies the arg is Number-
-    /// compatible (libm extern signatures are `f64 -> f64`).
-    fn lower_math_builtin_call(
+    /// Phase 2.7q-stdlib (ADR 0101 / renamed ADR 0103): emit a
+    /// namespace builtin call (math.* / string.* / future
+    /// namespaces) as `Callee::Builtin(...)`. Validates arity and
+    /// lowers args; the call-site arg-kind check at codegen
+    /// verifies operand types match the libc/libm extern signature.
+    fn lower_namespace_builtin_call(
         &mut self,
         builtin: Builtin,
         args: &[Expr],

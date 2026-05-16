@@ -845,6 +845,23 @@ fn emit_string_runtime_decls<'c>(
         ))
         .build();
     module.body().append_operation(exit_op.into());
+
+    // Phase 2.7q-stdlib-string (ADR 0103): toupper/tolower for
+    // `string.upper` / `string.lower` per-char case mapping. Both
+    // take and return int (i32) per C signatures.
+    for libc_name in ["toupper", "tolower"] {
+        let ty = llvm::r#type::function(types.i32, &[types.i32], false);
+        let op = LLVMFuncOperationBuilder::new(context, loc)
+            .body(Region::new())
+            .sym_name(StringAttribute::new(context, libc_name))
+            .function_type(TypeAttribute::new(ty))
+            .linkage(llvm::attributes::linkage(
+                context,
+                llvm::attributes::Linkage::External,
+            ))
+            .build();
+        module.body().append_operation(op.into());
+    }
 }
 
 fn emit_libm_decls<'c>(
@@ -7768,6 +7785,50 @@ fn emit_expr<'a, 'c>(
                     loc,
                 ))
             }
+            Callee::Builtin(Builtin::StringLen) => {
+                // Phase 2.7q-stdlib-string (ADR 0103): `string.len(s)` →
+                // `strlen(s)` then sitofp to f64 (Number-kind return).
+                let arg = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let len_i64 = emit_libc_call_i64(context, block, "strlen", &[arg], types, loc);
+                Ok(emit_i2f(block, len_i64, types, loc))
+            }
+            Callee::Builtin(b @ (Builtin::StringUpper | Builtin::StringLower)) => {
+                // Phase 2.7q-stdlib-string (ADR 0103): `string.upper` /
+                // `string.lower` share the malloc + memcpy + scf::while
+                // case-map loop via `emit_string_case_map`. Mapper is
+                // libc `toupper` / `tolower` respectively.
+                let arg = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let mapper = match b {
+                    Builtin::StringUpper => "toupper",
+                    Builtin::StringLower => "tolower",
+                    _ => unreachable!(),
+                };
+                Ok(emit_string_case_map(
+                    context, block, arg, mapper, types, loc,
+                ))
+            }
             Callee::User {
                 fid: FuncId(fid),
                 holding_local,
@@ -8259,6 +8320,148 @@ fn emit_i2f<'a, 'c>(
 /// (the second copy includes `b`'s NUL terminator). Returned `ptr`
 /// is the freshly-allocated buffer; intentionally leaks since we
 /// have no GC yet.
+/// Phase 2.7q-stdlib-string (ADR 0103): per-char case-map helper.
+/// Allocates a new String (libc `malloc`), memcpys the source
+/// including the null terminator, then walks each byte with the
+/// supplied libc mapper (`"toupper"` or `"tolower"`), storing the
+/// mapped value back in place. Returns the new String pointer.
+///
+/// Mirrors `emit_concat`'s alloc + memcpy shape and ADR 0057's
+/// `scf::r#while` loop pattern (the codebase uses scf::while as
+/// its iteration primitive — there is no scf::for in melior 0.27).
+///
+/// malloc OOM is unchecked, consistent with existing `emit_concat`
+/// / closure / table alloc sites. Future ADR consolidates the
+/// null-check across all alloc sites.
+fn emit_string_case_map<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    src: Value<'c, 'a>,
+    mapper_libc: &str,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let length = emit_libc_call_i64(context, block, "strlen", &[src], types, loc);
+    let one = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let size = block
+        .append_operation(arith::addi(length, one, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let buf = emit_libc_call_ptr(context, block, "malloc", &[size], types, loc);
+    // Full memcpy including the null terminator so the new String
+    // is zero-terminated even if length == 0.
+    let _ = emit_libc_call_ptr(context, block, "memcpy", &[buf, src, size], types, loc);
+
+    // for i in 0..length: buf[i] = mapper_libc((i32)buf[i]).
+    let zero = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let i8_ty: Type<'c> = IntegerType::new(context, 8).into();
+    let before_region = Region::new();
+    let before_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let i_arg: Value<'c, '_> = before_blk.argument(0).unwrap().into();
+        let cond: Value<'c, '_> = before_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Slt,
+                i_arg,
+                length,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        before_blk.append_operation(scf::condition(cond, &[i_arg], loc));
+    }
+    before_region.append_block(before_blk);
+    let after_region = Region::new();
+    let after_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let i_arg: Value<'c, '_> = after_blk.argument(0).unwrap().into();
+        // gep buf[i] (i8 elem).
+        let p_i: Value<'c, '_> = after_blk
+            .append_operation(
+                OperationBuilder::new("llvm.getelementptr", loc)
+                    .add_operands(&[buf, i_arg])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "elem_type"),
+                            TypeAttribute::new(i8_ty).into(),
+                        ),
+                        (
+                            Identifier::new(context, "rawConstantIndices"),
+                            DenseI32ArrayAttribute::new(context, &[i32::MIN]).into(),
+                        ),
+                    ])
+                    .add_results(&[types.ptr])
+                    .build()
+                    .expect("llvm.getelementptr"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        // load i8 at p_i.
+        let c_i8: Value<'c, '_> = after_blk
+            .append_operation(
+                OperationBuilder::new("llvm.load", loc)
+                    .add_operands(&[p_i])
+                    .add_results(&[i8_ty])
+                    .build()
+                    .expect("llvm.load i8"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        // sext i8 → i32.
+        let c_i32: Value<'c, '_> = after_blk
+            .append_operation(arith::extsi(c_i8, types.i32, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        // mapper(c_i32) → i32.
+        let mapped_i32 = emit_libc_call_i32(context, &after_blk, mapper_libc, &[c_i32], types, loc);
+        // trunc i32 → i8.
+        let mapped_i8: Value<'c, '_> = after_blk
+            .append_operation(arith::trunci(mapped_i32, i8_ty, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        // store i8 to p_i.
+        after_blk.append_operation(
+            OperationBuilder::new("llvm.store", loc)
+                .add_operands(&[mapped_i8, p_i])
+                .build()
+                .expect("llvm.store i8"),
+        );
+        let next: Value<'c, '_> = after_blk
+            .append_operation(arith::addi(i_arg, one, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        after_blk.append_operation(scf::r#yield(&[next], loc));
+    }
+    after_region.append_block(after_blk);
+    let while_op = scf::r#while(&[zero], &[types.i64], before_region, after_region, loc);
+    block.append_operation(while_op);
+    buf
+}
+
 fn emit_concat<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,

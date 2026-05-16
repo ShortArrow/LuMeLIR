@@ -400,6 +400,18 @@ pub enum Builtin {
     MathLog,
     /// `math.exp(x)` — exponential via libm `exp` (ADR 0102).
     MathExp,
+    /// `string.len(s)` — Lua's `#s`-equivalent function-call form.
+    /// Phase 2.7q-stdlib-string (ADR 0103). Dispatched via the
+    /// generic namespace chokepoint when `string` is an UNRESOLVED
+    /// identifier.
+    StringLen,
+    /// `string.upper(s)` — byte-wise ASCII uppercase. Allocates a
+    /// new String via libc malloc + memcpy + char-loop with
+    /// `toupper` (ADR 0103).
+    StringUpper,
+    /// `string.lower(s)` — byte-wise ASCII lowercase. Mirror of
+    /// `StringUpper` with `tolower` (ADR 0103).
+    StringLower,
 }
 
 impl Builtin {
@@ -435,6 +447,32 @@ impl Builtin {
         }
     }
 
+    /// Phase 2.7q-stdlib-string (ADR 0103): map a `string.<method>`
+    /// name to a Builtin variant. Returns None for unrecognized
+    /// methods so `lower_call` falls through to the normal
+    /// Index-callee path.
+    pub fn string_from_method(method: &str) -> Option<Self> {
+        match method {
+            "len" => Some(Builtin::StringLen),
+            "upper" => Some(Builtin::StringUpper),
+            "lower" => Some(Builtin::StringLower),
+            _ => None,
+        }
+    }
+
+    /// Phase 2.7q-stdlib-string (ADR 0103): generic namespace
+    /// dispatcher. `lower_call`'s namespace builtin chokepoint
+    /// invokes this with the unresolved `ns` identifier and the
+    /// method name. Future ADRs (table.* / io.* etc.) extend
+    /// here without touching the call site.
+    pub fn from_namespace_method(ns: &str, method: &str) -> Option<Self> {
+        match ns {
+            "math" => Self::math_from_method(method),
+            "string" => Self::string_from_method(method),
+            _ => None,
+        }
+    }
+
     pub fn arity(self) -> usize {
         match self {
             Builtin::Print => 1,
@@ -447,6 +485,7 @@ impl Builtin {
             Builtin::MathSqrt | Builtin::MathFloor | Builtin::MathAbs => 1,
             Builtin::MathPow => 2,
             Builtin::MathSin | Builtin::MathCos | Builtin::MathLog | Builtin::MathExp => 1,
+            Builtin::StringLen | Builtin::StringUpper | Builtin::StringLower => 1,
         }
     }
 
@@ -467,6 +506,9 @@ impl Builtin {
             Builtin::MathCos => "math.cos",
             Builtin::MathLog => "math.log",
             Builtin::MathExp => "math.exp",
+            Builtin::StringLen => "string.len",
+            Builtin::StringUpper => "string.upper",
+            Builtin::StringLower => "string.lower",
         }
     }
 
@@ -494,6 +536,9 @@ impl Builtin {
             | Builtin::MathCos
             | Builtin::MathLog
             | Builtin::MathExp => &[ValueKind::Number],
+            // Phase 2.7q-stdlib-string (ADR 0103).
+            Builtin::StringLen => &[ValueKind::Number],
+            Builtin::StringUpper | Builtin::StringLower => &[ValueKind::String],
         }
     }
 }
