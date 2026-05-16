@@ -457,6 +457,7 @@ fn ast_arg_kind(expr: &Expr) -> ValueKind {
 fn infer_user_function_param_kinds(
     chunk: &[Stmt],
     function_names: &HashMap<String, FuncId>,
+    method_funcs: &HashMap<(String, String), FuncId>,
     arities: &[usize],
 ) -> Vec<Vec<ValueKind>> {
     let mut kinds: Vec<Vec<ValueKind>> = arities
@@ -468,19 +469,20 @@ fn infer_user_function_param_kinds(
     fn visit_stmt(
         s: &Stmt,
         names: &HashMap<String, FuncId>,
+        method_funcs: &HashMap<(String, String), FuncId>,
         kinds: &mut Vec<Vec<ValueKind>>,
         seen: &mut Vec<bool>,
     ) {
         match &s.kind {
             StmtKind::Local { value, .. } | StmtKind::Assign { value, .. } => {
-                visit_expr(value, names, kinds, seen);
+                visit_expr(value, names, method_funcs, kinds, seen);
             }
-            StmtKind::ExprStmt(e) => visit_expr(e, names, kinds, seen),
-            StmtKind::Return { value: Some(e) } => visit_expr(e, names, kinds, seen),
+            StmtKind::ExprStmt(e) => visit_expr(e, names, method_funcs, kinds, seen),
+            StmtKind::Return { value: Some(e) } => visit_expr(e, names, method_funcs, kinds, seen),
             StmtKind::Return { value: None } => {}
             StmtKind::Block(b) => {
                 for st in b {
-                    visit_stmt(st, names, kinds, seen);
+                    visit_stmt(st, names, method_funcs, kinds, seen);
                 }
             }
             StmtKind::If {
@@ -489,26 +491,26 @@ fn infer_user_function_param_kinds(
                 elifs,
                 else_body,
             } => {
-                visit_expr(cond, names, kinds, seen);
+                visit_expr(cond, names, method_funcs, kinds, seen);
                 for st in then_body {
-                    visit_stmt(st, names, kinds, seen);
+                    visit_stmt(st, names, method_funcs, kinds, seen);
                 }
                 for (c, b) in elifs {
-                    visit_expr(c, names, kinds, seen);
+                    visit_expr(c, names, method_funcs, kinds, seen);
                     for st in b {
-                        visit_stmt(st, names, kinds, seen);
+                        visit_stmt(st, names, method_funcs, kinds, seen);
                     }
                 }
                 if let Some(b) = else_body {
                     for st in b {
-                        visit_stmt(st, names, kinds, seen);
+                        visit_stmt(st, names, method_funcs, kinds, seen);
                     }
                 }
             }
             StmtKind::While { cond, body } => {
-                visit_expr(cond, names, kinds, seen);
+                visit_expr(cond, names, method_funcs, kinds, seen);
                 for st in body {
-                    visit_stmt(st, names, kinds, seen);
+                    visit_stmt(st, names, method_funcs, kinds, seen);
                 }
             }
             StmtKind::ForNumeric {
@@ -518,25 +520,25 @@ fn infer_user_function_param_kinds(
                 body,
                 ..
             } => {
-                visit_expr(start, names, kinds, seen);
-                visit_expr(stop, names, kinds, seen);
+                visit_expr(start, names, method_funcs, kinds, seen);
+                visit_expr(stop, names, method_funcs, kinds, seen);
                 if let Some(s) = step {
-                    visit_expr(s, names, kinds, seen);
+                    visit_expr(s, names, method_funcs, kinds, seen);
                 }
                 for st in body {
-                    visit_stmt(st, names, kinds, seen);
+                    visit_stmt(st, names, method_funcs, kinds, seen);
                 }
             }
             StmtKind::ForIpairs { table, body, .. } => {
-                visit_expr(table, names, kinds, seen);
+                visit_expr(table, names, method_funcs, kinds, seen);
                 for st in body {
-                    visit_stmt(st, names, kinds, seen);
+                    visit_stmt(st, names, method_funcs, kinds, seen);
                 }
             }
             StmtKind::ForPairs { table, body, .. } => {
-                visit_expr(table, names, kinds, seen);
+                visit_expr(table, names, method_funcs, kinds, seen);
                 for st in body {
-                    visit_stmt(st, names, kinds, seen);
+                    visit_stmt(st, names, method_funcs, kinds, seen);
                 }
             }
             StmtKind::ForGeneric {
@@ -546,24 +548,24 @@ fn infer_user_function_param_kinds(
                 body,
                 ..
             } => {
-                visit_expr(iter, names, kinds, seen);
-                visit_expr(state, names, kinds, seen);
-                visit_expr(ctl, names, kinds, seen);
+                visit_expr(iter, names, method_funcs, kinds, seen);
+                visit_expr(state, names, method_funcs, kinds, seen);
+                visit_expr(ctl, names, method_funcs, kinds, seen);
                 for st in body {
-                    visit_stmt(st, names, kinds, seen);
+                    visit_stmt(st, names, method_funcs, kinds, seen);
                 }
             }
             StmtKind::Repeat { body, cond } => {
                 for st in body {
-                    visit_stmt(st, names, kinds, seen);
+                    visit_stmt(st, names, method_funcs, kinds, seen);
                 }
-                visit_expr(cond, names, kinds, seen);
+                visit_expr(cond, names, method_funcs, kinds, seen);
             }
             // FunctionDef bodies are also walked — recursive calls and
             // calls into sibling top-level functions count.
             StmtKind::FunctionDef { body, .. } => {
                 for st in body {
-                    visit_stmt(st, names, kinds, seen);
+                    visit_stmt(st, names, method_funcs, kinds, seen);
                 }
             }
             // Phase 2.6+-methods (ADR 0092): method-def bodies are
@@ -573,23 +575,23 @@ fn infer_user_function_param_kinds(
             // doesn't extend to Index-callee Calls).
             StmtKind::MethodDef { body, .. } => {
                 for st in body {
-                    visit_stmt(st, names, kinds, seen);
+                    visit_stmt(st, names, method_funcs, kinds, seen);
                 }
             }
             StmtKind::LocalMulti { values, .. } | StmtKind::AssignMulti { values, .. } => {
                 for v in values {
-                    visit_expr(v, names, kinds, seen);
+                    visit_expr(v, names, method_funcs, kinds, seen);
                 }
             }
             StmtKind::ReturnMulti { values } => {
                 for v in values {
-                    visit_expr(v, names, kinds, seen);
+                    visit_expr(v, names, method_funcs, kinds, seen);
                 }
             }
             StmtKind::IndexAssign { target, key, value } => {
-                visit_expr(target, names, kinds, seen);
-                visit_expr(key, names, kinds, seen);
-                visit_expr(value, names, kinds, seen);
+                visit_expr(target, names, method_funcs, kinds, seen);
+                visit_expr(key, names, method_funcs, kinds, seen);
+                visit_expr(value, names, method_funcs, kinds, seen);
             }
             StmtKind::Break => {}
         }
@@ -598,6 +600,7 @@ fn infer_user_function_param_kinds(
     fn visit_expr(
         e: &Expr,
         names: &HashMap<String, FuncId>,
+        method_funcs: &HashMap<(String, String), FuncId>,
         kinds: &mut Vec<Vec<ValueKind>>,
         seen: &mut Vec<bool>,
     ) {
@@ -613,34 +616,51 @@ fn infer_user_function_param_kinds(
                     }
                     seen[idx] = true;
                 }
-                visit_expr(callee, names, kinds, seen);
+                visit_expr(callee, names, method_funcs, kinds, seen);
                 for a in args {
-                    visit_expr(a, names, kinds, seen);
+                    visit_expr(a, names, method_funcs, kinds, seen);
                 }
             }
             ExprKind::BinOp { lhs, rhs, .. } => {
-                visit_expr(lhs, names, kinds, seen);
-                visit_expr(rhs, names, kinds, seen);
+                visit_expr(lhs, names, method_funcs, kinds, seen);
+                visit_expr(rhs, names, method_funcs, kinds, seen);
             }
             ExprKind::UnaryOp { operand, .. } => {
-                visit_expr(operand, names, kinds, seen);
+                visit_expr(operand, names, method_funcs, kinds, seen);
             }
             ExprKind::FunctionExpr { body, .. } => {
                 for st in body {
-                    visit_stmt(st, names, kinds, seen);
+                    visit_stmt(st, names, method_funcs, kinds, seen);
                 }
             }
-            // Phase 2.6+-methods (ADR 0092): MethodCall is an
-            // Index-callee Call after HIR desugar. The chunk-walker
-            // descends into receiver + args but intentionally does
-            // NOT refine first-param kinds at this point — the
-            // same carry-over as ADR 0091 (Index-callee call sites
-            // are invisible to direct-Ident refinement). Receiver-
-            // arg refinement is future work.
-            ExprKind::MethodCall { receiver, args, .. } => {
-                visit_expr(receiver, names, kinds, seen);
+            // Phase 2.6+-method-arg-refine (ADR 0093): MethodCall
+            // refinement via `method_funcs` lookup. Receiver must be
+            // an Ident (otherwise no static FuncId resolution today);
+            // explicit args (index 1..N) refine from literal kinds.
+            // `self` at index 0 stays at the placeholder kind — the
+            // ADR 0092 policy re-seeds Table at `lower_method_def`'s
+            // for_function call, regardless of what placeholder kind
+            // ends up there. First-call-site-wins semantics
+            // (`seen[idx]`) match the FunctionDef arm above.
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => {
+                if let ExprKind::Ident(recv_name) = &receiver.kind
+                    && let Some(&FuncId(idx)) =
+                        method_funcs.get(&(recv_name.clone(), method.clone()))
+                    && !seen[idx]
+                    && args.len() + 1 == kinds[idx].len()
+                {
+                    for (i, a) in args.iter().enumerate() {
+                        kinds[idx][i + 1] = ast_arg_kind(a);
+                    }
+                    seen[idx] = true;
+                }
+                visit_expr(receiver, names, method_funcs, kinds, seen);
                 for a in args {
-                    visit_expr(a, names, kinds, seen);
+                    visit_expr(a, names, method_funcs, kinds, seen);
                 }
             }
             _ => {}
@@ -648,7 +668,7 @@ fn infer_user_function_param_kinds(
     }
 
     for s in chunk {
-        visit_stmt(s, function_names, &mut kinds, &mut seen);
+        visit_stmt(s, function_names, method_funcs, &mut kinds, &mut seen);
     }
     kinds
 }
@@ -892,6 +912,51 @@ fn register_function_signature(
     id
 }
 
+/// Phase 2.6+-method-arg-refine (ADR 0093): pass-1 registration step
+/// for `MethodDef` statements, mirroring `register_function_signature`.
+/// Pre-allocates a `FuncId` and a placeholder `HirFunction` (mangled
+/// `user_anon_<idx>` matching ADR 0092's lowering naming) so the
+/// chunk-walker `infer_user_function_param_kinds` (Pass 1.5) can refine
+/// args by reading the index BEFORE the body is lowered (Pass 2).
+/// `lower_method_def` (ADR 0092) then re-uses this FuncId instead of
+/// freshly allocating one.
+///
+/// `effective_params` are the post-self-prepend params (caller is
+/// responsible for inserting `"self"` when `is_colon`). The index key
+/// is `(receiver, method)` — last-wins on collision (same semantics
+/// as `function_names`'s `insert` for shadowed FunctionDef names;
+/// future ADR can lift to source-order resolution).
+fn register_method_signature(
+    receiver: &str,
+    method: &str,
+    effective_params: &[String],
+    method_funcs: &mut HashMap<(String, String), FuncId>,
+    functions: &mut Vec<HirFunction>,
+    parent_scope: ParentScope,
+) -> FuncId {
+    let id = FuncId(functions.len());
+    functions.push(HirFunction {
+        name: String::new(),
+        mangled_name: format!("user_anon_{}", id.0),
+        params: effective_params
+            .iter()
+            .map(|p| LocalInfo {
+                name: p.clone(),
+                kind: ValueKind::Number,
+                func_id: None,
+                is_captured: false,
+            })
+            .collect(),
+        upvalues: Vec::new(),
+        locals: Vec::new(),
+        body: Vec::new(),
+        ret_kinds: Vec::new(),
+        parent_scope,
+    });
+    method_funcs.insert((receiver.to_owned(), method.to_owned()), id);
+    id
+}
+
 /// Phase 2.5f (ADR 0036): pass-2 body lowering step shared between
 /// top-level `lower()` and the nested-FunctionDef arm of
 /// `lower_function_body`. Lowers `body` into a fresh `LowerCtx`,
@@ -902,6 +967,7 @@ fn lower_into_function(
     params: &[String],
     body: &[Stmt],
     function_names: &HashMap<String, FuncId>,
+    method_funcs: &HashMap<(String, String), FuncId>,
     functions: &mut Vec<HirFunction>,
     outer_visible: HashMap<String, (LocalId, ValueKind)>,
 ) -> Result<(), HirError> {
@@ -909,6 +975,7 @@ fn lower_into_function(
     let external_kinds: Vec<ValueKind> = functions[fid.0].params.iter().map(|p| p.kind).collect();
     let mut sub_ctx = LowerCtx::for_function(
         function_names,
+        method_funcs,
         functions,
         params,
         body,
@@ -945,13 +1012,45 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
             );
         }
     }
+    // Phase 2.6+-method-arg-refine (ADR 0093): pass-1 also registers
+    // every top-level MethodDef so the chunk-walker can refine call-
+    // site arg kinds before lowering. Indexed by `(receiver, method)`
+    // — last-wins on shadowing, same as `function_names` (carry-over).
+    // FunctionDef and MethodDef walks are kept sequential (not
+    // interleaved) so the `funcdef_seq` counter in Pass 2 still maps
+    // 1:1 onto FunctionDef FuncIds in source order.
+    let mut method_funcs: HashMap<(String, String), FuncId> = HashMap::new();
+    for stmt in chunk {
+        if let StmtKind::MethodDef {
+            receiver,
+            method,
+            is_colon,
+            params,
+            ..
+        } = &stmt.kind
+        {
+            let mut effective_params: Vec<String> = Vec::with_capacity(params.len() + 1);
+            if *is_colon {
+                effective_params.push("self".to_owned());
+            }
+            effective_params.extend_from_slice(params);
+            register_method_signature(
+                receiver,
+                method,
+                &effective_params,
+                &mut method_funcs,
+                &mut functions,
+                ParentScope::Chunk,
+            );
+        }
+    }
     // Phase 2.5e (ADR 0020): pre-scan all call sites for top-level
     // function names, refining each function's param kinds from
     // literal arg kinds at the first observed call. Without this,
     // every param defaults to Number and Bool/Nil call args get
     // rejected by `lower_call`'s kind check.
     let arities: Vec<usize> = functions.iter().map(|f| f.params.len()).collect();
-    let inferred = infer_user_function_param_kinds(chunk, &function_names, &arities);
+    let inferred = infer_user_function_param_kinds(chunk, &function_names, &method_funcs, &arities);
     for (i, kinds) in inferred.iter().enumerate() {
         for (j, k) in kinds.iter().enumerate() {
             functions[i].params[j].kind = *k;
@@ -965,7 +1064,7 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
     // first with an empty `outer_visible`, which made top-level
     // captures statically unreachable; ADR 0037 documented that
     // gap, ADR 0042 closes it.
-    let mut ctx = LowerCtx::new(function_names.clone(), functions);
+    let mut ctx = LowerCtx::new(function_names.clone(), method_funcs.clone(), functions);
     // Phase 2.5c-full Commit 3b prep fix (ADR 0083): pass 1.5 — declare
     // a synthetic chunk local for every top-level `local function f`.
     // This is the same shape `local f = function() end` already
@@ -998,6 +1097,7 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
                 params,
                 body,
                 &ctx.function_names,
+                &ctx.method_funcs,
                 &mut ctx.functions,
                 outer_visible,
             )?;
@@ -1275,6 +1375,12 @@ struct LowerCtx {
     /// Function namespace inherited from the top-level pass (Phase
     /// 2.5a). Resolved at every `Call` to dispatch user vs builtin.
     function_names: HashMap<String, FuncId>,
+    /// Phase 2.6+-method-arg-refine (ADR 0093): MethodDef namespace
+    /// inherited from the top-level pass. `lower_method_def` reads
+    /// `(receiver, method) -> FuncId` to find its pre-allocated slot
+    /// instead of pushing a fresh `HirFunction`. Same last-wins
+    /// shadowing semantics as `function_names`.
+    method_funcs: HashMap<(String, String), FuncId>,
     /// Mirror of [`HirChunk::functions`] — needed by `infer_kind` for
     /// user-call return-type lookup. Phase 2.5a clones it into each
     /// `LowerCtx`; the cost is negligible at this scale.
@@ -1319,7 +1425,11 @@ struct LowerCtx {
 }
 
 impl LowerCtx {
-    fn new(function_names: HashMap<String, FuncId>, functions: Vec<HirFunction>) -> Self {
+    fn new(
+        function_names: HashMap<String, FuncId>,
+        method_funcs: HashMap<(String, String), FuncId>,
+        functions: Vec<HirFunction>,
+    ) -> Self {
         Self {
             locals: Vec::new(),
             outer_visible: HashMap::new(),
@@ -1328,6 +1438,7 @@ impl LowerCtx {
             readonly_locals: HashSet::new(),
             loop_break_targets: Vec::new(),
             function_names,
+            method_funcs,
             functions,
             in_function: None,
             in_function_ret_kinds: None,
@@ -1357,8 +1468,10 @@ impl LowerCtx {
     /// pre-scan of call sites, supplying Bool/Nil/Number kinds. The
     /// body-pre-scan wins for Function (body-callsite is decisive);
     /// `external_kinds` wins otherwise.
+    #[allow(clippy::too_many_arguments)]
     fn for_function(
         function_names: &HashMap<String, FuncId>,
+        method_funcs: &HashMap<(String, String), FuncId>,
         functions: &[HirFunction],
         params: &[String],
         body: &[Stmt],
@@ -1366,7 +1479,11 @@ impl LowerCtx {
         outer_visible: HashMap<String, (LocalId, ValueKind)>,
         containing_fn: FuncId,
     ) -> Self {
-        let mut ctx = Self::new(function_names.clone(), functions.to_vec());
+        let mut ctx = Self::new(
+            function_names.clone(),
+            method_funcs.clone(),
+            functions.to_vec(),
+        );
         ctx.outer_visible = outer_visible;
         ctx.containing_fn = Some(containing_fn);
         let body_kinds = infer_param_kinds(body, params);
@@ -1804,6 +1921,7 @@ impl LowerCtx {
                     params,
                     body,
                     &self.function_names,
+                    &self.method_funcs,
                     &mut self.functions,
                     outer_visible,
                 )?;
@@ -3480,6 +3598,7 @@ impl LowerCtx {
                 let outer_visible = self.outer_visible_snapshot();
                 let mut fn_ctx = LowerCtx::for_function(
                     &self.function_names,
+                    &self.method_funcs,
                     &self.functions,
                     params,
                     body,
@@ -4192,41 +4311,29 @@ impl LowerCtx {
         } else {
             params.to_vec()
         };
-        let id = FuncId(self.functions.len());
-        let mangled = format!("user_anon_{}", id.0);
-        let parent_scope = self.current_parent_scope();
-        self.functions.push(HirFunction {
-            name: String::new(),
-            mangled_name: mangled,
-            params: effective_params
-                .iter()
-                .map(|p| LocalInfo {
-                    name: p.clone(),
-                    kind: ValueKind::Number,
-                    func_id: None,
-                    is_captured: false,
-                })
-                .collect(),
-            upvalues: Vec::new(),
-            locals: Vec::new(),
-            body: Vec::new(),
-            ret_kinds: Vec::new(),
-            parent_scope,
-        });
-        let mut external_kinds: Vec<ValueKind> = vec![ValueKind::Number; effective_params.len()];
+        // Phase 2.6+-method-arg-refine (ADR 0093): the FuncId was
+        // pre-allocated in Pass 1 via `register_method_signature` and
+        // the placeholder is already in `self.functions`. Look it up
+        // by `(receiver, method)` so Pass 1.5's refinement of param
+        // kinds carries forward into `external_kinds` below.
+        let id = self.method_funcs[&(receiver.to_owned(), method.to_owned())];
+        let mut external_kinds: Vec<ValueKind> =
+            self.functions[id.0].params.iter().map(|p| p.kind).collect();
         if is_colon {
             // ADR 0092 MVP: `self` kind = Table so the dispatch
             // arg-kind matching (ADR 0082 strict-equal) succeeds for
             // the typical receiver `obj` where `local obj = {}` makes
-            // `obj` a Table-kind local. Future ADR (metatables /
-            // __index) will widen `self` to TaggedValue once dispatch
-            // permits arg widening; until then `self.field` reads use
-            // the existing Index-over-Table path (kind Number).
+            // `obj` a Table-kind local. ADR 0093: refinement may have
+            // pushed self toward another kind, but the policy seeds
+            // Table here unconditionally to maintain ADR 0092's
+            // contract. Future ADR (metatables / __index) will widen
+            // `self` to TaggedValue once dispatch permits arg widening.
             external_kinds[0] = ValueKind::Table;
         }
         let outer_visible = self.outer_visible_snapshot();
         let mut fn_ctx = LowerCtx::for_function(
             &self.function_names,
+            &self.method_funcs,
             &self.functions,
             &effective_params,
             body,
