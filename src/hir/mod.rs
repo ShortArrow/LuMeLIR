@@ -512,6 +512,78 @@ fn extract_index_chain(callee: &Expr) -> Option<(Vec<String>, String)> {
     }
 }
 
+/// Phase 2.6+-reassign-alias (ADR 0100): try to record one
+/// `(name, value)` binding into `alias_map`. Returns `true` if an
+/// insert happened (used by Round 2+ fixed-point's `changed`
+/// tracking). The helper unifies:
+///
+/// - Index-chain logic (ADR 0098 Round 1): value lowered as a
+///   chain of `Index{Index{..., Str}, Str}` over an Ident head;
+///   the chain + final segment look up into `method_funcs`.
+/// - Ident-rebind logic (ADR 0099 Round 2+): value is a bare
+///   `Ident(other)` whose name is already in `alias_map`; we
+///   propagate that FuncId.
+///
+/// `insert_only=true` enables the fixed-point invariant: don't
+/// overwrite existing entries. `insert_only=false` is the Round 1
+/// last-wins behavior matching `function_names` / `method_funcs`
+/// shadowing carry-over.
+fn record_alias_binding(
+    name: &str,
+    value: &Expr,
+    alias_map: &mut HashMap<String, FuncId>,
+    method_funcs: &HashMap<(Vec<String>, String), FuncId>,
+    insert_only: bool,
+) -> bool {
+    if insert_only && alias_map.contains_key(name) {
+        return false;
+    }
+    // Index-chain path (Round 1 fact source).
+    if let Some((chain, method_name)) = extract_index_chain(value)
+        && let Some(&fid) = method_funcs.get(&(chain, method_name))
+    {
+        alias_map.insert(name.to_owned(), fid);
+        return true;
+    }
+    // Ident-rebind path (Round 2+ propagation).
+    if let ExprKind::Ident(other) = &value.kind
+        && let Some(&fid) = alias_map.get(other)
+    {
+        alias_map.insert(name.to_owned(), fid);
+        return true;
+    }
+    false
+}
+
+/// Phase 2.6+-reassign-alias (ADR 0100): dispatch a single chunk-
+/// top-level stmt to `record_alias_binding`. Handles `Local`,
+/// `Assign`, `LocalMulti`, and `AssignMulti` uniformly. Returns
+/// `true` if any insert happened.
+fn process_alias_stmt(
+    stmt: &Stmt,
+    alias_map: &mut HashMap<String, FuncId>,
+    method_funcs: &HashMap<(Vec<String>, String), FuncId>,
+    insert_only: bool,
+) -> bool {
+    match &stmt.kind {
+        StmtKind::Local { name, value } | StmtKind::Assign { name, value } => {
+            record_alias_binding(name, value, alias_map, method_funcs, insert_only)
+        }
+        StmtKind::LocalMulti { names, values } | StmtKind::AssignMulti { names, values }
+            if names.len() == values.len() =>
+        {
+            let mut any = false;
+            for (n, v) in names.iter().zip(values.iter()) {
+                if record_alias_binding(n, v, alias_map, method_funcs, insert_only) {
+                    any = true;
+                }
+            }
+            any
+        }
+        _ => false,
+    }
+}
+
 /// Phase 2.5e (ADR 0020): walk the chunk AST to discover every call
 /// site whose callee is a top-level `FunctionDef` name, recording the
 /// static literal kind of each argument. The first call site for a
@@ -1182,74 +1254,28 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
     // Last-wins on `g` rebinds (HashMap insert semantics) — same
     // shadowing carry-over as `function_names` / `method_funcs`.
     // Pass-1 walk is TOP-LEVEL only (no descent into function bodies);
-    // function-body rebind / re-assignment / multi-step aliasing
-    // remain future work per ADR 0098 Non-goals.
+    // function-body rebind / control-flow re-assignment / etc. remain
+    // future work. Walker is TOP-LEVEL only (no descent into
+    // function bodies, if/while/for, etc.).
+    //
+    // Phase 2.6+-reassign-alias (ADR 0100): logic factored into
+    // `record_alias_binding` helper so Local / Assign / LocalMulti /
+    // AssignMulti × Round 1 (Index-chain last-wins) / Round 2+
+    // (Ident-rebind insert-only) all share one site (codex critical).
     let mut alias_map: HashMap<String, FuncId> = HashMap::new();
+    // Round 1: last-wins over Index-chain + Ident-rebind facts.
     for stmt in chunk {
-        match &stmt.kind {
-            StmtKind::Local { name, value } => {
-                if let Some((chain, method_name)) = extract_index_chain(value)
-                    && let Some(&fid) = method_funcs.get(&(chain, method_name))
-                {
-                    alias_map.insert(name.clone(), fid);
-                }
-            }
-            StmtKind::LocalMulti { names, values } if names.len() == values.len() => {
-                for (n, v) in names.iter().zip(values.iter()) {
-                    if let Some((chain, method_name)) = extract_index_chain(v)
-                        && let Some(&fid) = method_funcs.get(&(chain, method_name))
-                    {
-                        alias_map.insert(n.clone(), fid);
-                    }
-                }
-            }
-            _ => {}
-        }
+        process_alias_stmt(stmt, &mut alias_map, &method_funcs, false);
     }
-    // Phase 2.6+-multi-step-alias (ADR 0099): fixed-point closure
-    // over multi-step Ident → Ident aliases. After Round 1
-    // (Index-chain) above populates direct aliases like
-    // `local h = a.b.method`, Round 2+ propagates them through
-    // bare-Ident rebinds like `local g = h`.
-    //
-    // INVARIANT: insert-only. The `!alias_map.contains_key(name)`
-    // guard prevents overwriting entries, which guarantees
-    // termination — each iteration either grows `alias_map` by at
-    // least one entry or terminates. Bounded by the count of
-    // top-level Local bindings whose RHS resolves through the
-    // alias chain. Lua scoping forbids forward-reference
-    // (`local a = b` with b not yet declared), so cycles cannot
-    // form at chunk level.
-    //
-    // Round 1's last-wins shadowing (Index-chain) is preserved;
-    // Round 2's insert-only semantics is an acceptable divergence
-    // for the rebind-of-rebind case (documented in ADR 0099).
+    // Round 2+: fixed-point closure for multi-step Ident-rebinds.
+    // Insert-only guarantees termination (each iteration strictly
+    // grows alias_map over finite top-level Local/Assign names).
     let mut changed = true;
     while changed {
         changed = false;
         for stmt in chunk {
-            match &stmt.kind {
-                StmtKind::Local { name, value } => {
-                    if let ExprKind::Ident(other) = &value.kind
-                        && let Some(&fid) = alias_map.get(other)
-                        && !alias_map.contains_key(name)
-                    {
-                        alias_map.insert(name.clone(), fid);
-                        changed = true;
-                    }
-                }
-                StmtKind::LocalMulti { names, values } if names.len() == values.len() => {
-                    for (n, v) in names.iter().zip(values.iter()) {
-                        if let ExprKind::Ident(other) = &v.kind
-                            && let Some(&fid) = alias_map.get(other)
-                            && !alias_map.contains_key(n)
-                        {
-                            alias_map.insert(n.clone(), fid);
-                            changed = true;
-                        }
-                    }
-                }
-                _ => {}
+            if process_alias_stmt(stmt, &mut alias_map, &method_funcs, true) {
+                changed = true;
             }
         }
     }
