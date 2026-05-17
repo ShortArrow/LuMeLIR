@@ -400,6 +400,19 @@ fn emit_fmt_global<'c>(
         "table index is NaN\0",
         loc,
     );
+    // Phase 2.7r-stdlib-table (ADR 0106): runtime trap for
+    // `table.concat(t)` when an array-part element's tag is
+    // neither TAG_NUMBER nor TAG_STRING. Lua spec §6.8 mandates
+    // a runtime error for Bool/Nil/Table/Function elements
+    // (no implicit tostring coercion).
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_table_concat_bad_element",
+        "invalid value (non-string/number) in table for 'concat'\0",
+        loc,
+    );
 }
 
 fn emit_string_global<'c>(
@@ -7979,6 +7992,27 @@ fn emit_expr<'a, 'c>(
                     context, block, src, n_f64, types, loc,
                 ))
             }
+            Callee::Builtin(Builtin::TableConcat) => {
+                // Phase 2.7r-stdlib-table (ADR 0106): `table.concat(t)`
+                // — fixed arity 1, implicit sep="". The first
+                // non-math/non-string consumer of ADR 0103's
+                // `from_namespace_method` generic dispatcher. All
+                // runtime work in `emit_table_concat_runtime` (2-pass:
+                // length accumulation → malloc → copy + null-term).
+                let t_ptr = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                Ok(emit_table_concat_runtime(context, block, t_ptr, types, loc))
+            }
             Callee::User {
                 fid: FuncId(fid),
                 holding_local,
@@ -9004,6 +9038,517 @@ fn emit_string_rep_runtime<'a, 'c>(
     else_region.append_block(else_blk);
     let if_op = scf::r#if(count_pos, &[types.ptr], then_region, else_region, loc);
     block.append_operation(if_op).result(0).unwrap().into()
+}
+
+/// Phase 2.7r-stdlib-table (ADR 0106): `table.concat(t)` runtime.
+/// Lua 5.4 §6.8 array-part-only byte-wise concatenation with
+/// implicit `sep=""`. Each element must be TAG_NUMBER or
+/// TAG_STRING; any other tag (Bool/Nil/Table/Function/Deleted)
+/// traps via the `s_table_concat_bad_element` global.
+///
+/// 2-pass shape (Codex critical: NOT repeated `emit_concat`,
+/// which would be O(N²) by allocating per-step intermediates):
+/// pass 1 walks the array part to accumulate `total_len`;
+/// pass 2 mallocs once and walks again copying bytes. Numbers
+/// are stringified independently in each pass via the
+/// `emit_tostring(Number)` snprintf path — the redundant snprintf
+/// is intentional MVP simplicity. Future ADR may cache pass-1
+/// ptrs to skip the re-stringify.
+///
+/// Element-dispatch shape is INLINED in both passes (Codex
+/// critical: premature helper extract for a single fn-internal
+/// consumer; see `string.rep` precedent at `emit_string_rep_runtime`
+/// where the copy-loop was also kept inline).
+///
+/// Returns a freshly heap-allocated, null-terminated String ptr.
+/// Empty-table (length == 0) returns `emit_empty_string()`
+/// (ADR 0104 helper reuse).
+///
+/// `total_len` accumulation overflow + malloc OOM + snprintf
+/// fallibility are unchecked, matching existing string alloc
+/// helpers' carry-over policy (`emit_concat` / `emit_string_slice`
+/// / `emit_string_rep_runtime`).
+fn emit_table_concat_runtime<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    t_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    // Load length + array_buf from the 32-byte table header.
+    let len_slot = emit_byte_offset_ptr(context, block, t_ptr, TABLE_OFF_LEN, types, loc);
+    let length = emit_load(block, len_slot, types.i64, loc);
+    let arr_buf_slot = emit_byte_offset_ptr(context, block, t_ptr, TABLE_OFF_ARRAY_BUF, types, loc);
+    let arr_buf = emit_load(block, arr_buf_slot, types.ptr, loc);
+
+    let zero_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let one_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let elem_size = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, ARRAY_ELEM_SIZE).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let tag_number = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, TAG_NUMBER).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let tag_string = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, TAG_STRING).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+
+    // length > 0 → 2-pass; else → empty string.
+    let len_pos = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Sgt,
+            length,
+            zero_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        // ===== Pass 1: accumulate total_len. =====
+        let p1_before = Region::new();
+        // Carriers: (i, total) both i64.
+        let p1_before_blk = Block::new(&[(types.i64, loc), (types.i64, loc)]);
+        {
+            let i_arg: Value<'c, '_> = p1_before_blk.argument(0).unwrap().into();
+            let total_arg: Value<'c, '_> = p1_before_blk.argument(1).unwrap().into();
+            let cond: Value<'c, '_> = p1_before_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Slt,
+                    i_arg,
+                    length,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            p1_before_blk.append_operation(scf::condition(cond, &[i_arg, total_arg], loc));
+        }
+        p1_before.append_block(p1_before_blk);
+        let p1_after = Region::new();
+        let p1_after_blk = Block::new(&[(types.i64, loc), (types.i64, loc)]);
+        {
+            let i_arg: Value<'c, '_> = p1_after_blk.argument(0).unwrap().into();
+            let total_arg: Value<'c, '_> = p1_after_blk.argument(1).unwrap().into();
+            // elem_ptr = arr_buf + i * ARRAY_ELEM_SIZE
+            let slot_off: Value<'c, '_> = p1_after_blk
+                .append_operation(arith::muli(i_arg, elem_size, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let slot_ptr =
+                emit_byte_offset_ptr_dynamic(context, &p1_after_blk, arr_buf, slot_off, types, loc);
+            let tag = emit_load(&p1_after_blk, slot_ptr, types.i64, loc);
+            // Tag dispatch: NUMBER → stringify+strlen, STRING → strlen,
+            // else → trap. Yields elem_len (i64).
+            let elem_len = emit_table_concat_dispatch_len(
+                context,
+                &p1_after_blk,
+                slot_ptr,
+                tag,
+                tag_number,
+                tag_string,
+                types,
+                loc,
+            );
+            let next_total: Value<'c, '_> = p1_after_blk
+                .append_operation(arith::addi(total_arg, elem_len, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let next_i: Value<'c, '_> = p1_after_blk
+                .append_operation(arith::addi(i_arg, one_i64, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            p1_after_blk.append_operation(scf::r#yield(&[next_i, next_total], loc));
+        }
+        p1_after.append_block(p1_after_blk);
+        let p1_while = then_blk.append_operation(scf::r#while(
+            &[zero_i64, zero_i64],
+            &[types.i64, types.i64],
+            p1_before,
+            p1_after,
+            loc,
+        ));
+        let total: Value<'c, '_> = p1_while.result(1).unwrap().into();
+
+        // Allocate output buffer (total + 1 for null term).
+        let size = then_blk
+            .append_operation(arith::addi(total, one_i64, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let buf = emit_libc_call_ptr(context, &then_blk, "malloc", &[size], types, loc);
+
+        // ===== Pass 2: copy. =====
+        let p2_before = Region::new();
+        // Carriers: (i, offset) both i64.
+        let p2_before_blk = Block::new(&[(types.i64, loc), (types.i64, loc)]);
+        {
+            let i_arg: Value<'c, '_> = p2_before_blk.argument(0).unwrap().into();
+            let off_arg: Value<'c, '_> = p2_before_blk.argument(1).unwrap().into();
+            let cond: Value<'c, '_> = p2_before_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Slt,
+                    i_arg,
+                    length,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            p2_before_blk.append_operation(scf::condition(cond, &[i_arg, off_arg], loc));
+        }
+        p2_before.append_block(p2_before_blk);
+        let p2_after = Region::new();
+        let p2_after_blk = Block::new(&[(types.i64, loc), (types.i64, loc)]);
+        {
+            let i_arg: Value<'c, '_> = p2_after_blk.argument(0).unwrap().into();
+            let off_arg: Value<'c, '_> = p2_after_blk.argument(1).unwrap().into();
+            let slot_off: Value<'c, '_> = p2_after_blk
+                .append_operation(arith::muli(i_arg, elem_size, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let slot_ptr =
+                emit_byte_offset_ptr_dynamic(context, &p2_after_blk, arr_buf, slot_off, types, loc);
+            let tag = emit_load(&p2_after_blk, slot_ptr, types.i64, loc);
+            // Dispatch yields (str_ptr, elem_len). Numbers are
+            // re-stringified here (MVP simplicity; per-call leak).
+            let (str_ptr, elem_len) = emit_table_concat_dispatch_str(
+                context,
+                &p2_after_blk,
+                slot_ptr,
+                tag,
+                tag_number,
+                tag_string,
+                types,
+                loc,
+            );
+            let dst =
+                emit_byte_offset_ptr_dynamic(context, &p2_after_blk, buf, off_arg, types, loc);
+            let _ = emit_libc_call_ptr(
+                context,
+                &p2_after_blk,
+                "memcpy",
+                &[dst, str_ptr, elem_len],
+                types,
+                loc,
+            );
+            let next_off: Value<'c, '_> = p2_after_blk
+                .append_operation(arith::addi(off_arg, elem_len, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let next_i: Value<'c, '_> = p2_after_blk
+                .append_operation(arith::addi(i_arg, one_i64, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            p2_after_blk.append_operation(scf::r#yield(&[next_i, next_off], loc));
+        }
+        p2_after.append_block(p2_after_blk);
+        then_blk.append_operation(scf::r#while(
+            &[zero_i64, zero_i64],
+            &[types.i64, types.i64],
+            p2_before,
+            p2_after,
+            loc,
+        ));
+
+        // Null-terminate at buf[total].
+        let term_ptr = emit_byte_offset_ptr_dynamic(context, &then_blk, buf, total, types, loc);
+        let i8_ty: Type<'c> = IntegerType::new(context, 8).into();
+        let zero_i8 = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(i8_ty, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        then_blk.append_operation(
+            OperationBuilder::new("llvm.store", loc)
+                .add_operands(&[zero_i8, term_ptr])
+                .build()
+                .expect("llvm.store concat null term"),
+        );
+        then_blk.append_operation(scf::r#yield(&[buf], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    {
+        let empty = emit_empty_string(context, &else_blk, types, loc);
+        else_blk.append_operation(scf::r#yield(&[empty], loc));
+    }
+    else_region.append_block(else_blk);
+    let if_op = scf::r#if(len_pos, &[types.ptr], then_region, else_region, loc);
+    block.append_operation(if_op).result(0).unwrap().into()
+}
+
+/// Phase 2.7r-stdlib-table (ADR 0106): pass-1 element dispatch
+/// for `table.concat`. Loads payload and dispatches on tag:
+/// TAG_NUMBER → stringify (snprintf) + strlen, TAG_STRING →
+/// strlen of payload ptr, else → trap. Returns elem_len (i64).
+/// The string ptr produced by TAG_NUMBER's snprintf is discarded
+/// here (intentional MVP redundancy — pass 2 re-stringifies).
+#[allow(clippy::too_many_arguments)]
+fn emit_table_concat_dispatch_len<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_ptr: Value<'c, 'a>,
+    tag: Value<'c, 'a>,
+    tag_number: Value<'c, 'a>,
+    tag_string: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let payload_ptr =
+        emit_byte_offset_ptr(context, block, slot_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
+    let is_number: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            tag,
+            tag_number,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let num_region = Region::new();
+    let num_blk = Block::new(&[]);
+    {
+        let payload_f64 = emit_load(&num_blk, payload_ptr, types.f64, loc);
+        let str_ptr = emit_tostring(
+            context,
+            &num_blk,
+            payload_f64,
+            ValueKind::Number,
+            types,
+            loc,
+        );
+        let elem_len = emit_libc_call_i64(context, &num_blk, "strlen", &[str_ptr], types, loc);
+        num_blk.append_operation(scf::r#yield(&[elem_len], loc));
+    }
+    num_region.append_block(num_blk);
+    let nonnum_region = Region::new();
+    let nonnum_blk = Block::new(&[]);
+    {
+        let is_string: Value<'c, '_> = nonnum_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                tag,
+                tag_string,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let str_region = Region::new();
+        let str_blk = Block::new(&[]);
+        {
+            let str_ptr = emit_load(&str_blk, payload_ptr, types.ptr, loc);
+            let elem_len = emit_libc_call_i64(context, &str_blk, "strlen", &[str_ptr], types, loc);
+            str_blk.append_operation(scf::r#yield(&[elem_len], loc));
+        }
+        str_region.append_block(str_blk);
+        let trap_region = Region::new();
+        let trap_blk = Block::new(&[]);
+        {
+            let msg = emit_addressof(context, &trap_blk, "s_table_concat_bad_element", types, loc);
+            emit_exit_with_message(context, &trap_blk, msg, types, loc);
+            // Unreachable — but scf::r#if requires a yield matching
+            // the result types. Placeholder zero.
+            let placeholder = trap_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 0).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            trap_blk.append_operation(scf::r#yield(&[placeholder], loc));
+        }
+        trap_region.append_block(trap_blk);
+        let inner_if = scf::r#if(is_string, &[types.i64], str_region, trap_region, loc);
+        let inner_len: Value<'c, '_> = nonnum_blk
+            .append_operation(inner_if)
+            .result(0)
+            .unwrap()
+            .into();
+        nonnum_blk.append_operation(scf::r#yield(&[inner_len], loc));
+    }
+    nonnum_region.append_block(nonnum_blk);
+    let outer_if = scf::r#if(is_number, &[types.i64], num_region, nonnum_region, loc);
+    block.append_operation(outer_if).result(0).unwrap().into()
+}
+
+/// Phase 2.7r-stdlib-table (ADR 0106): pass-2 element dispatch
+/// for `table.concat`. Same tag-dispatch shape as
+/// `emit_table_concat_dispatch_len` but yields `(str_ptr,
+/// elem_len)` so the caller can memcpy. TAG_NUMBER re-runs the
+/// snprintf (no cache from pass 1; MVP simplicity).
+#[allow(clippy::too_many_arguments)]
+fn emit_table_concat_dispatch_str<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_ptr: Value<'c, 'a>,
+    tag: Value<'c, 'a>,
+    tag_number: Value<'c, 'a>,
+    tag_string: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> (Value<'c, 'a>, Value<'c, 'a>) {
+    let payload_ptr =
+        emit_byte_offset_ptr(context, block, slot_ptr, ARRAY_ELEM_OFF_VALUE, types, loc);
+    let is_number: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            tag,
+            tag_number,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let num_region = Region::new();
+    let num_blk = Block::new(&[]);
+    {
+        let payload_f64 = emit_load(&num_blk, payload_ptr, types.f64, loc);
+        let str_ptr = emit_tostring(
+            context,
+            &num_blk,
+            payload_f64,
+            ValueKind::Number,
+            types,
+            loc,
+        );
+        let elem_len = emit_libc_call_i64(context, &num_blk, "strlen", &[str_ptr], types, loc);
+        num_blk.append_operation(scf::r#yield(&[str_ptr, elem_len], loc));
+    }
+    num_region.append_block(num_blk);
+    let nonnum_region = Region::new();
+    let nonnum_blk = Block::new(&[]);
+    {
+        let is_string: Value<'c, '_> = nonnum_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                tag,
+                tag_string,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let str_region = Region::new();
+        let str_blk = Block::new(&[]);
+        {
+            let str_ptr = emit_load(&str_blk, payload_ptr, types.ptr, loc);
+            let elem_len = emit_libc_call_i64(context, &str_blk, "strlen", &[str_ptr], types, loc);
+            str_blk.append_operation(scf::r#yield(&[str_ptr, elem_len], loc));
+        }
+        str_region.append_block(str_blk);
+        let trap_region = Region::new();
+        let trap_blk = Block::new(&[]);
+        {
+            let msg = emit_addressof(context, &trap_blk, "s_table_concat_bad_element", types, loc);
+            emit_exit_with_message(context, &trap_blk, msg, types, loc);
+            // Unreachable placeholders.
+            let null_ptr = trap_blk
+                .append_operation(
+                    OperationBuilder::new("llvm.mlir.zero", loc)
+                        .add_results(&[types.ptr])
+                        .build()
+                        .expect("llvm.mlir.zero ptr"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let zero_len = trap_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 0).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            trap_blk.append_operation(scf::r#yield(&[null_ptr, zero_len], loc));
+        }
+        trap_region.append_block(trap_blk);
+        let inner_if = scf::r#if(
+            is_string,
+            &[types.ptr, types.i64],
+            str_region,
+            trap_region,
+            loc,
+        );
+        let inner_op = nonnum_blk.append_operation(inner_if);
+        let inner_str: Value<'c, '_> = inner_op.result(0).unwrap().into();
+        let inner_len: Value<'c, '_> = inner_op.result(1).unwrap().into();
+        nonnum_blk.append_operation(scf::r#yield(&[inner_str, inner_len], loc));
+    }
+    nonnum_region.append_block(nonnum_blk);
+    let outer_if = scf::r#if(
+        is_number,
+        &[types.ptr, types.i64],
+        num_region,
+        nonnum_region,
+        loc,
+    );
+    let outer_op = block.append_operation(outer_if);
+    (
+        outer_op.result(0).unwrap().into(),
+        outer_op.result(1).unwrap().into(),
+    )
 }
 
 fn emit_concat<'a, 'c>(

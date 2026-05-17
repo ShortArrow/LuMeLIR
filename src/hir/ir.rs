@@ -423,6 +423,15 @@ pub enum Builtin {
     /// `n <= 0` returns the empty string (runtime branch). Phase
     /// 2.7q-stdlib-string (ADR 0105).
     StringRep,
+    /// `table.concat(t)` — Lua 5.4 §6.8 array-part concatenation
+    /// with implicit `sep=""`. The first non-math, non-string
+    /// consumer of ADR 0103's `Builtin::from_namespace_method`
+    /// generic dispatcher. Fixed arity 1 (Option A scope); the
+    /// 2/3/4-arg forms (sep / i / j) are deferred future ADRs.
+    /// Elements must be Number or String; Bool/Nil/Table/Function
+    /// trap at runtime per Lua spec. Phase 2.7r-stdlib-table
+    /// (ADR 0106).
+    TableConcat,
 }
 
 impl Builtin {
@@ -475,15 +484,28 @@ impl Builtin {
         }
     }
 
+    /// Phase 2.7r-stdlib-table (ADR 0106): map a `table.<method>`
+    /// name to a Builtin variant. Returns None for unrecognized
+    /// methods so `lower_call` falls through to the normal
+    /// Index-callee path.
+    pub fn table_from_method(method: &str) -> Option<Self> {
+        match method {
+            "concat" => Some(Builtin::TableConcat),
+            _ => None,
+        }
+    }
+
     /// Phase 2.7q-stdlib-string (ADR 0103): generic namespace
     /// dispatcher. `lower_call`'s namespace builtin chokepoint
     /// invokes this with the unresolved `ns` identifier and the
-    /// method name. Future ADRs (table.* / io.* etc.) extend
-    /// here without touching the call site.
+    /// method name. Future ADRs (io.* etc.) extend here without
+    /// touching the call site. ADR 0106 added the `table`
+    /// namespace — the first non-math, non-string consumer.
     pub fn from_namespace_method(ns: &str, method: &str) -> Option<Self> {
         match ns {
             "math" => Self::math_from_method(method),
             "string" => Self::string_from_method(method),
+            "table" => Self::table_from_method(method),
             _ => None,
         }
     }
@@ -507,6 +529,8 @@ impl Builtin {
             Builtin::StringSub => 2,
             // ADR 0105 — string.rep takes exactly 2 args.
             Builtin::StringRep => 2,
+            // ADR 0106 — table.concat (Option A: arity 1 only).
+            Builtin::TableConcat => 1,
         }
     }
 
@@ -532,6 +556,7 @@ impl Builtin {
             Builtin::StringLower => "string.lower",
             Builtin::StringSub => "string.sub",
             Builtin::StringRep => "string.rep",
+            Builtin::TableConcat => "table.concat",
         }
     }
 
@@ -564,7 +589,8 @@ impl Builtin {
             Builtin::StringUpper
             | Builtin::StringLower
             | Builtin::StringSub
-            | Builtin::StringRep => &[ValueKind::String],
+            | Builtin::StringRep
+            | Builtin::TableConcat => &[ValueKind::String],
         }
     }
 }
