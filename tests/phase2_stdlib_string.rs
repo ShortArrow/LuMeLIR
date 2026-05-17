@@ -206,3 +206,86 @@ function string.sub(x) return x + 200 end
 print(string.sub(42))";
     assert_eq!(run_ok(src, "lumelir_string_sub_shadowed").trim(), "242");
 }
+
+// --- ADR 0105: string.rep (1 happy + 4 boundary + 2 arity + 1 shadow) ---
+//
+// Lua 5.4 §6.4 semantics:
+//   string.rep(s, n)
+//     - n <= 0 → empty string
+//     - n == 1 → s (copy)
+//     - n >= 1 → buf = malloc(n * #s + 1); n × memcpy(buf+i*#s, s, #s)
+//
+// Fixed arity 2; the variadic `sep` form `string.rep(s, n, sep)` is
+// a future ADR.
+
+#[test]
+fn string_rep_basic() {
+    let src = "print(string.rep(\"ab\", 3))";
+    assert_eq!(run_ok(src, "lumelir_string_rep_basic").trim(), "ababab");
+}
+
+#[test]
+fn string_rep_zero_is_empty() {
+    // n = 0 → "" (Lua spec).
+    let src = "print(string.rep(\"ab\", 0))";
+    assert_eq!(run_ok(src, "lumelir_string_rep_zero").trim(), "");
+}
+
+#[test]
+fn string_rep_one_is_identity_copy() {
+    // n = 1 → single copy, identical bytes.
+    let src = "print(string.rep(\"ab\", 1))";
+    assert_eq!(run_ok(src, "lumelir_string_rep_one").trim(), "ab");
+}
+
+#[test]
+fn string_rep_two_doubles() {
+    // n = 2 → loop runs twice.
+    let src = "print(string.rep(\"ab\", 2))";
+    assert_eq!(run_ok(src, "lumelir_string_rep_two").trim(), "abab");
+}
+
+#[test]
+fn string_rep_empty_src_is_empty() {
+    // Empty src × any n → empty (n * 0 = 0).
+    let src = "print(string.rep(\"\", 5))";
+    assert_eq!(run_ok(src, "lumelir_string_rep_empty_src").trim(), "");
+}
+
+#[test]
+fn string_rep_negative_n_is_empty() {
+    // n < 0 → "" per Lua spec (count_pos branch absorbs).
+    let src = "print(string.rep(\"ab\", -1))";
+    assert_eq!(run_ok(src, "lumelir_string_rep_neg").trim(), "");
+}
+
+#[test]
+fn string_rep_arity_zero_fails() {
+    let chunk = lumelir::parser::parse("print(string.rep())").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("string.rep with 0 args must fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("ArityMismatch"),
+        "expected ArityMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn string_rep_arity_three_fails() {
+    // Fixed arity 2; the variadic `sep` form is a future ADR.
+    let chunk = lumelir::parser::parse("print(string.rep(\"a\", 2, \"x\"))").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("string.rep with 3 args must fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("ArityMismatch"),
+        "expected ArityMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn string_rep_shadowed_respects_user_table() {
+    let src = "local string = {}
+function string.rep(x) return x + 300 end
+print(string.rep(42))";
+    assert_eq!(run_ok(src, "lumelir_string_rep_shadowed").trim(), "342");
+}

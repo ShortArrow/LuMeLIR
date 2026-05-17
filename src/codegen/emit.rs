@@ -7945,6 +7945,40 @@ fn emit_expr<'a, 'c>(
                 let if_op = scf::r#if(count_pos, &[types.ptr], then_region, else_region, loc);
                 Ok(block.append_operation(if_op).result(0).unwrap().into())
             }
+            Callee::Builtin(Builtin::StringRep) => {
+                // Phase 2.7q-stdlib-string (ADR 0105): `string.rep(s, n)`
+                // — fixed arity 2. All runtime work in
+                // `emit_string_rep_runtime` (strlen + fptosi + scf::if
+                // + malloc + scf::while copy-loop + null-term). This
+                // arm is pure plumbing.
+                let src = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let n_f64 = emit_expr(
+                    context,
+                    block,
+                    &args[1],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                Ok(emit_string_rep_runtime(
+                    context, block, src, n_f64, types, loc,
+                ))
+            }
             Callee::User {
                 fid: FuncId(fid),
                 holding_local,
@@ -8814,6 +8848,162 @@ fn emit_string_slice<'a, 'c>(
             .expect("llvm.store slice null term"),
     );
     buf
+}
+
+/// Phase 2.7q-stdlib-string (ADR 0105): `string.rep(s, n)` runtime
+/// emit. Lua 5.4 §6.4 semantics — repeat `s` exactly `n` times,
+/// returning a fresh heap-allocated String. `n <= 0` yields the
+/// empty string (no malloc beyond the 1-byte null-term carrier in
+/// `emit_empty_string`); positive `n` allocates `n * #s + 1` bytes
+/// and memcpys `s` into each slot via a `scf::r#while` loop.
+///
+/// Effectful helper boundary mirrors `emit_string_case_map` /
+/// `emit_string_slice`: all of strlen + fptosi + scf::if + alloc +
+/// copy-loop live inside this one function. The inner copy-loop
+/// is NOT extracted as its own helper — `table.concat`'s "multiple
+/// distinct sources" shape is different, and no other caller needs
+/// "same source repeated N times" today (Codex critical: avoid
+/// premature helper carved for implementation convenience only).
+///
+/// `n * #s` integer overflow and malloc OOM are unchecked, matching
+/// existing string alloc-and-leak shape (carry-over from
+/// `emit_concat` / `emit_string_case_map` / `emit_string_slice`).
+/// Future ADR consolidates the alloc-size policy.
+fn emit_string_rep_runtime<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    src: Value<'c, 'a>,
+    count_f64: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let len_i64 = emit_libc_call_i64(context, block, "strlen", &[src], types, loc);
+    let count_i64 = emit_f2i(block, count_f64, types, loc);
+    let zero_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let one_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    // Lua spec §6.4: n <= 0 → empty string.
+    let count_pos = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Sgt,
+            count_i64,
+            zero_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        // total = n * len; alloc(total + 1); fill loop; null-term.
+        let total = then_blk
+            .append_operation(arith::muli(count_i64, len_i64, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let size = then_blk
+            .append_operation(arith::addi(total, one_i64, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let buf = emit_libc_call_ptr(context, &then_blk, "malloc", &[size], types, loc);
+        // scf::r#while (no scf::for in melior 0.27) — carrier is the
+        // 0-based loop index i (i64). Each iter: memcpy(buf + i*len,
+        // src, len); i += 1; until i == count.
+        let before_region = Region::new();
+        let before_blk = Block::new(&[(types.i64, loc)]);
+        {
+            let i_arg: Value<'c, '_> = before_blk.argument(0).unwrap().into();
+            let cond: Value<'c, '_> = before_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Slt,
+                    i_arg,
+                    count_i64,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            before_blk.append_operation(scf::condition(cond, &[i_arg], loc));
+        }
+        before_region.append_block(before_blk);
+        let after_region = Region::new();
+        let after_blk = Block::new(&[(types.i64, loc)]);
+        {
+            let i_arg: Value<'c, '_> = after_blk.argument(0).unwrap().into();
+            // offset = i * len
+            let offset: Value<'c, '_> = after_blk
+                .append_operation(arith::muli(i_arg, len_i64, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let dst = emit_byte_offset_ptr_dynamic(context, &after_blk, buf, offset, types, loc);
+            let _ = emit_libc_call_ptr(
+                context,
+                &after_blk,
+                "memcpy",
+                &[dst, src, len_i64],
+                types,
+                loc,
+            );
+            let next: Value<'c, '_> = after_blk
+                .append_operation(arith::addi(i_arg, one_i64, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            after_blk.append_operation(scf::r#yield(&[next], loc));
+        }
+        after_region.append_block(after_blk);
+        let while_op = scf::r#while(&[zero_i64], &[types.i64], before_region, after_region, loc);
+        then_blk.append_operation(while_op);
+        // Null-terminate at buf[total].
+        let term_ptr = emit_byte_offset_ptr_dynamic(context, &then_blk, buf, total, types, loc);
+        let i8_ty: Type<'c> = IntegerType::new(context, 8).into();
+        let zero_i8 = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(i8_ty, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        then_blk.append_operation(
+            OperationBuilder::new("llvm.store", loc)
+                .add_operands(&[zero_i8, term_ptr])
+                .build()
+                .expect("llvm.store rep null term"),
+        );
+        then_blk.append_operation(scf::r#yield(&[buf], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    {
+        let empty = emit_empty_string(context, &else_blk, types, loc);
+        else_blk.append_operation(scf::r#yield(&[empty], loc));
+    }
+    else_region.append_block(else_blk);
+    let if_op = scf::r#if(count_pos, &[types.ptr], then_region, else_region, loc);
+    block.append_operation(if_op).result(0).unwrap().into()
 }
 
 fn emit_concat<'a, 'c>(

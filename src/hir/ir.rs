@@ -418,6 +418,11 @@ pub enum Builtin {
     /// precedent in `lower_builtin_call` (`Builtin::arity()` reports
     /// the minimum, 2). Phase 2.7q-stdlib-string (ADR 0104).
     StringSub,
+    /// `string.rep(s, n)` — Lua 5.4 §6.4 byte-wise repetition. Fixed
+    /// arity 2; the variadic `sep` 3-arg form is a future ADR.
+    /// `n <= 0` returns the empty string (runtime branch). Phase
+    /// 2.7q-stdlib-string (ADR 0105).
+    StringRep,
 }
 
 impl Builtin {
@@ -464,6 +469,8 @@ impl Builtin {
             "lower" => Some(Builtin::StringLower),
             // ADR 0104 — string.sub.
             "sub" => Some(Builtin::StringSub),
+            // ADR 0105 — string.rep.
+            "rep" => Some(Builtin::StringRep),
             _ => None,
         }
     }
@@ -498,6 +505,8 @@ impl Builtin {
             // the minimum here. The actual 2-or-3 check lives in
             // `lower_namespace_builtin_call` (Assert precedent).
             Builtin::StringSub => 2,
+            // ADR 0105 — string.rep takes exactly 2 args.
+            Builtin::StringRep => 2,
         }
     }
 
@@ -522,6 +531,7 @@ impl Builtin {
             Builtin::StringUpper => "string.upper",
             Builtin::StringLower => "string.lower",
             Builtin::StringSub => "string.sub",
+            Builtin::StringRep => "string.rep",
         }
     }
 
@@ -551,9 +561,10 @@ impl Builtin {
             | Builtin::MathExp => &[ValueKind::Number],
             // Phase 2.7q-stdlib-string (ADR 0103).
             Builtin::StringLen => &[ValueKind::Number],
-            Builtin::StringUpper | Builtin::StringLower | Builtin::StringSub => {
-                &[ValueKind::String]
-            }
+            Builtin::StringUpper
+            | Builtin::StringLower
+            | Builtin::StringSub
+            | Builtin::StringRep => &[ValueKind::String],
         }
     }
 }

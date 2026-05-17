@@ -251,7 +251,8 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // string.lower allocate and return a new String.
             Callee::Builtin(Builtin::StringUpper)
             | Callee::Builtin(Builtin::StringLower)
-            | Callee::Builtin(Builtin::StringSub) => ValueKind::String,
+            | Callee::Builtin(Builtin::StringSub)
+            | Callee::Builtin(Builtin::StringRep) => ValueKind::String,
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.
