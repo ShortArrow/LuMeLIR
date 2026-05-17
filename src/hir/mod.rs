@@ -4489,30 +4489,20 @@ impl LowerCtx {
                 });
             }
         };
-        // Phase 2.8b (ADR 0032): `print` is the one variadic builtin
-        // — accepts any arity ≥ 0. Phase 2.7m (ADR 0051): `assert`
-        // takes 1 *or* 2 args (the optional second is a String
-        // failure-message). Every other builtin keeps its fixed
-        // arity from `Builtin::arity()`.
-        if matches!(builtin, Builtin::Assert) {
-            if args.is_empty() || args.len() > 2 {
-                return Err(HirError::ArityMismatch {
-                    builtin: name.clone(),
-                    expected: 1,
-                    actual: args.len(),
-                    offset: whole.span.start,
-                });
-            }
-        } else if !matches!(builtin, Builtin::Print) {
-            let arity = builtin.arity();
-            if args.len() != arity {
-                return Err(HirError::ArityMismatch {
-                    builtin: name.clone(),
-                    expected: arity,
-                    actual: args.len(),
-                    offset: whole.span.start,
-                });
-            }
+        // Phase 2.7r-stdlib-table (ADR 0107): uniform range arity
+        // check. Replaces the previous Assert / Print special cases
+        // (Assert hardcoded 1-2 + Print "skip check") with one
+        // `(min, max)` comparison. Print's `(0, usize::MAX)` and
+        // Assert's `(1, 2)` from `Builtin::arity()` now flow
+        // through the same path as every other global builtin.
+        let (arity_min, arity_max) = builtin.arity();
+        if args.len() < arity_min || args.len() > arity_max {
+            return Err(HirError::ArityMismatch {
+                builtin: name.clone(),
+                expected: arity_min,
+                actual: args.len(),
+                offset: whole.span.start,
+            });
         }
         let lowered_args = args
             .iter()
@@ -4638,31 +4628,20 @@ impl LowerCtx {
         args: &[Expr],
         call_span: Span,
     ) -> Result<HirExprKind, HirError> {
-        // Phase 2.7q-stdlib-string (ADR 0104): `string.sub(s, i [, j])`
-        // is the first range-arity namespace builtin (2 or 3). The
-        // Assert precedent in `lower_builtin_call` is followed —
-        // `Builtin::arity()` reports the minimum (2), and the actual
-        // 2-or-3 check lives here. A future ADR can refactor to a
-        // generic min/max scheme once 3+ range builtins exist.
-        if matches!(builtin, Builtin::StringSub) {
-            if args.len() < 2 || args.len() > 3 {
-                return Err(HirError::ArityMismatch {
-                    builtin: builtin.name().to_owned(),
-                    expected: 2,
-                    actual: args.len(),
-                    offset: call_span.start,
-                });
-            }
-        } else {
-            let arity = builtin.arity();
-            if args.len() != arity {
-                return Err(HirError::ArityMismatch {
-                    builtin: builtin.name().to_owned(),
-                    expected: arity,
-                    actual: args.len(),
-                    offset: call_span.start,
-                });
-            }
+        // Phase 2.7r-stdlib-table (ADR 0107): uniform range arity
+        // check. Replaces ADR 0104's `StringSub` special case (2-3
+        // hardcoded) with the same `(min, max)` shape used in
+        // `lower_builtin_call`. `Builtin::arity()` is the single
+        // source of truth for both fixed-arity and range-arity
+        // builtins (Assert, StringSub, TableConcat).
+        let (arity_min, arity_max) = builtin.arity();
+        if args.len() < arity_min || args.len() > arity_max {
+            return Err(HirError::ArityMismatch {
+                builtin: builtin.name().to_owned(),
+                expected: arity_min,
+                actual: args.len(),
+                offset: call_span.start,
+            });
         }
         let lowered_args = args
             .iter()

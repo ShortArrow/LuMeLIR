@@ -7994,11 +7994,13 @@ fn emit_expr<'a, 'c>(
             }
             Callee::Builtin(Builtin::TableConcat) => {
                 // Phase 2.7r-stdlib-table (ADR 0106): `table.concat(t)`
-                // — fixed arity 1, implicit sep="". The first
-                // non-math/non-string consumer of ADR 0103's
-                // `from_namespace_method` generic dispatcher. All
-                // runtime work in `emit_table_concat_runtime` (2-pass:
-                // length accumulation → malloc → copy + null-term).
+                // — the first non-math/non-string consumer of ADR
+                // 0103's `from_namespace_method` generic dispatcher.
+                // ADR 0107 extends to `table.concat(t, sep)` via
+                // arity range (1, 2). All runtime work in
+                // `emit_table_concat_runtime`; this arm materialises
+                // the sep (empty-string for arity 1, lowered arg for
+                // arity 2) and forwards.
                 let t_ptr = emit_expr(
                     context,
                     block,
@@ -8011,7 +8013,41 @@ fn emit_expr<'a, 'c>(
                     in_function_cell_ptr,
                     loc,
                 )?;
-                Ok(emit_table_concat_runtime(context, block, t_ptr, types, loc))
+                let (sep_ptr, sep_len) = if args.len() == 1 {
+                    // Arity 1 path: synthesize empty sep so the
+                    // helper has a single uniform shape. sep_len = 0
+                    // makes pass-1 `sep_len * (length-1)` term zero
+                    // and pass-2 sep memcpy a no-op (0-byte copy).
+                    let empty = emit_empty_string(context, block, types, loc);
+                    let zero_len = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 0).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    (empty, zero_len)
+                } else {
+                    let sep = emit_expr(
+                        context,
+                        block,
+                        &args[1],
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
+                    )?;
+                    let sep_len = emit_libc_call_i64(context, block, "strlen", &[sep], types, loc);
+                    (sep, sep_len)
+                };
+                Ok(emit_table_concat_runtime(
+                    context, block, t_ptr, sep_ptr, sep_len, types, loc,
+                ))
             }
             Callee::User {
                 fid: FuncId(fid),
@@ -9068,10 +9104,13 @@ fn emit_string_rep_runtime<'a, 'c>(
 /// fallibility are unchecked, matching existing string alloc
 /// helpers' carry-over policy (`emit_concat` / `emit_string_slice`
 /// / `emit_string_rep_runtime`).
+#[allow(clippy::too_many_arguments)]
 fn emit_table_concat_runtime<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     t_ptr: Value<'c, 'a>,
+    sep_ptr: Value<'c, 'a>,
+    sep_len: Value<'c, 'a>,
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
@@ -9210,7 +9249,27 @@ fn emit_table_concat_runtime<'a, 'c>(
             p1_after,
             loc,
         ));
-        let total: Value<'c, '_> = p1_while.result(1).unwrap().into();
+        let elem_total: Value<'c, '_> = p1_while.result(1).unwrap().into();
+
+        // ADR 0107 sep accounting: there are (length - 1) sep
+        // insertions for `length` elements (no leading/trailing
+        // sep, and length > 0 is guaranteed by the outer scf::if).
+        // total = elem_total + sep_len * (length - 1).
+        let len_minus_one: Value<'c, '_> = then_blk
+            .append_operation(arith::subi(length, one_i64, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let sep_total: Value<'c, '_> = then_blk
+            .append_operation(arith::muli(sep_len, len_minus_one, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let total: Value<'c, '_> = then_blk
+            .append_operation(arith::addi(elem_total, sep_total, loc))
+            .result(0)
+            .unwrap()
+            .into();
 
         // Allocate output buffer (total + 1 for null term).
         let size = then_blk
@@ -9254,6 +9313,57 @@ fn emit_table_concat_runtime<'a, 'c>(
             let slot_ptr =
                 emit_byte_offset_ptr_dynamic(context, &p2_after_blk, arr_buf, slot_off, types, loc);
             let tag = emit_load(&p2_after_blk, slot_ptr, types.i64, loc);
+            // ADR 0107: before every element except the first
+            // (i > 0), memcpy `sep_len` bytes from `sep_ptr` to
+            // `buf + off_arg` and advance the offset by sep_len.
+            // Wrapped in scf::r#if so the i == 0 path is a no-op.
+            let is_after_first: Value<'c, '_> = p2_after_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Sgt,
+                    i_arg,
+                    zero_i64,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let sep_then_region = Region::new();
+            let sep_then_blk = Block::new(&[]);
+            {
+                let sep_dst =
+                    emit_byte_offset_ptr_dynamic(context, &sep_then_blk, buf, off_arg, types, loc);
+                let _ = emit_libc_call_ptr(
+                    context,
+                    &sep_then_blk,
+                    "memcpy",
+                    &[sep_dst, sep_ptr, sep_len],
+                    types,
+                    loc,
+                );
+                let off_after_sep: Value<'c, '_> = sep_then_blk
+                    .append_operation(arith::addi(off_arg, sep_len, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                sep_then_blk.append_operation(scf::r#yield(&[off_after_sep], loc));
+            }
+            sep_then_region.append_block(sep_then_blk);
+            let sep_else_region = Region::new();
+            let sep_else_blk = Block::new(&[]);
+            sep_else_blk.append_operation(scf::r#yield(&[off_arg], loc));
+            sep_else_region.append_block(sep_else_blk);
+            let off_after_sep: Value<'c, '_> = p2_after_blk
+                .append_operation(scf::r#if(
+                    is_after_first,
+                    &[types.i64],
+                    sep_then_region,
+                    sep_else_region,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
             // Dispatch yields (str_ptr, elem_len). Numbers are
             // re-stringified here (MVP simplicity; per-call leak).
             let (str_ptr, elem_len) = emit_table_concat_dispatch_str(
@@ -9266,8 +9376,14 @@ fn emit_table_concat_runtime<'a, 'c>(
                 types,
                 loc,
             );
-            let dst =
-                emit_byte_offset_ptr_dynamic(context, &p2_after_blk, buf, off_arg, types, loc);
+            let dst = emit_byte_offset_ptr_dynamic(
+                context,
+                &p2_after_blk,
+                buf,
+                off_after_sep,
+                types,
+                loc,
+            );
             let _ = emit_libc_call_ptr(
                 context,
                 &p2_after_blk,
@@ -9277,7 +9393,7 @@ fn emit_table_concat_runtime<'a, 'c>(
                 loc,
             );
             let next_off: Value<'c, '_> = p2_after_blk
-                .append_operation(arith::addi(off_arg, elem_len, loc))
+                .append_operation(arith::addi(off_after_sep, elem_len, loc))
                 .result(0)
                 .unwrap()
                 .into();

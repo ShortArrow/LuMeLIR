@@ -510,27 +510,37 @@ impl Builtin {
         }
     }
 
-    pub fn arity(self) -> usize {
+    /// Phase 2.7r-stdlib-table (ADR 0107): arity spec as
+    /// `(min, max)` range. Fixed-arity builtins use `(N, N)`;
+    /// range-arity builtins (Print, Assert, StringSub,
+    /// TableConcat) report their inclusive bounds. Replaces the
+    /// `arity() -> usize` + ad-hoc special-case branches at
+    /// `lower_builtin_call` / `lower_namespace_builtin_call` that
+    /// previously handled Print's variadic case and Assert /
+    /// StringSub's range. Now both call sites do a uniform
+    /// `args.len() < min || args.len() > max` check.
+    pub fn arity(self) -> (usize, usize) {
         match self {
-            Builtin::Print => 1,
-            Builtin::ToString => 1,
-            Builtin::ToNumber => 1,
-            Builtin::Type => 1,
-            Builtin::Assert => 1,
-            Builtin::Error => 1,
-            Builtin::Next => 2,
-            Builtin::MathSqrt | Builtin::MathFloor | Builtin::MathAbs => 1,
-            Builtin::MathPow => 2,
-            Builtin::MathSin | Builtin::MathCos | Builtin::MathLog | Builtin::MathExp => 1,
-            Builtin::StringLen | Builtin::StringUpper | Builtin::StringLower => 1,
-            // ADR 0104 — string.sub takes 2 or 3 args; report
-            // the minimum here. The actual 2-or-3 check lives in
-            // `lower_namespace_builtin_call` (Assert precedent).
-            Builtin::StringSub => 2,
-            // ADR 0105 — string.rep takes exactly 2 args.
-            Builtin::StringRep => 2,
-            // ADR 0106 — table.concat (Option A: arity 1 only).
-            Builtin::TableConcat => 1,
+            // Variadic — Lua's `print` accepts any positive arity
+            // including 0.
+            Builtin::Print => (0, usize::MAX),
+            Builtin::ToString => (1, 1),
+            Builtin::ToNumber => (1, 1),
+            Builtin::Type => (1, 1),
+            // ADR 0030 / 0051: assert(v) or assert(v, msg).
+            Builtin::Assert => (1, 2),
+            Builtin::Error => (1, 1),
+            Builtin::Next => (2, 2),
+            Builtin::MathSqrt | Builtin::MathFloor | Builtin::MathAbs => (1, 1),
+            Builtin::MathPow => (2, 2),
+            Builtin::MathSin | Builtin::MathCos | Builtin::MathLog | Builtin::MathExp => (1, 1),
+            Builtin::StringLen | Builtin::StringUpper | Builtin::StringLower => (1, 1),
+            // ADR 0104 — string.sub(s, i) or string.sub(s, i, j).
+            Builtin::StringSub => (2, 3),
+            // ADR 0105 — string.rep(s, n) exact arity 2.
+            Builtin::StringRep => (2, 2),
+            // ADR 0106/0107 — table.concat(t) or table.concat(t, sep).
+            Builtin::TableConcat => (1, 2),
         }
     }
 

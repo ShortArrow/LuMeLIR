@@ -107,13 +107,91 @@ print(table.concat(42))";
 
 #[test]
 fn table_concat_arity_zero_fails() {
-    // Fixed arity 1; calling with 0 must surface ArityMismatch via
-    // `lower_namespace_builtin_call`.
+    // Arity range (1, 2); calling with 0 must surface ArityMismatch
+    // via `lower_namespace_builtin_call` uniform range check after
+    // ADR 0107 (was: fixed arity 1 with special case).
     let chunk = lumelir::parser::parse("print(table.concat())").unwrap();
     let err = lumelir::hir::lower(&chunk).expect_err("table.concat with 0 args must fail");
     let msg = format!("{err:?}");
     assert!(
         msg.contains("ArityMismatch"),
         "expected ArityMismatch, got: {msg}"
+    );
+}
+
+// --- ADR 0107: table.concat(t, sep) — 5 happy + 1 arity-3 pin
+// + 1 dynamic-sep happy ---
+//
+// Lua 5.4 §6.8 arity 2 form: insert `sep` between adjacent
+// elements (no leading/trailing sep). Empty `sep` is a no-op,
+// equivalent to arity 1. Single-element table emits no sep
+// at all (no adjacency to insert into).
+
+#[test]
+fn table_concat_with_sep_basic() {
+    let src = "print(table.concat({\"a\", \"b\", \"c\"}, \", \"))";
+    assert_eq!(
+        run_ok(src, "lumelir_table_concat_sep_basic").trim(),
+        "a, b, c"
+    );
+}
+
+#[test]
+fn table_concat_with_empty_sep() {
+    // Explicit "" sep ≡ arity 1 default. Pins arity-2 dispatch
+    // path returning the same bytes as the arity-1 path.
+    let src = "print(table.concat({\"a\", \"b\", \"c\"}, \"\"))";
+    assert_eq!(run_ok(src, "lumelir_table_concat_sep_empty").trim(), "abc");
+}
+
+#[test]
+fn table_concat_empty_with_sep() {
+    // Empty table → "" regardless of sep (no adjacencies).
+    let src = "print(table.concat({}, \", \"))";
+    assert_eq!(run_ok(src, "lumelir_table_concat_empty_sep").trim(), "");
+}
+
+#[test]
+fn table_concat_single_with_sep() {
+    // 1-element table → element only, no sep prefix/suffix.
+    let src = "print(table.concat({\"only\"}, \", \"))";
+    assert_eq!(
+        run_ok(src, "lumelir_table_concat_single_sep").trim(),
+        "only"
+    );
+}
+
+#[test]
+fn table_concat_numbers_with_sep() {
+    // Number elements pass through emit_tostring(Number) +
+    // sep insertion between them.
+    let src = "print(table.concat({1, 2, 3}, \"-\"))";
+    assert_eq!(run_ok(src, "lumelir_table_concat_num_sep").trim(), "1-2-3");
+}
+
+#[test]
+fn table_concat_arity_three_fails() {
+    // After ADR 0107 the range is (1, 2). The (t, sep, i) /
+    // (t, sep, i, j) forms remain future work; 3 args must still
+    // reject. Pins the uniform range check at the upper bound.
+    let chunk = lumelir::parser::parse("print(table.concat({}, \",\", 1))").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("table.concat with 3 args must fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("ArityMismatch"),
+        "expected ArityMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn table_concat_with_dynamic_sep() {
+    // sep need not be a literal; any String-kind expression
+    // works. Pins that emit_expr for args[1] integrates with
+    // the codegen sep-insertion path.
+    let src = "local s = \", \"
+print(table.concat({\"a\", \"b\"}, s))";
+    assert_eq!(
+        run_ok(src, "lumelir_table_concat_dynamic_sep").trim(),
+        "a, b"
     );
 }
