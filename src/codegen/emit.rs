@@ -413,6 +413,20 @@ fn emit_fmt_global<'c>(
         "invalid value (non-string/number) in table for 'concat'\0",
         loc,
     );
+    // Phase 2.7q-stdlib-string (ADR 0109): runtime trap for
+    // `string.byte(s, i)` when `i` is out of range after
+    // normalization (i past end or empty string). Lua spec returns
+    // `nil` in this case, but our Number-return contract has no
+    // nil representation; a future multi-result-builtin ADR may
+    // restore nil semantics.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_string_byte_out_of_range",
+        "bad argument #2 to 'byte' (out of range)\0",
+        loc,
+    );
 }
 
 fn emit_string_global<'c>(
@@ -7815,6 +7829,131 @@ fn emit_expr<'a, 'c>(
                 )?;
                 let len_i64 = emit_libc_call_i64(context, block, "strlen", &[arg], types, loc);
                 Ok(emit_i2f(block, len_i64, types, loc))
+            }
+            Callee::Builtin(Builtin::StringByte) => {
+                // Phase 2.7q-stdlib-string (ADR 0109):
+                // `string.byte(s [, i])` — single-position byte
+                // code retrieval. 3rd consumer of ADR 0104's
+                // `emit_normalize_sub_bounds` helper via the
+                // single-position trick: pass `j_raw = i_raw` so
+                // both clamp identically. Out-of-range manifests
+                // as `i_norm > j_norm` and traps with the new
+                // `s_string_byte_out_of_range` diagnostic.
+                //
+                // Lua spec returns nil for out-of-range; we trap
+                // because the Number-return contract has no nil
+                // representation. Future multi-result-builtin ADR
+                // may restore nil semantics.
+                let src = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let one_i64 = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 1).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let i_raw = if args.len() == 2 {
+                    let i_f64 = emit_expr(
+                        context,
+                        block,
+                        &args[1],
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
+                    )?;
+                    emit_f2i(block, i_f64, types, loc)
+                } else {
+                    one_i64
+                };
+                let len_i64 = emit_libc_call_i64(context, block, "strlen", &[src], types, loc);
+                // Single-position trick: j_raw = i_raw. ADR 0104
+                // helper reuse — its asymmetric clamp (i UP to 1,
+                // j DOWN to len) detects out-of-range as i > j.
+                let (i_norm, j_norm) =
+                    emit_normalize_sub_bounds(context, block, len_i64, i_raw, i_raw, types, loc);
+                let in_range = block
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Sge,
+                        j_norm,
+                        i_norm,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let then_region = Region::new();
+                let then_blk = Block::new(&[]);
+                {
+                    // byte_ptr = src + (i_norm - 1)
+                    let offset = then_blk
+                        .append_operation(arith::subi(i_norm, one_i64, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let byte_ptr =
+                        emit_byte_offset_ptr_dynamic(context, &then_blk, src, offset, types, loc);
+                    let i8_ty: Type<'c> = IntegerType::new(context, 8).into();
+                    let byte_i8 = emit_load(&then_blk, byte_ptr, i8_ty, loc);
+                    // Zero-extend i8 → i64 (byte is unsigned 0-255).
+                    let byte_i64: Value<'c, '_> = then_blk
+                        .append_operation(
+                            OperationBuilder::new("arith.extui", loc)
+                                .add_operands(&[byte_i8])
+                                .add_results(&[types.i64])
+                                .build()
+                                .expect("arith.extui i8 -> i64"),
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let byte_f64 = emit_i2f(&then_blk, byte_i64, types, loc);
+                    then_blk.append_operation(scf::r#yield(&[byte_f64], loc));
+                }
+                then_region.append_block(then_blk);
+                let else_region = Region::new();
+                let else_blk = Block::new(&[]);
+                {
+                    let msg = emit_addressof(
+                        context,
+                        &else_blk,
+                        "s_string_byte_out_of_range",
+                        types,
+                        loc,
+                    );
+                    emit_exit_with_message(context, &else_blk, msg, types, loc);
+                    // Unreachable placeholder for scf::r#if type-check.
+                    let zero_f64 = else_blk
+                        .append_operation(arith::constant(
+                            context,
+                            FloatAttribute::new(context, types.f64, 0.0).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    else_blk.append_operation(scf::r#yield(&[zero_f64], loc));
+                }
+                else_region.append_block(else_blk);
+                let if_op = scf::r#if(in_range, &[types.f64], then_region, else_region, loc);
+                Ok(block.append_operation(if_op).result(0).unwrap().into())
             }
             Callee::Builtin(b @ (Builtin::StringUpper | Builtin::StringLower)) => {
                 // Phase 2.7q-stdlib-string (ADR 0103): `string.upper` /

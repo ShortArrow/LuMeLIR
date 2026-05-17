@@ -289,3 +289,97 @@ function string.rep(x) return x + 300 end
 print(string.rep(42))";
     assert_eq!(run_ok(src, "lumelir_string_rep_shadowed").trim(), "342");
 }
+
+// --- ADR 0109: string.byte(s, i?) — 3rd consumer of
+// emit_normalize_sub_bounds (ADR 0104) ---
+//
+// Lua 5.4 §6.4 single-position form. Returns the byte code
+// (0-255) at index i (default 1). Negative i indexes from the
+// end. Out-of-range traps (Lua spec returns nil; we trap because
+// Number-return contract has no nil representation).
+//
+// emit_normalize_sub_bounds is reused with j_raw = i_raw — the
+// 3rd call shape (single-position) after string.sub (range slice)
+// and table.concat (join walk). Validates the abstraction across
+// 3 distinct consumers.
+
+#[test]
+fn string_byte_default_i() {
+    let src = "print(string.byte(\"ABC\"))";
+    assert_eq!(run_ok(src, "lumelir_string_byte_default").trim(), "65");
+}
+
+#[test]
+fn string_byte_explicit_i() {
+    let src = "print(string.byte(\"ABC\", 2))";
+    assert_eq!(run_ok(src, "lumelir_string_byte_explicit").trim(), "66");
+}
+
+#[test]
+fn string_byte_negative_i_last() {
+    // i = -1 → from-end last char (C = 67).
+    let src = "print(string.byte(\"ABC\", -1))";
+    assert_eq!(run_ok(src, "lumelir_string_byte_neg_last").trim(), "67");
+}
+
+#[test]
+fn string_byte_negative_i_first() {
+    // i = -3 → from-end first char (A = 65).
+    let src = "print(string.byte(\"ABC\", -3))";
+    assert_eq!(run_ok(src, "lumelir_string_byte_neg_first").trim(), "65");
+}
+
+#[test]
+fn string_byte_single_char() {
+    // 1-char string, default i=1.
+    let src = "print(string.byte(\"a\"))";
+    assert_eq!(run_ok(src, "lumelir_string_byte_single").trim(), "97");
+}
+
+#[test]
+fn string_byte_out_of_range_traps() {
+    // i past end (i=10 on "ABC" len=3): Lua spec returns nil;
+    // we trap because Number-return contract has no nil
+    // representation. Test only asserts non-zero exit (message
+    // wording loosely coupled).
+    let src = "print(string.byte(\"ABC\", 10))";
+    let out = compile_and_run(src, "lumelir_string_byte_oor_trap");
+    assert!(
+        !out.status.success(),
+        "out-of-range i must trap, but binary exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn string_byte_arity_zero_fails() {
+    // arity (1, 2): 0 args must reject via uniform range check.
+    let chunk = lumelir::parser::parse("print(string.byte())").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("string.byte with 0 args must fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("ArityMismatch"),
+        "expected ArityMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn string_byte_arity_three_fails() {
+    // Single-position only; multi-byte form (s, i, j) is a future
+    // multi-result-builtin ADR. 3 args reject at the (1, 2) upper
+    // bound.
+    let chunk = lumelir::parser::parse("print(string.byte(\"a\", 1, 2))").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("string.byte with 3 args must fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("ArityMismatch"),
+        "expected ArityMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn string_byte_shadowed_respects_user_table() {
+    let src = "local string = {}
+function string.byte(x) return x + 400 end
+print(string.byte(42))";
+    assert_eq!(run_ok(src, "lumelir_string_byte_shadowed").trim(), "442");
+}

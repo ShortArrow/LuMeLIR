@@ -423,6 +423,15 @@ pub enum Builtin {
     /// `n <= 0` returns the empty string (runtime branch). Phase
     /// 2.7q-stdlib-string (ADR 0105).
     StringRep,
+    /// `string.byte(s [, i])` — Lua 5.4 §6.4 single-position byte
+    /// code retrieval. Returns the byte (0-255) at index i
+    /// (default 1). Negative i indexes from the end. Out-of-range
+    /// traps (Number-return contract has no nil representation;
+    /// future multi-result-builtin ADR may restore nil semantics).
+    /// 3rd consumer of ADR 0104's `emit_normalize_sub_bounds`
+    /// helper (single-position trick: passes `j_raw = i_raw`).
+    /// Phase 2.7q-stdlib-string (ADR 0109).
+    StringByte,
     /// `table.concat(t)` — Lua 5.4 §6.8 array-part concatenation
     /// with implicit `sep=""`. The first non-math, non-string
     /// consumer of ADR 0103's `Builtin::from_namespace_method`
@@ -480,6 +489,8 @@ impl Builtin {
             "sub" => Some(Builtin::StringSub),
             // ADR 0105 — string.rep.
             "rep" => Some(Builtin::StringRep),
+            // ADR 0109 — string.byte (single-position form).
+            "byte" => Some(Builtin::StringByte),
             _ => None,
         }
     }
@@ -539,6 +550,9 @@ impl Builtin {
             Builtin::StringSub => (2, 3),
             // ADR 0105 — string.rep(s, n) exact arity 2.
             Builtin::StringRep => (2, 2),
+            // ADR 0109 — string.byte(s [, i]) single-position
+            // form. Multi-byte (s, i, j) is future work.
+            Builtin::StringByte => (1, 2),
             // ADR 0106/0107/0108 — table.concat(t [, sep [, i [, j]]]).
             // Lua 5.4 §6.8 full signature: arity 1 (default sep="",
             // i=1, j=#t), 2 (explicit sep), 3 (explicit i, default
@@ -569,6 +583,7 @@ impl Builtin {
             Builtin::StringLower => "string.lower",
             Builtin::StringSub => "string.sub",
             Builtin::StringRep => "string.rep",
+            Builtin::StringByte => "string.byte",
             Builtin::TableConcat => "table.concat",
         }
     }
@@ -597,8 +612,8 @@ impl Builtin {
             | Builtin::MathCos
             | Builtin::MathLog
             | Builtin::MathExp => &[ValueKind::Number],
-            // Phase 2.7q-stdlib-string (ADR 0103).
-            Builtin::StringLen => &[ValueKind::Number],
+            // Phase 2.7q-stdlib-string (ADR 0103/0109).
+            Builtin::StringLen | Builtin::StringByte => &[ValueKind::Number],
             Builtin::StringUpper
             | Builtin::StringLower
             | Builtin::StringSub
