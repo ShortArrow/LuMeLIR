@@ -539,8 +539,11 @@ impl Builtin {
             Builtin::StringSub => (2, 3),
             // ADR 0105 — string.rep(s, n) exact arity 2.
             Builtin::StringRep => (2, 2),
-            // ADR 0106/0107 — table.concat(t) or table.concat(t, sep).
-            Builtin::TableConcat => (1, 2),
+            // ADR 0106/0107/0108 — table.concat(t [, sep [, i [, j]]]).
+            // Lua 5.4 §6.8 full signature: arity 1 (default sep="",
+            // i=1, j=#t), 2 (explicit sep), 3 (explicit i, default
+            // j=#t), 4 (explicit i and j).
+            Builtin::TableConcat => (1, 4),
         }
     }
 

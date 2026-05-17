@@ -7996,11 +7996,14 @@ fn emit_expr<'a, 'c>(
                 // Phase 2.7r-stdlib-table (ADR 0106): `table.concat(t)`
                 // — the first non-math/non-string consumer of ADR
                 // 0103's `from_namespace_method` generic dispatcher.
-                // ADR 0107 extends to `table.concat(t, sep)` via
-                // arity range (1, 2). All runtime work in
-                // `emit_table_concat_runtime`; this arm materialises
-                // the sep (empty-string for arity 1, lowered arg for
-                // arity 2) and forwards.
+                // ADR 0107 added arity 2 (`t, sep`).
+                // ADR 0108 extends to full Lua 5.4 §6.8: arity (1, 4)
+                // with optional integer bounds `i, j`. Bounds default
+                // to (1, #t) and are normalized via
+                // `emit_normalize_sub_bounds` — the SAME pure SSA
+                // helper extracted in ADR 0104 for `string.sub`
+                // (cross-namespace reuse is the architectural payoff
+                // of this ADR).
                 let t_ptr = emit_expr(
                     context,
                     block,
@@ -8016,7 +8019,7 @@ fn emit_expr<'a, 'c>(
                 let (sep_ptr, sep_len) = if args.len() == 1 {
                     // Arity 1 path: synthesize empty sep so the
                     // helper has a single uniform shape. sep_len = 0
-                    // makes pass-1 `sep_len * (length-1)` term zero
+                    // makes pass-1 `sep_len * (range_len-1)` zero
                     // and pass-2 sep memcpy a no-op (0-byte copy).
                     let empty = emit_empty_string(context, block, types, loc);
                     let zero_len = block
@@ -8045,8 +8048,59 @@ fn emit_expr<'a, 'c>(
                     let sep_len = emit_libc_call_i64(context, block, "strlen", &[sep], types, loc);
                     (sep, sep_len)
                 };
+                // ADR 0108: load #t once for default j and for the
+                // normalization. Defaults: i = 1, j = #t.
+                let len_slot =
+                    emit_byte_offset_ptr(context, block, t_ptr, TABLE_OFF_LEN, types, loc);
+                let length = emit_load(block, len_slot, types.i64, loc);
+                let one_i64 = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 1).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let i_raw = if args.len() >= 3 {
+                    let i_f64 = emit_expr(
+                        context,
+                        block,
+                        &args[2],
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
+                    )?;
+                    emit_f2i(block, i_f64, types, loc)
+                } else {
+                    one_i64
+                };
+                let j_raw = if args.len() == 4 {
+                    let j_f64 = emit_expr(
+                        context,
+                        block,
+                        &args[3],
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
+                    )?;
+                    emit_f2i(block, j_f64, types, loc)
+                } else {
+                    length
+                };
+                // ADR 0104 helper reuse — cross-namespace validation.
+                let (i_norm, j_norm) =
+                    emit_normalize_sub_bounds(context, block, length, i_raw, j_raw, types, loc);
                 Ok(emit_table_concat_runtime(
-                    context, block, t_ptr, sep_ptr, sep_len, types, loc,
+                    context, block, t_ptr, sep_ptr, sep_len, i_norm, j_norm, types, loc,
                 ))
             }
             Callee::User {
@@ -9111,12 +9165,19 @@ fn emit_table_concat_runtime<'a, 'c>(
     t_ptr: Value<'c, 'a>,
     sep_ptr: Value<'c, 'a>,
     sep_len: Value<'c, 'a>,
+    // ADR 0108: pre-normalized 1-based inclusive bounds [i_norm,
+    // j_norm] supplied by the caller. Caller uses
+    // `emit_normalize_sub_bounds` (ADR 0104 cross-namespace
+    // reuse) to derive these from raw user i/j (or defaults
+    // i=1, j=#t). `j_norm < i_norm` indicates empty result.
+    i_norm: Value<'c, 'a>,
+    j_norm: Value<'c, 'a>,
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
-    // Load length + array_buf from the 32-byte table header.
-    let len_slot = emit_byte_offset_ptr(context, block, t_ptr, TABLE_OFF_LEN, types, loc);
-    let length = emit_load(block, len_slot, types.i64, loc);
+    // Load array_buf from the 32-byte table header. (length is no
+    // longer needed by the helper itself — the loop range is
+    // governed by the pre-normalized bounds.)
     let arr_buf_slot = emit_byte_offset_ptr(context, block, t_ptr, TABLE_OFF_ARRAY_BUF, types, loc);
     let arr_buf = emit_load(block, arr_buf_slot, types.ptr, loc);
 
@@ -9166,15 +9227,25 @@ fn emit_table_concat_runtime<'a, 'c>(
         .unwrap()
         .into();
 
-    // length > 0 → 2-pass; else → empty string.
-    let len_pos = block
+    // ADR 0108: j_norm >= i_norm → 2-pass over the bounded
+    // range; else → empty string. Catches both "empty table
+    // (j_norm < 1 = i_norm clamp)" and "user i > user j after
+    // normalize" with one guard.
+    let range_nonempty = block
         .append_operation(arith::cmpi(
             context,
-            arith::CmpiPredicate::Sgt,
-            length,
-            zero_i64,
+            arith::CmpiPredicate::Sge,
+            j_norm,
+            i_norm,
             loc,
         ))
+        .result(0)
+        .unwrap()
+        .into();
+    // 0-based loop start (carrier `i_arg` walks array indices,
+    // not Lua 1-based indices). i_zero_start = i_norm - 1.
+    let i_zero_start = block
+        .append_operation(arith::subi(i_norm, one_i64, loc))
         .result(0)
         .unwrap()
         .into();
@@ -9189,12 +9260,15 @@ fn emit_table_concat_runtime<'a, 'c>(
         {
             let i_arg: Value<'c, '_> = p1_before_blk.argument(0).unwrap().into();
             let total_arg: Value<'c, '_> = p1_before_blk.argument(1).unwrap().into();
+            // ADR 0108: 0-based walk stops at j_norm exclusively
+            // (= 1-based j_norm inclusive). `i < j_norm` walks
+            // indices [i_zero_start, j_norm - 1].
             let cond: Value<'c, '_> = p1_before_blk
                 .append_operation(arith::cmpi(
                     context,
                     arith::CmpiPredicate::Slt,
                     i_arg,
-                    length,
+                    j_norm,
                     loc,
                 ))
                 .result(0)
@@ -9242,8 +9316,10 @@ fn emit_table_concat_runtime<'a, 'c>(
             p1_after_blk.append_operation(scf::r#yield(&[next_i, next_total], loc));
         }
         p1_after.append_block(p1_after_blk);
+        // ADR 0108: carrier i_arg starts at i_zero_start (1-based
+        // i_norm translated to 0-based), total at 0.
         let p1_while = then_blk.append_operation(scf::r#while(
-            &[zero_i64, zero_i64],
+            &[i_zero_start, zero_i64],
             &[types.i64, types.i64],
             p1_before,
             p1_after,
@@ -9251,17 +9327,17 @@ fn emit_table_concat_runtime<'a, 'c>(
         ));
         let elem_total: Value<'c, '_> = p1_while.result(1).unwrap().into();
 
-        // ADR 0107 sep accounting: there are (length - 1) sep
-        // insertions for `length` elements (no leading/trailing
-        // sep, and length > 0 is guaranteed by the outer scf::if).
-        // total = elem_total + sep_len * (length - 1).
-        let len_minus_one: Value<'c, '_> = then_blk
-            .append_operation(arith::subi(length, one_i64, loc))
+        // ADR 0108 sep accounting: range_count = j_norm - i_norm
+        // + 1; sep insertions = range_count - 1 = j_norm - i_norm.
+        // Safe inside `range_nonempty` guard since j_norm >= i_norm
+        // ⇒ (j_norm - i_norm) >= 0.
+        let range_minus_one: Value<'c, '_> = then_blk
+            .append_operation(arith::subi(j_norm, i_norm, loc))
             .result(0)
             .unwrap()
             .into();
         let sep_total: Value<'c, '_> = then_blk
-            .append_operation(arith::muli(sep_len, len_minus_one, loc))
+            .append_operation(arith::muli(sep_len, range_minus_one, loc))
             .result(0)
             .unwrap()
             .into();
@@ -9286,12 +9362,13 @@ fn emit_table_concat_runtime<'a, 'c>(
         {
             let i_arg: Value<'c, '_> = p2_before_blk.argument(0).unwrap().into();
             let off_arg: Value<'c, '_> = p2_before_blk.argument(1).unwrap().into();
+            // ADR 0108: same 0-based stop as Pass 1.
             let cond: Value<'c, '_> = p2_before_blk
                 .append_operation(arith::cmpi(
                     context,
                     arith::CmpiPredicate::Slt,
                     i_arg,
-                    length,
+                    j_norm,
                     loc,
                 ))
                 .result(0)
@@ -9313,16 +9390,18 @@ fn emit_table_concat_runtime<'a, 'c>(
             let slot_ptr =
                 emit_byte_offset_ptr_dynamic(context, &p2_after_blk, arr_buf, slot_off, types, loc);
             let tag = emit_load(&p2_after_blk, slot_ptr, types.i64, loc);
-            // ADR 0107: before every element except the first
-            // (i > 0), memcpy `sep_len` bytes from `sep_ptr` to
-            // `buf + off_arg` and advance the offset by sep_len.
-            // Wrapped in scf::r#if so the i == 0 path is a no-op.
+            // ADR 0108: before every element except the first
+            // OF THE BOUNDED RANGE (i > i_zero_start, NOT i > 0),
+            // memcpy `sep_len` bytes from `sep_ptr` to
+            // `buf + off_arg` and advance offset by sep_len.
+            // i_zero_start = i_norm - 1, so the carrier-init iter
+            // matches `i == i_zero_start` and skips sep.
             let is_after_first: Value<'c, '_> = p2_after_blk
                 .append_operation(arith::cmpi(
                     context,
                     arith::CmpiPredicate::Sgt,
                     i_arg,
-                    zero_i64,
+                    i_zero_start,
                     loc,
                 ))
                 .result(0)
@@ -9405,8 +9484,10 @@ fn emit_table_concat_runtime<'a, 'c>(
             p2_after_blk.append_operation(scf::r#yield(&[next_i, next_off], loc));
         }
         p2_after.append_block(p2_after_blk);
+        // ADR 0108: same carrier init as Pass 1 — i_arg starts at
+        // i_zero_start, offset at 0.
         then_blk.append_operation(scf::r#while(
-            &[zero_i64, zero_i64],
+            &[i_zero_start, zero_i64],
             &[types.i64, types.i64],
             p2_before,
             p2_after,
@@ -9441,7 +9522,7 @@ fn emit_table_concat_runtime<'a, 'c>(
         else_blk.append_operation(scf::r#yield(&[empty], loc));
     }
     else_region.append_block(else_blk);
-    let if_op = scf::r#if(len_pos, &[types.ptr], then_region, else_region, loc);
+    let if_op = scf::r#if(range_nonempty, &[types.ptr], then_region, else_region, loc);
     block.append_operation(if_op).result(0).unwrap().into()
 }
 

@@ -170,20 +170,6 @@ fn table_concat_numbers_with_sep() {
 }
 
 #[test]
-fn table_concat_arity_three_fails() {
-    // After ADR 0107 the range is (1, 2). The (t, sep, i) /
-    // (t, sep, i, j) forms remain future work; 3 args must still
-    // reject. Pins the uniform range check at the upper bound.
-    let chunk = lumelir::parser::parse("print(table.concat({}, \",\", 1))").unwrap();
-    let err = lumelir::hir::lower(&chunk).expect_err("table.concat with 3 args must fail");
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("ArityMismatch"),
-        "expected ArityMismatch, got: {msg}"
-    );
-}
-
-#[test]
 fn table_concat_with_dynamic_sep() {
     // sep need not be a literal; any String-kind expression
     // works. Pins that emit_expr for args[1] integrates with
@@ -193,5 +179,79 @@ print(table.concat({\"a\", \"b\"}, s))";
     assert_eq!(
         run_ok(src, "lumelir_table_concat_dynamic_sep").trim(),
         "a, b"
+    );
+}
+
+// --- ADR 0108: table.concat(t, sep, i, j) full Lua 5.4 §6.8 ---
+//
+// Bounds normalization reuses ADR 0104's `emit_normalize_sub_bounds`
+// helper verbatim (cross-namespace reuse — the architectural payoff
+// of this ADR). i/j semantics match `string.sub`: negative-translate,
+// clamp to [1, #t], i > j returns empty string.
+//
+// Default i = 1; default j = #t. Lua spec mandates strict
+// out-of-bounds error but we follow `string.sub`'s clamping precedent
+// (deliberate spec deviation; arg-validation policy ADR may revisit).
+
+#[test]
+fn table_concat_with_i_only() {
+    // Default j = #t (= 3).
+    let src = "print(table.concat({\"a\", \"b\", \"c\"}, \"-\", 2))";
+    assert_eq!(run_ok(src, "lumelir_table_concat_i_only").trim(), "b-c");
+}
+
+#[test]
+fn table_concat_with_i_and_j() {
+    // Explicit bounds.
+    let src = "print(table.concat({\"a\", \"b\", \"c\", \"d\"}, \"-\", 2, 3))";
+    assert_eq!(run_ok(src, "lumelir_table_concat_i_and_j").trim(), "b-c");
+}
+
+#[test]
+fn table_concat_negative_i() {
+    // Negative i → #t + i + 1. -2 → 3 - 2 + 1 = 2 → walk [2, 3].
+    let src = "print(table.concat({\"a\", \"b\", \"c\"}, \"-\", -2))";
+    assert_eq!(run_ok(src, "lumelir_table_concat_neg_i").trim(), "b-c");
+}
+
+#[test]
+fn table_concat_negative_j() {
+    // Negative j → #t + j + 1. -2 → 4 - 2 + 1 = 3 → walk [1, 3].
+    let src = "print(table.concat({\"a\", \"b\", \"c\", \"d\"}, \"-\", 1, -2))";
+    assert_eq!(run_ok(src, "lumelir_table_concat_neg_j").trim(), "a-b-c");
+}
+
+#[test]
+fn table_concat_i_equals_j() {
+    // Single-element range; no sep insertion.
+    let src = "print(table.concat({\"a\", \"b\", \"c\"}, \"-\", 2, 2))";
+    assert_eq!(run_ok(src, "lumelir_table_concat_i_eq_j").trim(), "b");
+}
+
+#[test]
+fn table_concat_i_greater_j_empty() {
+    // i > j after normalize → empty string (outer guard).
+    let src = "print(table.concat({\"a\", \"b\", \"c\"}, \"-\", 3, 1))";
+    assert_eq!(run_ok(src, "lumelir_table_concat_i_gt_j").trim(), "");
+}
+
+#[test]
+fn table_concat_j_clamp_to_len() {
+    // j > #t → clamp to #t. String.sub precedent (Lua spec
+    // technically mandates error; deliberate clamp deviation).
+    let src = "print(table.concat({\"a\", \"b\"}, \"-\", 1, 100))";
+    assert_eq!(run_ok(src, "lumelir_table_concat_j_clamp").trim(), "a-b");
+}
+
+#[test]
+fn table_concat_arity_five_fails() {
+    // Range is (1, 4); 5 args must reject. Pins the new upper
+    // bound after the (1, 2) → (1, 4) widening.
+    let chunk = lumelir::parser::parse("print(table.concat({}, \",\", 1, 2, 3))").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("table.concat with 5 args must fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("ArityMismatch"),
+        "expected ArityMismatch, got: {msg}"
     );
 }
