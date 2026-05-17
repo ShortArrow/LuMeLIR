@@ -412,6 +412,12 @@ pub enum Builtin {
     /// `string.lower(s)` — byte-wise ASCII lowercase. Mirror of
     /// `StringUpper` with `tolower` (ADR 0103).
     StringLower,
+    /// `string.sub(s, i [, j])` — Lua 5.4 §6.4 substring. The first
+    /// range-arity (2-or-3) namespace builtin; arity-range check
+    /// lives in `lower_namespace_builtin_call` per the `Assert`
+    /// precedent in `lower_builtin_call` (`Builtin::arity()` reports
+    /// the minimum, 2). Phase 2.7q-stdlib-string (ADR 0104).
+    StringSub,
 }
 
 impl Builtin {
@@ -456,6 +462,8 @@ impl Builtin {
             "len" => Some(Builtin::StringLen),
             "upper" => Some(Builtin::StringUpper),
             "lower" => Some(Builtin::StringLower),
+            // ADR 0104 — string.sub.
+            "sub" => Some(Builtin::StringSub),
             _ => None,
         }
     }
@@ -486,6 +494,10 @@ impl Builtin {
             Builtin::MathPow => 2,
             Builtin::MathSin | Builtin::MathCos | Builtin::MathLog | Builtin::MathExp => 1,
             Builtin::StringLen | Builtin::StringUpper | Builtin::StringLower => 1,
+            // ADR 0104 — string.sub takes 2 or 3 args; report
+            // the minimum here. The actual 2-or-3 check lives in
+            // `lower_namespace_builtin_call` (Assert precedent).
+            Builtin::StringSub => 2,
         }
     }
 
@@ -509,6 +521,7 @@ impl Builtin {
             Builtin::StringLen => "string.len",
             Builtin::StringUpper => "string.upper",
             Builtin::StringLower => "string.lower",
+            Builtin::StringSub => "string.sub",
         }
     }
 
@@ -538,7 +551,9 @@ impl Builtin {
             | Builtin::MathExp => &[ValueKind::Number],
             // Phase 2.7q-stdlib-string (ADR 0103).
             Builtin::StringLen => &[ValueKind::Number],
-            Builtin::StringUpper | Builtin::StringLower => &[ValueKind::String],
+            Builtin::StringUpper | Builtin::StringLower | Builtin::StringSub => {
+                &[ValueKind::String]
+            }
         }
     }
 }

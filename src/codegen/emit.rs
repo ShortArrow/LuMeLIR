@@ -7829,6 +7829,122 @@ fn emit_expr<'a, 'c>(
                     context, block, arg, mapper, types, loc,
                 ))
             }
+            Callee::Builtin(Builtin::StringSub) => {
+                // Phase 2.7q-stdlib-string (ADR 0104): `string.sub(s, i [, j])`
+                // — bounds-normalize via the pure helper, then dispatch
+                // on `count > 0` to either `emit_string_slice` (live
+                // slice) or `emit_empty_string` (i > j after normalize).
+                //
+                // The Lua spec §6.4 semantics — negative indices, j
+                // absent ⇔ j = -1 ⇔ post-translate j = len, clamp
+                // to [1, len] — are implemented entirely in
+                // `emit_normalize_sub_bounds`. The emit arm is the
+                // glue: f2i the f64 args, compute strlen, branch.
+                let src = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let i_f64 = emit_expr(
+                    context,
+                    block,
+                    &args[1],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let len_i64 = emit_libc_call_i64(context, block, "strlen", &[src], types, loc);
+                let i_i64 = emit_f2i(block, i_f64, types, loc);
+                // j absent ⇔ post-translate j = len (Lua spec §6.4).
+                let j_i64 = if args.len() == 3 {
+                    let j_f64 = emit_expr(
+                        context,
+                        block,
+                        &args[2],
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
+                    )?;
+                    emit_f2i(block, j_f64, types, loc)
+                } else {
+                    len_i64
+                };
+                let (i_norm, j_norm) =
+                    emit_normalize_sub_bounds(context, block, len_i64, i_i64, j_i64, types, loc);
+                // count = j_norm - i_norm + 1. Branch on count > 0
+                // (equivalently i_norm <= j_norm).
+                let one_i64 = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 1).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let j_minus_i = block
+                    .append_operation(arith::subi(j_norm, i_norm, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let count = block
+                    .append_operation(arith::addi(j_minus_i, one_i64, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let zero_i64 = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let count_pos = block
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Sgt,
+                        count,
+                        zero_i64,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let then_region = Region::new();
+                let then_blk = Block::new(&[]);
+                {
+                    let slice =
+                        emit_string_slice(context, &then_blk, src, i_norm, count, types, loc);
+                    then_blk.append_operation(scf::r#yield(&[slice], loc));
+                }
+                then_region.append_block(then_blk);
+                let else_region = Region::new();
+                let else_blk = Block::new(&[]);
+                {
+                    let empty = emit_empty_string(context, &else_blk, types, loc);
+                    else_blk.append_operation(scf::r#yield(&[empty], loc));
+                }
+                else_region.append_block(else_blk);
+                let if_op = scf::r#if(count_pos, &[types.ptr], then_region, else_region, loc);
+                Ok(block.append_operation(if_op).result(0).unwrap().into())
+            }
             Callee::User {
                 fid: FuncId(fid),
                 holding_local,
@@ -8459,6 +8575,244 @@ fn emit_string_case_map<'a, 'c>(
     after_region.append_block(after_blk);
     let while_op = scf::r#while(&[zero], &[types.i64], before_region, after_region, loc);
     block.append_operation(while_op);
+    buf
+}
+
+/// Phase 2.7q-stdlib-string (ADR 0104): allocate a freshly heap-
+/// allocated empty String. Per-call `malloc(1) + store 0` matches
+/// the existing alloc-and-leak shape (no GC yet). Used by the
+/// `string.sub` empty-result branch when normalized `i > j`.
+fn emit_empty_string<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let one_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let buf = emit_libc_call_ptr(context, block, "malloc", &[one_i64], types, loc);
+    let i8_ty: Type<'c> = IntegerType::new(context, 8).into();
+    let zero_i8 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(i8_ty, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    block.append_operation(
+        OperationBuilder::new("llvm.store", loc)
+            .add_operands(&[zero_i8, buf])
+            .build()
+            .expect("llvm.store empty string null term"),
+    );
+    buf
+}
+
+/// Phase 2.7q-stdlib-string (ADR 0104): pure SSA bounds normalization
+/// for Lua 5.4 §6.4 `string.sub(s, i, j)`. Returns the post-translate,
+/// post-clamp `(i_norm, j_norm)` pair in 1-based-inclusive convention.
+///
+/// Semantics (all values i64):
+/// - if `i < 0`: `i = len + i + 1` (suffix indexing)
+/// - clamp `i = max(i, 1)`
+/// - if `j < 0`: `j = len + j + 1` (also suffix)
+/// - clamp `j = min(j, len)`
+///
+/// Result may still satisfy `i_norm > j_norm`; the caller dispatches
+/// to `emit_empty_string` in that case via `scf::r#if`.
+fn emit_normalize_sub_bounds<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    len_i64: Value<'c, 'a>,
+    i_i64: Value<'c, 'a>,
+    j_i64: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> (Value<'c, 'a>, Value<'c, 'a>) {
+    let zero = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let one = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    // i side: i_from_end = len + i + 1; i_t = (i < 0) ? i_from_end : i
+    let i_neg = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Slt,
+            i_i64,
+            zero,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let len_plus_i = block
+        .append_operation(arith::addi(len_i64, i_i64, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let i_from_end = block
+        .append_operation(arith::addi(len_plus_i, one, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let i_t = block
+        .append_operation(arith::select(i_neg, i_from_end, i_i64, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    // i_clamped = max(i_t, 1)
+    let i_lt_one = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Slt,
+            i_t,
+            one,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let i_clamped = block
+        .append_operation(arith::select(i_lt_one, one, i_t, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    // j side: j_from_end = len + j + 1; j_t = (j < 0) ? j_from_end : j
+    let j_neg = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Slt,
+            j_i64,
+            zero,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let len_plus_j = block
+        .append_operation(arith::addi(len_i64, j_i64, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let j_from_end = block
+        .append_operation(arith::addi(len_plus_j, one, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let j_t = block
+        .append_operation(arith::select(j_neg, j_from_end, j_i64, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    // j_clamped = min(j_t, len)
+    let j_gt_len = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Sgt,
+            j_t,
+            len_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let j_clamped = block
+        .append_operation(arith::select(j_gt_len, len_i64, j_t, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    (i_clamped, j_clamped)
+}
+
+/// Phase 2.7q-stdlib-string (ADR 0104): materialize a substring by
+/// `malloc(length + 1) + memcpy(buf, src + (start - 1), length)` +
+/// null-terminate. `start_1based` is the Lua 1-based start index;
+/// `length` is the byte count. Caller is responsible for ensuring
+/// `length >= 1` and the slice lives inside `src`'s bounds — for
+/// `string.sub` this is guaranteed by `emit_normalize_sub_bounds` +
+/// the `length > 0` guard at the call site.
+///
+/// Future-reusable for `string.find` / `string.match` capture
+/// extraction.
+fn emit_string_slice<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    src: Value<'c, 'a>,
+    start_1based: Value<'c, 'a>,
+    length: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let one = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let size = block
+        .append_operation(arith::addi(length, one, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let buf = emit_libc_call_ptr(context, block, "malloc", &[size], types, loc);
+    let offset = block
+        .append_operation(arith::subi(start_1based, one, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let src_off = emit_byte_offset_ptr_dynamic(context, block, src, offset, types, loc);
+    let _ = emit_libc_call_ptr(
+        context,
+        block,
+        "memcpy",
+        &[buf, src_off, length],
+        types,
+        loc,
+    );
+    // Null-terminate at buf[length].
+    let term_ptr = emit_byte_offset_ptr_dynamic(context, block, buf, length, types, loc);
+    let i8_ty: Type<'c> = IntegerType::new(context, 8).into();
+    let zero_i8 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(i8_ty, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    block.append_operation(
+        OperationBuilder::new("llvm.store", loc)
+            .add_operands(&[zero_i8, term_ptr])
+            .build()
+            .expect("llvm.store slice null term"),
+    );
     buf
 }
 

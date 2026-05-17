@@ -249,9 +249,9 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             | Callee::Builtin(Builtin::StringLen) => ValueKind::Number,
             // Phase 2.7q-stdlib-string (ADR 0103): string.upper /
             // string.lower allocate and return a new String.
-            Callee::Builtin(Builtin::StringUpper) | Callee::Builtin(Builtin::StringLower) => {
-                ValueKind::String
-            }
+            Callee::Builtin(Builtin::StringUpper)
+            | Callee::Builtin(Builtin::StringLower)
+            | Callee::Builtin(Builtin::StringSub) => ValueKind::String,
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.
@@ -4636,14 +4636,31 @@ impl LowerCtx {
         args: &[Expr],
         call_span: Span,
     ) -> Result<HirExprKind, HirError> {
-        let arity = builtin.arity();
-        if args.len() != arity {
-            return Err(HirError::ArityMismatch {
-                builtin: builtin.name().to_owned(),
-                expected: arity,
-                actual: args.len(),
-                offset: call_span.start,
-            });
+        // Phase 2.7q-stdlib-string (ADR 0104): `string.sub(s, i [, j])`
+        // is the first range-arity namespace builtin (2 or 3). The
+        // Assert precedent in `lower_builtin_call` is followed —
+        // `Builtin::arity()` reports the minimum (2), and the actual
+        // 2-or-3 check lives here. A future ADR can refactor to a
+        // generic min/max scheme once 3+ range builtins exist.
+        if matches!(builtin, Builtin::StringSub) {
+            if args.len() < 2 || args.len() > 3 {
+                return Err(HirError::ArityMismatch {
+                    builtin: builtin.name().to_owned(),
+                    expected: 2,
+                    actual: args.len(),
+                    offset: call_span.start,
+                });
+            }
+        } else {
+            let arity = builtin.arity();
+            if args.len() != arity {
+                return Err(HirError::ArityMismatch {
+                    builtin: builtin.name().to_owned(),
+                    expected: arity,
+                    actual: args.len(),
+                    offset: call_span.start,
+                });
+            }
         }
         let lowered_args = args
             .iter()

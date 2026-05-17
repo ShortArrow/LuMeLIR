@@ -106,3 +106,103 @@ fn string_len_arity_mismatch() {
         "expected ArityMismatch, got: {msg}"
     );
 }
+
+// --- ADR 0104: string.sub (5 happy + 3 boundary + 2 arity + 1 shadow) ---
+//
+// Lua 5.4 §6.4 semantics:
+//   string.sub(s, i [, j])
+//     - i < 0 → from-end (#s + i + 1)
+//     - i < 1 after translate → clamped to 1
+//     - j absent → j = #s
+//     - j < 0 → from-end (#s + j + 1)
+//     - j > #s → clamped to #s
+//     - i > j after normalize → empty string
+//     - else → bytes s[i-1..j-1] (0-indexed, inclusive)
+//
+// Bounds-normalization helper is extracted as pure SSA logic
+// (Codex critical pre-extract). String-slice helper is
+// future-reusable for `string.find` capture extraction.
+
+#[test]
+fn string_sub_basic_2arg() {
+    let src = "print(string.sub(\"hello\", 2, 4))";
+    assert_eq!(run_ok(src, "lumelir_string_sub_basic").trim(), "ell");
+}
+
+#[test]
+fn string_sub_suffix_negative_i() {
+    let src = "print(string.sub(\"hello\", -3))";
+    assert_eq!(run_ok(src, "lumelir_string_sub_suffix").trim(), "llo");
+}
+
+#[test]
+fn string_sub_prefix_2arg() {
+    let src = "print(string.sub(\"hello\", 1, 3))";
+    assert_eq!(run_ok(src, "lumelir_string_sub_prefix").trim(), "hel");
+}
+
+#[test]
+fn string_sub_all_omit_j() {
+    let src = "print(string.sub(\"hello\", 1))";
+    assert_eq!(run_ok(src, "lumelir_string_sub_all").trim(), "hello");
+}
+
+#[test]
+fn string_sub_negative_j() {
+    let src = "print(string.sub(\"hello\", 2, -1))";
+    assert_eq!(run_ok(src, "lumelir_string_sub_neg_j").trim(), "ello");
+}
+
+#[test]
+fn string_sub_j_clamp_to_len() {
+    let src = "print(string.sub(\"abc\", 1, 100))";
+    assert_eq!(run_ok(src, "lumelir_string_sub_clamp_j").trim(), "abc");
+}
+
+#[test]
+fn string_sub_i_past_end_empty() {
+    let src = "print(string.sub(\"abc\", 10))";
+    assert_eq!(run_ok(src, "lumelir_string_sub_past_end").trim(), "");
+}
+
+#[test]
+fn string_sub_i_gt_j_empty() {
+    // After normalization i=3, j=1 → i > j → empty.
+    let src = "print(string.sub(\"hello\", 3, 1))";
+    assert_eq!(run_ok(src, "lumelir_string_sub_i_gt_j").trim(), "");
+}
+
+#[test]
+fn string_sub_arity_zero_fails() {
+    // string.sub takes 2 or 3 args; 0 must surface ArityMismatch.
+    let chunk = lumelir::parser::parse("print(string.sub())").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("string.sub with 0 args must fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("ArityMismatch"),
+        "expected ArityMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn string_sub_arity_four_fails() {
+    // string.sub takes 2 or 3 args; 4 must surface ArityMismatch.
+    let chunk = lumelir::parser::parse("print(string.sub(\"a\", 1, 2, 3))").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("string.sub with 4 args must fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("ArityMismatch"),
+        "expected ArityMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn string_sub_shadowed_respects_user_table() {
+    // Same shadowing semantics as string.len (ADR 0103). If
+    // user declares `local string = {}`, the namespace builtin
+    // dispatch must skip and let the user's table take over.
+    let src = "local string = {}
+function string.sub(x) return x + 200 end
+print(string.sub(42))";
+    assert_eq!(run_ok(src, "lumelir_string_sub_shadowed").trim(), "242");
+}
