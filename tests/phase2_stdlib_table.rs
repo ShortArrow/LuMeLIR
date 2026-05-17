@@ -306,3 +306,156 @@ fn table_concat_rejects_non_number_j() {
         "expected BuiltinArgKindMismatch, got: {msg}"
     );
 }
+
+// --- ADR 0111: table.insert(t, v) / (t, pos, v) ---
+//
+// Lua 5.4 §6.8 spec:
+//   arity 2: pos = #t + 1 (append form)
+//   arity 3: insert at pos (1-based, valid [1, #t + 1]);
+//            elements [pos..#t] shift right by 1
+//   pos < 1 OR pos > #t + 1: runtime error
+//   value: any kind (including Nil)
+//   returns nothing (void)
+//
+// param_kinds is arity-sensitive (codex critical): arity 2 →
+// [Table, TaggedValue], arity 3 → [Table, Number, TaggedValue].
+// ADR 0110 TaggedValue skip semantics allows any-kind value.
+
+#[test]
+fn table_insert_append_basic() {
+    let src = "local t = {1, 2, 3}
+table.insert(t, 4)
+print(t[4])
+print(#t)";
+    let out = run_ok(src, "lumelir_table_insert_append");
+    let lines: Vec<&str> = out.trim().lines().collect();
+    assert_eq!(lines, ["4", "4"]);
+}
+
+#[test]
+fn table_insert_middle() {
+    let src = "local t = {1, 3, 4}
+table.insert(t, 2, 2)
+print(t[2])
+print(#t)";
+    let out = run_ok(src, "lumelir_table_insert_middle");
+    let lines: Vec<&str> = out.trim().lines().collect();
+    assert_eq!(lines, ["2", "4"]);
+}
+
+#[test]
+fn table_insert_head() {
+    // pos=1 → head insert; existing elements shift right.
+    let src = "local t = {2, 3}
+table.insert(t, 1, 1)
+print(t[1])
+print(t[2])
+print(t[3])";
+    let out = run_ok(src, "lumelir_table_insert_head");
+    let lines: Vec<&str> = out.trim().lines().collect();
+    assert_eq!(lines, ["1", "2", "3"]);
+}
+
+#[test]
+fn table_insert_at_tail_position() {
+    // pos=#t+1 ≡ append (no shift, but valid range).
+    let src = "local t = {1, 2}
+table.insert(t, 3, 3)
+print(t[3])
+print(#t)";
+    let out = run_ok(src, "lumelir_table_insert_tail_pos");
+    let lines: Vec<&str> = out.trim().lines().collect();
+    assert_eq!(lines, ["3", "3"]);
+}
+
+#[test]
+fn table_insert_into_empty() {
+    // Empty table: grow + write at pos 1.
+    let src = "local t = {}
+table.insert(t, \"x\")
+print(t[1])
+print(#t)";
+    let out = run_ok(src, "lumelir_table_insert_empty");
+    let lines: Vec<&str> = out.trim().lines().collect();
+    assert_eq!(lines, ["x", "1"]);
+}
+
+#[test]
+fn table_insert_string_value() {
+    // Value any-kind: String literal works.
+    let src = "local t = {1, 2}
+table.insert(t, \"hello\")
+print(t[3])";
+    assert_eq!(
+        run_ok(src, "lumelir_table_insert_string_val").trim(),
+        "hello"
+    );
+}
+
+#[test]
+fn table_insert_tagged_value() {
+    // TaggedValue source (from table lookup) propagates through
+    // emit_value_slot_store_dispatched.
+    let src = "local src = {42}
+local dst = {}
+local x = src[1]
+table.insert(dst, x)
+print(dst[1])";
+    assert_eq!(run_ok(src, "lumelir_table_insert_tagged_val").trim(), "42");
+}
+
+#[test]
+fn table_insert_pos_zero_traps() {
+    // pos < 1 → runtime trap.
+    let src = "local t = {1}
+table.insert(t, 0, 99)";
+    let out = compile_and_run(src, "lumelir_table_insert_pos_zero");
+    assert!(
+        !out.status.success(),
+        "pos=0 must trap, but binary exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn table_insert_pos_past_end_plus_one_traps() {
+    // pos > #t + 1 → runtime trap.
+    let src = "local t = {1}
+table.insert(t, 5, 99)";
+    let out = compile_and_run(src, "lumelir_table_insert_pos_past_end");
+    assert!(
+        !out.status.success(),
+        "pos > #t+1 must trap, but binary exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn table_insert_rejects_non_table_first_arg() {
+    // arity-2 path: param_kinds[0] = Table.
+    let chunk = lumelir::parser::parse("table.insert(\"str\", 1)").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("table.insert with String first must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("BuiltinArgKindMismatch"),
+        "expected BuiltinArgKindMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn table_insert_rejects_non_number_pos() {
+    // arity-3 path: param_kinds_for_arity(3)[1] = Number.
+    let chunk = lumelir::parser::parse("table.insert({}, \"x\", 99)").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("table.insert with String pos must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("BuiltinArgKindMismatch"),
+        "expected BuiltinArgKindMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn table_insert_shadowed_respects_user_table() {
+    let src = "local table = {}
+function table.insert(x) return x + 600 end
+print(table.insert(42))";
+    assert_eq!(run_ok(src, "lumelir_table_insert_shadowed").trim(), "642");
+}

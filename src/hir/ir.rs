@@ -432,6 +432,15 @@ pub enum Builtin {
     /// helper (single-position trick: passes `j_raw = i_raw`).
     /// Phase 2.7q-stdlib-string (ADR 0109).
     StringByte,
+    /// `table.insert(list, [pos,] value)` — Lua 5.4 §6.8 array
+    /// mutation. arity 2 (append) or 3 (positional insert with
+    /// shift). The first **arity-sensitive** namespace builtin —
+    /// arg 1 changes semantics: value (arity 2) vs pos (arity 3).
+    /// Routed via `Builtin::param_kinds_for_arity(argc)` so the
+    /// ADR 0110 policy contract stays uniform without
+    /// re-introducing a `lower_namespace_builtin_call` special
+    /// case. Phase 2.7r-stdlib-table (ADR 0111).
+    TableInsert,
     /// `table.concat(t)` — Lua 5.4 §6.8 array-part concatenation
     /// with implicit `sep=""`. The first non-math, non-string
     /// consumer of ADR 0103's `Builtin::from_namespace_method`
@@ -502,6 +511,8 @@ impl Builtin {
     pub fn table_from_method(method: &str) -> Option<Self> {
         match method {
             "concat" => Some(Builtin::TableConcat),
+            // ADR 0111 — table.insert (mutation primitive).
+            "insert" => Some(Builtin::TableInsert),
             _ => None,
         }
     }
@@ -558,6 +569,9 @@ impl Builtin {
             // i=1, j=#t), 2 (explicit sep), 3 (explicit i, default
             // j=#t), 4 (explicit i and j).
             Builtin::TableConcat => (1, 4),
+            // ADR 0111 — table.insert(list, [pos,] value).
+            // arity 2 = append, arity 3 = positional insert.
+            Builtin::TableInsert => (2, 3),
         }
     }
 
@@ -585,6 +599,7 @@ impl Builtin {
             Builtin::StringRep => "string.rep",
             Builtin::StringByte => "string.byte",
             Builtin::TableConcat => "table.concat",
+            Builtin::TableInsert => "table.insert",
         }
     }
 
@@ -619,6 +634,8 @@ impl Builtin {
             | Builtin::StringSub
             | Builtin::StringRep
             | Builtin::TableConcat => &[ValueKind::String],
+            // ADR 0111 — table.insert is void (Lua spec).
+            Builtin::TableInsert => &[],
         }
     }
 
@@ -630,13 +647,19 @@ impl Builtin {
     /// scope for this ADR).
     ///
     /// `lower_namespace_builtin_call` (`src/hir/mod.rs`) iterates
-    /// `args[0..args.len()]` against `param_kinds[0..args.len()]` —
-    /// missing positions for range-arity builtins (Sub, Byte,
-    /// Concat) are naturally skipped via `.get(i)`. TaggedValue
-    /// args (table lookups, function params, etc.) are skipped at
-    /// the call site; runtime tag-check is deferred to a future
-    /// ADR.
-    pub fn param_kinds(self) -> &'static [ValueKind] {
+    /// `args[0..args.len()]` against the returned slice — missing
+    /// positions for range-arity builtins (Sub, Byte, Concat) are
+    /// naturally skipped via `.get(i)`. TaggedValue args (table
+    /// lookups, function params, etc.) are skipped at the call
+    /// site; runtime tag-check is deferred to a future ADR.
+    ///
+    /// Phase 2.7r (ADR 0111): signature widened from
+    /// `param_kinds()` to `param_kinds_for_arity(argc)` because
+    /// `table.insert` is the first builtin where the per-position
+    /// expected kind depends on the actual arity (arg 1 is the
+    /// **value** in arity 2 vs the **pos** in arity 3). All other
+    /// builtins ignore `argc` and return their static slice.
+    pub fn param_kinds_for_arity(self, argc: usize) -> &'static [ValueKind] {
         match self {
             // Global builtins: not checked here (existing per-builtin
             // logic in `lower_builtin_call`). Future ADR may unify.
@@ -670,6 +693,17 @@ impl Builtin {
                 ValueKind::Number,
                 ValueKind::Number,
             ],
+            // ADR 0111 — table.insert is arity-sensitive:
+            //   arity 2: [Table, TaggedValue]  (arg 1 = value, any kind)
+            //   arity 3: [Table, Number, TaggedValue]  (arg 1 = pos)
+            // Other argc values are unreachable in practice
+            // (arity range (2, 3) check fires earlier in
+            // `lower_namespace_builtin_call`).
+            Builtin::TableInsert => match argc {
+                2 => &[ValueKind::Table, ValueKind::TaggedValue],
+                3 => &[ValueKind::Table, ValueKind::Number, ValueKind::TaggedValue],
+                _ => &[],
+            },
         }
     }
 }

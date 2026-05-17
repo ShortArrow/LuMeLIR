@@ -255,6 +255,10 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             | Callee::Builtin(Builtin::StringSub)
             | Callee::Builtin(Builtin::StringRep)
             | Callee::Builtin(Builtin::TableConcat) => ValueKind::String,
+            // ADR 0111 — table.insert is void; expression-position
+            // use synthesises a Number placeholder (same shape as
+            // Print). Statement position discards.
+            Callee::Builtin(Builtin::TableInsert) => ValueKind::Number,
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.
@@ -4656,13 +4660,23 @@ impl LowerCtx {
         // builtins return an empty `param_kinds` slice so the loop
         // is a no-op for them (their checks live in
         // `lower_builtin_call`).
-        let param_kinds = builtin.param_kinds();
+        let param_kinds = builtin.param_kinds_for_arity(args.len());
         for (i, lowered) in lowered_args.iter().enumerate() {
             let Some(&expected) = param_kinds.get(i) else {
                 continue;
             };
             let actual = infer_kind(lowered, &self.locals, &self.functions);
-            if matches!(actual, ValueKind::TaggedValue) {
+            // Skip when either side is TaggedValue:
+            //   - actual TaggedValue (e.g. table-lookup, function
+            //     param origin): runtime tag-check chokepoint is
+            //     deferred to a future ADR.
+            //   - expected TaggedValue (ADR 0111): the spec
+            //     contract says "any kind accepted" (e.g. the
+            //     `value` arg of `table.insert`). param_kinds uses
+            //     ValueKind::TaggedValue as the "any" sentinel.
+            if matches!(actual, ValueKind::TaggedValue)
+                || matches!(expected, ValueKind::TaggedValue)
+            {
                 continue;
             }
             if actual != expected {

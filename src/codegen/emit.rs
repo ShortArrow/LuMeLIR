@@ -427,6 +427,19 @@ fn emit_fmt_global<'c>(
         "bad argument #2 to 'byte' (out of range)\0",
         loc,
     );
+    // Phase 2.7r-stdlib-table (ADR 0111): runtime trap for
+    // `table.insert(t, pos, v)` when `pos` is outside the
+    // 1-based-inclusive range `[1, #t + 1]`. Lua spec §6.8
+    // mandates a runtime error for both pos < 1 and
+    // pos > #t + 1; pos = #t + 1 is valid (append equivalent).
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_table_insert_pos_out_of_range",
+        "bad argument #2 to 'insert' (position out of bounds)\0",
+        loc,
+    );
 }
 
 fn emit_string_global<'c>(
@@ -805,6 +818,23 @@ fn emit_string_runtime_decls<'c>(
         ))
         .build();
     module.body().append_operation(memcpy_op.into());
+
+    // Phase 2.7r-stdlib-table (ADR 0111): memmove(dst, src, n) →
+    // overlap-safe byte copy. Used by `table.insert` to shift
+    // 16-byte tagged slots right when inserting at a non-tail
+    // position (memcpy is UB on overlap; memmove is the
+    // C-standard fix). Same signature as memcpy.
+    let memmove_ty = llvm::r#type::function(types.ptr, &[types.ptr, types.ptr, types.i64], false);
+    let memmove_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "memmove"))
+        .function_type(TypeAttribute::new(memmove_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(memmove_op.into());
 
     // Phase 2.6a-grow (ADR 0057): free(ptr) -> void. Used to
     // release the old `array_buf` after a doubling realloc; safe
@@ -8242,6 +8272,100 @@ fn emit_expr<'a, 'c>(
                     context, block, t_ptr, sep_ptr, sep_len, i_norm, j_norm, types, loc,
                 ))
             }
+            Callee::Builtin(Builtin::TableInsert) => {
+                // Phase 2.7r-stdlib-table (ADR 0111):
+                // `table.insert(list, [pos,] value)` mutation
+                // primitive.
+                //
+                // arity 2 form (`insert(t, v)`): pos defaults to
+                // `#t + 1` (append).
+                // arity 3 form (`insert(t, pos, v)`): pos is
+                // 1-based; runtime-checked against `[1, #t + 1]`.
+                //
+                // value can be any kind (Lua spec); the storage
+                // path branches on the value expression's
+                // statically-inferred kind:
+                //   - TaggedValue Local: raw 16-byte slot copy
+                //     (preserves Nil tag and any payload bits)
+                //   - concrete kind: `emit_value_slot_store_dispatched`
+                //
+                // Void return: yields a placeholder f64 0.0 so the
+                // call site type-checks against the expression-position
+                // contract (statement position discards).
+                let t_ptr = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let one_i64 = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 1).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                // Load length once (needed for both default-pos
+                // arity-2 form and the range check).
+                let len_slot =
+                    emit_byte_offset_ptr(context, block, t_ptr, TABLE_OFF_LEN, types, loc);
+                let len = emit_load(block, len_slot, types.i64, loc);
+                // Materialise pos: arity 2 → len + 1, arity 3 →
+                // emit_f2i(args[1]).
+                let (pos_i64, value_expr) = if args.len() == 2 {
+                    let pos = block
+                        .append_operation(arith::addi(len, one_i64, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    (pos, &args[1])
+                } else {
+                    let pos_f64 = emit_expr(
+                        context,
+                        block,
+                        &args[1],
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
+                    )?;
+                    let pos = emit_f2i(block, pos_f64, types, loc);
+                    (pos, &args[2])
+                };
+                emit_table_insert_runtime(
+                    context,
+                    block,
+                    t_ptr,
+                    len,
+                    pos_i64,
+                    value_expr,
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                // void return — Print/etc. precedent: yield f64 0.0.
+                let zero = arith::constant(
+                    context,
+                    FloatAttribute::new(context, types.f64, 0.0).into(),
+                    loc,
+                );
+                Ok(block.append_operation(zero).result(0).unwrap().into())
+            }
             Callee::User {
                 fid: FuncId(fid),
                 holding_local,
@@ -9663,6 +9787,285 @@ fn emit_table_concat_runtime<'a, 'c>(
     else_region.append_block(else_blk);
     let if_op = scf::r#if(range_nonempty, &[types.ptr], then_region, else_region, loc);
     block.append_operation(if_op).result(0).unwrap().into()
+}
+
+/// Phase 2.7r-stdlib-table (ADR 0111): `table.insert(t, pos, v)`
+/// runtime. Handles both arity-2 (caller passes `pos = len + 1`,
+/// no actual shift needed) and arity-3 (explicit pos, shift if
+/// `pos <= len`).
+///
+/// Steps:
+/// 1. Range check: `1 <= pos <= len + 1`; trap with
+///    `s_table_insert_pos_out_of_range` on out-of-bounds.
+/// 2. `emit_table_grow_if_needed` to ensure cap >= `len + 1`
+///    (reuses ADR 0057 grow path).
+/// 3. Reload `array_buf` (grow may have realloc'd).
+/// 4. If `pos <= len`, `memmove` the trailing `(len - pos + 1)`
+///    slots one position right (overlap-safe).
+/// 5. Store value into `array_buf[pos - 1]` — branching on the
+///    value expression's static kind. TaggedValue Local source
+///    does a raw 16-byte slot copy (preserves Nil/tag); concrete
+///    kinds use `emit_value_slot_store_dispatched` (ADR 0064).
+/// 6. Increment `length`.
+///
+/// Caller-supplied `len_pre` is the **pre-insert** length —
+/// avoids re-loading and stays consistent across the operation.
+#[allow(clippy::too_many_arguments)]
+fn emit_table_insert_runtime<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    t_ptr: Value<'c, 'a>,
+    len_pre: Value<'c, 'a>,
+    pos_i64: Value<'c, 'a>,
+    value_expr: &HirExpr,
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    let one_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    // max_valid_pos = len_pre + 1
+    let max_valid: Value<'c, '_> = block
+        .append_operation(arith::addi(len_pre, one_i64, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    // pos out-of-bounds: pos < 1 || pos > len_pre + 1
+    let pos_too_low: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Slt,
+            pos_i64,
+            one_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let pos_too_high: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Sgt,
+            pos_i64,
+            max_valid,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let oob: Value<'c, '_> = block
+        .append_operation(arith::ori(pos_too_low, pos_too_high, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let trap_then = Region::new();
+    let trap_then_blk = Block::new(&[]);
+    {
+        let msg = emit_addressof(
+            context,
+            &trap_then_blk,
+            "s_table_insert_pos_out_of_range",
+            types,
+            loc,
+        );
+        emit_exit_with_message(context, &trap_then_blk, msg, types, loc);
+        trap_then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    trap_then.append_block(trap_then_blk);
+    let trap_else = Region::new();
+    let trap_else_blk = Block::new(&[]);
+    trap_else_blk.append_operation(scf::r#yield(&[], loc));
+    trap_else.append_block(trap_else_blk);
+    block.append_operation(scf::r#if(oob, &[], trap_then, trap_else, loc));
+
+    // Grow if needed: ensure cap >= max_valid (= len_pre + 1).
+    emit_table_grow_if_needed(context, block, t_ptr, max_valid, len_pre, types, loc);
+    // Reload array_buf (grow may have realloc'd to a new buffer).
+    let arr_buf_slot = emit_byte_offset_ptr(context, block, t_ptr, TABLE_OFF_ARRAY_BUF, types, loc);
+    let arr_buf = emit_load(block, arr_buf_slot, types.ptr, loc);
+
+    let elem_size = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, ARRAY_ELEM_SIZE).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+
+    // shift_needed = pos <= len_pre (i.e., not a tail insert)
+    let shift_needed: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Sle,
+            pos_i64,
+            len_pre,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    // pos_zero = pos - 1 (0-based slot index)
+    let pos_zero: Value<'c, '_> = block
+        .append_operation(arith::subi(pos_i64, one_i64, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let shift_then = Region::new();
+    let shift_then_blk = Block::new(&[]);
+    {
+        // src = array_buf + pos_zero * ARRAY_ELEM_SIZE
+        let src_off: Value<'c, '_> = shift_then_blk
+            .append_operation(arith::muli(pos_zero, elem_size, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let src_ptr =
+            emit_byte_offset_ptr_dynamic(context, &shift_then_blk, arr_buf, src_off, types, loc);
+        // dst = array_buf + (pos_zero + 1) * ARRAY_ELEM_SIZE
+        let dst_zero: Value<'c, '_> = shift_then_blk
+            .append_operation(arith::addi(pos_zero, one_i64, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let dst_off: Value<'c, '_> = shift_then_blk
+            .append_operation(arith::muli(dst_zero, elem_size, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let dst_ptr =
+            emit_byte_offset_ptr_dynamic(context, &shift_then_blk, arr_buf, dst_off, types, loc);
+        // bytes = (len_pre - pos + 1) * ARRAY_ELEM_SIZE
+        let span: Value<'c, '_> = shift_then_blk
+            .append_operation(arith::subi(len_pre, pos_i64, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let span_plus_one: Value<'c, '_> = shift_then_blk
+            .append_operation(arith::addi(span, one_i64, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let bytes: Value<'c, '_> = shift_then_blk
+            .append_operation(arith::muli(span_plus_one, elem_size, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let _ = emit_libc_call_ptr(
+            context,
+            &shift_then_blk,
+            "memmove",
+            &[dst_ptr, src_ptr, bytes],
+            types,
+            loc,
+        );
+        shift_then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    shift_then.append_block(shift_then_blk);
+    let shift_else = Region::new();
+    let shift_else_blk = Block::new(&[]);
+    shift_else_blk.append_operation(scf::r#yield(&[], loc));
+    shift_else.append_block(shift_else_blk);
+    block.append_operation(scf::r#if(shift_needed, &[], shift_then, shift_else, loc));
+
+    // target_slot = array_buf + pos_zero * ARRAY_ELEM_SIZE
+    let target_off: Value<'c, '_> = block
+        .append_operation(arith::muli(pos_zero, elem_size, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let target_slot = emit_byte_offset_ptr_dynamic(context, block, arr_buf, target_off, types, loc);
+
+    // Value storage: branch on the value expression's static kind.
+    // TaggedValue Local sources need a raw 16-byte slot copy
+    // (mirrors emit.rs:2606 precedent — preserves Nil tag + any
+    // payload bit pattern). Concrete kinds use the existing
+    // emit_value_slot_store_dispatched chokepoint (ADR 0064/0067).
+    let value_kind = infer_kind(value_expr, locals, functions);
+    if let HirExprKind::Local(LocalId(src_idx)) = &value_expr.kind
+        && matches!(value_kind, ValueKind::TaggedValue)
+    {
+        let src_slot = slots[*src_idx];
+        let tag = emit_load(block, src_slot, types.i64, loc);
+        emit_store(block, tag, target_slot, loc);
+        let src_value_ptr =
+            emit_byte_offset_ptr(context, block, src_slot, ARRAY_ELEM_OFF_VALUE, types, loc);
+        let dst_value_ptr = emit_byte_offset_ptr(
+            context,
+            block,
+            target_slot,
+            ARRAY_ELEM_OFF_VALUE,
+            types,
+            loc,
+        );
+        let payload = emit_load(block, src_value_ptr, types.i64, loc);
+        emit_store(block, payload, dst_value_ptr, loc);
+    } else {
+        let v = if matches!(value_kind, ValueKind::Nil) {
+            // Nil sources don't materialise an SSA value; the store
+            // helper ignores the value arg for Nil. Use a
+            // placeholder f64 0.0.
+            let zero_op = arith::constant(
+                context,
+                FloatAttribute::new(context, types.f64, 0.0).into(),
+                loc,
+            );
+            block.append_operation(zero_op).result(0).unwrap().into()
+        } else {
+            emit_expr(
+                context,
+                block,
+                value_expr,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
+            )?
+        };
+        emit_value_slot_store_dispatched(context, block, target_slot, v, value_kind, types, loc);
+    }
+
+    // length += 1
+    let new_len: Value<'c, '_> = block
+        .append_operation(arith::addi(len_pre, one_i64, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_store(
+        block,
+        new_len,
+        len_slot_of(context, block, t_ptr, types, loc),
+        loc,
+    );
+    Ok(())
+}
+
+/// ADR 0111 helper: load slot ptr for `t_ptr + TABLE_OFF_LEN`.
+/// Tiny gep wrapper used by `emit_table_insert_runtime` to write
+/// the post-insert length without keeping a Value across regions.
+fn len_slot_of<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    t_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    emit_byte_offset_ptr(context, block, t_ptr, TABLE_OFF_LEN, types, loc)
 }
 
 /// Phase 2.7r-stdlib-table (ADR 0106): pass-1 element dispatch
