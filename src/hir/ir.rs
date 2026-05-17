@@ -621,4 +621,55 @@ impl Builtin {
             | Builtin::TableConcat => &[ValueKind::String],
         }
     }
+
+    /// Phase 2.7t-stdlib-arg-kind-validation (ADR 0110): per-position
+    /// expected kind for each argument of a namespace stdlib builtin
+    /// (math.* / string.* / table.*). Slice length = max arity.
+    /// Empty slice means "no per-arg checks" (global builtins are
+    /// checked individually in `lower_builtin_call` and are out of
+    /// scope for this ADR).
+    ///
+    /// `lower_namespace_builtin_call` (`src/hir/mod.rs`) iterates
+    /// `args[0..args.len()]` against `param_kinds[0..args.len()]` —
+    /// missing positions for range-arity builtins (Sub, Byte,
+    /// Concat) are naturally skipped via `.get(i)`. TaggedValue
+    /// args (table lookups, function params, etc.) are skipped at
+    /// the call site; runtime tag-check is deferred to a future
+    /// ADR.
+    pub fn param_kinds(self) -> &'static [ValueKind] {
+        match self {
+            // Global builtins: not checked here (existing per-builtin
+            // logic in `lower_builtin_call`). Future ADR may unify.
+            Builtin::Print
+            | Builtin::ToString
+            | Builtin::ToNumber
+            | Builtin::Type
+            | Builtin::Assert
+            | Builtin::Error
+            | Builtin::Next => &[],
+            // math.* — all single-Number arg except pow (Number, Number).
+            Builtin::MathSqrt
+            | Builtin::MathFloor
+            | Builtin::MathAbs
+            | Builtin::MathSin
+            | Builtin::MathCos
+            | Builtin::MathLog
+            | Builtin::MathExp => &[ValueKind::Number],
+            Builtin::MathPow => &[ValueKind::Number, ValueKind::Number],
+            // string.* — first arg String; bounds args Number.
+            Builtin::StringLen | Builtin::StringUpper | Builtin::StringLower => {
+                &[ValueKind::String]
+            }
+            Builtin::StringSub => &[ValueKind::String, ValueKind::Number, ValueKind::Number],
+            Builtin::StringRep => &[ValueKind::String, ValueKind::Number],
+            Builtin::StringByte => &[ValueKind::String, ValueKind::Number],
+            // table.* — first arg Table; sep String; bounds Number.
+            Builtin::TableConcat => &[
+                ValueKind::Table,
+                ValueKind::String,
+                ValueKind::Number,
+                ValueKind::Number,
+            ],
+        }
+    }
 }

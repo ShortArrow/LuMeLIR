@@ -14,6 +14,26 @@ pub enum HirError {
         offset: usize,
     },
 
+    /// Phase 2.7t-stdlib-arg-kind-validation (ADR 0110): a
+    /// namespace stdlib builtin (math.* / string.* / table.*)
+    /// received an argument whose statically-inferred
+    /// `ValueKind` does not match the per-position spec in
+    /// `Builtin::param_kinds()`. `arg_index` is 1-based for
+    /// user-friendly diagnostics. TaggedValue args are skipped
+    /// at this check (runtime tag-check is deferred to a
+    /// future ADR).
+    #[error(
+        "builtin '{builtin}' arg #{arg_index} expects {expected}, got {actual} \
+         (ADR 0110)"
+    )]
+    BuiltinArgKindMismatch {
+        builtin: String,
+        arg_index: usize,
+        expected: String,
+        actual: String,
+        offset: usize,
+    },
+
     #[error("unsupported call form")]
     UnsupportedCall { offset: usize },
 
@@ -150,6 +170,7 @@ impl HirError {
         match self {
             HirError::UndefinedName { offset, .. }
             | HirError::ArityMismatch { offset, .. }
+            | HirError::BuiltinArgKindMismatch { offset, .. }
             | HirError::UnsupportedCall { offset }
             | HirError::TypeMismatch { offset, .. }
             | HirError::ReadOnlyAssign { offset, .. }

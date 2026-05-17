@@ -383,3 +383,64 @@ function string.byte(x) return x + 400 end
 print(string.byte(42))";
     assert_eq!(run_ok(src, "lumelir_string_byte_shadowed").trim(), "442");
 }
+
+// --- ADR 0110: arg-kind validation negative pins ---
+//
+// string.* の per-arg kind を静的検証。
+// String が必要な引数に Number/Bool/Nil 等を渡すと HIR reject。
+// TaggedValue は skip (runtime check 将来 ADR)。
+
+#[test]
+fn string_len_rejects_number() {
+    let chunk = lumelir::parser::parse("print(string.len(42))").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("string.len with Number must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("BuiltinArgKindMismatch"),
+        "expected BuiltinArgKindMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn string_upper_rejects_nil() {
+    let chunk = lumelir::parser::parse("print(string.upper(nil))").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("string.upper with Nil must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("BuiltinArgKindMismatch"),
+        "expected BuiltinArgKindMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn string_sub_rejects_non_string_first() {
+    let chunk = lumelir::parser::parse("print(string.sub(42, 1))").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("string.sub with Number first must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("BuiltinArgKindMismatch"),
+        "expected BuiltinArgKindMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn string_sub_rejects_non_number_second() {
+    let chunk = lumelir::parser::parse("print(string.sub(\"a\", \"x\"))").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("string.sub with String second must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("BuiltinArgKindMismatch"),
+        "expected BuiltinArgKindMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn string_byte_rejects_non_string() {
+    let chunk = lumelir::parser::parse("print(string.byte(123))").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("string.byte with Number must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("BuiltinArgKindMismatch"),
+        "expected BuiltinArgKindMismatch, got: {msg}"
+    );
+}

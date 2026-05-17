@@ -255,3 +255,54 @@ fn table_concat_arity_five_fails() {
         "expected ArityMismatch, got: {msg}"
     );
 }
+
+// --- ADR 0110: arg-kind validation negative pins ---
+//
+// table.concat の per-arg kind を静的検証。
+// arg 0 Table, arg 1 String, args 2/3 Number。
+// TaggedValue 由来 (table-lookup 由来等) は skip — 将来 ADR で
+// runtime tag-check を追加。
+
+#[test]
+fn table_concat_rejects_non_table() {
+    let chunk = lumelir::parser::parse("print(table.concat(\"not_table\"))").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("table.concat with String must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("BuiltinArgKindMismatch"),
+        "expected BuiltinArgKindMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn table_concat_rejects_non_string_sep() {
+    let chunk = lumelir::parser::parse("print(table.concat({}, 42))").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("table.concat with Number sep must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("BuiltinArgKindMismatch"),
+        "expected BuiltinArgKindMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn table_concat_rejects_non_number_i() {
+    let chunk = lumelir::parser::parse("print(table.concat({}, \",\", \"x\"))").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("table.concat with String i must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("BuiltinArgKindMismatch"),
+        "expected BuiltinArgKindMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn table_concat_rejects_non_number_j() {
+    let chunk = lumelir::parser::parse("print(table.concat({}, \",\", 1, \"y\"))").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("table.concat with String j must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("BuiltinArgKindMismatch"),
+        "expected BuiltinArgKindMismatch, got: {msg}"
+    );
+}

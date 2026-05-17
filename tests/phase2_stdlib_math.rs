@@ -167,3 +167,43 @@ fn math_pow_arity_mismatch() {
         "expected ArityMismatch, got: {msg}"
     );
 }
+
+// --- ADR 0110: arg-kind validation negative pins ---
+//
+// namespace builtin の per-arg kind は静的に検証される。
+// math.* は全て Number を要求; 非 Number は HIR で reject。
+// TaggedValue (table-lookup 由来等) は skip — 将来 ADR で
+// runtime tag-check を追加。
+
+#[test]
+fn math_sqrt_rejects_string() {
+    let chunk = lumelir::parser::parse("print(math.sqrt(\"hello\"))").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("math.sqrt with String must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("BuiltinArgKindMismatch"),
+        "expected BuiltinArgKindMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn math_pow_rejects_string_first() {
+    let chunk = lumelir::parser::parse("print(math.pow(\"x\", 2))").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("math.pow with String first must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("BuiltinArgKindMismatch"),
+        "expected BuiltinArgKindMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn math_floor_rejects_bool() {
+    let chunk = lumelir::parser::parse("print(math.floor(true))").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("math.floor with Bool must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("BuiltinArgKindMismatch"),
+        "expected BuiltinArgKindMismatch, got: {msg}"
+    );
+}
