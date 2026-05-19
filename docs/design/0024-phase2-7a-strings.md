@@ -1,8 +1,18 @@
 # 0024. Phase 2.7a: String Literals, `print(string)`, and `#` Length
 
-- **Status:** Accepted
+- **Status:** Accepted (ABI surface superseded by ADR 0112)
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
+
+> **Superseded ABI:** ADR 0112 (2026-05-19) replaced the
+> `!llvm.ptr`-to-NUL-terminated-C-string representation defined
+> here with a boxed string object (`{i64 len, i8 data[len+1]}`)
+> to restore Lua spec-compliant byte-string semantics
+> (embedded NUL correctness). The HIR `ValueKind::String`
+> contract and the `#s` / `print(string)` user-visible surface
+> are unchanged; only the codegen representation and consumer
+> chokepoints (`emit_string_obj_len` / `_data` / `_eq` /
+> `_compare` / `_hash`) were swapped.
 
 ## Context
 

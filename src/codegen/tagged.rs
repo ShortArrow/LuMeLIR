@@ -22,8 +22,8 @@ use melior::{
 use crate::hir::ValueKind;
 
 use super::primitive::{
-    Types, emit_addressof, emit_byte_offset_ptr, emit_exit_with_message, emit_libc_call_i32,
-    emit_load, emit_printf, emit_store,
+    Types, emit_addressof, emit_byte_offset_ptr, emit_exit_with_message, emit_load,
+    emit_print_string_obj, emit_printf, emit_store, emit_string_obj_eq,
 };
 
 // =============================================================
@@ -618,8 +618,8 @@ pub(crate) fn emit_print_tagged_local<'a, 'c>(
                 .result(0)
                 .unwrap()
                 .into();
-            let fmt_ptr = emit_addressof(context, &bool_then_blk, "fmt_str_raw", types, loc);
-            emit_printf(context, &bool_then_blk, fmt_ptr, chosen, types, loc);
+            // ADR 0112: s_true / s_false are boxed string objects.
+            emit_print_string_obj(context, &bool_then_blk, chosen, types, loc);
             bool_then_blk.append_operation(scf::r#yield(&[], loc));
         }
         bool_then.append_block(bool_then_blk);
@@ -650,9 +650,9 @@ pub(crate) fn emit_print_tagged_local<'a, 'c>(
             let string_then = Region::new();
             let string_then_blk = Block::new(&[]);
             {
+                // ADR 0112: payload is a boxed string object ptr.
                 let payload_ptr = emit_load(&string_then_blk, value_ptr, types.ptr, loc);
-                let fmt_ptr = emit_addressof(context, &string_then_blk, "fmt_str_raw", types, loc);
-                emit_printf(context, &string_then_blk, fmt_ptr, payload_ptr, types, loc);
+                emit_print_string_obj(context, &string_then_blk, payload_ptr, types, loc);
                 string_then_blk.append_operation(scf::r#yield(&[], loc));
             }
             string_then.append_block(string_then_blk);
@@ -689,8 +689,7 @@ pub(crate) fn emit_print_tagged_local<'a, 'c>(
                 let nil_then_blk = Block::new(&[]);
                 {
                     let nil_ptr = emit_addressof(context, &nil_then_blk, "s_nil", types, loc);
-                    let fmt_ptr = emit_addressof(context, &nil_then_blk, "fmt_str_raw", types, loc);
-                    emit_printf(context, &nil_then_blk, fmt_ptr, nil_ptr, types, loc);
+                    emit_print_string_obj(context, &nil_then_blk, nil_ptr, types, loc);
                     nil_then_blk.append_operation(scf::r#yield(&[], loc));
                 }
                 nil_then.append_block(nil_then_blk);
@@ -732,9 +731,7 @@ pub(crate) fn emit_print_tagged_local<'a, 'c>(
                             types,
                             loc,
                         );
-                        let fmt_ptr =
-                            emit_addressof(context, &fn_then_blk, "fmt_str_raw", types, loc);
-                        emit_printf(context, &fn_then_blk, fmt_ptr, fn_ptr, types, loc);
+                        emit_print_string_obj(context, &fn_then_blk, fn_ptr, types, loc);
                         fn_then_blk.append_operation(scf::r#yield(&[], loc));
                     }
                     fn_then.append_block(fn_then_blk);
@@ -771,9 +768,7 @@ pub(crate) fn emit_print_tagged_local<'a, 'c>(
                                 types,
                                 loc,
                             );
-                            let fmt_ptr =
-                                emit_addressof(context, &tbl_then_blk, "fmt_str_raw", types, loc);
-                            emit_printf(context, &tbl_then_blk, fmt_ptr, tbl_ptr, types, loc);
+                            emit_print_string_obj(context, &tbl_then_blk, tbl_ptr, types, loc);
                             tbl_then_blk.append_operation(scf::r#yield(&[], loc));
                         }
                         tbl_then.append_block(tbl_then_blk);
@@ -970,36 +965,12 @@ pub(crate) fn emit_tagged_eq_local_local<'a, 'c>(
                     let str_then = Region::new();
                     let str_then_blk = Block::new(&[]);
                     {
+                        // ADR 0112: payloads are boxed string object
+                        // ptrs. emit_string_obj_eq is length+memcmp-
+                        // based (no NUL truncation false positives).
                         let lp = emit_load(&str_then_blk, lhs_payload, types.ptr, loc);
                         let rp = emit_load(&str_then_blk, rhs_payload, types.ptr, loc);
-                        let cmp = emit_libc_call_i32(
-                            context,
-                            &str_then_blk,
-                            "strcmp",
-                            &[lp, rp],
-                            types,
-                            loc,
-                        );
-                        let zero_i32 = str_then_blk
-                            .append_operation(arith::constant(
-                                context,
-                                IntegerAttribute::new(types.i32, 0).into(),
-                                loc,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into();
-                        let eq: Value<'c, '_> = str_then_blk
-                            .append_operation(arith::cmpi(
-                                context,
-                                arith::CmpiPredicate::Eq,
-                                cmp,
-                                zero_i32,
-                                loc,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into();
+                        let eq = emit_string_obj_eq(context, &str_then_blk, lp, rp, types, loc);
                         str_then_blk.append_operation(scf::r#yield(&[eq], loc));
                     }
                     str_then.append_block(str_then_blk);

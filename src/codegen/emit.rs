@@ -39,7 +39,10 @@ use super::error::CodegenError;
 use super::primitive::{
     Types, emit_addressof, emit_byte_offset_ptr, emit_byte_offset_ptr_dynamic,
     emit_exit_with_message, emit_libc_call_f64, emit_libc_call_i32, emit_libc_call_i64,
-    emit_libc_call_ptr, emit_libc_call_void, emit_load, emit_printf, emit_store,
+    emit_libc_call_ptr, emit_libc_call_void, emit_load, emit_print_string_obj, emit_printf,
+    emit_store, emit_string_obj_alloc, emit_string_obj_compare, emit_string_obj_data,
+    emit_string_obj_eq, emit_string_obj_finalize_nul, emit_string_obj_from_bytes,
+    emit_string_obj_hash, emit_string_obj_len,
 };
 use super::tagged::{
     ARRAY_ELEM_OFF_VALUE, ARRAY_ELEM_SIZE, HashKeyValidityPolicy, TAG_BOOL, TAG_DELETED,
@@ -202,26 +205,41 @@ fn emit_fmt_global<'c>(
     i8_type: Type<'c>,
     loc: Location<'c>,
 ) {
-    emit_string_global(context, module, i8_type, "fmt", "%g\n\0", loc);
-    // Phase 2.2b: format and string pool for `print(bool)`.
-    emit_string_global(context, module, i8_type, "fmt_str", "%s\n\0", loc);
+    // Phase 2.7u-string-abi-refactor (ADR 0112): format strings
+    // remain raw C-strings (printf consumes them as `const char *`,
+    // not as Lua values). All `fmt_*` globals use `emit_cstr_global`
+    // (no `{i64 len, i8 data[len+1]}` header). All other static
+    // globals (s_true/false/nil/typename_*/tab/newline/diagnostic
+    // msgs/user literals) flow through `emit_string_global` and
+    // get the boxed-object form.
+    emit_cstr_global(context, module, i8_type, "fmt", "%g\n\0", loc);
+    emit_cstr_global(context, module, i8_type, "fmt_str", "%s\n\0", loc);
+    emit_cstr_global(context, module, i8_type, "fmt_str_lensafe", "%.*s\n\0", loc);
+    emit_cstr_global(
+        context,
+        module,
+        i8_type,
+        "fmt_str_raw_lensafe",
+        "%.*s\0",
+        loc,
+    );
     emit_string_global(context, module, i8_type, "s_true", "true\0", loc);
     emit_string_global(context, module, i8_type, "s_false", "false\0", loc);
     // Phase 2.3a: nil string for `print(nil)`.
     emit_string_global(context, module, i8_type, "s_nil", "nil\0", loc);
     // Phase 2.8b (ADR 0032): no-newline siblings of `fmt`/`fmt_str`,
     // plus literal `\t`/`\n` payloads, for multi-arg `print(a, b, ...)`.
-    emit_string_global(context, module, i8_type, "fmt_raw", "%g\0", loc);
-    emit_string_global(context, module, i8_type, "fmt_str_raw", "%s\0", loc);
+    emit_cstr_global(context, module, i8_type, "fmt_raw", "%g\0", loc);
+    emit_cstr_global(context, module, i8_type, "fmt_str_raw", "%s\0", loc);
     emit_string_global(context, module, i8_type, "s_tab", "\t\0", loc);
     emit_string_global(context, module, i8_type, "s_newline", "\n\0", loc);
     // Phase 2.7c (ADR 0026): `%.14g` is the Lua-spec format for
     // `tostring(number)`. The trailing `\0` lets snprintf consume it
     // as a C string.
-    emit_string_global(context, module, i8_type, "fmt_tostring_g", "%.14g\0", loc);
+    emit_cstr_global(context, module, i8_type, "fmt_tostring_g", "%.14g\0", loc);
     // Phase 2.7e (ADR 0028): `%lf` parses an f64 from a string for
     // `tonumber(string)` via `sscanf`.
-    emit_string_global(context, module, i8_type, "fmt_tonumber_lf", "%lf\0", loc);
+    emit_cstr_global(context, module, i8_type, "fmt_tonumber_lf", "%lf\0", loc);
     // Phase 2.7f (ADR 0029): per-kind Lua type-name strings for the
     // `type(x)` builtin. Each is NUL-terminated so they can flow
     // straight through `print(type(x))` / concat without any copy.
@@ -440,9 +458,30 @@ fn emit_fmt_global<'c>(
         "bad argument #2 to 'insert' (position out of bounds)\0",
         loc,
     );
+    // Phase 2.7u-string-abi-refactor (ADR 0112): runtime trap for
+    // `emit_alloc_with_oom_check` when malloc returns NULL. Fires
+    // from string-alloc chokepoint helpers (concat / case_map /
+    // slice / rep / table_concat / empty / tostring number /
+    // string_obj_alloc). Out of scope: table grow / hash grow /
+    // closure cell allocs (those keep ADR 0057+ raw malloc until a
+    // future alloc-policy ADR consolidates).
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_alloc_oom",
+        "out of memory\0",
+        loc,
+    );
 }
 
-fn emit_string_global<'c>(
+/// Emit a **raw C-string global** (NUL-terminated `[N x i8]`).
+/// Used for printf format strings (`fmt_*`) which libc consumes
+/// as `const char *` — they must remain raw bytes without the
+/// boxed-object header.
+///
+/// `value` must include the trailing `\0` (existing convention).
+fn emit_cstr_global<'c>(
     context: &'c Context,
     module: &Module<'c>,
     i8_type: Type<'c>,
@@ -461,6 +500,70 @@ fn emit_string_global<'c>(
         ))
         .constant(melior::ir::attribute::Attribute::unit(context))
         .value(StringAttribute::new(context, value).into())
+        .build();
+    module.body().append_operation(global_op.into());
+}
+
+/// Phase 2.7u-string-abi-refactor (ADR 0112): emit a static
+/// **boxed Lua string object** global with the runtime layout
+/// defined in `primitive.rs`:
+///
+///   `[i64 len_le, i8 data[len], i8 0]`
+///
+/// `len` is the byte count excluding the trailing compat NUL.
+/// The caller passes `value` with a trailing `\0` (legacy
+/// convention preserved); this function strips that to compute
+/// `len`, then re-emits `len_le` header + data + fresh compat
+/// NUL.
+///
+/// The initializer bytes may contain arbitrary `u8` values
+/// (LE-encoded `len` may have high bytes > 0x7F; data may
+/// contain embedded NUL via `\x00` escapes). We tunnel them
+/// through `StringAttribute::new` via `String::from_utf8_unchecked`
+/// — MLIR's string attribute is internally a `(data, length)`
+/// pair and accepts arbitrary bytes at the C++ level; the Rust
+/// `String` is used only as a transport (no UTF-8-assuming
+/// methods are called).
+///
+/// Used for all Lua-value strings: literal singletons
+/// (s_true/false/nil), type names (s_typename_*), diagnostic
+/// messages, print separators (s_tab / s_newline), and user
+/// literals (lstr_N). Format strings stay on `emit_cstr_global`.
+fn emit_string_global<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    i8_type: Type<'c>,
+    name: &str,
+    value: &str,
+    loc: Location<'c>,
+) {
+    let value_bytes = value.as_bytes();
+    let body_len = value_bytes.len().saturating_sub(1);
+    let body_bytes = &value_bytes[..body_len];
+
+    let mut init_bytes = Vec::with_capacity(8 + body_len + 1);
+    init_bytes.extend_from_slice(&(body_len as i64).to_le_bytes());
+    init_bytes.extend_from_slice(body_bytes);
+    init_bytes.push(0u8);
+
+    // SAFETY: bytes pass verbatim to MLIR's string attribute and
+    // emit as `[N x i8] c"..."` in LLVM IR. Neither MLIR nor LLVM
+    // interprets them as UTF-8; the Rust `String` is just a
+    // transport carrier for the `&str` arg of `StringAttribute::new`.
+    let init_string = unsafe { String::from_utf8_unchecked(init_bytes) };
+
+    let total_len = 8 + body_len + 1;
+    let array_type = llvm::r#type::array(i8_type, total_len as u32);
+    let global_op = GlobalOperationBuilder::new(context, loc)
+        .initializer(Region::new())
+        .global_type(TypeAttribute::new(array_type))
+        .sym_name(StringAttribute::new(context, name))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::Internal,
+        ))
+        .constant(melior::ir::attribute::Attribute::unit(context))
+        .value(StringAttribute::new(context, &init_string).into())
         .build();
     module.body().append_operation(global_op.into());
 }
@@ -835,6 +938,23 @@ fn emit_string_runtime_decls<'c>(
         ))
         .build();
     module.body().append_operation(memmove_op.into());
+
+    // Phase 2.7u-string-abi-refactor (ADR 0112): memcmp(a, b, n) →
+    // byte-equal comparison returning negative/zero/positive i32.
+    // Used by emit_string_obj_eq / _compare to replace strcmp,
+    // which truncates at embedded NUL. Same signature shape as
+    // memcpy/memmove.
+    let memcmp_ty = llvm::r#type::function(types.i32, &[types.ptr, types.ptr, types.i64], false);
+    let memcmp_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "memcmp"))
+        .function_type(TypeAttribute::new(memcmp_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(memcmp_op.into());
 
     // Phase 2.6a-grow (ADR 0057): free(ptr) -> void. Used to
     // release the old `array_buf` after a doubling realloc; safe
@@ -5128,132 +5248,6 @@ fn emit_table_grow_if_needed<'a, 'c>(
     block.append_operation(scf::r#if(need_grow, &[], then_region, else_region, loc));
 }
 
-/// Phase 2.6b-hash (ADR 0058): FNV-1a 64-bit hash of a NUL-
-/// terminated C string. `strlen` gives the byte count, then a
-/// `scf.while` loop folds each byte into the running hash.
-/// Returns the i64 hash value (bit pattern interpreted as
-/// unsigned for bucket masking).
-fn emit_string_hash<'a, 'c>(
-    context: &'c Context,
-    block: &'a Block<'c>,
-    str_ptr: Value<'c, 'a>,
-    types: &Types<'c>,
-    loc: Location<'c>,
-) -> Value<'c, 'a> {
-    // FNV-1a 64-bit constants: offset basis and prime. The offset
-    // basis 14695981039346656037 doesn't fit in i64 as positive,
-    // but as bit pattern it equals -3750763034362895579 i64 —
-    // store via the wrapping reinterpretation.
-    const FNV_OFFSET_BASIS: i64 = -3750763034362895579;
-    const FNV_PRIME: i64 = 1099511628211;
-    let len_i64 = emit_libc_call_i64(context, block, "strlen", &[str_ptr], types, loc);
-    let init_hash = block
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(types.i64, FNV_OFFSET_BASIS).into(),
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    let init_idx = block
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(types.i64, 0).into(),
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    // scf.while [hash, idx] -> hash:
-    //   before: yield (idx < len) carrying hash, idx
-    //   after : load byte, hash = (hash xor byte) * prime; idx++; yield hash, idx
-    let before_region = Region::new();
-    let before_blk = Block::new(&[(types.i64, loc), (types.i64, loc)]);
-    {
-        let hash_arg: Value<'c, '_> = before_blk.argument(0).unwrap().into();
-        let idx_arg: Value<'c, '_> = before_blk.argument(1).unwrap().into();
-        let cond: Value<'c, '_> = before_blk
-            .append_operation(arith::cmpi(
-                context,
-                arith::CmpiPredicate::Slt,
-                idx_arg,
-                len_i64,
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        before_blk.append_operation(scf::condition(cond, &[hash_arg, idx_arg], loc));
-    }
-    before_region.append_block(before_blk);
-    let after_region = Region::new();
-    let after_blk = Block::new(&[(types.i64, loc), (types.i64, loc)]);
-    {
-        let hash_arg: Value<'c, '_> = after_blk.argument(0).unwrap().into();
-        let idx_arg: Value<'c, '_> = after_blk.argument(1).unwrap().into();
-        // byte_ptr = str_ptr + idx (gep i8)
-        let byte_ptr =
-            emit_byte_offset_ptr_dynamic(context, &after_blk, str_ptr, idx_arg, types, loc);
-        // i8 byte → i64 zero-extended
-        let byte_i8 = emit_load(&after_blk, byte_ptr, types.i8, loc);
-        let byte_i64: Value<'c, '_> = after_blk
-            .append_operation(
-                OperationBuilder::new("arith.extui", loc)
-                    .add_operands(&[byte_i8])
-                    .add_results(&[types.i64])
-                    .build()
-                    .expect("arith.extui i8 -> i64"),
-            )
-            .result(0)
-            .unwrap()
-            .into();
-        let xored: Value<'c, '_> = after_blk
-            .append_operation(arith::xori(hash_arg, byte_i64, loc))
-            .result(0)
-            .unwrap()
-            .into();
-        let prime = after_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(types.i64, FNV_PRIME).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let new_hash: Value<'c, '_> = after_blk
-            .append_operation(arith::muli(xored, prime, loc))
-            .result(0)
-            .unwrap()
-            .into();
-        let one = after_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(types.i64, 1).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        let new_idx: Value<'c, '_> = after_blk
-            .append_operation(arith::addi(idx_arg, one, loc))
-            .result(0)
-            .unwrap()
-            .into();
-        after_blk.append_operation(scf::r#yield(&[new_hash, new_idx], loc));
-    }
-    after_region.append_block(after_blk);
-    let while_op = scf::r#while(
-        &[init_hash, init_idx],
-        &[types.i64, types.i64],
-        before_region,
-        after_region,
-        loc,
-    );
-    block.append_operation(while_op).result(0).unwrap().into()
-}
-
 /// Phase 2.6b-hash (ADR 0058): if `header.hash_buf` is null,
 /// allocate the initial hash region (header for cap+count, then
 /// `cap` zeroed entries), and store the buffer pointer in the
@@ -5465,8 +5459,11 @@ fn emit_hash_key_hash_dispatched<'a, 'c>(
     let str_then = Region::new();
     let str_then_blk = Block::new(&[]);
     {
+        // ADR 0112: payload is a boxed string object ptr. FNV-1a
+        // is now bounded by the header `len` field (not strlen)
+        // so embedded NUL bytes participate in the hash.
         let str_ptr = emit_load(&str_then_blk, payload_ptr, types.ptr, loc);
-        let h = emit_string_hash(context, &str_then_blk, str_ptr, types, loc);
+        let h = emit_string_obj_hash(context, &str_then_blk, str_ptr, types, loc);
         str_then_blk.append_operation(scf::r#yield(&[h], loc));
     }
     str_then.append_block(str_then_blk);
@@ -5548,29 +5545,13 @@ fn emit_hash_key_eq_dispatched<'a, 'c>(
         let str_then = Region::new();
         let str_then_blk = Block::new(&[]);
         {
+            // ADR 0112: String payloads are boxed-object ptrs;
+            // hash-key eq is length-aware byte equality, not
+            // strcmp (strcmp truncates at NUL → false collisions
+            // for embedded-NUL keys).
             let pa = emit_load(&str_then_blk, payload_a, types.ptr, loc);
             let pb = emit_load(&str_then_blk, payload_b, types.ptr, loc);
-            let cmp = emit_libc_call_i32(context, &str_then_blk, "strcmp", &[pa, pb], types, loc);
-            let zero_i32 = str_then_blk
-                .append_operation(arith::constant(
-                    context,
-                    IntegerAttribute::new(types.i32, 0).into(),
-                    loc,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            let eq: Value<'c, '_> = str_then_blk
-                .append_operation(arith::cmpi(
-                    context,
-                    arith::CmpiPredicate::Eq,
-                    cmp,
-                    zero_i32,
-                    loc,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
+            let eq = emit_string_obj_eq(context, &str_then_blk, pa, pb, types, loc);
             str_then_blk.append_operation(scf::r#yield(&[eq], loc));
         }
         str_then.append_block(str_then_blk);
@@ -7321,9 +7302,9 @@ fn emit_expr<'a, 'c>(
                     loc,
                 )?;
                 let len_i64 = match kind {
-                    ValueKind::String => {
-                        emit_libc_call_i64(context, block, "strlen", &[v], types, loc)
-                    }
+                    // ADR 0112: String value is a boxed object ptr;
+                    // header `len` field is the truth source.
+                    ValueKind::String => emit_string_obj_len(block, v, types, loc),
                     ValueKind::Table => emit_load(block, v, types.i64, loc),
                     _ => unreachable!("HIR rejects #x for non-String/Table kinds"),
                 };
@@ -7857,7 +7838,8 @@ fn emit_expr<'a, 'c>(
                     in_function_cell_ptr,
                     loc,
                 )?;
-                let len_i64 = emit_libc_call_i64(context, block, "strlen", &[arg], types, loc);
+                // ADR 0112: string.len reads the header len field.
+                let len_i64 = emit_string_obj_len(block, arg, types, loc);
                 Ok(emit_i2f(block, len_i64, types, loc))
             }
             Callee::Builtin(Builtin::StringByte) => {
@@ -7912,7 +7894,8 @@ fn emit_expr<'a, 'c>(
                 } else {
                     one_i64
                 };
-                let len_i64 = emit_libc_call_i64(context, block, "strlen", &[src], types, loc);
+                // ADR 0112: src is a boxed string object.
+                let len_i64 = emit_string_obj_len(block, src, types, loc);
                 // Single-position trick: j_raw = i_raw. ADR 0104
                 // helper reuse — its asymmetric clamp (i UP to 1,
                 // j DOWN to len) detects out-of-range as i > j.
@@ -7932,14 +7915,17 @@ fn emit_expr<'a, 'c>(
                 let then_region = Region::new();
                 let then_blk = Block::new(&[]);
                 {
-                    // byte_ptr = src + (i_norm - 1)
+                    // byte_ptr = data + (i_norm - 1) where `data` is
+                    // the string object's data region (ADR 0112).
                     let offset = then_blk
                         .append_operation(arith::subi(i_norm, one_i64, loc))
                         .result(0)
                         .unwrap()
                         .into();
-                    let byte_ptr =
-                        emit_byte_offset_ptr_dynamic(context, &then_blk, src, offset, types, loc);
+                    let data_ptr = emit_string_obj_data(context, &then_blk, src, types, loc);
+                    let byte_ptr = emit_byte_offset_ptr_dynamic(
+                        context, &then_blk, data_ptr, offset, types, loc,
+                    );
                     let i8_ty: Type<'c> = IntegerType::new(context, 8).into();
                     let byte_i8 = emit_load(&then_blk, byte_ptr, i8_ty, loc);
                     // Zero-extend i8 → i64 (byte is unsigned 0-255).
@@ -8046,7 +8032,8 @@ fn emit_expr<'a, 'c>(
                     in_function_cell_ptr,
                     loc,
                 )?;
-                let len_i64 = emit_libc_call_i64(context, block, "strlen", &[src], types, loc);
+                // ADR 0112: src is a boxed string object.
+                let len_i64 = emit_string_obj_len(block, src, types, loc);
                 let i_i64 = emit_f2i(block, i_f64, types, loc);
                 // j absent ⇔ post-translate j = len (Lua spec §6.4).
                 let j_i64 = if args.len() == 3 {
@@ -8214,7 +8201,8 @@ fn emit_expr<'a, 'c>(
                         in_function_cell_ptr,
                         loc,
                     )?;
-                    let sep_len = emit_libc_call_i64(context, block, "strlen", &[sep], types, loc);
+                    // ADR 0112: sep is a boxed string object.
+                    let sep_len = emit_string_obj_len(block, sep, types, loc);
                     (sep, sep_len)
                 };
                 // ADR 0108: load #t once for default j and for the
@@ -8878,31 +8866,38 @@ fn emit_string_case_map<'a, 'c>(
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
-    let length = emit_libc_call_i64(context, block, "strlen", &[src], types, loc);
-    let one = block
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(types.i64, 1).into(),
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    let size = block
-        .append_operation(arith::addi(length, one, loc))
-        .result(0)
-        .unwrap()
-        .into();
-    let buf = emit_libc_call_ptr(context, block, "malloc", &[size], types, loc);
-    // Full memcpy including the null terminator so the new String
-    // is zero-terminated even if length == 0.
-    let _ = emit_libc_call_ptr(context, block, "memcpy", &[buf, src, size], types, loc);
+    // ADR 0112: src is a boxed string object. Allocate a new
+    // object of the same length, copy data, apply case-map
+    // in-place, finalize the compat NUL.
+    let length = emit_string_obj_len(block, src, types, loc);
+    let src_data = emit_string_obj_data(context, block, src, types, loc);
+    let new_obj = emit_string_obj_alloc(context, block, length, types, loc);
+    let buf = emit_string_obj_data(context, block, new_obj, types, loc);
+    // Copy data bytes (not including caller's compat NUL — we
+    // finalize the new object's NUL ourselves after the loop).
+    let _ = emit_libc_call_ptr(
+        context,
+        block,
+        "memcpy",
+        &[buf, src_data, length],
+        types,
+        loc,
+    );
 
     // for i in 0..length: buf[i] = mapper_libc((i32)buf[i]).
     let zero = block
         .append_operation(arith::constant(
             context,
             IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let one = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
             loc,
         ))
         .result(0)
@@ -8996,7 +8991,9 @@ fn emit_string_case_map<'a, 'c>(
     after_region.append_block(after_blk);
     let while_op = scf::r#while(&[zero], &[types.i64], before_region, after_region, loc);
     block.append_operation(while_op);
-    buf
+    // ADR 0112: finalize the compat NUL terminator.
+    emit_string_obj_finalize_nul(context, block, new_obj, length, types, loc);
+    new_obj
 }
 
 /// Phase 2.7q-stdlib-string (ADR 0104): allocate a freshly heap-
@@ -9009,33 +9006,20 @@ fn emit_empty_string<'a, 'c>(
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
-    let one_i64 = block
+    // ADR 0112: allocate a boxed string object with len=0. Helper
+    // stores len at offset 0 and we finalize the compat NUL.
+    let zero_i64 = block
         .append_operation(arith::constant(
             context,
-            IntegerAttribute::new(types.i64, 1).into(),
+            IntegerAttribute::new(types.i64, 0).into(),
             loc,
         ))
         .result(0)
         .unwrap()
         .into();
-    let buf = emit_libc_call_ptr(context, block, "malloc", &[one_i64], types, loc);
-    let i8_ty: Type<'c> = IntegerType::new(context, 8).into();
-    let zero_i8 = block
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(i8_ty, 0).into(),
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    block.append_operation(
-        OperationBuilder::new("llvm.store", loc)
-            .add_operands(&[zero_i8, buf])
-            .build()
-            .expect("llvm.store empty string null term"),
-    );
-    buf
+    let obj = emit_string_obj_alloc(context, block, zero_i64, types, loc);
+    emit_string_obj_finalize_nul(context, block, obj, zero_i64, types, loc);
+    obj
 }
 
 /// Phase 2.7q-stdlib-string (ADR 0104): pure SSA bounds normalization
@@ -9187,6 +9171,9 @@ fn emit_string_slice<'a, 'c>(
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
+    // ADR 0112: src is a boxed string object. Slice copies
+    // `length` bytes from src.data + (start-1) into a fresh
+    // object's data region; helper handles header + NUL term.
     let one = block
         .append_operation(arith::constant(
             context,
@@ -9196,45 +9183,14 @@ fn emit_string_slice<'a, 'c>(
         .result(0)
         .unwrap()
         .into();
-    let size = block
-        .append_operation(arith::addi(length, one, loc))
-        .result(0)
-        .unwrap()
-        .into();
-    let buf = emit_libc_call_ptr(context, block, "malloc", &[size], types, loc);
     let offset = block
         .append_operation(arith::subi(start_1based, one, loc))
         .result(0)
         .unwrap()
         .into();
-    let src_off = emit_byte_offset_ptr_dynamic(context, block, src, offset, types, loc);
-    let _ = emit_libc_call_ptr(
-        context,
-        block,
-        "memcpy",
-        &[buf, src_off, length],
-        types,
-        loc,
-    );
-    // Null-terminate at buf[length].
-    let term_ptr = emit_byte_offset_ptr_dynamic(context, block, buf, length, types, loc);
-    let i8_ty: Type<'c> = IntegerType::new(context, 8).into();
-    let zero_i8 = block
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(i8_ty, 0).into(),
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    block.append_operation(
-        OperationBuilder::new("llvm.store", loc)
-            .add_operands(&[zero_i8, term_ptr])
-            .build()
-            .expect("llvm.store slice null term"),
-    );
-    buf
+    let src_data = emit_string_obj_data(context, block, src, types, loc);
+    let src_off = emit_byte_offset_ptr_dynamic(context, block, src_data, offset, types, loc);
+    emit_string_obj_from_bytes(context, block, src_off, length, types, loc)
 }
 
 /// Phase 2.7q-stdlib-string (ADR 0105): `string.rep(s, n)` runtime
@@ -9264,7 +9220,9 @@ fn emit_string_rep_runtime<'a, 'c>(
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
-    let len_i64 = emit_libc_call_i64(context, block, "strlen", &[src], types, loc);
+    // ADR 0112: src is a boxed string object.
+    let len_i64 = emit_string_obj_len(block, src, types, loc);
+    let src_data = emit_string_obj_data(context, block, src, types, loc);
     let count_i64 = emit_f2i(block, count_f64, types, loc);
     let zero_i64 = block
         .append_operation(arith::constant(
@@ -9299,21 +9257,18 @@ fn emit_string_rep_runtime<'a, 'c>(
     let then_region = Region::new();
     let then_blk = Block::new(&[]);
     {
-        // total = n * len; alloc(total + 1); fill loop; null-term.
+        // ADR 0112: total = n * len; allocate boxed object of
+        // that data length. The fill loop writes into the data
+        // region (object body), not a raw buffer.
         let total = then_blk
             .append_operation(arith::muli(count_i64, len_i64, loc))
             .result(0)
             .unwrap()
             .into();
-        let size = then_blk
-            .append_operation(arith::addi(total, one_i64, loc))
-            .result(0)
-            .unwrap()
-            .into();
-        let buf = emit_libc_call_ptr(context, &then_blk, "malloc", &[size], types, loc);
-        // scf::r#while (no scf::for in melior 0.27) — carrier is the
-        // 0-based loop index i (i64). Each iter: memcpy(buf + i*len,
-        // src, len); i += 1; until i == count.
+        let new_obj = emit_string_obj_alloc(context, &then_blk, total, types, loc);
+        let buf = emit_string_obj_data(context, &then_blk, new_obj, types, loc);
+        // scf::r#while carrier is the 0-based loop index i.
+        // Each iter: memcpy(buf + i*len, src_data, len); i += 1.
         let before_region = Region::new();
         let before_blk = Block::new(&[(types.i64, loc)]);
         {
@@ -9347,7 +9302,7 @@ fn emit_string_rep_runtime<'a, 'c>(
                 context,
                 &after_blk,
                 "memcpy",
-                &[dst, src, len_i64],
+                &[dst, src_data, len_i64],
                 types,
                 loc,
             );
@@ -9361,25 +9316,9 @@ fn emit_string_rep_runtime<'a, 'c>(
         after_region.append_block(after_blk);
         let while_op = scf::r#while(&[zero_i64], &[types.i64], before_region, after_region, loc);
         then_blk.append_operation(while_op);
-        // Null-terminate at buf[total].
-        let term_ptr = emit_byte_offset_ptr_dynamic(context, &then_blk, buf, total, types, loc);
-        let i8_ty: Type<'c> = IntegerType::new(context, 8).into();
-        let zero_i8 = then_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(i8_ty, 0).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        then_blk.append_operation(
-            OperationBuilder::new("llvm.store", loc)
-                .add_operands(&[zero_i8, term_ptr])
-                .build()
-                .expect("llvm.store rep null term"),
-        );
-        then_blk.append_operation(scf::r#yield(&[buf], loc));
+        // ADR 0112: write compat NUL terminator via helper.
+        emit_string_obj_finalize_nul(context, &then_blk, new_obj, total, types, loc);
+        then_blk.append_operation(scf::r#yield(&[new_obj], loc));
     }
     then_region.append_block(then_blk);
     let else_region = Region::new();
@@ -9610,13 +9549,10 @@ fn emit_table_concat_runtime<'a, 'c>(
             .unwrap()
             .into();
 
-        // Allocate output buffer (total + 1 for null term).
-        let size = then_blk
-            .append_operation(arith::addi(total, one_i64, loc))
-            .result(0)
-            .unwrap()
-            .into();
-        let buf = emit_libc_call_ptr(context, &then_blk, "malloc", &[size], types, loc);
+        // ADR 0112: allocate result as a boxed string object;
+        // its data region holds the concat bytes.
+        let new_obj = emit_string_obj_alloc(context, &then_blk, total, types, loc);
+        let buf = emit_string_obj_data(context, &then_blk, new_obj, types, loc);
 
         // ===== Pass 2: copy. =====
         let p2_before = Region::new();
@@ -9673,13 +9609,16 @@ fn emit_table_concat_runtime<'a, 'c>(
             let sep_then_region = Region::new();
             let sep_then_blk = Block::new(&[]);
             {
+                // ADR 0112: sep_ptr is a boxed string object;
+                // memcpy reads from its data region.
                 let sep_dst =
                     emit_byte_offset_ptr_dynamic(context, &sep_then_blk, buf, off_arg, types, loc);
+                let sep_data = emit_string_obj_data(context, &sep_then_blk, sep_ptr, types, loc);
                 let _ = emit_libc_call_ptr(
                     context,
                     &sep_then_blk,
                     "memcpy",
-                    &[sep_dst, sep_ptr, sep_len],
+                    &[sep_dst, sep_data, sep_len],
                     types,
                     loc,
                 );
@@ -9726,11 +9665,14 @@ fn emit_table_concat_runtime<'a, 'c>(
                 types,
                 loc,
             );
+            // ADR 0112: str_ptr is a boxed string object;
+            // memcpy reads from its data region.
+            let str_data = emit_string_obj_data(context, &p2_after_blk, str_ptr, types, loc);
             let _ = emit_libc_call_ptr(
                 context,
                 &p2_after_blk,
                 "memcpy",
-                &[dst, str_ptr, elem_len],
+                &[dst, str_data, elem_len],
                 types,
                 loc,
             );
@@ -9757,25 +9699,10 @@ fn emit_table_concat_runtime<'a, 'c>(
             loc,
         ));
 
-        // Null-terminate at buf[total].
-        let term_ptr = emit_byte_offset_ptr_dynamic(context, &then_blk, buf, total, types, loc);
-        let i8_ty: Type<'c> = IntegerType::new(context, 8).into();
-        let zero_i8 = then_blk
-            .append_operation(arith::constant(
-                context,
-                IntegerAttribute::new(i8_ty, 0).into(),
-                loc,
-            ))
-            .result(0)
-            .unwrap()
-            .into();
-        then_blk.append_operation(
-            OperationBuilder::new("llvm.store", loc)
-                .add_operands(&[zero_i8, term_ptr])
-                .build()
-                .expect("llvm.store concat null term"),
-        );
-        then_blk.append_operation(scf::r#yield(&[buf], loc));
+        // ADR 0112: finalize compat NUL on the new string object;
+        // yield the object header ptr (not the data ptr).
+        emit_string_obj_finalize_nul(context, &then_blk, new_obj, total, types, loc);
+        then_blk.append_operation(scf::r#yield(&[new_obj], loc));
     }
     then_region.append_block(then_blk);
     let else_region = Region::new();
@@ -10110,7 +10037,9 @@ fn emit_table_concat_dispatch_len<'a, 'c>(
             types,
             loc,
         );
-        let elem_len = emit_libc_call_i64(context, &num_blk, "strlen", &[str_ptr], types, loc);
+        // ADR 0112: emit_tostring(Number) now returns a boxed
+        // string object. Read length from the header.
+        let elem_len = emit_string_obj_len(&num_blk, str_ptr, types, loc);
         num_blk.append_operation(scf::r#yield(&[elem_len], loc));
     }
     num_region.append_block(num_blk);
@@ -10132,7 +10061,8 @@ fn emit_table_concat_dispatch_len<'a, 'c>(
         let str_blk = Block::new(&[]);
         {
             let str_ptr = emit_load(&str_blk, payload_ptr, types.ptr, loc);
-            let elem_len = emit_libc_call_i64(context, &str_blk, "strlen", &[str_ptr], types, loc);
+            // ADR 0112: payload is a boxed string object ptr.
+            let elem_len = emit_string_obj_len(&str_blk, str_ptr, types, loc);
             str_blk.append_operation(scf::r#yield(&[elem_len], loc));
         }
         str_region.append_block(str_blk);
@@ -10209,7 +10139,9 @@ fn emit_table_concat_dispatch_str<'a, 'c>(
             types,
             loc,
         );
-        let elem_len = emit_libc_call_i64(context, &num_blk, "strlen", &[str_ptr], types, loc);
+        // ADR 0112: emit_tostring(Number) now returns a boxed
+        // string object. Read length from the header.
+        let elem_len = emit_string_obj_len(&num_blk, str_ptr, types, loc);
         num_blk.append_operation(scf::r#yield(&[str_ptr, elem_len], loc));
     }
     num_region.append_block(num_blk);
@@ -10231,7 +10163,8 @@ fn emit_table_concat_dispatch_str<'a, 'c>(
         let str_blk = Block::new(&[]);
         {
             let str_ptr = emit_load(&str_blk, payload_ptr, types.ptr, loc);
-            let elem_len = emit_libc_call_i64(context, &str_blk, "strlen", &[str_ptr], types, loc);
+            // ADR 0112: payload is a boxed string object ptr.
+            let elem_len = emit_string_obj_len(&str_blk, str_ptr, types, loc);
             str_blk.append_operation(scf::r#yield(&[str_ptr, elem_len], loc));
         }
         str_region.append_block(str_blk);
@@ -10298,66 +10231,28 @@ fn emit_concat<'a, 'c>(
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
-    let la = emit_libc_call_i64(context, block, "strlen", &[lhs], types, loc);
-    let lb = emit_libc_call_i64(context, block, "strlen", &[rhs], types, loc);
-    let one = block
-        .append_operation(arith::constant(
-            context,
-            IntegerAttribute::new(types.i64, 1).into(),
-            loc,
-        ))
-        .result(0)
-        .unwrap()
-        .into();
-    let lab = block
+    // ADR 0112: lhs and rhs are boxed string objects. Allocate
+    // a new object with combined length, then memcpy the two
+    // data regions into the new object's data; helper finalizes
+    // the compat NUL.
+    let la = emit_string_obj_len(block, lhs, types, loc);
+    let lb = emit_string_obj_len(block, rhs, types, loc);
+    let lhs_data = emit_string_obj_data(context, block, lhs, types, loc);
+    let rhs_data = emit_string_obj_data(context, block, rhs, types, loc);
+    let total = block
         .append_operation(arith::addi(la, lb, loc))
         .result(0)
         .unwrap()
         .into();
-    let total = block
-        .append_operation(arith::addi(lab, one, loc))
-        .result(0)
-        .unwrap()
-        .into();
-    let buf = emit_libc_call_ptr(context, block, "malloc", &[total], types, loc);
-    // memcpy(buf, lhs, la)
-    let _ = emit_libc_call_ptr(context, block, "memcpy", &[buf, lhs, la], types, loc);
-    // memcpy(buf + la, rhs, lb + 1)
-    let dst2 = block
-        .append_operation(
-            OperationBuilder::new("llvm.getelementptr", loc)
-                .add_operands(&[buf, la])
-                .add_attributes(&[
-                    (
-                        Identifier::new(context, "elem_type"),
-                        TypeAttribute::new(IntegerType::new(context, 8).into()).into(),
-                    ),
-                    (
-                        Identifier::new(context, "rawConstantIndices"),
-                        DenseI32ArrayAttribute::new(context, &[i32::MIN]).into(),
-                    ),
-                ])
-                .add_results(&[types.ptr])
-                .build()
-                .expect("llvm.getelementptr"),
-        )
-        .result(0)
-        .unwrap()
-        .into();
-    let lb_plus_one = block
-        .append_operation(arith::addi(lb, one, loc))
-        .result(0)
-        .unwrap()
-        .into();
-    let _ = emit_libc_call_ptr(
-        context,
-        block,
-        "memcpy",
-        &[dst2, rhs, lb_plus_one],
-        types,
-        loc,
-    );
-    buf
+    let new_obj = emit_string_obj_alloc(context, block, total, types, loc);
+    let buf = emit_string_obj_data(context, block, new_obj, types, loc);
+    // memcpy(buf, lhs_data, la)
+    let _ = emit_libc_call_ptr(context, block, "memcpy", &[buf, lhs_data, la], types, loc);
+    // memcpy(buf + la, rhs_data, lb)
+    let dst2 = emit_byte_offset_ptr_dynamic(context, block, buf, la, types, loc);
+    let _ = emit_libc_call_ptr(context, block, "memcpy", &[dst2, rhs_data, lb], types, loc);
+    emit_string_obj_finalize_nul(context, block, new_obj, total, types, loc);
+    new_obj
 }
 
 /// Phase 2.7c (ADR 0026): convert `value` (of static `kind`) into a
@@ -10389,10 +10284,12 @@ fn emit_tostring<'a, 'c>(
         }
         ValueKind::Nil => emit_addressof(context, block, "s_nil", types, loc),
         ValueKind::Number => {
-            // Allocate a fixed-size buffer (32 bytes — covers any f64
-            // formatted with %.14g plus sign, dot, exponent, NUL),
-            // then `snprintf(buf, 32, "%.14g", n)`. Returns the buf
-            // ptr; intentionally leaks (no GC, ADR 0025).
+            // ADR 0112: snprintf produces a raw C-string in scratch;
+            // we then wrap it as a boxed string object so consumers
+            // (print, concat, table.concat, etc.) see the same ABI
+            // as user literals. Allocate 32-byte scratch (covers
+            // any f64 formatted with %.14g plus sign / dot /
+            // exponent / NUL).
             let buf_size = block
                 .append_operation(arith::constant(
                     context,
@@ -10433,7 +10330,12 @@ fn emit_tostring<'a, 'c>(
                 .build()
                 .expect("llvm.call @snprintf");
             block.append_operation(call_op);
-            buf
+            // ADR 0112: wrap the snprintf result (NUL-term C-string
+            // in `buf`) into a boxed string object. Use strlen on
+            // the scratch to find actual length (snprintf may have
+            // written fewer bytes than buf_size).
+            let actual_len = emit_libc_call_i64(context, block, "strlen", &[buf], types, loc);
+            emit_string_obj_from_bytes(context, block, buf, actual_len, types, loc)
         }
         // Phase 2.7n (ADR 0052): `tostring(f)` returns the literal
         // "function". Reuses the global `s_typename_function`
@@ -10499,11 +10401,16 @@ fn emit_tonumber<'a, 'c>(
                 .unwrap()
                 .into();
             let fmt_ptr = emit_addressof(context, block, "fmt_tonumber_lf", types, loc);
+            // ADR 0112 deviation: `value` is a boxed string object;
+            // sscanf needs the raw C-string. Pass the data ptr —
+            // any embedded NUL byte will silently truncate the
+            // parse (Lua spec allows partial parse to nil).
+            let value_data = emit_string_obj_data(context, block, value, types, loc);
             let sscanf_callee_ty =
                 llvm::r#type::function(types.i32, &[types.ptr, types.ptr, types.ptr], true);
             let n = i32::try_from(3usize).unwrap();
             let call_op = OperationBuilder::new("llvm.call", loc)
-                .add_operands(&[value, fmt_ptr, receiver])
+                .add_operands(&[value_data, fmt_ptr, receiver])
                 .add_attributes(&[
                     (
                         Identifier::new(context, "callee"),
@@ -10767,11 +10674,12 @@ fn emit_arith_operand_plan<'a, 'c>(
     }
 }
 
-/// Phase 2.7b/d (ADRs 0025, 0027): String equality and ordering via
-/// `strcmp`. `strcmp(a, b)` returns negative / zero / positive; the
-/// per-op predicate then projects that to an i1. Lexicographic
-/// ordering uses **signed** comparisons (`Slt` / `Sle` / `Sgt` /
-/// `Sge`) since `strcmp` returns a signed `int`.
+/// Phase 2.7b/d (ADRs 0025, 0027) + ADR 0112: String equality and
+/// ordering on boxed string objects. `emit_string_obj_compare`
+/// returns a 3-way signed i32 (negative/zero/positive) like
+/// `strcmp`, but length-aware so embedded NULs participate. The
+/// per-op predicate projects that to an i1. Lexicographic
+/// ordering uses **signed** comparisons.
 fn emit_string_cmp<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
@@ -10781,7 +10689,7 @@ fn emit_string_cmp<'a, 'c>(
     types: &Types<'c>,
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
-    let cmp = emit_libc_call_i32(context, block, "strcmp", &[lhs, rhs], types, loc);
+    let cmp = emit_string_obj_compare(context, block, lhs, rhs, types, loc);
     let zero = block
         .append_operation(arith::constant(
             context,
@@ -10903,6 +10811,8 @@ fn emit_print_value_raw<'a, 'c>(
             emit_printf(context, block, fmt_ptr, value, types, loc);
         }
         ValueKind::Bool => {
+            // ADR 0112: s_true / s_false are boxed string objects;
+            // select between them, then print length-safe.
             let true_ptr = emit_addressof(context, block, "s_true", types, loc);
             let false_ptr = emit_addressof(context, block, "s_false", types, loc);
             let select_op = OperationBuilder::new("llvm.select", loc)
@@ -10911,17 +10821,17 @@ fn emit_print_value_raw<'a, 'c>(
                 .build()
                 .expect("llvm.select");
             let chosen: Value<'c, 'a> = block.append_operation(select_op).result(0).unwrap().into();
-            let fmt_ptr = emit_addressof(context, block, "fmt_str_raw", types, loc);
-            emit_printf(context, block, fmt_ptr, chosen, types, loc);
+            emit_print_string_obj(context, block, chosen, types, loc);
         }
         ValueKind::Nil => {
+            // ADR 0112: s_nil is a boxed string object.
             let nil_ptr = emit_addressof(context, block, "s_nil", types, loc);
-            let fmt_ptr = emit_addressof(context, block, "fmt_str_raw", types, loc);
-            emit_printf(context, block, fmt_ptr, nil_ptr, types, loc);
+            emit_print_string_obj(context, block, nil_ptr, types, loc);
         }
         ValueKind::String => {
-            let fmt_ptr = emit_addressof(context, block, "fmt_str_raw", types, loc);
-            emit_printf(context, block, fmt_ptr, value, types, loc);
+            // ADR 0112: string value is boxed object ptr; print
+            // length-safe via %.*s.
+            emit_print_string_obj(context, block, value, types, loc);
         }
         ValueKind::Function(_) | ValueKind::Table => unreachable!(
             "Function/Table args are rejected at HIR-time \
@@ -11435,35 +11345,10 @@ fn emit_tagged_eq_runtime_dispatch<'a, 'c>(
                     .into()
             }
             ValueKind::String => {
-                // strcmp(payload_ptr, typed_val) == 0
-                let cmp = emit_libc_call_i32(
-                    context,
-                    &then_blk,
-                    "strcmp",
-                    &[payload, typed_val],
-                    types,
-                    loc,
-                );
-                let zero_i32 = then_blk
-                    .append_operation(arith::constant(
-                        context,
-                        IntegerAttribute::new(types.i32, 0).into(),
-                        loc,
-                    ))
-                    .result(0)
-                    .unwrap()
-                    .into();
-                then_blk
-                    .append_operation(arith::cmpi(
-                        context,
-                        arith::CmpiPredicate::Eq,
-                        cmp,
-                        zero_i32,
-                        loc,
-                    ))
-                    .result(0)
-                    .unwrap()
-                    .into()
+                // ADR 0112: length-aware byte equality on
+                // boxed string objects (strcmp would truncate
+                // at embedded NUL).
+                emit_string_obj_eq(context, &then_blk, payload, typed_val, types, loc)
             }
             _ => unreachable!(),
         };
@@ -11873,8 +11758,11 @@ fn emit_tostring_tagged_local<'a, 'c>(
     block.append_operation(if_op).result(0).unwrap().into()
 }
 
-/// Phase 2.8b (ADR 0032): emit `printf("%s", @<global_name>)` for
-/// the literal tab / newline separators in multi-arg print.
+/// Phase 2.8b (ADR 0032) / 2.7u (ADR 0112): emit a length-safe
+/// print of a static string-object global (tab / newline / etc.).
+/// Post-0112 the globals carry a `{i64 len, data, NUL}` header,
+/// so we read `len` from the header and use `printf("%.*s", ...)`
+/// via `emit_print_string_obj`.
 fn emit_print_literal<'c>(
     context: &'c Context,
     block: &Block<'c>,
@@ -11882,9 +11770,8 @@ fn emit_print_literal<'c>(
     types: &Types<'c>,
     loc: Location<'c>,
 ) {
-    let fmt_ptr = emit_addressof(context, block, "fmt_str_raw", types, loc);
     let payload = emit_addressof(context, block, global_name, types, loc);
-    emit_printf(context, block, fmt_ptr, payload, types, loc);
+    emit_print_string_obj(context, block, payload, types, loc);
 }
 
 /// Phase 2.7g (ADR 0030): runtime check for `assert(cond)`. When
