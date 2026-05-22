@@ -40,18 +40,25 @@ enum Commands {
         #[arg(long, value_enum)]
         emit: Option<EmitStage>,
     },
-    /// Compile and immediately execute Lua source. The argument is
-    /// treated as a path when a file with that name exists,
+    /// Compile and immediately execute Lua source. The first arg
+    /// is treated as a path when a file with that name exists,
     /// otherwise as inline Lua code (e.g. `lumelir run
     /// 'print(1+2)'`). Pass `-` to read from stdin explicitly, or
     /// omit the argument when piping (`echo 'print(1)' | lumelir
     /// run`) — implicit stdin only fires when stdin is not a TTY.
+    /// Any further positional args are exposed to the Lua script
+    /// as `arg[1]`, `arg[2]`, ... (ADR 0115).
     Run {
         /// File path (loaded as Lua source) OR inline Lua code if
         /// the value does not name an existing file. `-` reads
         /// from stdin. Omit entirely to read stdin when it is
         /// piped.
         input: Option<String>,
+        /// Trailing positional args passed to the Lua script as
+        /// `arg[1]`, `arg[2]`, ... (Lua §6.1 / §8.1 MVP scope:
+        /// `arg[1]+` only, no `arg[0]` / negative indices).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        script_args: Vec<String>,
     },
 }
 
@@ -64,6 +71,6 @@ pub fn run() -> Result<()> {
             target,
             emit,
         } => compile::invoke(&input, output.as_deref(), &target, emit),
-        Commands::Run { input } => run::invoke(input.as_deref()),
+        Commands::Run { input, script_args } => run::invoke(input.as_deref(), &script_args),
     }
 }

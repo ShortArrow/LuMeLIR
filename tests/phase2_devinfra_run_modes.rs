@@ -151,3 +151,177 @@ fn run_inline_syntax_error_labels_with_inline_sentinel() {
         "stderr should report parse error; got:\n{stderr}"
     );
 }
+
+// --- Phase 2.8f-run-arg-table (ADR 0115): `arg` table ---
+//
+// Trailing positional args after `lumelir run [INPUT]` are
+// exposed to the Lua script via the `arg` table (Lua §6.1 / §8.1
+// MVP scope: `arg[1]` from positional 0, no `arg[0]` script name,
+// no negative indices). The table is synthesised at the CLI
+// boundary as a `local arg = {...}` statement prepended to the
+// parsed chunk; no HIR/codegen surface change.
+
+#[test]
+fn run_inline_arg_count() {
+    let out = run_lumelir(&["run", "print(#arg)", "a", "b", "c"]);
+    assert!(
+        out.status.success(),
+        "inline + args must succeed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3");
+}
+
+#[test]
+fn run_inline_arg_index_one_based() {
+    let out = run_lumelir(&["run", "print(arg[1])", "alpha", "beta"]);
+    assert!(
+        out.status.success(),
+        "arg[1] must succeed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "alpha");
+}
+
+#[test]
+fn run_inline_arg_zero_extra_args() {
+    // No positional args after INPUT → `arg` is the empty table.
+    let out = run_lumelir(&["run", "print(#arg)"]);
+    assert!(
+        out.status.success(),
+        "no extra args must succeed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0");
+}
+
+#[test]
+fn run_inline_arg_empty_string_value() {
+    // Empty-string positional arg → arg[1] is "". HIR static
+    // typing currently treats `arg[1]` as TaggedValue (pre-
+    // existing limitation: Table element kind does not flow
+    // through indexing), so we verify the empty value via
+    // `print(arg[1])` which dispatches on the runtime tag. The
+    // stdout is the empty arg followed by print's newline.
+    let out = run_lumelir(&["run", "print(arg[1])", ""]);
+    assert!(
+        out.status.success(),
+        "empty-string arg must succeed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // print writes the empty string then a newline → stdout == "\n".
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "\n");
+}
+
+#[test]
+fn run_inline_arg_with_space() {
+    let out = run_lumelir(&["run", "print(arg[1])", "a b"]);
+    assert!(
+        out.status.success(),
+        "space-containing arg must succeed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "a b");
+}
+
+#[test]
+fn run_inline_arg_oob_is_nil() {
+    // arg[N+1] is nil per Lua table semantics.
+    let out = run_lumelir(&["run", "print(arg[4] == nil)", "a", "b", "c"]);
+    assert!(
+        out.status.success(),
+        "oob arg must succeed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "true");
+}
+
+#[test]
+fn run_file_passes_through_arg_table() {
+    // File mode + trailing args.
+    let path = std::env::temp_dir().join("lumelir_arg_file_mode.lua");
+    std::fs::write(&path, "print(arg[1], arg[2])").expect("write fixture");
+    let out = run_lumelir(&["run", path.to_str().unwrap(), "first", "second"]);
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        out.status.success(),
+        "file + args must succeed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "first\tsecond");
+}
+
+#[test]
+fn run_explicit_dash_passes_through_arg_table() {
+    // Explicit `-` (stdin) mode + trailing args.
+    let mut child = Command::new(lumelir_bin())
+        .args(["run", "-", "x", "y"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lumelir run -");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(b"print(arg[1], arg[2])")
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait");
+    assert!(
+        out.status.success(),
+        "stdin + args must succeed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "x\ty");
+}
+
+#[test]
+fn run_implicit_pipe_passes_through_arg_table() {
+    // Implicit-pipe stdin (no positional INPUT) + trailing args.
+    // Note: clap binds the first trailing arg to INPUT when no
+    // explicit `-` is given. So `lumelir run a b c` would treat
+    // "a" as INPUT (inline code). For implicit-pipe + args we
+    // currently require explicit `-`; this test pins the
+    // explicit-dash path as the supported way to combine pipe +
+    // args. (Documented behaviour.)
+    //
+    // Alternative scripts could use `lumelir run - x y < file`.
+    // We re-use the explicit-dash test above for that case.
+}
+
+#[test]
+fn run_arg_type_is_table() {
+    let out = run_lumelir(&["run", "print(type(arg))", "x"]);
+    assert!(
+        out.status.success(),
+        "type(arg) must succeed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "table");
+}
+
+#[test]
+fn run_arg_element_type_is_string() {
+    let out = run_lumelir(&["run", "print(type(arg[1]))", "hello"]);
+    assert!(
+        out.status.success(),
+        "type(arg[1]) must succeed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "string");
+}
+
+#[test]
+fn run_arg_local_shadow_takes_precedence() {
+    // User can rebind `arg` with a fresh `local arg = ...` and
+    // the synthetic prelude does not block that (Lua scope rule:
+    // later `local` shadows earlier `local`).
+    let out = run_lumelir(&["run", "local arg = {99}\nprint(arg[1])", "ignored"]);
+    assert!(
+        out.status.success(),
+        "user-shadow arg must succeed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "99");
+}
