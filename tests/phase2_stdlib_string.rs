@@ -444,3 +444,144 @@ fn string_byte_rejects_non_string() {
         "expected BuiltinArgKindMismatch, got: {msg}"
     );
 }
+
+// --- Phase 2.7v-stdlib-string-char (ADR 0113): `string.char(...)` ---
+//
+// Lua 5.4 §6.4 variadic byte-producer. Each arg must be an integer-
+// valued Number in [0, 255]; returns a boxed string object (ADR 0112).
+// Embedded NUL is fully supported via the boxed ABI.
+//
+// Trap surface (per Lua reference impl):
+// - out-of-range (<0, >255, NaN, +Inf) → s_string_char_out_of_range
+// - non-integer (e.g. 1.5) → s_string_char_non_integer
+//
+// Variadic Number arg-kind in HIR is expressed via the new
+// `Builtin::expected_param_kind(argc, pos)` method (per-position
+// function, since the existing `param_kinds_for_arity` static slice
+// cannot represent argc-Number repetition).
+
+#[test]
+fn string_char_basic_three() {
+    // string.char(65,66,67) → "ABC" (length 3, byte readback).
+    let src = "local s = string.char(65, 66, 67)
+print(#s)
+print(string.byte(s, 1))
+print(string.byte(s, 2))
+print(string.byte(s, 3))";
+    let out = run_ok(src, "lumelir_string_char_basic");
+    let lines: Vec<&str> = out.trim().lines().collect();
+    assert_eq!(lines, ["3", "65", "66", "67"]);
+}
+
+#[test]
+fn string_char_single_byte_pin() {
+    // #string.char(65) == 1.
+    let src = "print(#string.char(65))";
+    assert_eq!(run_ok(src, "lumelir_string_char_single").trim(), "1");
+}
+
+#[test]
+fn string_char_empty_arity_zero() {
+    // string.char() returns the empty string (arity 0 valid per Lua spec).
+    let src = "print(#string.char())";
+    assert_eq!(run_ok(src, "lumelir_string_char_empty").trim(), "0");
+}
+
+#[test]
+fn string_char_byte_zero_low_edge() {
+    // string.char(0) is a valid 1-byte NUL string.
+    let src = "print(#string.char(0))";
+    assert_eq!(run_ok(src, "lumelir_string_char_zero").trim(), "1");
+}
+
+#[test]
+fn string_char_byte_255_high_edge() {
+    // string.char(255) is a valid 1-byte 0xff string;
+    // string.byte readback returns 255.
+    let src = "print(string.byte(string.char(255), 1))";
+    assert_eq!(run_ok(src, "lumelir_string_char_255").trim(), "255");
+}
+
+#[test]
+fn string_char_byte_256_traps() {
+    // 256 is out of [0, 255] — trap via s_string_char_out_of_range.
+    let src = "print(string.char(256))";
+    let out = compile_and_run(src, "lumelir_string_char_256_trap");
+    assert!(
+        !out.status.success(),
+        "byte 256 must trap, but binary exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn string_char_byte_negative_traps() {
+    // -1 is below 0 — trap via s_string_char_out_of_range.
+    let src = "print(string.char(-1))";
+    let out = compile_and_run(src, "lumelir_string_char_neg_trap");
+    assert!(
+        !out.status.success(),
+        "byte -1 must trap, but binary exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn string_char_non_integer_traps() {
+    // 1.5 is in range but not integer-valued — trap via
+    // s_string_char_non_integer.
+    let src = "print(string.char(1.5))";
+    let out = compile_and_run(src, "lumelir_string_char_15_trap");
+    assert!(
+        !out.status.success(),
+        "byte 1.5 must trap, but binary exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn string_char_nan_traps() {
+    // 0/0 = NaN. `cmpf Oge`/`Ole` are unordered → false →
+    // range check fails → trap via s_string_char_out_of_range.
+    // (NaN is naturally rejected by the range gate.)
+    let src = "print(string.char(0/0))";
+    let out = compile_and_run(src, "lumelir_string_char_nan_trap");
+    assert!(
+        !out.status.success(),
+        "NaN must trap, but binary exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn string_char_inf_traps() {
+    // 1/0 = +Inf. Inf > 255 fails Ole → range trap. (Inf is
+    // rejected by the range gate, not a separate Inf-specific check.)
+    let src = "print(string.char(1/0))";
+    let out = compile_and_run(src, "lumelir_string_char_inf_trap");
+    assert!(
+        !out.status.success(),
+        "Inf must trap, but binary exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn string_char_rejects_non_number() {
+    // Each arg must be Number; String arg rejected at HIR-time per
+    // ADR 0110 param_kinds check (extended via expected_param_kind
+    // for variadic Number).
+    let chunk = lumelir::parser::parse("print(string.char(\"x\"))").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("string.char with String must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("BuiltinArgKindMismatch"),
+        "expected BuiltinArgKindMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn string_char_shadowed_respects_user_table() {
+    // User shadow `local string = {}` must take over per Lua
+    // semantics — same precedent as math (ADR 0101) and string.*
+    // builtins (ADR 0103+).
+    let src = "local string = {}
+function string.char(x) return x + 600 end
+print(string.char(42))";
+    assert_eq!(run_ok(src, "lumelir_string_char_shadowed").trim(), "642");
+}

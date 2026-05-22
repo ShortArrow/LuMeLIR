@@ -212,3 +212,37 @@ print(t[\"A\"])";
     let lines: Vec<&str> = out.trim().lines().collect();
     assert_eq!(lines, ["1", "2"]);
 }
+
+// --- ADR 0113 producer × 0112 ABI payoff visibility ---
+
+#[test]
+fn string_abi_char_produces_embedded_nul() {
+    // `string.char(0, 65, 0, 66)` is the first producer that can
+    // build a string with embedded NUL bytes. Pre-0112 ABI
+    // (strlen-based) would report length 0 or 1; 0112 ABI
+    // (header length) reports the true byte count = 4.
+    assert_eq!(
+        run(
+            "print(#string.char(0, 65, 0, 66))",
+            "lumelir_27u_char_embedded_nul"
+        )
+        .trim(),
+        "4"
+    );
+}
+
+#[test]
+fn string_abi_char_nul_roundtrip_via_byte() {
+    // Round-trip: char-build a string with embedded NULs, then
+    // byte-read each position. Pre-0112 ABI would corrupt this
+    // because the string would be silently truncated at the
+    // first NUL.
+    let src = "local s = string.char(0, 65, 0, 66)
+print(string.byte(s, 1))
+print(string.byte(s, 2))
+print(string.byte(s, 3))
+print(string.byte(s, 4))";
+    let out = run(src, "lumelir_27u_char_nul_roundtrip");
+    let lines: Vec<&str> = out.trim().lines().collect();
+    assert_eq!(lines, ["0", "65", "0", "66"]);
+}

@@ -254,6 +254,7 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             | Callee::Builtin(Builtin::StringLower)
             | Callee::Builtin(Builtin::StringSub)
             | Callee::Builtin(Builtin::StringRep)
+            | Callee::Builtin(Builtin::StringChar)
             | Callee::Builtin(Builtin::TableConcat) => ValueKind::String,
             // ADR 0111 — table.insert is void; expression-position
             // use synthesises a Number placeholder (same shape as
@@ -4653,16 +4654,18 @@ impl LowerCtx {
             .map(|a| self.lower_expr(a))
             .collect::<Result<Vec<_>, _>>()?;
         // Phase 2.7t-stdlib-arg-kind-validation (ADR 0110): per-arg
-        // static kind check against `Builtin::param_kinds()`.
+        // static kind check.
+        // Phase 2.7v-stdlib-string-char (ADR 0113): driver swapped
+        // from `param_kinds_for_arity.get(i)` to
+        // `expected_param_kind(argc, i)` so variadic Number specs
+        // (string.char) can express argc-Number repetition. Existing
+        // builtins fall through to the static slice — zero
+        // behavioural change.
         // Concrete-kind mismatch → reject at HIR. TaggedValue args
         // (table-lookup / function-param origin) are skipped; runtime
-        // tag-check chokepoint is deferred to a future ADR. Global
-        // builtins return an empty `param_kinds` slice so the loop
-        // is a no-op for them (their checks live in
-        // `lower_builtin_call`).
-        let param_kinds = builtin.param_kinds_for_arity(args.len());
+        // tag-check chokepoint is deferred to a future ADR.
         for (i, lowered) in lowered_args.iter().enumerate() {
-            let Some(&expected) = param_kinds.get(i) else {
+            let Some(expected) = builtin.expected_param_kind(args.len(), i) else {
                 continue;
             };
             let actual = infer_kind(lowered, &self.locals, &self.functions);

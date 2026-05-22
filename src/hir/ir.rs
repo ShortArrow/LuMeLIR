@@ -432,6 +432,23 @@ pub enum Builtin {
     /// helper (single-position trick: passes `j_raw = i_raw`).
     /// Phase 2.7q-stdlib-string (ADR 0109).
     StringByte,
+    /// `string.char(...)` — Lua 5.4 §6.4 variadic byte-producer.
+    /// Each arg must be an integer-valued Number in [0, 255];
+    /// returns a boxed string object (ADR 0112). Embedded NUL
+    /// is fully supported via the boxed ABI — the first new
+    /// producer enabled by 0112.
+    ///
+    /// The first builtin with variadic Number per-position kind
+    /// spec; introduces `Builtin::expected_param_kind(argc, pos)`
+    /// because the existing static-slice `param_kinds_for_arity`
+    /// API cannot represent argc-Number repetition.
+    ///
+    /// Validation chokepoint `emit_check_byte_arg` resolves the
+    /// ADR 0105/0109 `emit_f2i` NaN/Inf carry-over for this site:
+    /// range FIRST (cmpf Ord* rejects NaN/Inf naturally), integer
+    /// SECOND (libm floor on finite x), f2i LAST (validated x).
+    /// Phase 2.7v-stdlib-string-char (ADR 0113).
+    StringChar,
     /// `table.insert(list, [pos,] value)` — Lua 5.4 §6.8 array
     /// mutation. arity 2 (append) or 3 (positional insert with
     /// shift). The first **arity-sensitive** namespace builtin —
@@ -500,6 +517,8 @@ impl Builtin {
             "rep" => Some(Builtin::StringRep),
             // ADR 0109 — string.byte (single-position form).
             "byte" => Some(Builtin::StringByte),
+            // ADR 0113 — string.char (variadic byte-producer).
+            "char" => Some(Builtin::StringChar),
             _ => None,
         }
     }
@@ -564,6 +583,9 @@ impl Builtin {
             // ADR 0109 — string.byte(s [, i]) single-position
             // form. Multi-byte (s, i, j) is future work.
             Builtin::StringByte => (1, 2),
+            // ADR 0113 — string.char(...) variadic byte-producer.
+            // Print precedent for variadic (0, usize::MAX).
+            Builtin::StringChar => (0, usize::MAX),
             // ADR 0106/0107/0108 — table.concat(t [, sep [, i [, j]]]).
             // Lua 5.4 §6.8 full signature: arity 1 (default sep="",
             // i=1, j=#t), 2 (explicit sep), 3 (explicit i, default
@@ -598,6 +620,7 @@ impl Builtin {
             Builtin::StringSub => "string.sub",
             Builtin::StringRep => "string.rep",
             Builtin::StringByte => "string.byte",
+            Builtin::StringChar => "string.char",
             Builtin::TableConcat => "table.concat",
             Builtin::TableInsert => "table.insert",
         }
@@ -633,6 +656,7 @@ impl Builtin {
             | Builtin::StringLower
             | Builtin::StringSub
             | Builtin::StringRep
+            | Builtin::StringChar
             | Builtin::TableConcat => &[ValueKind::String],
             // ADR 0111 — table.insert is void (Lua spec).
             Builtin::TableInsert => &[],
@@ -704,6 +728,29 @@ impl Builtin {
                 3 => &[ValueKind::Table, ValueKind::Number, ValueKind::TaggedValue],
                 _ => &[],
             },
+            // ADR 0113 — string.char is variadic Number; the
+            // static-slice API cannot express argc-Number
+            // repetition. `expected_param_kind` handles this
+            // builtin directly and bypasses the slice.
+            Builtin::StringChar => &[],
+        }
+    }
+
+    /// Phase 2.7v-stdlib-string-char (ADR 0113): per-position
+    /// expected kind, given the call-site arity and position.
+    /// Generalises `param_kinds_for_arity` to handle variadic
+    /// per-position kind specs (`string.char` is the first
+    /// trigger: every position is Number for any argc).
+    ///
+    /// Existing builtins delegate to `param_kinds_for_arity`
+    /// (slice-indexed lookup) — zero behavioural change.
+    /// `lower_namespace_builtin_call`'s check loop drives this
+    /// method per position so variadic Number works uniformly.
+    pub fn expected_param_kind(self, argc: usize, pos: usize) -> Option<ValueKind> {
+        match self {
+            // Every position is Number, regardless of argc.
+            Builtin::StringChar => Some(ValueKind::Number),
+            _ => self.param_kinds_for_arity(argc).get(pos).copied(),
         }
     }
 }

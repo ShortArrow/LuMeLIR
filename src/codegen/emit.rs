@@ -458,6 +458,29 @@ fn emit_fmt_global<'c>(
         "bad argument #2 to 'insert' (position out of bounds)\0",
         loc,
     );
+    // Phase 2.7v-stdlib-string-char (ADR 0113): runtime trap for
+    // `string.char(n)` when n is outside [0, 255] (NaN / +Inf
+    // fail the cmpf-Ord range check naturally — same diagnostic).
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_string_char_out_of_range",
+        "bad argument to 'char' (value out of range)\0",
+        loc,
+    );
+    // Phase 2.7v-stdlib-string-char (ADR 0113): runtime trap for
+    // `string.char(n)` when n is in [0, 255] but not integer-
+    // valued (e.g. 1.5). Distinguished from the range diagnostic
+    // because Lua reference impl reports a different error.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_string_char_non_integer",
+        "bad argument to 'char' (number has no integer representation)\0",
+        loc,
+    );
     // Phase 2.7u-string-abi-refactor (ADR 0112): runtime trap for
     // `emit_alloc_with_oom_check` when malloc returns NULL. Fires
     // from string-alloc chokepoint helpers (concat / case_map /
@@ -8148,6 +8171,35 @@ fn emit_expr<'a, 'c>(
                     context, block, src, n_f64, types, loc,
                 ))
             }
+            Callee::Builtin(Builtin::StringChar) => {
+                // Phase 2.7v-stdlib-string-char (ADR 0113):
+                // variadic byte-producer. Lowers each arg as f64,
+                // then `emit_string_char_runtime` allocates a boxed
+                // string object (ADR 0112) of length args.len() and
+                // stores per-arg validated bytes into the data
+                // region. Validation (range + integer + f2i) goes
+                // through `emit_check_byte_arg`, resolving the
+                // ADR 0105/0109 NaN/Inf carry-over at this site.
+                let mut args_f64 = Vec::with_capacity(args.len());
+                for arg in args {
+                    let v = emit_expr(
+                        context,
+                        block,
+                        arg,
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
+                    )?;
+                    args_f64.push(v);
+                }
+                Ok(emit_string_char_runtime(
+                    context, block, &args_f64, types, loc,
+                ))
+            }
             Callee::Builtin(Builtin::TableConcat) => {
                 // Phase 2.7r-stdlib-table (ADR 0106): `table.concat(t)`
                 // — the first non-math/non-string consumer of ADR
@@ -9330,6 +9382,195 @@ fn emit_string_rep_runtime<'a, 'c>(
     else_region.append_block(else_blk);
     let if_op = scf::r#if(count_pos, &[types.ptr], then_region, else_region, loc);
     block.append_operation(if_op).result(0).unwrap().into()
+}
+
+/// Phase 2.7v-stdlib-string-char (ADR 0113): trap if `cond_i1` is
+/// true, with the given diagnostic global as the error message.
+/// Generalises `emit_table_index_nan_trap_if` (ADR 0086) to any
+/// diagnostic global name so the same scf.if + exit_with_message
+/// shape can be reused for per-spec error surfaces (out-of-range
+/// vs non-integer in `string.char`).
+fn emit_trap_if<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    cond_i1: Value<'c, 'a>,
+    msg_global: &str,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        let msg = emit_addressof(context, &then_blk, msg_global, types, loc);
+        emit_exit_with_message(context, &then_blk, msg, types, loc);
+        then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(cond_i1, &[], then_region, else_region, loc));
+}
+
+/// Phase 2.7v-stdlib-string-char (ADR 0113): validate one f64 arg
+/// of `string.char(...)` per Lua §6.4 and return the f2i'd i64
+/// byte. Order is significant:
+///
+/// 1. Range check `0.0 <= x <= 255.0` via `cmpf Oge`/`Ole`. NaN
+///    is naturally rejected (Ord predicates return false for
+///    unordered operands), and +Inf fails the upper bound. This
+///    resolves the ADR 0105/0109 carry-over that left raw
+///    `emit_f2i` exposed to NaN/Inf UB.
+/// 2. Integer check `x == libm floor(x)` via `cmpf Oeq`. Safe at
+///    this point because the range gate has already proven x
+///    finite, so libm `floor` is well-defined.
+/// 3. `emit_f2i` runs only after both gates pass.
+///
+/// Two distinct diagnostic globals fire (`s_string_char_out_of_range`
+/// vs `s_string_char_non_integer`) to match Lua reference impl
+/// error wording.
+fn emit_check_byte_arg<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    arg_f64: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let lo = block
+        .append_operation(arith::constant(
+            context,
+            FloatAttribute::new(context, types.f64, 0.0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let hi = block
+        .append_operation(arith::constant(
+            context,
+            FloatAttribute::new(context, types.f64, 255.0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let ge_lo: Value<'c, '_> = block
+        .append_operation(arith::cmpf(context, CmpfPredicate::Oge, arg_f64, lo, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let le_hi: Value<'c, '_> = block
+        .append_operation(arith::cmpf(context, CmpfPredicate::Ole, arg_f64, hi, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let in_range: Value<'c, '_> = block
+        .append_operation(arith::andi(ge_lo, le_hi, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let true_i1 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i1, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let out_of_range: Value<'c, '_> = block
+        .append_operation(arith::xori(in_range, true_i1, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_trap_if(
+        context,
+        block,
+        out_of_range,
+        "s_string_char_out_of_range",
+        types,
+        loc,
+    );
+    // Range pass → x is finite in [0, 255]; libm floor is safe.
+    let floored = emit_libm_call(context, block, "floor", &[arg_f64], types, loc);
+    let is_int: Value<'c, '_> = block
+        .append_operation(arith::cmpf(
+            context,
+            CmpfPredicate::Oeq,
+            arg_f64,
+            floored,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let not_int: Value<'c, '_> = block
+        .append_operation(arith::xori(is_int, true_i1, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_trap_if(
+        context,
+        block,
+        not_int,
+        "s_string_char_non_integer",
+        types,
+        loc,
+    );
+    // Validated finite integer in [0, 255] → fptosi safe.
+    emit_f2i(block, arg_f64, types, loc)
+}
+
+/// Phase 2.7v-stdlib-string-char (ADR 0113): `string.char(...)`
+/// runtime. Builds a boxed string object (ADR 0112) whose `len`
+/// equals the variadic argc and whose data bytes are the f2i'd
+/// arg values (one byte per arg). Per-arg validation goes
+/// through `emit_check_byte_arg`, so any out-of-range or non-
+/// integer value traps before the corresponding byte is stored.
+///
+/// `len` is the Rust-side `args_f64.len()` (call-site static) —
+/// no runtime multiplication, no alloc-size overflow risk.
+fn emit_string_char_runtime<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    args_f64: &[Value<'c, 'a>],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let len_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, args_f64.len() as i64).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let new_obj = emit_string_obj_alloc(context, block, len_i64, types, loc);
+    let data = emit_string_obj_data(context, block, new_obj, types, loc);
+    for (i, &arg_f64) in args_f64.iter().enumerate() {
+        let byte_i64 = emit_check_byte_arg(context, block, arg_f64, types, loc);
+        let i8_ty: Type<'c> = IntegerType::new(context, 8).into();
+        let byte_i8: Value<'c, '_> = block
+            .append_operation(arith::trunci(byte_i64, i8_ty, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let off = block
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, i as i64).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let dst = emit_byte_offset_ptr_dynamic(context, block, data, off, types, loc);
+        emit_store(block, byte_i8, dst, loc);
+    }
+    emit_string_obj_finalize_nul(context, block, new_obj, len_i64, types, loc);
+    new_obj
 }
 
 /// Phase 2.7r-stdlib-table (ADR 0106): `table.concat(t)` runtime.
