@@ -481,6 +481,61 @@ fn emit_fmt_global<'c>(
         "bad argument to 'char' (number has no integer representation)\0",
         loc,
     );
+    // Phase 2.7w-emit-f2i-gate-sweep (ADR 0114): per-builtin
+    // diagnostic globals fired by `emit_check_integer_arg` at the
+    // 10 sites whose Lua spec mandates integer args (and where
+    // pre-0114 codegen used raw `emit_f2i` → NaN/Inf UB + silent
+    // fractional truncation). Per-builtin name to mirror Lua
+    // reference impl error message style ("bad argument #N to
+    // 'fn' (number has no integer representation)").
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_string_byte_non_integer",
+        "bad argument #2 to 'byte' (number has no integer representation)\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_string_sub_non_integer",
+        "bad argument to 'sub' (number has no integer representation)\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_string_rep_non_integer",
+        "bad argument #2 to 'rep' (number has no integer representation)\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_table_concat_non_integer",
+        "bad argument to 'concat' (number has no integer representation)\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_table_insert_non_integer",
+        "bad argument #2 to 'insert' (number has no integer representation)\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_bitwise_non_integer",
+        "number has no integer representation\0",
+        loc,
+    );
     // Phase 2.7u-string-abi-refactor (ADR 0112): runtime trap for
     // `emit_alloc_with_oom_check` when malloc returns NULL. Fires
     // from string-alloc chokepoint helpers (concat / case_map /
@@ -591,32 +646,6 @@ fn emit_string_global<'c>(
     module.body().append_operation(global_op.into());
 }
 
-/// Phase 2.6b-hash-key-nan (ADR 0086): emit `if cond then exit
-/// "table index is NaN" end`. Reuses the ADR 0084 nil-trap shape:
-/// scf.if → printf("%s\n", s_table_index_nan) → exit(1) on the
-/// then branch, scf.yield no-op on the else branch.
-fn emit_table_index_nan_trap_if<'a, 'c>(
-    context: &'c Context,
-    block: &'a Block<'c>,
-    cond_i1: Value<'c, 'a>,
-    types: &Types<'c>,
-    loc: Location<'c>,
-) {
-    let then_region = Region::new();
-    let then_blk = Block::new(&[]);
-    {
-        let msg = emit_addressof(context, &then_blk, "s_table_index_nan", types, loc);
-        emit_exit_with_message(context, &then_blk, msg, types, loc);
-        then_blk.append_operation(scf::r#yield(&[], loc));
-    }
-    then_region.append_block(then_blk);
-    let else_region = Region::new();
-    let else_blk = Block::new(&[]);
-    else_blk.append_operation(scf::r#yield(&[], loc));
-    else_region.append_block(else_blk);
-    block.append_operation(scf::r#if(cond_i1, &[], then_region, else_region, loc));
-}
-
 /// Phase 2.6b-hash-key-validity (ADR 0087): runtime tag-validity
 /// gate at the hash probe entry. Replaces the ADR 0086
 /// `emit_hash_key_nan_preflight` and folds in ADR 0084's per-call
@@ -629,9 +658,10 @@ fn emit_table_index_nan_trap_if<'a, 'c>(
 /// `tagged.rs::policy_for_tag` as a pure function; this helper
 /// is the effectful emitter that consults that matrix and lays
 /// down the MLIR scf.if + trap structure. Trap message globals
-/// (`s_table_index_nil`, `s_table_index_nan`) and the underlying
-/// `emit_table_index_nan_trap_if` shape stay owned here in
-/// emit.rs.
+/// (`s_table_index_nil`, `s_table_index_nan`) live here in
+/// emit.rs; the trap shape itself routes through the generic
+/// `emit_trap_if` helper (ADR 0114, supersedes the legacy
+/// hardcoded-message `emit_table_index_nan_trap_if` of ADR 0086).
 ///
 /// TAG_NIL must be tested before TAG_NUMBER — the nil slot has
 /// no f64 payload, so the NaN load must not run on it. Other
@@ -702,7 +732,7 @@ fn emit_hash_key_runtime_validity_gate<'a, 'c>(
                         .result(0)
                         .unwrap()
                         .into();
-                    emit_table_index_nan_trap_if(context, &then_blk, is_nan, types, loc);
+                    emit_trap_if(context, &then_blk, is_nan, "s_table_index_nan", types, loc);
                 }
             }
         }
@@ -3102,7 +3132,7 @@ fn emit_stmt<'a, 'c>(
                         .result(0)
                         .unwrap()
                         .into();
-                    emit_table_index_nan_trap_if(context, block, is_nan, types, loc);
+                    emit_trap_if(context, block, is_nan, "s_table_index_nan", types, loc);
                     let key_i = emit_f2i(block, key_f, types, loc);
                     let length_i = emit_load(block, target_ptr, types.i64, loc);
                     // Lower bound: key >= 1 (else trap; same
@@ -4787,7 +4817,7 @@ fn emit_local_init_tagged<'a, 'c>(
                 .result(0)
                 .unwrap()
                 .into();
-            emit_table_index_nan_trap_if(context, block, is_nan, types, loc);
+            emit_trap_if(context, block, is_nan, "s_table_index_nan", types, loc);
             let key_i = emit_f2i(block, key_f, types, loc);
             let length_i = emit_load(block, target_ptr, types.i64, loc);
             let one = block
@@ -6919,7 +6949,7 @@ fn emit_expr<'a, 'c>(
                         .result(0)
                         .unwrap()
                         .into();
-                    emit_table_index_nan_trap_if(context, block, is_nan, types, loc);
+                    emit_trap_if(context, block, is_nan, "s_table_index_nan", types, loc);
                     let key_i = emit_f2i(block, key_f, types, loc);
                     let length_i = emit_load(block, target_ptr, types.i64, loc);
                     emit_table_bounds_check(context, block, key_i, length_i, types, loc);
@@ -7913,7 +7943,15 @@ fn emit_expr<'a, 'c>(
                         in_function_cell_ptr,
                         loc,
                     )?;
-                    emit_f2i(block, i_f64, types, loc)
+                    // Phase 2.7w (ADR 0114): integer gate replaces raw f2i.
+                    emit_check_integer_arg(
+                        context,
+                        block,
+                        i_f64,
+                        "s_string_byte_non_integer",
+                        types,
+                        loc,
+                    )
                 } else {
                     one_i64
                 };
@@ -8057,7 +8095,15 @@ fn emit_expr<'a, 'c>(
                 )?;
                 // ADR 0112: src is a boxed string object.
                 let len_i64 = emit_string_obj_len(block, src, types, loc);
-                let i_i64 = emit_f2i(block, i_f64, types, loc);
+                // Phase 2.7w (ADR 0114): integer gate on i/j replaces raw f2i.
+                let i_i64 = emit_check_integer_arg(
+                    context,
+                    block,
+                    i_f64,
+                    "s_string_sub_non_integer",
+                    types,
+                    loc,
+                );
                 // j absent ⇔ post-translate j = len (Lua spec §6.4).
                 let j_i64 = if args.len() == 3 {
                     let j_f64 = emit_expr(
@@ -8072,7 +8118,14 @@ fn emit_expr<'a, 'c>(
                         in_function_cell_ptr,
                         loc,
                     )?;
-                    emit_f2i(block, j_f64, types, loc)
+                    emit_check_integer_arg(
+                        context,
+                        block,
+                        j_f64,
+                        "s_string_sub_non_integer",
+                        types,
+                        loc,
+                    )
                 } else {
                     len_i64
                 };
@@ -8284,7 +8337,15 @@ fn emit_expr<'a, 'c>(
                         in_function_cell_ptr,
                         loc,
                     )?;
-                    emit_f2i(block, i_f64, types, loc)
+                    // Phase 2.7w (ADR 0114): integer gate replaces raw f2i.
+                    emit_check_integer_arg(
+                        context,
+                        block,
+                        i_f64,
+                        "s_table_concat_non_integer",
+                        types,
+                        loc,
+                    )
                 } else {
                     one_i64
                 };
@@ -8301,7 +8362,14 @@ fn emit_expr<'a, 'c>(
                         in_function_cell_ptr,
                         loc,
                     )?;
-                    emit_f2i(block, j_f64, types, loc)
+                    emit_check_integer_arg(
+                        context,
+                        block,
+                        j_f64,
+                        "s_table_concat_non_integer",
+                        types,
+                        loc,
+                    )
                 } else {
                     length
                 };
@@ -8380,7 +8448,15 @@ fn emit_expr<'a, 'c>(
                         in_function_cell_ptr,
                         loc,
                     )?;
-                    let pos = emit_f2i(block, pos_f64, types, loc);
+                    // Phase 2.7w (ADR 0114): integer gate replaces raw f2i.
+                    let pos = emit_check_integer_arg(
+                        context,
+                        block,
+                        pos_f64,
+                        "s_table_insert_non_integer",
+                        types,
+                        loc,
+                    );
                     (pos, &args[2])
                 };
                 emit_table_insert_runtime(
@@ -8736,8 +8812,14 @@ fn emit_binop<'a, 'c>(
         // `arith.sitofp`. Lua 5.4 bitwise ops are integer-typed; we
         // truncate the f64 representation just like `math.tointeger`.
         BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
-            let li = emit_f2i(block, lhs, types, loc);
-            let ri = emit_f2i(block, rhs, types, loc);
+            // Phase 2.7w (ADR 0114): Lua §3.4.2 mandates that float
+            // operands of bitwise ops have integer representation;
+            // otherwise raise a runtime error. integer gate replaces
+            // the prior silent-truncating raw f2i.
+            let li =
+                emit_check_integer_arg(context, block, lhs, "s_bitwise_non_integer", types, loc);
+            let ri =
+                emit_check_integer_arg(context, block, rhs, "s_bitwise_non_integer", types, loc);
             let res_i = match op {
                 BinOp::BitAnd => block
                     .append_operation(arith::andi(li, ri, loc))
@@ -8829,7 +8911,16 @@ fn emit_unary<'a, 'c>(
         }
         // Phase 2.2c (ADR 0022): `~x = x XOR -1` after f64→i64.
         UnaryOp::BitNot => {
-            let xi = emit_f2i(block, operand, types, loc);
+            // Phase 2.7w (ADR 0114): Lua §3.4.2 — same integer-or-error
+            // policy as BinOp bitwise ops.
+            let xi = emit_check_integer_arg(
+                context,
+                block,
+                operand,
+                "s_bitwise_non_integer",
+                types,
+                loc,
+            );
             let neg_one = block
                 .append_operation(arith::constant(
                     context,
@@ -9275,7 +9366,17 @@ fn emit_string_rep_runtime<'a, 'c>(
     // ADR 0112: src is a boxed string object.
     let len_i64 = emit_string_obj_len(block, src, types, loc);
     let src_data = emit_string_obj_data(context, block, src, types, loc);
-    let count_i64 = emit_f2i(block, count_f64, types, loc);
+    // Phase 2.7w (ADR 0114): integer gate on n replaces raw f2i.
+    // n=0 / n=-1 are still valid integer values → existing
+    // count_pos branch below returns empty string per Lua §6.4.
+    let count_i64 = emit_check_integer_arg(
+        context,
+        block,
+        count_f64,
+        "s_string_rep_non_integer",
+        types,
+        loc,
+    );
     let zero_i64 = block
         .append_operation(arith::constant(
             context,
@@ -9384,12 +9485,11 @@ fn emit_string_rep_runtime<'a, 'c>(
     block.append_operation(if_op).result(0).unwrap().into()
 }
 
-/// Phase 2.7v-stdlib-string-char (ADR 0113): trap if `cond_i1` is
-/// true, with the given diagnostic global as the error message.
-/// Generalises `emit_table_index_nan_trap_if` (ADR 0086) to any
-/// diagnostic global name so the same scf.if + exit_with_message
-/// shape can be reused for per-spec error surfaces (out-of-range
-/// vs non-integer in `string.char`).
+/// Phase 2.7v-stdlib-string-char (ADR 0113), generalised by
+/// ADR 0114: trap if `cond_i1` is true, with the given diagnostic
+/// global as the error message. Supersedes the legacy hardcoded-
+/// message `emit_table_index_nan_trap_if` of ADR 0086 — its 3
+/// callers now route here with `"s_table_index_nan"`.
 fn emit_trap_if<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
@@ -9519,6 +9619,100 @@ fn emit_check_byte_arg<'a, 'c>(
         loc,
     );
     // Validated finite integer in [0, 255] → fptosi safe.
+    emit_f2i(block, arg_f64, types, loc)
+}
+
+/// Phase 2.7w-emit-f2i-gate-sweep (ADR 0114): validate one f64
+/// arg as integer-valued Number and return the f2i'd i64.
+///
+/// Resolves the carry-over from ADR 0105/0109 that left raw
+/// `emit_f2i` exposed at 7 stdlib + 3 bitwise sites where the
+/// Lua spec mandates integer args. Sibling to ADR 0113's
+/// `emit_check_byte_arg` but without the range gate (callers
+/// handle their own clamps via `emit_normalize_sub_bounds` or
+/// inline range checks); the integer-only policy is uniform
+/// across all 10 sites so no per-caller policy enum is needed.
+///
+/// 1. **Finite check** `(x - x) == 0.0`: NaN-NaN = NaN ≠ 0;
+///    +Inf-Inf = NaN ≠ 0; finite-finite = 0. `cmpf Oeq` is
+///    ordered so NaN-vs-0 yields false → trap.
+/// 2. **Integer check** `x == libm floor(x)`: 1.5 ≠ 1.0; 1.0
+///    matches. Safe to call libm `floor` here because step 1
+///    has already proven x finite.
+/// 3. **f2i**: runs only on validated finite-integer x, so
+///    `arith.fptosi` is well-defined.
+///
+/// Single trap branch per call (the Lua reference impl uses one
+/// "number has no integer representation" error for NaN, Inf,
+/// and non-integer cases collectively). Caller supplies the
+/// dedicated diagnostic global to keep error messages user-
+/// meaningful (one global per builtin family, matching the
+/// `s_string_byte_out_of_range` precedent from ADR 0109).
+fn emit_check_integer_arg<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    arg_f64: Value<'c, 'a>,
+    msg_global: &str,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let zero_f64 = block
+        .append_operation(arith::constant(
+            context,
+            FloatAttribute::new(context, types.f64, 0.0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let diff: Value<'c, '_> = block
+        .append_operation(arith::subf(arg_f64, arg_f64, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let is_finite: Value<'c, '_> = block
+        .append_operation(arith::cmpf(
+            context,
+            CmpfPredicate::Oeq,
+            diff,
+            zero_f64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let floored = emit_libm_call(context, block, "floor", &[arg_f64], types, loc);
+    let is_int: Value<'c, '_> = block
+        .append_operation(arith::cmpf(
+            context,
+            CmpfPredicate::Oeq,
+            arg_f64,
+            floored,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let ok: Value<'c, '_> = block
+        .append_operation(arith::andi(is_finite, is_int, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let true_i1 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i1, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let not_ok: Value<'c, '_> = block
+        .append_operation(arith::xori(ok, true_i1, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_trap_if(context, block, not_ok, msg_global, types, loc);
     emit_f2i(block, arg_f64, types, loc)
 }
 

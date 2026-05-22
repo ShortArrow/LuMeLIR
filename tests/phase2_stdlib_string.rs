@@ -585,3 +585,62 @@ function string.char(x) return x + 600 end
 print(string.char(42))";
     assert_eq!(run_ok(src, "lumelir_string_char_shadowed").trim(), "642");
 }
+
+// --- Phase 2.7w-emit-f2i-gate-sweep (ADR 0114) ---
+//
+// Lua §6.4 string.* bounds args are integer-valued Number per
+// `luaL_checkinteger`. Pre-0114 the codegen called raw
+// `arith.fptosi` (UB for NaN/Inf, silent truncate for fractions).
+// ADR 0114 inserts `emit_check_integer_arg` at the 3 string.*
+// `emit_f2i` sites (byte i / sub i,j / rep n) routed through
+// dedicated diagnostic globals.
+
+#[test]
+fn string_byte_non_integer_i_traps() {
+    let src = "print(string.byte(\"ABC\", 1.5))";
+    let out = compile_and_run(src, "lumelir_string_byte_nonint_trap");
+    assert!(
+        !out.status.success(),
+        "string.byte(_, 1.5) must trap, but exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn string_sub_non_integer_i_traps() {
+    let src = "print(string.sub(\"hello\", 1.5, 3))";
+    let out = compile_and_run(src, "lumelir_string_sub_nonint_i_trap");
+    assert!(
+        !out.status.success(),
+        "string.sub(_, 1.5, _) must trap, but exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn string_sub_nan_i_traps() {
+    let src = "local x = 0/0\nprint(string.sub(\"hello\", x, 3))";
+    let out = compile_and_run(src, "lumelir_string_sub_nan_i_trap");
+    assert!(
+        !out.status.success(),
+        "string.sub(_, NaN, _) must trap, but exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn string_rep_non_integer_n_traps() {
+    let src = "print(string.rep(\"ab\", 1.5))";
+    let out = compile_and_run(src, "lumelir_string_rep_nonint_trap");
+    assert!(
+        !out.status.success(),
+        "string.rep(_, 1.5) must trap, but exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn string_rep_inf_n_traps() {
+    let src = "local x = 1/0\nprint(string.rep(\"ab\", x))";
+    let out = compile_and_run(src, "lumelir_string_rep_inf_trap");
+    assert!(
+        !out.status.success(),
+        "string.rep(_, Inf) must trap, but exited 0: {out:?}"
+    );
+}

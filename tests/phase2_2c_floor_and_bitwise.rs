@@ -87,3 +87,116 @@ fn bitwise_in_user_function() {
 print(pack(3, 5))";
     assert_eq!(run(src, "lumelir_22c_pack").trim(), "53");
 }
+
+// --- Phase 2.7w-emit-f2i-gate-sweep (ADR 0114) ---
+//
+// Lua 5.4 §3.4.2: "All bitwise operations convert their operands
+// to integers ... If a float operand does not have an integer
+// representation, a runtime error is raised."
+//
+// Pre-0114 the codegen called `arith.fptosi` raw on the bitwise
+// f64 operands (`emit_f2i` at `src/codegen/emit.rs:8861-8876`),
+// which is UB for NaN/Inf and silently truncates fractions. ADR
+// 0114 inserts `emit_check_integer_arg` at all 10 unprotected
+// sites (string.* / table.* / bitwise) — these pins verify the
+// bitwise side traps as the spec mandates.
+//
+// Test pattern: non-zero exit assertion (message wording loosely
+// coupled — `compile_and_run` direct, not `run`).
+
+fn compile_and_run(src: &str, output_name: &str) -> std::process::Output {
+    let output = std::env::temp_dir().join(output_name);
+    let chunk = lumelir::parser::parse(src).unwrap();
+    let hir = lumelir::hir::lower(&chunk).unwrap();
+    lumelir::codegen::compile(&hir, &output).unwrap();
+    let result = Command::new(&output)
+        .output()
+        .expect("failed to run compiled binary");
+    let _ = std::fs::remove_file(&output);
+    result
+}
+
+#[test]
+fn bitwise_band_non_integer_lhs_traps() {
+    // 1.5 has no integer representation — Lua §3.4.2 mandates trap.
+    let src = "print(1.5 & 3)";
+    let out = compile_and_run(src, "lumelir_22c_band_nonint_lhs_trap");
+    assert!(
+        !out.status.success(),
+        "1.5 & 3 must trap, but exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn bitwise_band_non_integer_rhs_traps() {
+    let src = "print(3 & 1.5)";
+    let out = compile_and_run(src, "lumelir_22c_band_nonint_rhs_trap");
+    assert!(
+        !out.status.success(),
+        "3 & 1.5 must trap, but exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn bitwise_band_nan_traps() {
+    // 0/0 = NaN. cmpf-Oeq(NaN-NaN, 0) = false (NaN != 0) → finite
+    // check fails → s_bitwise_non_integer trap.
+    let src = "local x = 0/0\nprint(x & 3)";
+    let out = compile_and_run(src, "lumelir_22c_band_nan_trap");
+    assert!(
+        !out.status.success(),
+        "NaN & 3 must trap, but exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn bitwise_bor_inf_traps() {
+    // 1/0 = +Inf. Inf - Inf = NaN ≠ 0 → finite check fails → trap.
+    let src = "local x = 1/0\nprint(x | 3)";
+    let out = compile_and_run(src, "lumelir_22c_bor_inf_trap");
+    assert!(
+        !out.status.success(),
+        "Inf | 3 must trap, but exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn bitwise_bxor_non_integer_traps() {
+    let src = "print(1.5 ~ 3)";
+    let out = compile_and_run(src, "lumelir_22c_bxor_nonint_trap");
+    assert!(
+        !out.status.success(),
+        "1.5 ~ 3 must trap, but exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn bitwise_shl_non_integer_rhs_traps() {
+    // Shift amount non-integer → trap.
+    let src = "print(1 << 1.5)";
+    let out = compile_and_run(src, "lumelir_22c_shl_nonint_trap");
+    assert!(
+        !out.status.success(),
+        "1 << 1.5 must trap, but exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn bitwise_bnot_non_integer_traps() {
+    let src = "print(~1.5)";
+    let out = compile_and_run(src, "lumelir_22c_bnot_nonint_trap");
+    assert!(
+        !out.status.success(),
+        "~1.5 must trap, but exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn bitwise_bnot_nan_traps() {
+    let src = "local x = 0/0\nprint(~x)";
+    let out = compile_and_run(src, "lumelir_22c_bnot_nan_trap");
+    assert!(
+        !out.status.success(),
+        "~NaN must trap, but exited 0: {out:?}"
+    );
+}

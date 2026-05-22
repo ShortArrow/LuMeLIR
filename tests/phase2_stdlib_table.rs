@@ -459,3 +459,52 @@ function table.insert(x) return x + 600 end
 print(table.insert(42))";
     assert_eq!(run_ok(src, "lumelir_table_insert_shadowed").trim(), "642");
 }
+
+// --- Phase 2.7w-emit-f2i-gate-sweep (ADR 0114) ---
+//
+// Lua §6.8 table.* bounds / pos args are integer-valued Number
+// per `luaL_checkinteger`. Pre-0114 the codegen called raw
+// `arith.fptosi` (UB for NaN/Inf, silent truncate for fractions).
+// ADR 0114 routes these through `emit_check_integer_arg` with
+// dedicated diagnostic globals (s_table_concat_non_integer /
+// s_table_insert_non_integer).
+
+#[test]
+fn table_concat_non_integer_i_traps() {
+    let src = "print(table.concat({\"a\", \"b\", \"c\"}, \",\", 1.5))";
+    let out = compile_and_run(src, "lumelir_table_concat_nonint_i_trap");
+    assert!(
+        !out.status.success(),
+        "table.concat(_, _, 1.5) must trap, but exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn table_concat_nan_j_traps() {
+    let src = "local x = 0/0\nprint(table.concat({\"a\", \"b\", \"c\"}, \",\", 1, x))";
+    let out = compile_and_run(src, "lumelir_table_concat_nan_j_trap");
+    assert!(
+        !out.status.success(),
+        "table.concat(_, _, _, NaN) must trap, but exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn table_insert_non_integer_pos_traps() {
+    let src = "local t = {1, 2, 3}\ntable.insert(t, 1.5, 99)";
+    let out = compile_and_run(src, "lumelir_table_insert_nonint_pos_trap");
+    assert!(
+        !out.status.success(),
+        "table.insert(_, 1.5, _) must trap, but exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn table_insert_inf_pos_traps() {
+    let src = "local t = {1, 2, 3}\nlocal x = 1/0\ntable.insert(t, x, 99)";
+    let out = compile_and_run(src, "lumelir_table_insert_inf_pos_trap");
+    assert!(
+        !out.status.success(),
+        "table.insert(_, Inf, _) must trap, but exited 0: {out:?}"
+    );
+}
