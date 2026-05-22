@@ -43,12 +43,15 @@ enum Commands {
     /// Compile and immediately execute Lua source. The argument is
     /// treated as a path when a file with that name exists,
     /// otherwise as inline Lua code (e.g. `lumelir run
-    /// 'print(1+2)'`). Pass `-` to read from stdin.
+    /// 'print(1+2)'`). Pass `-` to read from stdin explicitly, or
+    /// omit the argument when piping (`echo 'print(1)' | lumelir
+    /// run`) — implicit stdin only fires when stdin is not a TTY.
     Run {
         /// File path (loaded as Lua source) OR inline Lua code if
         /// the value does not name an existing file. `-` reads
-        /// from stdin.
-        input: String,
+        /// from stdin. Omit entirely to read stdin when it is
+        /// piped.
+        input: Option<String>,
     },
 }
 
@@ -61,6 +64,6 @@ pub fn run() -> Result<()> {
             target,
             emit,
         } => compile::invoke(&input, output.as_deref(), &target, emit),
-        Commands::Run { input } => run::invoke(&input),
+        Commands::Run { input } => run::invoke(input.as_deref()),
     }
 }

@@ -82,6 +82,59 @@ fn run_stdin_dash_reads_source() {
 }
 
 #[test]
+fn run_no_arg_reads_piped_stdin() {
+    // `echo ... | lumelir run` (no positional arg) reads stdin
+    // when stdin is not a TTY. Unix-style implicit pipe input.
+    let mut child = Command::new(lumelir_bin())
+        .arg("run")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lumelir run");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(b"print(\"piped-no-arg\")")
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait");
+    assert!(
+        out.status.success(),
+        "implicit stdin run must succeed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.trim(), "piped-no-arg");
+}
+
+#[test]
+fn run_no_arg_implicit_stdin_label_on_error() {
+    // Implicit-stdin parse error renders with the `<stdin>`
+    // sentinel label (same path as explicit `-`).
+    let mut child = Command::new(lumelir_bin())
+        .arg("run")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lumelir run");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(b"print(1 +")
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait");
+    assert!(!out.status.success(), "broken stdin must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("<stdin>"),
+        "stderr should mention <stdin> label; got:\n{stderr}"
+    );
+}
+
+#[test]
 fn run_inline_syntax_error_labels_with_inline_sentinel() {
     // Parse error from inline source uses `<inline>` as the label
     // in the diagnostic prefix, so the user can tell it was not
