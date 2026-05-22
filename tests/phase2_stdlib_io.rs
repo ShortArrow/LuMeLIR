@@ -107,6 +107,33 @@ fn io_write_then_print_adds_newline() {
     assert_eq!(stdout, b"ab\n");
 }
 
+#[test]
+fn io_write_tagged_index_source_dispatches_on_runtime_tag() {
+    // Mirrors the Print ADR 0065 fix: when the arg is an inline
+    // `Index` expression (here `arg[1]`), the codegen must route
+    // through the tagged-tmp materialisation path even when
+    // `infer_kind` statically returns Number (HIR does not
+    // propagate the table-element kind). Without this dispatch
+    // the String payload is read as a Number and traps with
+    // "table value type mismatch".
+    //
+    // This test exercises the combined ADR 0115 (`arg` table) +
+    // ADR 0116 (`io.write`) surface end-to-end.
+    let path = std::env::temp_dir().join("lumelir_io_write_arg_idx.lua");
+    std::fs::write(&path, "io.write(\"hi \"); io.write(arg[1])").expect("write fixture");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_lumelir"))
+        .args(["run", path.to_str().unwrap(), "world"])
+        .output()
+        .expect("spawn lumelir");
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        out.status.success(),
+        "io.write(arg[1]) must succeed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"hi world");
+}
+
 // --- HIR negative pins (Lua §6.6: Number or String only) ---
 
 #[test]

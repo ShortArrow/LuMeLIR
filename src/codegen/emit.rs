@@ -7506,66 +7506,71 @@ fn emit_expr<'a, 'c>(
             // reject by existing walks, so by the time we reach
             // codegen only Number / String / TaggedValue remain.
             Callee::Builtin(Builtin::IoWrite) => {
+                // ADR 0064 / 0065 / 0074 sibling per Print arm: the
+                // Local / inline Index / User-Call-returning-
+                // TaggedValue branches dispatch on the runtime tag
+                // regardless of `infer_kind`'s static answer,
+                // because HIR static typing does not propagate
+                // table-element kind through indexing — `arg[1]`
+                // is statically Number but at runtime carries
+                // whatever the table slot holds. Routing through
+                // `emit_print_tagged_local` is correct for
+                // Number/String alike.
                 for a in args.iter() {
-                    let kind = infer_kind(a, locals, functions);
-                    // ADR 0064 / 0065 / 0074 sibling: TaggedValue
-                    // sources need per-source dispatch so that
-                    // String payloads print via the boxed object
-                    // path (ADR 0112) rather than the Number
-                    // payload extractor.
-                    if kind == ValueKind::TaggedValue {
-                        if let HirExprKind::Local(LocalId(idx)) = &a.kind {
-                            emit_print_tagged_local(context, block, slots[*idx], types, loc);
-                            continue;
-                        }
-                        if let HirExprKind::Index { target, key } = &a.kind {
-                            let tmp = emit_inline_index_into_tagged_tmp(
-                                context,
-                                block,
-                                target,
-                                key,
-                                slots,
-                                locals,
-                                functions,
-                                types,
-                                params_len,
-                                in_function_cell_ptr,
-                                loc,
-                            )?;
-                            emit_print_tagged_local(context, block, tmp, types, loc);
-                            continue;
-                        }
-                        if let HirExprKind::Call {
-                            callee:
-                                Callee::User {
-                                    fid: FuncId(fid),
-                                    holding_local,
-                                },
-                            args: call_args,
-                        } = &a.kind
-                            && matches!(
-                                functions[*fid].ret_kinds.first(),
-                                Some(ValueKind::TaggedValue)
-                            )
-                        {
-                            let tmp = emit_call_user_into_tagged_tmp(
-                                context,
-                                block,
-                                *fid,
-                                *holding_local,
-                                call_args,
-                                slots,
-                                locals,
-                                functions,
-                                types,
-                                params_len,
-                                in_function_cell_ptr,
-                                loc,
-                            )?;
-                            emit_print_tagged_local(context, block, tmp, types, loc);
-                            continue;
-                        }
+                    if let HirExprKind::Local(LocalId(idx)) = &a.kind
+                        && matches!(infer_kind(a, locals, functions), ValueKind::TaggedValue)
+                    {
+                        emit_print_tagged_local(context, block, slots[*idx], types, loc);
+                        continue;
                     }
+                    if let HirExprKind::Index { target, key } = &a.kind {
+                        let tmp = emit_inline_index_into_tagged_tmp(
+                            context,
+                            block,
+                            target,
+                            key,
+                            slots,
+                            locals,
+                            functions,
+                            types,
+                            params_len,
+                            in_function_cell_ptr,
+                            loc,
+                        )?;
+                        emit_print_tagged_local(context, block, tmp, types, loc);
+                        continue;
+                    }
+                    if let HirExprKind::Call {
+                        callee:
+                            Callee::User {
+                                fid: FuncId(fid),
+                                holding_local,
+                            },
+                        args: call_args,
+                    } = &a.kind
+                        && matches!(
+                            functions[*fid].ret_kinds.first(),
+                            Some(ValueKind::TaggedValue)
+                        )
+                    {
+                        let tmp = emit_call_user_into_tagged_tmp(
+                            context,
+                            block,
+                            *fid,
+                            *holding_local,
+                            call_args,
+                            slots,
+                            locals,
+                            functions,
+                            types,
+                            params_len,
+                            in_function_cell_ptr,
+                            loc,
+                        )?;
+                        emit_print_tagged_local(context, block, tmp, types, loc);
+                        continue;
+                    }
+                    let kind = infer_kind(a, locals, functions);
                     let v = emit_expr(
                         context,
                         block,
