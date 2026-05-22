@@ -7498,6 +7498,98 @@ fn emit_expr<'a, 'c>(
                 );
                 Ok(block.append_operation(zero).result(0).unwrap().into())
             }
+            // Phase 2.7x-stdlib-io-write (ADR 0116): `io.write(...)`
+            // — variadic stdout writer. Sibling of Print without
+            // the tab separator and without a trailing newline.
+            // Per Lua §6.6 only Number / String args are valid;
+            // Bool / Nil reject at HIR time, Function / Table
+            // reject by existing walks, so by the time we reach
+            // codegen only Number / String / TaggedValue remain.
+            Callee::Builtin(Builtin::IoWrite) => {
+                for a in args.iter() {
+                    let kind = infer_kind(a, locals, functions);
+                    // ADR 0064 / 0065 / 0074 sibling: TaggedValue
+                    // sources need per-source dispatch so that
+                    // String payloads print via the boxed object
+                    // path (ADR 0112) rather than the Number
+                    // payload extractor.
+                    if kind == ValueKind::TaggedValue {
+                        if let HirExprKind::Local(LocalId(idx)) = &a.kind {
+                            emit_print_tagged_local(context, block, slots[*idx], types, loc);
+                            continue;
+                        }
+                        if let HirExprKind::Index { target, key } = &a.kind {
+                            let tmp = emit_inline_index_into_tagged_tmp(
+                                context,
+                                block,
+                                target,
+                                key,
+                                slots,
+                                locals,
+                                functions,
+                                types,
+                                params_len,
+                                in_function_cell_ptr,
+                                loc,
+                            )?;
+                            emit_print_tagged_local(context, block, tmp, types, loc);
+                            continue;
+                        }
+                        if let HirExprKind::Call {
+                            callee:
+                                Callee::User {
+                                    fid: FuncId(fid),
+                                    holding_local,
+                                },
+                            args: call_args,
+                        } = &a.kind
+                            && matches!(
+                                functions[*fid].ret_kinds.first(),
+                                Some(ValueKind::TaggedValue)
+                            )
+                        {
+                            let tmp = emit_call_user_into_tagged_tmp(
+                                context,
+                                block,
+                                *fid,
+                                *holding_local,
+                                call_args,
+                                slots,
+                                locals,
+                                functions,
+                                types,
+                                params_len,
+                                in_function_cell_ptr,
+                                loc,
+                            )?;
+                            emit_print_tagged_local(context, block, tmp, types, loc);
+                            continue;
+                        }
+                    }
+                    let v = emit_expr(
+                        context,
+                        block,
+                        a,
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
+                    )?;
+                    emit_print_value_raw(context, block, v, kind, types, loc);
+                }
+                // io.write returns a file handle in Lua spec;
+                // MVP yields the same f64 0.0 placeholder as
+                // Print / TableInsert.
+                let zero = arith::constant(
+                    context,
+                    FloatAttribute::new(context, types.f64, 0.0).into(),
+                    loc,
+                );
+                Ok(block.append_operation(zero).result(0).unwrap().into())
+            }
             // Phase 2.7c (ADR 0026): `tostring(x)` materialises a
             // String for the four supported kinds. Function values
             // are rejected at HIR-time and never reach codegen.

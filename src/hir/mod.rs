@@ -260,6 +260,9 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // use synthesises a Number placeholder (same shape as
             // Print). Statement position discards.
             Callee::Builtin(Builtin::TableInsert) => ValueKind::Number,
+            // ADR 0116 — io.write is void; same Number placeholder
+            // pattern (Print/TableInsert precedent).
+            Callee::Builtin(Builtin::IoWrite) => ValueKind::Number,
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.
@@ -4690,6 +4693,29 @@ impl LowerCtx {
                     actual: actual.name().to_owned(),
                     offset: call_span.start,
                 });
+            }
+        }
+        // Phase 2.7x-stdlib-io-write (ADR 0116): io.write accepts
+        // Number or String per Lua §6.6. The standard slice check
+        // above skips IoWrite via the TaggedValue sentinel; this
+        // follow-up loop adds the spec-mandated reject for Bool /
+        // Nil (Function / Table already rejected by
+        // FunctionUsedAsValue and table-as-value walks elsewhere).
+        if matches!(builtin, Builtin::IoWrite) {
+            for (i, lowered) in lowered_args.iter().enumerate() {
+                let actual = infer_kind(lowered, &self.locals, &self.functions);
+                match actual {
+                    ValueKind::Number | ValueKind::String | ValueKind::TaggedValue => {}
+                    _ => {
+                        return Err(HirError::BuiltinArgKindMismatch {
+                            builtin: builtin.name().to_owned(),
+                            arg_index: i + 1,
+                            expected: "number or string".to_owned(),
+                            actual: actual.name().to_owned(),
+                            offset: call_span.start,
+                        });
+                    }
+                }
             }
         }
         Ok(HirExprKind::Call {

@@ -467,6 +467,16 @@ pub enum Builtin {
     /// trap at runtime per Lua spec. Phase 2.7r-stdlib-table
     /// (ADR 0106).
     TableConcat,
+    /// `io.write(...)` — Lua 5.4 §6.6 stdout writer. Sibling of
+    /// `print` without the tab separator and without a trailing
+    /// newline. Variadic; each arg must be Number or String per
+    /// the spec (Bool/Nil reject at HIR time, Function/Table
+    /// reject via existing FunctionUsedAsValue walks).
+    ///
+    /// Phase 2.7x-stdlib-io-write (ADR 0116) — the first
+    /// `io.*` namespace builtin and the 4th consumer of
+    /// `Builtin::from_namespace_method`.
+    IoWrite,
 }
 
 impl Builtin {
@@ -536,6 +546,17 @@ impl Builtin {
         }
     }
 
+    /// Phase 2.7x-stdlib-io-write (ADR 0116): map an
+    /// `io.<method>` name to a Builtin variant. First io.*
+    /// builtin; future entries (read/open/close/...) extend
+    /// here without touching the call-site dispatcher.
+    pub fn io_from_method(method: &str) -> Option<Self> {
+        match method {
+            "write" => Some(Builtin::IoWrite),
+            _ => None,
+        }
+    }
+
     /// Phase 2.7q-stdlib-string (ADR 0103): generic namespace
     /// dispatcher. `lower_call`'s namespace builtin chokepoint
     /// invokes this with the unresolved `ns` identifier and the
@@ -547,6 +568,8 @@ impl Builtin {
             "math" => Self::math_from_method(method),
             "string" => Self::string_from_method(method),
             "table" => Self::table_from_method(method),
+            // ADR 0116 — io.* namespace.
+            "io" => Self::io_from_method(method),
             _ => None,
         }
     }
@@ -594,6 +617,8 @@ impl Builtin {
             // ADR 0111 — table.insert(list, [pos,] value).
             // arity 2 = append, arity 3 = positional insert.
             Builtin::TableInsert => (2, 3),
+            // ADR 0116 — io.write(...) variadic, Print precedent.
+            Builtin::IoWrite => (0, usize::MAX),
         }
     }
 
@@ -623,6 +648,7 @@ impl Builtin {
             Builtin::StringChar => "string.char",
             Builtin::TableConcat => "table.concat",
             Builtin::TableInsert => "table.insert",
+            Builtin::IoWrite => "io.write",
         }
     }
 
@@ -660,6 +686,10 @@ impl Builtin {
             | Builtin::TableConcat => &[ValueKind::String],
             // ADR 0111 — table.insert is void (Lua spec).
             Builtin::TableInsert => &[],
+            // ADR 0116 — io.write returns the file handle in the
+            // Lua reference impl; MVP scope returns void
+            // (Print precedent).
+            Builtin::IoWrite => &[],
         }
     }
 
@@ -733,6 +763,11 @@ impl Builtin {
             // repetition. `expected_param_kind` handles this
             // builtin directly and bypasses the slice.
             Builtin::StringChar => &[],
+            // ADR 0116 — io.write is variadic Number-or-String;
+            // standard slice check uses TaggedValue sentinel
+            // (any-accepted), followed by a IoWrite-specific
+            // Bool/Nil reject in `lower_namespace_builtin_call`.
+            Builtin::IoWrite => &[],
         }
     }
 
@@ -750,6 +785,12 @@ impl Builtin {
         match self {
             // Every position is Number, regardless of argc.
             Builtin::StringChar => Some(ValueKind::Number),
+            // ADR 0116 — io.write accepts Number or String per
+            // position. Use the TaggedValue sentinel to skip the
+            // standard single-kind check; lower_namespace_builtin_call
+            // adds an IoWrite-specific Number/String-only loop
+            // that rejects Bool/Nil.
+            Builtin::IoWrite => Some(ValueKind::TaggedValue),
             _ => self.param_kinds_for_arity(argc).get(pos).copied(),
         }
     }
