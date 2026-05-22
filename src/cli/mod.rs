@@ -40,10 +40,15 @@ enum Commands {
         #[arg(long, value_enum)]
         emit: Option<EmitStage>,
     },
-    /// Compile and immediately execute a Lua source file.
+    /// Compile and immediately execute Lua source. The argument is
+    /// treated as a path when a file with that name exists,
+    /// otherwise as inline Lua code (e.g. `lumelir run
+    /// 'print(1+2)'`). Pass `-` to read from stdin.
     Run {
-        /// Input Lua source file.
-        input: PathBuf,
+        /// File path (loaded as Lua source) OR inline Lua code if
+        /// the value does not name an existing file. `-` reads
+        /// from stdin.
+        input: String,
     },
 }
 
