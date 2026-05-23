@@ -268,6 +268,10 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // void return). Single-value position takes the
             // TaggedValue.
             Callee::Builtin(Builtin::TableRemove) => ValueKind::TaggedValue,
+            // ADR 0119 — io.read returns String-or-nil; single-
+            // value position takes the TaggedValue (TableRemove
+            // precedent).
+            Callee::Builtin(Builtin::IoRead) => ValueKind::TaggedValue,
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.
@@ -4698,6 +4702,35 @@ impl LowerCtx {
                     actual: actual.name().to_owned(),
                     offset: call_span.start,
                 });
+            }
+        }
+        // Phase 2.7x-stdlib-io-read (ADR 0119): io.read accepts
+        // only a literal `"*l"` or `"l"` format string for MVP.
+        // The standard slice check above validates the kind
+        // (String); this follow-up loop validates the literal
+        // value at HIR time so `*n` / `*a` / other formats and
+        // non-literal expressions fail at compile time.
+        if matches!(builtin, Builtin::IoRead) && lowered_args.len() == 1 {
+            match &lowered_args[0].kind {
+                HirExprKind::Str(s) if s == "*l" || s == "l" => {}
+                HirExprKind::Str(s) => {
+                    return Err(HirError::BuiltinArgKindMismatch {
+                        builtin: builtin.name().to_owned(),
+                        arg_index: 1,
+                        expected: "\"*l\" or \"l\" (string literal)".to_owned(),
+                        actual: format!("\"{}\"", s.escape_default()),
+                        offset: call_span.start,
+                    });
+                }
+                _ => {
+                    return Err(HirError::BuiltinArgKindMismatch {
+                        builtin: builtin.name().to_owned(),
+                        arg_index: 1,
+                        expected: "string literal \"*l\" or \"l\"".to_owned(),
+                        actual: "non-literal expression".to_owned(),
+                        offset: call_span.start,
+                    });
+                }
             }
         }
         // Phase 2.7x-stdlib-io-write (ADR 0116): io.write accepts

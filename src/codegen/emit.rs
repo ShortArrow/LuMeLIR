@@ -166,6 +166,11 @@ pub(crate) fn emit_module_unverified<'c>(
     // emit_print_string_obj.
     emit_fwrite_decl(context, &module, &types, loc);
     emit_stdout_extern_decl(context, &module, &types, loc);
+    // Phase 2.7x-stdlib-io-read (ADR 0119): symmetric to the
+    // stdout/fwrite pair — `getline` reads a line from `stdin`
+    // and `io.read` wraps it into a boxed string object.
+    emit_getline_decl(context, &module, &types, loc);
+    emit_stdin_extern_decl(context, &module, &types, loc);
     emit_libm_decls(context, &module, &types, loc);
     emit_strlen_decl(context, &module, &types, loc);
     emit_string_runtime_decls(context, &module, &types, loc);
@@ -824,6 +829,34 @@ fn emit_fwrite_decl<'c>(
     module.body().append_operation(fwrite_op.into());
 }
 
+/// Phase 2.7x-stdlib-io-read (ADR 0119): declare libc/POSIX
+/// `getline(char **lineptr, size_t *n, FILE *stream) -> ssize_t`.
+/// Used by `emit_io_read_runtime` to read a line from stdin
+/// into a dynamically-allocated buffer; `getline` grows the
+/// buffer as needed so long lines do not truncate (`fgets`
+/// alternative was rejected as ad-hoc).
+///
+/// `ssize_t` is `i64` on x86_64 Linux. Sibling of
+/// `emit_fwrite_decl`; both bind via the standard glibc symbol.
+fn emit_getline_decl<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let getline_ty = llvm::r#type::function(types.i64, &[types.ptr, types.ptr, types.ptr], false);
+    let getline_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "getline"))
+        .function_type(TypeAttribute::new(getline_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(getline_op.into());
+}
+
 /// Phase 2.devinfra-stdout-fwrite (ADR 0117): declare the libc
 /// `extern FILE *stdout;` global as an external linkage symbol.
 /// `emit_print_string_obj` reads this address, loads the
@@ -862,6 +895,37 @@ fn emit_stdout_extern_decl<'c>(
         ])
         .build()
         .expect("llvm.mlir.global @stdout external");
+    module.body().append_operation(global_op);
+}
+
+/// Phase 2.7x-stdlib-io-read (ADR 0119): declare the libc
+/// `extern FILE *stdin;` global as an external linkage symbol.
+/// Mirror of `emit_stdout_extern_decl`; `emit_io_read_runtime`
+/// loads this address and passes the FILE * to `getline`.
+fn emit_stdin_extern_decl<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let global_op = OperationBuilder::new("llvm.mlir.global", loc)
+        .add_regions([Region::new()])
+        .add_attributes(&[
+            (
+                Identifier::new(context, "global_type"),
+                TypeAttribute::new(types.ptr).into(),
+            ),
+            (
+                Identifier::new(context, "sym_name"),
+                StringAttribute::new(context, "stdin").into(),
+            ),
+            (
+                Identifier::new(context, "linkage"),
+                llvm::attributes::linkage(context, llvm::attributes::Linkage::External),
+            ),
+        ])
+        .build()
+        .expect("llvm.mlir.global @stdin external");
     module.body().append_operation(global_op);
 }
 
@@ -8729,6 +8793,25 @@ fn emit_expr<'a, 'c>(
                 );
                 Ok(block.append_operation(zero).result(0).unwrap().into())
             }
+            Callee::Builtin(Builtin::IoRead) => {
+                // Phase 2.7x-stdlib-io-read (ADR 0119):
+                // `io.read([format])` — arity 0 (default "*l")
+                // and arity 1 ("*l" / "l") share the same
+                // runtime path. The format arg has already been
+                // validated at HIR time (only "*l" / "l"
+                // literals are accepted), so codegen ignores
+                // the arg here.
+                //
+                // Returns TaggedValue via a tmp 16-byte slot:
+                // TAG_STRING + boxed-object payload on success,
+                // TAG_NIL on EOF. Consumers (LocalInit with
+                // TaggedValue kind, etc.) read tag + payload
+                // from the slot.
+                let out_slot =
+                    emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
+                emit_io_read_runtime(context, block, out_slot, types, loc);
+                Ok(out_slot)
+            }
             Callee::Builtin(Builtin::TableRemove) => {
                 // Phase 2.7r-stdlib-table (ADR 0118):
                 // `table.remove(t [, pos])` — mirror of
@@ -11007,6 +11090,258 @@ fn emit_table_remove_runtime<'a, 'c>(
     }
     noop_region.append_block(noop_blk);
     block.append_operation(scf::r#if(is_real, &[], real_region, noop_region, loc));
+}
+
+/// Phase 2.7x-stdlib-io-read (ADR 0119): read one line from stdin
+/// via POSIX `getline` and write the result (tag, payload) to the
+/// caller-supplied 16-byte tmp slot.
+///
+/// `getline(&lineptr, &n, stdin)` returns the byte count of the
+/// line (including the trailing `\n`) or `-1` on EOF / error.
+/// On success we copy `n_read - (last == '\n' ? 1 : 0)` bytes
+/// into a fresh boxed string object (ADR 0112) and free the
+/// libc-owned buffer. On EOF we write `TAG_NIL` and free the
+/// buffer (`getline` may have allocated even when no bytes were
+/// read; `free(NULL)` is a no-op per POSIX).
+///
+/// The boxed-string copy isolates the Lua-visible lifetime from
+/// libc's realloc-able buffer, so subsequent `getline` calls reuse
+/// their own buffer without invalidating the previous result.
+fn emit_io_read_runtime<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    out_slot: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let i8_ty: Type<'c> = IntegerType::new(context, 8).into();
+    let one_i32 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i32, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    // alloca char *lineptr;
+    let lineptr_slot: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.alloca", loc)
+                .add_operands(&[one_i32])
+                .add_attributes(&[(
+                    Identifier::new(context, "elem_type"),
+                    TypeAttribute::new(types.ptr).into(),
+                )])
+                .add_results(&[types.ptr])
+                .build()
+                .expect("llvm.alloca char*"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    // alloca size_t n;
+    let n_slot: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.alloca", loc)
+                .add_operands(&[one_i32])
+                .add_attributes(&[(
+                    Identifier::new(context, "elem_type"),
+                    TypeAttribute::new(types.i64).into(),
+                )])
+                .add_results(&[types.ptr])
+                .build()
+                .expect("llvm.alloca size_t"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    // Initialise *lineptr = NULL, *n = 0.
+    let null_ptr: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.mlir.zero", loc)
+                .add_results(&[types.ptr])
+                .build()
+                .expect("llvm.mlir.zero ptr"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_store(block, null_ptr, lineptr_slot, loc);
+    emit_store(block, zero_i64, n_slot, loc);
+
+    // Load stdin FILE*.
+    let stdin_addr = emit_addressof(context, block, "stdin", types, loc);
+    let stdin_ptr = emit_load(block, stdin_addr, types.ptr, loc);
+
+    // ssize_t n_read = getline(&lineptr, &n, stdin);
+    let getline_call = OperationBuilder::new("llvm.call", loc)
+        .add_operands(&[lineptr_slot, n_slot, stdin_ptr])
+        .add_attributes(&[
+            (
+                Identifier::new(context, "callee"),
+                FlatSymbolRefAttribute::new(context, "getline").into(),
+            ),
+            (
+                Identifier::new(context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(context, &[3, 0]).into(),
+            ),
+            (
+                Identifier::new(context, "op_bundle_sizes"),
+                DenseI32ArrayAttribute::new(context, &[]).into(),
+            ),
+        ])
+        .add_results(&[types.i64])
+        .build()
+        .expect("llvm.call @getline");
+    let n_read: Value<'c, '_> = block
+        .append_operation(getline_call)
+        .result(0)
+        .unwrap()
+        .into();
+
+    let neg_one_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, -1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let is_eof: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            n_read,
+            neg_one_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+
+    let eof_region = Region::new();
+    let eof_blk = Block::new(&[]);
+    {
+        // EOF: out_slot.tag = TAG_NIL; free getline's buffer
+        // (may be NULL if it never alloc'd; free(NULL) is a no-op).
+        let nil_tag = eof_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        emit_store(&eof_blk, nil_tag, out_slot, loc);
+        let buf = emit_load(&eof_blk, lineptr_slot, types.ptr, loc);
+        emit_libc_call_void(context, &eof_blk, "free", &[buf], loc);
+        eof_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    eof_region.append_block(eof_blk);
+
+    let line_region = Region::new();
+    let line_blk = Block::new(&[]);
+    {
+        // line bytes = lineptr; effective length strips a trailing
+        // '\n' (if any) so the boxed string matches Lua's "line
+        // without terminator" contract.
+        let buf = emit_load(&line_blk, lineptr_slot, types.ptr, loc);
+        let one_i64 = line_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let last_idx: Value<'c, '_> = line_blk
+            .append_operation(arith::subi(n_read, one_i64, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let last_byte_ptr =
+            emit_byte_offset_ptr_dynamic(context, &line_blk, buf, last_idx, types, loc);
+        let last_byte = emit_load(&line_blk, last_byte_ptr, i8_ty, loc);
+        let nl_i8 = line_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(i8_ty, b'\n' as i64).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let has_nl: Value<'c, '_> = line_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                last_byte,
+                nl_i8,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let line_len: Value<'c, '_> = line_blk
+            .append_operation(arith::select(has_nl, last_idx, n_read, loc))
+            .result(0)
+            .unwrap()
+            .into();
+
+        // Allocate boxed string object and memcpy the line bytes
+        // (post-strip).
+        let obj = emit_string_obj_alloc(context, &line_blk, line_len, types, loc);
+        let data = emit_string_obj_data(context, &line_blk, obj, types, loc);
+        let _ = emit_libc_call_ptr(
+            context,
+            &line_blk,
+            "memcpy",
+            &[data, buf, line_len],
+            types,
+            loc,
+        );
+        emit_string_obj_finalize_nul(context, &line_blk, obj, line_len, types, loc);
+
+        // free getline's buffer — the boxed copy is now standalone.
+        emit_libc_call_void(context, &line_blk, "free", &[buf], loc);
+
+        // out_slot.tag = TAG_STRING, payload = obj ptr.
+        let string_tag = line_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_STRING).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        emit_store(&line_blk, string_tag, out_slot, loc);
+        let payload_slot = emit_byte_offset_ptr(
+            context,
+            &line_blk,
+            out_slot,
+            ARRAY_ELEM_OFF_VALUE,
+            types,
+            loc,
+        );
+        emit_store(&line_blk, obj, payload_slot, loc);
+        line_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    line_region.append_block(line_blk);
+    block.append_operation(scf::r#if(is_eof, &[], eof_region, line_region, loc));
 }
 
 /// Phase 2.7r-stdlib-table (ADR 0106): pass-1 element dispatch

@@ -481,6 +481,21 @@ pub enum Builtin {
     /// element can be any Lua kind. Phase 2.7r-stdlib-table
     /// (ADR 0118).
     TableRemove,
+    /// `io.read([format])` — Lua 5.4 §6.6 line input. Reads from
+    /// stdin via POSIX getline; returns the line as a String
+    /// (without the trailing newline) or nil on EOF.
+    ///
+    /// MVP scope: format defaults to "*l" when omitted; explicit
+    /// "*l" / "l" both accepted (Lua 5.3 deprecated `*` prefix
+    /// but kept it). HIR rejects unsupported formats (`*n`, `*a`,
+    /// `n`) and non-literal format args so the constraint fires
+    /// at compile time. Phase 2.7x-stdlib-io-read (ADR 0119).
+    ///
+    /// Sibling of `IoWrite` in the io.* namespace. `ret_kinds =
+    /// [TaggedValue]` because the result is either a String or
+    /// nil; consumers see it via a tmp tagged slot per the ADR
+    /// 0118 `emit_local_init_tagged` builtin-TaggedValue path.
+    IoRead,
     /// `io.write(...)` — Lua 5.4 §6.6 stdout writer. Sibling of
     /// `print` without the tab separator and without a trailing
     /// newline. Variadic; each arg must be Number or String per
@@ -569,6 +584,8 @@ impl Builtin {
     pub fn io_from_method(method: &str) -> Option<Self> {
         match method {
             "write" => Some(Builtin::IoWrite),
+            // ADR 0119 — io.read (line input).
+            "read" => Some(Builtin::IoRead),
             _ => None,
         }
     }
@@ -639,6 +656,9 @@ impl Builtin {
             Builtin::TableRemove => (1, 2),
             // ADR 0116 — io.write(...) variadic, Print precedent.
             Builtin::IoWrite => (0, usize::MAX),
+            // ADR 0119 — io.read([format]). arity 0 = default
+            // `"*l"`, arity 1 = explicit format ("*l" / "l").
+            Builtin::IoRead => (0, 1),
         }
     }
 
@@ -670,6 +690,7 @@ impl Builtin {
             Builtin::TableInsert => "table.insert",
             Builtin::TableRemove => "table.remove",
             Builtin::IoWrite => "io.write",
+            Builtin::IoRead => "io.read",
         }
     }
 
@@ -715,6 +736,10 @@ impl Builtin {
             // Lua reference impl; MVP scope returns void
             // (Print precedent).
             Builtin::IoWrite => &[],
+            // ADR 0119 — io.read returns a String on success or
+            // nil on EOF; TaggedValue covers the union (TableRemove
+            // precedent).
+            Builtin::IoRead => &[ValueKind::TaggedValue],
         }
     }
 
@@ -789,6 +814,15 @@ impl Builtin {
             Builtin::TableRemove => match argc {
                 1 => &[ValueKind::Table],
                 2 => &[ValueKind::Table, ValueKind::Number],
+                _ => &[],
+            },
+            // ADR 0119 — io.read([format]). arity 0 = no args
+            // (default "*l"); arity 1 = String literal format.
+            // The literal-value check ("*l" / "l" only) lives
+            // in `lower_namespace_builtin_call`.
+            Builtin::IoRead => match argc {
+                0 => &[],
+                1 => &[ValueKind::String],
                 _ => &[],
             },
             // ADR 0113 — string.char is variadic Number; the
