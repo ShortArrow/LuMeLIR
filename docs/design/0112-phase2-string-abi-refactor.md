@@ -246,6 +246,12 @@ header alloc. Codex critical scope-drift guard.
 ## Future work
 
 - **ADR 0113 = `string.char(...)` proper** — direct payoff.
+  **RESOLVED by ADR 0113 (2026-05-22)**.
+- **stdout NUL truncation** (`emit_print_string_obj` used
+  `printf("%.*s")`, POSIX `%s` stops at NUL) — was not on this
+  list at the time of ADR 0112 but discovered while landing
+  ADR 0116. **RESOLVED by ADR 0117 (2026-05-22)** via fwrite
+  chokepoint swap.
 - **MLIR shape regression tests** for string object layout.
 - **String interning** — Phase 3 GC.
 - **UTF-8 awareness** — `utf8.*` library.
