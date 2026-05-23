@@ -1,12 +1,8 @@
 # CLAUDE.md
 
-Canonical working conventions for this repository live in **[AGENTS.md](./AGENTS.md)**.
-Read that file first. It covers:
+Canonical working conventions live in **[CONTRIBUTING.md](./CONTRIBUTING.md)** — read that first (coding principles, TDD, commits, ADR workflow, dependency policy, setup).
 
-- Current phase status (Phase 0 complete, Phase 1 PoC in progress)
-- Coding principles (FP / Clean Architecture / TDD)
-- Commit, ADR, and dependency policies
-- LLM-agent-specific rules (destructive operations, forbidden files, Windows/bash gotchas)
+LLM-agent-specific safety rules layered on top live in **[AGENTS.md](./AGENTS.md)** — also required reading (destructive ops, do-not-touch list, commit / push instructions).
 
 ## Claude-Specific Notes
 
