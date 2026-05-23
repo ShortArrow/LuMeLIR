@@ -508,3 +508,173 @@ fn table_insert_inf_pos_traps() {
         "table.insert(_, Inf, _) must trap, but exited 0: {out:?}"
     );
 }
+
+// --- Phase 2.7r-stdlib-table (ADR 0118): `table.remove(t [, pos])` ---
+//
+// Lua 5.4 §6.6 mutation primitive. Mirror of ADR 0111 `table.insert`,
+// but with shift-LEFT and a non-void TaggedValue return (the removed
+// element).
+//
+// Validity per Lua spec:
+// - 1 ≤ pos ≤ #t              → shift-left + return value
+// - pos == #t + 1              → no-op, returns nil (spec edge)
+// - #t == 0 AND pos == 0       → no-op, returns nil (spec edge for empty)
+// - otherwise                  → trap "position out of bounds"
+
+#[test]
+fn table_remove_default_pos_tail_pop() {
+    // Default pos = #t → tail pop. Length decrements, leading
+    // elements unchanged.
+    let src = "local t = {1, 2, 3}
+table.remove(t)
+print(#t, t[1], t[2])";
+    assert_eq!(
+        run_ok(src, "lumelir_table_remove_default_tail").trim(),
+        "2\t1\t2"
+    );
+}
+
+#[test]
+fn table_remove_returns_removed_number() {
+    // Return value is the removed element (TaggedValue, Number
+    // payload here).
+    let src = "local t = {10, 20, 30}
+local v = table.remove(t)
+print(v)";
+    assert_eq!(
+        run_ok(src, "lumelir_table_remove_return_number").trim(),
+        "30"
+    );
+}
+
+#[test]
+fn table_remove_explicit_pos_one_head() {
+    // pos = 1 → head pop with shift-left of the rest.
+    let src = "local t = {1, 2, 3}
+table.remove(t, 1)
+print(#t, t[1], t[2])";
+    assert_eq!(run_ok(src, "lumelir_table_remove_head").trim(), "2\t2\t3");
+}
+
+#[test]
+fn table_remove_explicit_pos_middle() {
+    // pos = 2 in a 4-element table → middle removal, trailing
+    // elements shift left by one.
+    let src = "local t = {1, 2, 3, 4}
+table.remove(t, 2)
+print(#t, t[1], t[2], t[3])";
+    assert_eq!(
+        run_ok(src, "lumelir_table_remove_middle").trim(),
+        "3\t1\t3\t4"
+    );
+}
+
+#[test]
+fn table_remove_single_element_table() {
+    // 1-element table: default pos = 1, returns the element and
+    // leaves an empty table.
+    let src = "local t = {99}
+local v = table.remove(t)
+print(v, #t)";
+    assert_eq!(run_ok(src, "lumelir_table_remove_single").trim(), "99\t0");
+}
+
+#[test]
+fn table_remove_returns_removed_string() {
+    // Verifies the TaggedValue return carries String payloads,
+    // not just Number.
+    let src = "local t = {\"a\", \"b\"}
+local v = table.remove(t)
+print(v)";
+    assert_eq!(
+        run_ok(src, "lumelir_table_remove_return_string").trim(),
+        "b"
+    );
+}
+
+#[test]
+fn table_remove_pos_size_plus_one_returns_nil() {
+    // Spec edge: pos == #t + 1 is a no-op that returns nil. The
+    // table itself is unchanged.
+    let src = "local t = {1}
+local v = table.remove(t, 2)
+print(v, #t)";
+    assert_eq!(
+        run_ok(src, "lumelir_table_remove_pos_plus_one").trim(),
+        "nil\t1"
+    );
+}
+
+#[test]
+fn table_remove_empty_default_pos_traps() {
+    // Empty table + default pos: per Lua reference impl,
+    // `luaL_optinteger(L, 2, size)` defaults pos = 0, which fails
+    // the `1 <= pos <= size + 1` check (with the size==0,
+    // pos==0 special case still permitted as a no-op in the
+    // manual, but the canonical impl traps — we follow impl).
+    let src = "local t = {}
+table.remove(t)";
+    let out = compile_and_run(src, "lumelir_table_remove_empty_default_trap");
+    assert!(
+        !out.status.success(),
+        "table.remove({{}}) must trap, but exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn table_remove_pos_zero_nonempty_traps() {
+    // pos = 0 on a non-empty table is always out of range.
+    let src = "local t = {1}
+table.remove(t, 0)";
+    let out = compile_and_run(src, "lumelir_table_remove_pos_zero_trap");
+    assert!(
+        !out.status.success(),
+        "table.remove(_, 0) must trap, but exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn table_remove_pos_past_end_plus_one_traps() {
+    // pos > #t + 1 is out of range.
+    let src = "local t = {1, 2}
+table.remove(t, 4)";
+    let out = compile_and_run(src, "lumelir_table_remove_pos_past_end_trap");
+    assert!(
+        !out.status.success(),
+        "table.remove(_, len+2) must trap, but exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn table_remove_non_integer_pos_traps() {
+    // ADR 0114 integer gate fires for non-integer pos.
+    let src = "local t = {1, 2}
+table.remove(t, 1.5)";
+    let out = compile_and_run(src, "lumelir_table_remove_nonint_pos_trap");
+    assert!(
+        !out.status.success(),
+        "table.remove(_, 1.5) must trap, but exited 0: {out:?}"
+    );
+}
+
+#[test]
+fn table_remove_non_table_first_arg_hir_rejects() {
+    // First arg must be Table; Number rejected at HIR-time.
+    let chunk = lumelir::parser::parse("table.remove(42)").unwrap();
+    let err = lumelir::hir::lower(&chunk).expect_err("table.remove with Number must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("BuiltinArgKindMismatch"),
+        "expected BuiltinArgKindMismatch, got: {msg}"
+    );
+}
+
+#[test]
+fn table_remove_shadowed_respects_user_table() {
+    // User shadow `local table = {}` must take over per Lua
+    // semantics — same precedent as table.insert / io.write etc.
+    let src = "local table = {}
+function table.remove(x) return x + 800 end
+print(table.remove(42))";
+    assert_eq!(run_ok(src, "lumelir_table_remove_shadowed").trim(), "842");
+}

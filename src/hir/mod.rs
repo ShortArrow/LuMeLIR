@@ -263,6 +263,11 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // ADR 0116 — io.write is void; same Number placeholder
             // pattern (Print/TableInsert precedent).
             Callee::Builtin(Builtin::IoWrite) => ValueKind::Number,
+            // ADR 0118 — table.remove returns the removed
+            // element as TaggedValue (first table.* with a non-
+            // void return). Single-value position takes the
+            // TaggedValue.
+            Callee::Builtin(Builtin::TableRemove) => ValueKind::TaggedValue,
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.

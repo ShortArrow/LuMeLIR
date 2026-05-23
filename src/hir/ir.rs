@@ -467,6 +467,20 @@ pub enum Builtin {
     /// trap at runtime per Lua spec. Phase 2.7r-stdlib-table
     /// (ADR 0106).
     TableConcat,
+    /// `table.remove(list [, pos])` — Lua 5.4 §6.6 array
+    /// mutation primitive. Mirror of ADR 0111 `TableInsert` with
+    /// shift-LEFT instead of shift-right and a non-void
+    /// TaggedValue return (the removed element).
+    ///
+    /// Validity: `1 ≤ pos ≤ #t` is normal; `pos == #t + 1` is a
+    /// no-op returning nil; otherwise traps. Default `pos = #t`
+    /// (tail pop) when arity is 1.
+    ///
+    /// First table.* builtin whose `ret_kinds` is non-empty —
+    /// returns `[ValueKind::TaggedValue]` because the removed
+    /// element can be any Lua kind. Phase 2.7r-stdlib-table
+    /// (ADR 0118).
+    TableRemove,
     /// `io.write(...)` — Lua 5.4 §6.6 stdout writer. Sibling of
     /// `print` without the tab separator and without a trailing
     /// newline. Variadic; each arg must be Number or String per
@@ -542,6 +556,8 @@ impl Builtin {
             "concat" => Some(Builtin::TableConcat),
             // ADR 0111 — table.insert (mutation primitive).
             "insert" => Some(Builtin::TableInsert),
+            // ADR 0118 — table.remove (mutation primitive, mirror).
+            "remove" => Some(Builtin::TableRemove),
             _ => None,
         }
     }
@@ -617,6 +633,10 @@ impl Builtin {
             // ADR 0111 — table.insert(list, [pos,] value).
             // arity 2 = append, arity 3 = positional insert.
             Builtin::TableInsert => (2, 3),
+            // ADR 0118 — table.remove(list [, pos]).
+            // arity 1 = tail pop (default pos = #list);
+            // arity 2 = explicit pos.
+            Builtin::TableRemove => (1, 2),
             // ADR 0116 — io.write(...) variadic, Print precedent.
             Builtin::IoWrite => (0, usize::MAX),
         }
@@ -648,6 +668,7 @@ impl Builtin {
             Builtin::StringChar => "string.char",
             Builtin::TableConcat => "table.concat",
             Builtin::TableInsert => "table.insert",
+            Builtin::TableRemove => "table.remove",
             Builtin::IoWrite => "io.write",
         }
     }
@@ -686,6 +707,10 @@ impl Builtin {
             | Builtin::TableConcat => &[ValueKind::String],
             // ADR 0111 — table.insert is void (Lua spec).
             Builtin::TableInsert => &[],
+            // ADR 0118 — table.remove returns the removed element
+            // as TaggedValue (table elements are heterogeneous).
+            // First table.* with a non-void return.
+            Builtin::TableRemove => &[ValueKind::TaggedValue],
             // ADR 0116 — io.write returns the file handle in the
             // Lua reference impl; MVP scope returns void
             // (Print precedent).
@@ -756,6 +781,14 @@ impl Builtin {
             Builtin::TableInsert => match argc {
                 2 => &[ValueKind::Table, ValueKind::TaggedValue],
                 3 => &[ValueKind::Table, ValueKind::Number, ValueKind::TaggedValue],
+                _ => &[],
+            },
+            // ADR 0118 — table.remove arity-sensitive:
+            //   arity 1: [Table]                 (default pos = #t)
+            //   arity 2: [Table, Number]         (explicit pos)
+            Builtin::TableRemove => match argc {
+                1 => &[ValueKind::Table],
+                2 => &[ValueKind::Table, ValueKind::Number],
                 _ => &[],
             },
             // ADR 0113 — string.char is variadic Number; the

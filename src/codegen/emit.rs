@@ -459,6 +459,31 @@ fn emit_fmt_global<'c>(
         "bad argument #2 to 'insert' (position out of bounds)\0",
         loc,
     );
+    // Phase 2.7r-stdlib-table (ADR 0118): runtime trap for
+    // `table.remove(t [, pos])` when `pos` is outside the
+    // valid range (1 ≤ pos ≤ #t + 1). Lua spec §6.6: pos must
+    // be in [1, #t] for a real removal, or #t + 1 for a no-op
+    // returning nil; anything else is "bad argument".
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_table_remove_pos_out_of_range",
+        "bad argument #2 to 'remove' (position out of bounds)\0",
+        loc,
+    );
+    // Phase 2.7r-stdlib-table (ADR 0118): mirror of the
+    // ADR 0114 integer gate for table.insert. Fires from
+    // `emit_check_integer_arg` when pos is a non-integer
+    // Number (e.g. 1.5).
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_table_remove_non_integer",
+        "bad argument #2 to 'remove' (number has no integer representation)\0",
+        loc,
+    );
     // Phase 2.7v-stdlib-string-char (ADR 0113): runtime trap for
     // `string.char(n)` when n is outside [0, 255] (NaN / +Inf
     // fail the cmpf-Ord range check naturally — same diagnostic).
@@ -2864,6 +2889,56 @@ fn emit_stmt<'a, 'c>(
                                 in_function_cell_ptr,
                                 loc,
                             )?;
+                        }
+                        HirExprKind::Call {
+                            callee: Callee::Builtin(builtin),
+                            ..
+                        } if matches!(
+                            builtin.ret_kinds().first(),
+                            Some(ValueKind::TaggedValue)
+                        ) =>
+                        {
+                            // Phase 2.7r-stdlib-table (ADR 0118):
+                            // builtin returning TaggedValue (today
+                            // only `table.remove`). The builtin's
+                            // emit arm yields a tmp 16-byte slot
+                            // ptr; copy its (tag, payload) into the
+                            // destination local's slot — same
+                            // 16-byte raw-i64 idiom as the Local
+                            // TaggedValue source path below.
+                            let src_slot = emit_expr(
+                                context,
+                                block,
+                                value,
+                                slots,
+                                locals,
+                                functions,
+                                types,
+                                params_len,
+                                in_function_cell_ptr,
+                                loc,
+                            )?;
+                            let dst_slot = slots[id.0];
+                            let tag = emit_load(block, src_slot, types.i64, loc);
+                            emit_store(block, tag, dst_slot, loc);
+                            let src_value_ptr = emit_byte_offset_ptr(
+                                context,
+                                block,
+                                src_slot,
+                                ARRAY_ELEM_OFF_VALUE,
+                                types,
+                                loc,
+                            );
+                            let dst_value_ptr = emit_byte_offset_ptr(
+                                context,
+                                block,
+                                dst_slot,
+                                ARRAY_ELEM_OFF_VALUE,
+                                types,
+                                loc,
+                            );
+                            let payload = emit_load(block, src_value_ptr, types.i64, loc);
+                            emit_store(block, payload, dst_value_ptr, loc);
                         }
                         HirExprKind::IndexTagged { target, key } => {
                             emit_local_init_tagged(
@@ -8654,6 +8729,70 @@ fn emit_expr<'a, 'c>(
                 );
                 Ok(block.append_operation(zero).result(0).unwrap().into())
             }
+            Callee::Builtin(Builtin::TableRemove) => {
+                // Phase 2.7r-stdlib-table (ADR 0118):
+                // `table.remove(t [, pos])` — mirror of
+                // `table.insert`. arity 1 → tail pop (default
+                // pos = #t); arity 2 → explicit pos with the
+                // ADR 0114 integer gate.
+                //
+                // Non-void return: the removed element comes
+                // back as TaggedValue via a tmp 16-byte tagged
+                // slot. The expression result IS that slot ptr;
+                // consumers (LocalInit with TaggedValue kind,
+                // print, etc.) read tag+payload from there.
+                let t_ptr = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let len_slot =
+                    emit_byte_offset_ptr(context, block, t_ptr, TABLE_OFF_LEN, types, loc);
+                let len_pre = emit_load(block, len_slot, types.i64, loc);
+                let pos_i64 = if args.len() == 1 {
+                    // arity 1 → default pos = #t (tail pop).
+                    len_pre
+                } else {
+                    let pos_f64 = emit_expr(
+                        context,
+                        block,
+                        &args[1],
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
+                    )?;
+                    // ADR 0114 integer gate (mirror of table.insert).
+                    emit_check_integer_arg(
+                        context,
+                        block,
+                        pos_f64,
+                        "s_table_remove_non_integer",
+                        types,
+                        loc,
+                    )
+                };
+                // Tmp 16-byte tagged slot for the removed value.
+                // The runtime helper writes (tag, payload) here.
+                let out_slot =
+                    emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
+                emit_table_remove_runtime(
+                    context, block, t_ptr, len_pre, pos_i64, out_slot, types, loc,
+                );
+                // Expression result: the slot ptr (consumer reads
+                // it as a TaggedValue source).
+                Ok(out_slot)
+            }
             Callee::User {
                 fid: FuncId(fid),
                 holding_local,
@@ -10600,6 +10739,274 @@ fn len_slot_of<'a, 'c>(
     loc: Location<'c>,
 ) -> Value<'c, 'a> {
     emit_byte_offset_ptr(context, block, t_ptr, TABLE_OFF_LEN, types, loc)
+}
+
+/// Phase 2.7r-stdlib-table (ADR 0118): `table.remove(t [, pos])`
+/// runtime. Mirror of `emit_table_insert_runtime` with shift-
+/// LEFT instead of shift-right and a non-void return: the
+/// removed element's 16-byte (tag, payload) is copied to the
+/// caller-supplied `out_slot`.
+///
+/// Bounds policy per Lua §6.6:
+/// - `1 ≤ pos ≤ len_pre`: normal path — load slot, shift trailing
+///   entries left by one, decrement length.
+/// - `pos == len_pre + 1`: spec no-op — `out_slot.tag = NIL`,
+///   length unchanged. (Lua manual: "the element list[pos] is
+///   erased".)
+/// - otherwise: trap with `s_table_remove_pos_out_of_range`.
+///
+/// Note `len_pre == 0 AND pos == 0` (empty table + default pos)
+/// fails the upper bound (`max_valid = 1`), so it traps — matches
+/// the Lua 5.4 reference impl (`luaL_optinteger(L, 2, size)`
+/// defaults pos to 0 for empty lists and the argcheck fires).
+///
+/// Caller-supplied `out_slot` must be a 16-byte tagged slot
+/// (typically alloca'd by the emit arm). The caller-supplied
+/// `len_pre` matches the table's `length` field at call entry.
+#[allow(clippy::too_many_arguments)]
+fn emit_table_remove_runtime<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    t_ptr: Value<'c, 'a>,
+    len_pre: Value<'c, 'a>,
+    pos_i64: Value<'c, 'a>,
+    out_slot: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let one_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let elem_size = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, ARRAY_ELEM_SIZE).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    // max_valid = len_pre + 1 (spec edge: pos = len_pre + 1 is a no-op).
+    let max_valid: Value<'c, '_> = block
+        .append_operation(arith::addi(len_pre, one_i64, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    // pos out-of-bounds: pos < 1 || pos > len_pre + 1.
+    let pos_too_low: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Slt,
+            pos_i64,
+            one_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let pos_too_high: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Sgt,
+            pos_i64,
+            max_valid,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let oob: Value<'c, '_> = block
+        .append_operation(arith::ori(pos_too_low, pos_too_high, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_trap_if(
+        context,
+        block,
+        oob,
+        "s_table_remove_pos_out_of_range",
+        types,
+        loc,
+    );
+
+    // is_real_removal = (pos <= len_pre). When false here we are
+    // in the spec no-op edge (pos == len_pre + 1) — write NIL to
+    // out_slot and leave the table unchanged.
+    let is_real: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Sle,
+            pos_i64,
+            len_pre,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let nil_tag = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, TAG_NIL).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+
+    let real_region = Region::new();
+    let real_blk = Block::new(&[]);
+    {
+        // Reload array_buf — table may have been grown elsewhere
+        // since the caller measured len_pre, though for remove
+        // we never grow. The reload mirrors emit_table_insert_runtime
+        // for safety.
+        let arr_buf_slot =
+            emit_byte_offset_ptr(context, &real_blk, t_ptr, TABLE_OFF_ARRAY_BUF, types, loc);
+        let arr_buf = emit_load(&real_blk, arr_buf_slot, types.ptr, loc);
+        // pos_zero = pos - 1 (0-based slot index).
+        let pos_zero: Value<'c, '_> = real_blk
+            .append_operation(arith::subi(pos_i64, one_i64, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        // target = array_buf + pos_zero * ARRAY_ELEM_SIZE.
+        let target_off: Value<'c, '_> = real_blk
+            .append_operation(arith::muli(pos_zero, elem_size, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let target_slot =
+            emit_byte_offset_ptr_dynamic(context, &real_blk, arr_buf, target_off, types, loc);
+        // Copy the removed element's 16-byte (tag, payload) into
+        // out_slot. Raw i64-pair copy preserves any payload
+        // bit pattern (Number f64, Bool zext, String/Function/
+        // Table ptr) per ADR 0064.
+        let removed_tag = emit_load(&real_blk, target_slot, types.i64, loc);
+        emit_store(&real_blk, removed_tag, out_slot, loc);
+        let src_value_ptr = emit_byte_offset_ptr(
+            context,
+            &real_blk,
+            target_slot,
+            ARRAY_ELEM_OFF_VALUE,
+            types,
+            loc,
+        );
+        let dst_value_ptr = emit_byte_offset_ptr(
+            context,
+            &real_blk,
+            out_slot,
+            ARRAY_ELEM_OFF_VALUE,
+            types,
+            loc,
+        );
+        let removed_payload = emit_load(&real_blk, src_value_ptr, types.i64, loc);
+        emit_store(&real_blk, removed_payload, dst_value_ptr, loc);
+
+        // shift_needed = pos < len_pre (i.e., not a tail removal).
+        let shift_needed: Value<'c, '_> = real_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Slt,
+                pos_i64,
+                len_pre,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let shift_then = Region::new();
+        let shift_then_blk = Block::new(&[]);
+        {
+            // dst = array_buf + pos_zero * ARRAY_ELEM_SIZE (= target_slot).
+            let dst_ptr = emit_byte_offset_ptr_dynamic(
+                context,
+                &shift_then_blk,
+                arr_buf,
+                target_off,
+                types,
+                loc,
+            );
+            // src = array_buf + (pos_zero + 1) * ARRAY_ELEM_SIZE.
+            let src_zero: Value<'c, '_> = shift_then_blk
+                .append_operation(arith::addi(pos_zero, one_i64, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let src_off: Value<'c, '_> = shift_then_blk
+                .append_operation(arith::muli(src_zero, elem_size, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let src_ptr = emit_byte_offset_ptr_dynamic(
+                context,
+                &shift_then_blk,
+                arr_buf,
+                src_off,
+                types,
+                loc,
+            );
+            // bytes = (len_pre - pos) * ARRAY_ELEM_SIZE. Trailing
+            // entries (pos+1 .. len_pre) become positions
+            // (pos .. len_pre - 1).
+            let span: Value<'c, '_> = shift_then_blk
+                .append_operation(arith::subi(len_pre, pos_i64, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let bytes: Value<'c, '_> = shift_then_blk
+                .append_operation(arith::muli(span, elem_size, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let _ = emit_libc_call_ptr(
+                context,
+                &shift_then_blk,
+                "memmove",
+                &[dst_ptr, src_ptr, bytes],
+                types,
+                loc,
+            );
+            shift_then_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        shift_then.append_block(shift_then_blk);
+        let shift_else = Region::new();
+        let shift_else_blk = Block::new(&[]);
+        shift_else_blk.append_operation(scf::r#yield(&[], loc));
+        shift_else.append_block(shift_else_blk);
+        real_blk.append_operation(scf::r#if(shift_needed, &[], shift_then, shift_else, loc));
+
+        // length -= 1.
+        let new_len: Value<'c, '_> = real_blk
+            .append_operation(arith::subi(len_pre, one_i64, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        emit_store(
+            &real_blk,
+            new_len,
+            len_slot_of(context, &real_blk, t_ptr, types, loc),
+            loc,
+        );
+        real_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    real_region.append_block(real_blk);
+    let noop_region = Region::new();
+    let noop_blk = Block::new(&[]);
+    {
+        // Spec no-op (pos == len_pre + 1): out_slot.tag = NIL.
+        // Payload slot is left undefined since the consumer
+        // dispatches on tag first (TAG_NIL → no payload read).
+        emit_store(&noop_blk, nil_tag, out_slot, loc);
+        noop_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    noop_region.append_block(noop_blk);
+    block.append_operation(scf::r#if(is_real, &[], real_region, noop_region, loc));
 }
 
 /// Phase 2.7r-stdlib-table (ADR 0106): pass-1 element dispatch
