@@ -10,9 +10,46 @@ Each file captures a single design decision — what was chosen, what was reject
 | `docs/design/README.md` (this file) | Global ADR conventions + chronological index |
 | `docs/design/NNNN-*.md` | Canonical single-decision records |
 | `docs/design/tagged-semantics.md` | TaggedValue runtime SoT (slot layout, producer/consumer matrix, §8 TaggedValue-related ADR appendix) |
-| `AGENTS.md` | Working agreements + current-phase progress summary |
+| `CONTRIBUTING.md` | Universal working conventions (humans + LLMs) — *current rules* |
+| `AGENTS.md` | LLM-agent safety guardrails |
 
-The ADR docs are the source of truth for *what was decided*; `AGENTS.md` tracks *what is currently happening* across active lanes. Old AGENTS rows are not edited as history — they get shorter as ADRs mature, but the underlying ADR doc stays the canonical record.
+The ADR docs are the source of truth for *what was decided* and *why*; `CONTRIBUTING.md` is the source of truth for *the current rules* derived from those decisions. The two are linked: each policy section in `CONTRIBUTING.md` cross-references the foundational ADR that justifies it.
+
+## When to write an ADR
+
+Write an ADR when **all three** apply:
+
+1. **Defensible alternative existed.** You chose A over B (or C). A future reviewer might ask "why not B?".
+2. **Future-binding.** The decision constrains how future code is shaped — layering, ABI, dispatcher contract, dependency boundary, etc.
+3. **Not implied by existing decisions.** If an established pattern already covers this case, this is implementation, not architecture.
+
+### Self-test before writing
+
+- *"6 months from now, will reading this doc explain WHY the codebase is shaped this way?"* — Yes → ADR.
+- *"In code review, if someone proposed the alternative, would this doc be the canonical rejection record?"* — Yes → ADR.
+
+### Not ADR-worthy — go to commit log instead
+
+- Feature implementation following an established pattern (new builtin, new operator).
+- Pure refactor / Tidy First with a single obvious path.
+- Bug fix.
+- Test or lint policy tweak.
+
+### Project-policy decisions
+
+Foundational engineering policies — FP / CA / TDD / TidyFirst / CI-CD / Release / Security / Documentation / Dependencies / Phase tags / Commit conventions / PR discipline — are recorded as **foundational ADRs** (`0120`–`0131`). `CONTRIBUTING.md` holds the *current rules*; foundational ADRs hold the *rationale and alternatives*. The two are not redundant: `CONTRIBUTING.md` is mutable as practice evolves; the ADR is the immutable record of what was considered and decided.
+
+## `Kind:` header convention
+
+Every ADR file declares its kind at the top:
+
+| Kind | Use |
+|---|---|
+| `Architecture Decision` | Real ADRs: defensible alternative + future-binding + cross-cutting. Listed under "Architecture Decisions" in the index. |
+| `Feature Memo` | Feature-implementation memos from before the criteria was formalized. Kept for history; not referenced as policy. |
+| `Refactor Memo` | Pure-refactor records from before the criteria was formalized. Kept for history. |
+
+New ADR files written from now on should normally be `Architecture Decision`. `Feature Memo` / `Refactor Memo` are essentially historical; new feature or refactor work belongs in commit messages, not new ADRs.
 
 ## Conventions
 
@@ -65,6 +102,7 @@ Write in the present tense of the decision ("We choose X"), not future plans ("W
 # NNNN. <Title>
 
 - **Status:** Proposed | Accepted | Superseded by NNNN | Deprecated
+- **Kind:** Architecture Decision
 - **Date:** YYYY-MM-DD
 - **Deciders:** <names / handles>
 
@@ -232,3 +270,15 @@ Run via `cargo test --test adr_doc_consistency`. CI fails fast if a feature comm
 - [0117 — phase2-stdout-fwrite](0117-phase2-stdout-fwrite.md) — resolves ADR 0112 NUL truncation
 - [0118 — phase2-stdlib-table-remove](0118-phase2-stdlib-table-remove.md)
 - [0119 — phase2-stdlib-io-read](0119-phase2-stdlib-io-read.md)
+- [0120 — engineering-principles-fp-first](0120-engineering-principles-fp-first.md) — foundational
+- [0121 — layering-clean-architecture](0121-layering-clean-architecture.md) — foundational
+- [0122 — tdd-red-green-refactor](0122-tdd-red-green-refactor.md) — foundational
+- [0123 — tidyfirst-refactor-discipline](0123-tidyfirst-refactor-discipline.md) — foundational
+- [0124 — ci-cd-policy](0124-ci-cd-policy.md) — foundational
+- [0125 — release-procedure](0125-release-procedure.md) — foundational
+- [0126 — security-policy](0126-security-policy.md) — foundational
+- [0127 — documentation-policy](0127-documentation-policy.md) — foundational
+- [0128 — dependency-addition-policy](0128-dependency-addition-policy.md) — foundational
+- [0129 — phase-tag-convention](0129-phase-tag-convention.md) — foundational
+- [0130 — commit-message-convention](0130-commit-message-convention.md) — foundational
+- [0131 — pr-discipline-code-review](0131-pr-discipline-code-review.md) — foundational
