@@ -849,9 +849,22 @@ pub(crate) fn emit_string_obj_hash<'a, 'c>(
     block.append_operation(while_op).result(0).unwrap().into()
 }
 
-/// Print a string object to stdout via `printf("%.*s",
-/// len_i32, data)`. Length-safe — embedded NUL bytes pass
-/// through.
+/// Phase 2.devinfra-stdout-fwrite (ADR 0117): write a string
+/// object to stdout via `fwrite(data, 1, len, stdout)`. Binary-
+/// safe — embedded NUL bytes pass through.
+///
+/// Supersedes the pre-0117 implementation that used
+/// `printf("%.*s", len_i32, data)`, which per POSIX `%s`
+/// semantics truncates at the first NUL byte. Lua §2.4 mandates
+/// 8-bit clean strings (any byte, including NUL), so the printf
+/// path defeated ADR 0112's boxed-string ABI promise at the
+/// stdout chokepoint.
+///
+/// Lookup the libc `extern FILE *stdout;` symbol, load the
+/// FILE pointer, and pass it as the 4th argument to fwrite.
+/// The return value (count of items written) is ignored —
+/// matches Lua spec where `io.write` does not surface short-
+/// write errors.
 pub(crate) fn emit_print_string_obj<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
@@ -860,42 +873,45 @@ pub(crate) fn emit_print_string_obj<'a, 'c>(
     loc: Location<'c>,
 ) {
     let len = emit_string_obj_len(block, s_ptr, types, loc);
-    let len_i32: Value<'c, '_> = block
-        .append_operation(arith::trunci(len, types.i32, loc))
+    let data = emit_string_obj_data(context, block, s_ptr, types, loc);
+    let one_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
         .result(0)
         .unwrap()
         .into();
-    let data = emit_string_obj_data(context, block, s_ptr, types, loc);
-    let fmt = emit_addressof(context, block, "fmt_str_raw_lensafe", types, loc);
-    // printf("%.*s", len_i32, data) — variadic, 3 args total.
+    let stdout_addr = emit_addressof(context, block, "stdout", types, loc);
+    let stdout_ptr = emit_load(block, stdout_addr, types.ptr, loc);
+    // fwrite(data, 1, len, stdout) — non-variadic, 4 args.
     let call_op = OperationBuilder::new("llvm.call", loc)
-        .add_operands(&[fmt, len_i32, data])
+        .add_operands(&[data, one_i64, len, stdout_ptr])
         .add_attributes(&[
             (
                 Identifier::new(context, "callee"),
-                FlatSymbolRefAttribute::new(context, "printf").into(),
+                FlatSymbolRefAttribute::new(context, "fwrite").into(),
             ),
             (
                 Identifier::new(context, "operandSegmentSizes"),
-                DenseI32ArrayAttribute::new(context, &[3, 0]).into(),
+                DenseI32ArrayAttribute::new(context, &[4, 0]).into(),
             ),
             (
                 Identifier::new(context, "op_bundle_sizes"),
                 DenseI32ArrayAttribute::new(context, &[]).into(),
             ),
-            (
-                Identifier::new(context, "var_callee_type"),
-                TypeAttribute::new(llvm::r#type::function(types.i32, &[types.ptr], true)).into(),
-            ),
         ])
-        .add_results(&[types.i32])
+        .add_results(&[types.i64])
         .build()
-        .expect("llvm.call @printf (lensafe)");
+        .expect("llvm.call @fwrite");
     block.append_operation(call_op);
 }
 
-/// Print a string object followed by `\n` (length-safe variant
-/// of the legacy `printf("%s\n", ptr)` pattern).
+/// Phase 2.devinfra-stdout-fwrite (ADR 0117): print a string
+/// object followed by `\n`. Implemented as two fwrite calls —
+/// once for the string data, once for the global `s_newline`
+/// boxed object — so both reuse the binary-safe chokepoint.
 pub(crate) fn emit_println_string_obj<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
@@ -903,36 +919,9 @@ pub(crate) fn emit_println_string_obj<'a, 'c>(
     types: &Types<'c>,
     loc: Location<'c>,
 ) {
-    let len = emit_string_obj_len(block, s_ptr, types, loc);
-    let len_i32: Value<'c, '_> = block
-        .append_operation(arith::trunci(len, types.i32, loc))
-        .result(0)
-        .unwrap()
-        .into();
-    let data = emit_string_obj_data(context, block, s_ptr, types, loc);
-    let fmt = emit_addressof(context, block, "fmt_str_lensafe", types, loc);
-    let call_op = OperationBuilder::new("llvm.call", loc)
-        .add_operands(&[fmt, len_i32, data])
-        .add_attributes(&[
-            (
-                Identifier::new(context, "callee"),
-                FlatSymbolRefAttribute::new(context, "printf").into(),
-            ),
-            (
-                Identifier::new(context, "operandSegmentSizes"),
-                DenseI32ArrayAttribute::new(context, &[3, 0]).into(),
-            ),
-            (
-                Identifier::new(context, "op_bundle_sizes"),
-                DenseI32ArrayAttribute::new(context, &[]).into(),
-            ),
-            (
-                Identifier::new(context, "var_callee_type"),
-                TypeAttribute::new(llvm::r#type::function(types.i32, &[types.ptr], true)).into(),
-            ),
-        ])
-        .add_results(&[types.i32])
-        .build()
-        .expect("llvm.call @printf (println lensafe)");
-    block.append_operation(call_op);
+    emit_print_string_obj(context, block, s_ptr, types, loc);
+    // Inline equivalent of `emit_print_literal("s_newline")` —
+    // primitive.rs does not depend on emit.rs.
+    let newline_ptr = emit_addressof(context, block, "s_newline", types, loc);
+    emit_print_string_obj(context, block, newline_ptr, types, loc);
 }

@@ -188,6 +188,12 @@ header alloc. Codex critical scope-drift guard.
   validation ADR may revisit).
 - **OOM trap untestable from Lua**: no language-visible OOM
   scenario, so no e2e. Helper exists for uniform alloc surface.
+- **stdout NUL truncation (RESOLVED by ADR 0117)**: the original
+  ADR 0112 left `emit_print_string_obj` on `printf("%.*s", len,
+  data)`, which per POSIX `%s` semantics stops at the first NUL —
+  defeating the boxed-ABI promise at the stdout chokepoint. ADR
+  0117 swapped the chokepoint to `fwrite(data, 1, len, stdout)`,
+  restoring binary-safe Lua §2.4 "8-bit clean" stdout.
 
 ## Non-ad-hoc framing
 

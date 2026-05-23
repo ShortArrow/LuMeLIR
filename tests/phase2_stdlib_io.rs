@@ -65,24 +65,50 @@ fn io_write_mixed_number_and_string() {
 }
 
 #[test]
-fn io_write_embedded_nul_loses_bytes_after_nul() {
-    // Carry-over from ADR 0112: `emit_print_string_obj` uses
-    // `printf("%.*s", len, data)` which per POSIX `%s`
-    // semantics stops at the first NUL byte. So `io.write` (and
-    // `print`) of a string starting with NUL emit zero bytes.
-    // The boxed ABI itself preserves the bytes (length, byte
-    // readback, equality, hashing all work) — only the stdout
-    // path truncates. A future ADR will swap the printf chokepoint
-    // for fwrite(data, 1, len, stdout) to restore spec-compliant
-    // output.
-    //
-    // This test pins the CURRENT behaviour so a future fix surfaces
-    // as a test update rather than a silent change.
+fn io_write_embedded_nul_preserves_bytes() {
+    // ADR 0117 resolved the ADR 0112 carry-over: `emit_print_string_obj`
+    // now uses `fwrite(data, 1, len, stdout)` instead of
+    // `printf("%.*s", ...)`, so binary-safe stdout writes preserve
+    // every byte including embedded NULs. Lua §2.4: "Lua is also
+    // 8-bit clean: strings can contain any 8-bit value, including
+    // embedded zeros ('\\0')."
     let stdout = run_ok(
         "io.write(string.char(0, 65, 0, 66))",
-        "lumelir_io_write_embedded_nul_truncates",
+        "lumelir_io_write_embedded_nul_preserves",
     );
-    assert_eq!(stdout, &[][..]);
+    assert_eq!(stdout, &[0u8, 65, 0, 66][..]);
+}
+
+#[test]
+fn io_write_middle_nul_preserves_bytes() {
+    // NUL in the middle of the byte sequence — different chokepoint
+    // pin from leading-NUL above.
+    let stdout = run_ok(
+        "io.write(string.char(65, 0, 66))",
+        "lumelir_io_write_middle_nul_preserves",
+    );
+    assert_eq!(stdout, &[65u8, 0, 66][..]);
+}
+
+#[test]
+fn io_write_lone_nul_preserves_bytes() {
+    // 1-byte string containing only NUL: `printf("%s")` would emit
+    // zero bytes (truncate immediately); `fwrite(_, 1, 1, _)` emits
+    // the byte.
+    let stdout = run_ok(
+        "io.write(string.char(0))",
+        "lumelir_io_write_lone_nul_preserves",
+    );
+    assert_eq!(stdout, &[0u8][..]);
+}
+
+#[test]
+fn io_write_ascii_regression() {
+    // NUL-free strings must continue to emit identical bytes
+    // through the new fwrite path (no off-by-one, no missing
+    // terminator). Regression pin for ADR 0117.
+    let stdout = run_ok("io.write(\"ABC\")", "lumelir_io_write_ascii_regression");
+    assert_eq!(stdout, &[65u8, 66, 67][..]);
 }
 
 #[test]

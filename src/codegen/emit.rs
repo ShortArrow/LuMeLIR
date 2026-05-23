@@ -160,6 +160,12 @@ pub(crate) fn emit_module_unverified<'c>(
     emit_fmt_global(context, &module, i8_type, loc);
     emit_user_string_globals(context, &module, i8_type, &types, loc);
     emit_printf_decl(context, &module, &types, loc);
+    // Phase 2.devinfra-stdout-fwrite (ADR 0117): binary-safe
+    // stdout writer + libc stdout symbol declaration. Replaces
+    // the printf("%.*s", ...) NUL-truncation chokepoint in
+    // emit_print_string_obj.
+    emit_fwrite_decl(context, &module, &types, loc);
+    emit_stdout_extern_decl(context, &module, &types, loc);
     emit_libm_decls(context, &module, &types, loc);
     emit_strlen_decl(context, &module, &types, loc);
     emit_string_runtime_decls(context, &module, &types, loc);
@@ -214,15 +220,10 @@ fn emit_fmt_global<'c>(
     // get the boxed-object form.
     emit_cstr_global(context, module, i8_type, "fmt", "%g\n\0", loc);
     emit_cstr_global(context, module, i8_type, "fmt_str", "%s\n\0", loc);
-    emit_cstr_global(context, module, i8_type, "fmt_str_lensafe", "%.*s\n\0", loc);
-    emit_cstr_global(
-        context,
-        module,
-        i8_type,
-        "fmt_str_raw_lensafe",
-        "%.*s\0",
-        loc,
-    );
+    // Phase 2.devinfra-stdout-fwrite (ADR 0117): `fmt_str_lensafe`
+    // / `fmt_str_raw_lensafe` (`"%.*s\\n"` / `"%.*s"`) were the
+    // single-use printf format strings for `emit_print[ln]_string_obj`.
+    // Both are dead after the fwrite chokepoint swap.
     emit_string_global(context, module, i8_type, "s_true", "true\0", loc);
     emit_string_global(context, module, i8_type, "s_false", "false\0", loc);
     // Phase 2.3a: nil string for `print(nil)`.
@@ -763,6 +764,80 @@ fn emit_printf_decl<'c>(
         ))
         .build();
     module.body().append_operation(printf_op.into());
+}
+
+/// Phase 2.devinfra-stdout-fwrite (ADR 0117): declare libc
+/// `fwrite(const void *ptr, size_t size, size_t nmemb, FILE
+/// *stream) -> size_t`. Used by `emit_print_string_obj` to
+/// replace the `printf("%.*s", len, data)` chokepoint which
+/// per POSIX `%s` semantics truncates at the first NUL byte,
+/// defeating ADR 0112's boxed-string ABI promise (Lua §2.4
+/// "8-bit clean").
+///
+/// Non-variadic 4-arg signature; `size_t` is `i64` on x86_64
+/// Linux.
+fn emit_fwrite_decl<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let fwrite_fn_type = llvm::r#type::function(
+        types.i64,
+        &[types.ptr, types.i64, types.i64, types.ptr],
+        false,
+    );
+    let fwrite_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "fwrite"))
+        .function_type(TypeAttribute::new(fwrite_fn_type))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(fwrite_op.into());
+}
+
+/// Phase 2.devinfra-stdout-fwrite (ADR 0117): declare the libc
+/// `extern FILE *stdout;` global as an external linkage symbol.
+/// `emit_print_string_obj` reads this address, loads the
+/// `FILE *` pointer, and passes it to `fwrite`.
+///
+/// On x86_64 Linux / glibc, `stdout` is a real exported symbol
+/// (not a macro), so the ELF resolver binds it at link time.
+/// macOS (`__stdoutp` macro) / Windows (`_iob_func()`) are
+/// out of scope per the ADR 0117 non-goals.
+fn emit_stdout_extern_decl<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    // `GlobalOperationBuilder` requires `value` and `initializer`
+    // slots to be Set for `.build()`; external globals omit both.
+    // Construct the op via `OperationBuilder` instead — equivalent
+    // to the MLIR textual form:
+    //   llvm.mlir.global external @stdout() : !llvm.ptr
+    let global_op = OperationBuilder::new("llvm.mlir.global", loc)
+        .add_regions([Region::new()])
+        .add_attributes(&[
+            (
+                Identifier::new(context, "global_type"),
+                TypeAttribute::new(types.ptr).into(),
+            ),
+            (
+                Identifier::new(context, "sym_name"),
+                StringAttribute::new(context, "stdout").into(),
+            ),
+            (
+                Identifier::new(context, "linkage"),
+                llvm::attributes::linkage(context, llvm::attributes::Linkage::External),
+            ),
+        ])
+        .build()
+        .expect("llvm.mlir.global @stdout external");
+    module.body().append_operation(global_op);
 }
 
 /// Phase 2.7a (ADR 0024): walk the HIR, collect every `HirExprKind::Str`
