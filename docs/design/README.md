@@ -151,12 +151,50 @@ Run via `cargo test --test adr_doc_consistency`. CI fails fast if a feature comm
 
 ## Index
 
+The index is split by `Kind:` (see "Kind: header convention" above). Architecture Decisions are the primary reading list; Feature and Refactor Memos are kept for history.
+
+### Architecture Decisions
+
+Foundational + decision-grade entries. Read these to understand *why* the codebase is shaped the way it is.
+
 - [0001 — lexer-implementation](0001-lexer-implementation.md)
 - [0002 — lib-rs-layering](0002-lib-rs-layering.md)
 - [0003 — error-handling](0003-error-handling.md)
 - [0004 — parser-implementation](0004-parser-implementation.md)
 - [0005 — mlir-environment](0005-mlir-environment.md)
 - [0006 — phase1-codegen](0006-phase1-codegen.md)
+- [0068 — phase2-6c-tag-doc-consolidate](0068-phase2-6c-tag-doc-consolidate.md) — tagged-semantics.md SoT
+- [0082 — phase2-5x-callee-dispatch](0082-phase2-5x-callee-dispatch.md)
+- [0083 — phase2-5c-full-closures](0083-phase2-5c-full-closures.md) — supersedes 0044
+- [0091 — phase2-callee-normalization](0091-phase2-callee-normalization.md)
+- [0092 — phase2-method-syntax](0092-phase2-method-syntax.md)
+- [0093 — phase2-method-arg-refine](0093-phase2-method-arg-refine.md)
+- [0094 — phase2-method-idx-call-refine](0094-phase2-method-idx-call-refine.md)
+- [0096 — phase2-multi-segment-method-def](0096-phase2-multi-segment-method-def.md)
+- [0097 — phase2-multi-seg-call-refine](0097-phase2-multi-seg-call-refine.md)
+- [0098 — phase2-name-rebind-refine](0098-phase2-name-rebind-refine.md)
+- [0099 — phase2-multi-step-alias](0099-phase2-multi-step-alias.md)
+- [0100 — phase2-reassign-alias](0100-phase2-reassign-alias.md)
+- [0120 — engineering-principles-fp-first](0120-engineering-principles-fp-first.md) — foundational
+- [0121 — layering-clean-architecture](0121-layering-clean-architecture.md) — foundational
+- [0122 — tdd-red-green-refactor](0122-tdd-red-green-refactor.md) — foundational
+- [0123 — tidyfirst-refactor-discipline](0123-tidyfirst-refactor-discipline.md) — foundational
+- [0124 — ci-cd-policy](0124-ci-cd-policy.md) — foundational
+- [0125 — release-procedure](0125-release-procedure.md) — foundational
+- [0126 — security-policy](0126-security-policy.md) — foundational
+- [0127 — documentation-policy](0127-documentation-policy.md) — foundational
+- [0128 — dependency-addition-policy](0128-dependency-addition-policy.md) — foundational
+- [0129 — phase-tag-convention](0129-phase-tag-convention.md) — foundational
+- [0130 — commit-message-convention](0130-commit-message-convention.md) — foundational
+- [0131 — pr-discipline-code-review](0131-pr-discipline-code-review.md) — foundational
+
+### Feature Implementation Memos
+
+Historical records of Phase 2 feature increments. Useful for "how was X implemented" archaeology but not architectural reading.
+
+<details>
+<summary>91 entries — click to expand</summary>
+
 - [0007 — phase2-0-local-and-multistmt](0007-phase2-0-local-and-multistmt.md)
 - [0008 — phase2-1-assign-and-blocks](0008-phase2-1-assign-and-blocks.md)
 - [0009 — phase2-2a-arith-operators](0009-phase2-2a-arith-operators.md)
@@ -194,10 +232,6 @@ Run via `cargo test --test adr_doc_consistency`. CI fails fast if a feature comm
 - [0041 — phase2-8d-shebang](0041-phase2-8d-shebang.md)
 - [0042 — phase2-5c1-top-level-capture](0042-phase2-5c1-top-level-capture.md)
 - [0043 — phase2-5c2-kind-captures](0043-phase2-5c2-kind-captures.md)
-- [0044 — phase2-5c3-closure-escapes](0044-phase2-5c3-closure-escapes.md) — (superseded by ADR 0083)
-- [0045 — phase2-9a-diagnostics](0045-phase2-9a-diagnostics.md)
-- [0046 — phase2-9b-source-snippets](0046-phase2-9b-source-snippets.md)
-- [0047 — phase2-9c-strip-offset-from-display](0047-phase2-9c-strip-offset-from-display.md)
 - [0048 — phase2-0a-auto-declare-globals](0048-phase2-0a-auto-declare-globals.md)
 - [0049 — phase2-1a-multi-target-assign](0049-phase2-1a-multi-target-assign.md)
 - [0050 — phase2-1b-assign-multi-from-call](0050-phase2-1b-assign-multi-from-call.md)
@@ -206,7 +240,6 @@ Run via `cargo test --test adr_doc_consistency`. CI fails fast if a feature comm
 - [0053 — phase2-6a-min-empty-tables](0053-phase2-6a-min-empty-tables.md)
 - [0054 — phase2-6a-arr-array-index](0054-phase2-6a-arr-array-index.md)
 - [0055 — phase2-6a-wr-array-write](0055-phase2-6a-wr-array-write.md)
-- [0056 — phase2-6a-norm-stable-table-header](0056-phase2-6a-norm-stable-table-header.md)
 - [0057 — phase2-6a-grow-array-push](0057-phase2-6a-grow-array-push.md)
 - [0058 — phase2-6b-hash-keys](0058-phase2-6b-hash-keys.md)
 - [0059 — phase2-6c-tag-arr](0059-phase2-6c-tag-arr.md)
@@ -215,15 +248,11 @@ Run via `cargo test --test adr_doc_consistency`. CI fails fast if a feature comm
 - [0062 — phase2-6c-tag-hash-hard](0062-phase2-6c-tag-hash-hard.md)
 - [0063 — phase2-6c-tag-locals](0063-phase2-6c-tag-locals.md)
 - [0064 — phase2-6c-tag-hetero](0064-phase2-6c-tag-hetero.md)
-- [0065 — phase2-6c-tag-hetero-fix](0065-phase2-6c-tag-hetero-fix.md)
-- [0066 — phase2-6c-tag-hetero-eq](0066-phase2-6c-tag-hetero-eq.md)
 - [0067 — phase2-6c-tag-consumers](0067-phase2-6c-tag-consumers.md)
-- [0068 — phase2-6c-tag-doc-consolidate](0068-phase2-6c-tag-doc-consolidate.md) — tagged-semantics.md SoT
 - [0069 — phase2-6c-tag-defensive-trap](0069-phase2-6c-tag-defensive-trap.md)
 - [0070 — phase2-6c-tag-consumers-inline](0070-phase2-6c-tag-consumers-inline.md)
 - [0071 — phase2-6c-tag-fn-tbl](0071-phase2-6c-tag-fn-tbl.md)
 - [0072 — phase2-6c-tag-fn-tbl-call](0072-phase2-6c-tag-fn-tbl-call.md)
-- [0073 — phase2-6c-tag-rs-split](0073-phase2-6c-tag-rs-split.md)
 - [0074 — phase2-6c-tag-locals-fn](0074-phase2-6c-tag-locals-fn.md)
 - [0075 — phase2-6c-tag-callee-arity](0075-phase2-6c-tag-callee-arity.md)
 - [0076 — phase2-6c-tag-locals-fn-multi](0076-phase2-6c-tag-locals-fn-multi.md)
@@ -232,25 +261,12 @@ Run via `cargo test --test adr_doc_consistency`. CI fails fast if a feature comm
 - [0079 — phase2-6b-hash-keys](0079-phase2-6b-hash-keys.md) — tagged-key Plan E
 - [0080 — phase2-8e-iter-pairs](0080-phase2-8e-iter-pairs.md)
 - [0081 — phase2-8e-iter-next](0081-phase2-8e-iter-next.md)
-- [0082 — phase2-5x-callee-dispatch](0082-phase2-5x-callee-dispatch.md)
-- [0083 — phase2-5c-full-closures](0083-phase2-5c-full-closures.md) — supersedes 0044
 - [0084 — phase2-8e-iter-tk](0084-phase2-8e-iter-tk.md)
 - [0085 — phase2-8e-iter-generic](0085-phase2-8e-iter-generic.md)
 - [0086 — phase2-6b-hash-key-nan](0086-phase2-6b-hash-key-nan.md)
-- [0087 — phase2-6b-hash-key-validity](0087-phase2-6b-hash-key-validity.md)
 - [0088 — phase2-6b-hash-lookup-miss](0088-phase2-6b-hash-lookup-miss.md)
 - [0089 — phase2-7p-tagged-arith-coerce](0089-phase2-7p-tagged-arith-coerce.md)
-- [0090 — phase2-devinfra-emit](0090-phase2-devinfra-emit.md) — first `2.devinfra-*` lane
-- [0091 — phase2-callee-normalization](0091-phase2-callee-normalization.md)
-- [0092 — phase2-method-syntax](0092-phase2-method-syntax.md)
-- [0093 — phase2-method-arg-refine](0093-phase2-method-arg-refine.md)
-- [0094 — phase2-method-idx-call-refine](0094-phase2-method-idx-call-refine.md)
 - [0095 — phase2-nested-index-assign-widen](0095-phase2-nested-index-assign-widen.md)
-- [0096 — phase2-multi-segment-method-def](0096-phase2-multi-segment-method-def.md)
-- [0097 — phase2-multi-seg-call-refine](0097-phase2-multi-seg-call-refine.md)
-- [0098 — phase2-name-rebind-refine](0098-phase2-name-rebind-refine.md)
-- [0099 — phase2-multi-step-alias](0099-phase2-multi-step-alias.md)
-- [0100 — phase2-reassign-alias](0100-phase2-reassign-alias.md)
 - [0101 — phase2-stdlib-math](0101-phase2-stdlib-math.md)
 - [0102 — phase2-stdlib-math-pow-trig-log](0102-phase2-stdlib-math-pow-trig-log.md)
 - [0103 — phase2-stdlib-string-begin](0103-phase2-stdlib-string-begin.md)
@@ -270,15 +286,20 @@ Run via `cargo test --test adr_doc_consistency`. CI fails fast if a feature comm
 - [0117 — phase2-stdout-fwrite](0117-phase2-stdout-fwrite.md) — resolves ADR 0112 NUL truncation
 - [0118 — phase2-stdlib-table-remove](0118-phase2-stdlib-table-remove.md)
 - [0119 — phase2-stdlib-io-read](0119-phase2-stdlib-io-read.md)
-- [0120 — engineering-principles-fp-first](0120-engineering-principles-fp-first.md) — foundational
-- [0121 — layering-clean-architecture](0121-layering-clean-architecture.md) — foundational
-- [0122 — tdd-red-green-refactor](0122-tdd-red-green-refactor.md) — foundational
-- [0123 — tidyfirst-refactor-discipline](0123-tidyfirst-refactor-discipline.md) — foundational
-- [0124 — ci-cd-policy](0124-ci-cd-policy.md) — foundational
-- [0125 — release-procedure](0125-release-procedure.md) — foundational
-- [0126 — security-policy](0126-security-policy.md) — foundational
-- [0127 — documentation-policy](0127-documentation-policy.md) — foundational
-- [0128 — dependency-addition-policy](0128-dependency-addition-policy.md) — foundational
-- [0129 — phase-tag-convention](0129-phase-tag-convention.md) — foundational
-- [0130 — commit-message-convention](0130-commit-message-convention.md) — foundational
-- [0131 — pr-discipline-code-review](0131-pr-discipline-code-review.md) — foundational
+
+</details>
+
+### Refactor Memos
+
+Pure structural / tidying records.
+
+- [0044 — phase2-5c3-closure-escapes](0044-phase2-5c3-closure-escapes.md) — superseded by ADR 0083
+- [0045 — phase2-9a-diagnostics](0045-phase2-9a-diagnostics.md)
+- [0046 — phase2-9b-source-snippets](0046-phase2-9b-source-snippets.md)
+- [0047 — phase2-9c-strip-offset-from-display](0047-phase2-9c-strip-offset-from-display.md)
+- [0056 — phase2-6a-norm-stable-table-header](0056-phase2-6a-norm-stable-table-header.md)
+- [0065 — phase2-6c-tag-hetero-fix](0065-phase2-6c-tag-hetero-fix.md)
+- [0066 — phase2-6c-tag-hetero-eq](0066-phase2-6c-tag-hetero-eq.md)
+- [0073 — phase2-6c-tag-rs-split](0073-phase2-6c-tag-rs-split.md)
+- [0087 — phase2-6b-hash-key-validity](0087-phase2-6b-hash-key-validity.md)
+- [0090 — phase2-devinfra-emit](0090-phase2-devinfra-emit.md) — first `2.devinfra-*` lane

@@ -93,6 +93,40 @@ fn agents_md_adr_references_resolve() {
 }
 
 #[test]
+fn contributing_md_adr_references_resolve() {
+    // Same shape as the AGENTS counterpart, applied to CONTRIBUTING.md
+    // — that is where universal-conventions content lives now, so this
+    // is where ADR cross-references concentrate. Catches a moved or
+    // renamed ADR doc breaking the rationale links in CONTRIBUTING.md.
+    let body = fs::read_to_string("CONTRIBUTING.md").expect("read CONTRIBUTING.md");
+    let files = list_adr_files();
+    let mut missing: BTreeSet<u32> = BTreeSet::new();
+    let mut prev_was_adr = false;
+    for raw in body.split_whitespace() {
+        if prev_was_adr {
+            let digits: String = raw
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if digits.len() == 4
+                && let Ok(n) = digits.parse::<u32>()
+                && !files.contains(&n)
+            {
+                missing.insert(n);
+            }
+            prev_was_adr = false;
+        } else if raw == "ADR" || raw.ends_with("ADR") {
+            prev_was_adr = true;
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "CONTRIBUTING.md references missing ADR docs: {missing:?}"
+    );
+}
+
+#[test]
 fn adr_has_kind_header() {
     // Every `docs/design/NNNN-*.md` declares a `**Kind:**` header so the
     // 3-section index (Architecture Decision / Feature Memo / Refactor
