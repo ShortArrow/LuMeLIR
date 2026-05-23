@@ -1,6 +1,7 @@
 # 0006. Phase 1 Codegen: Standard MLIR Dialects, No HIR, melior 0.27
 
 - **Status:** Accepted
+- **Kind:** Architecture Decision
 - **Date:** 2026-04-19
 - **Deciders:** ShortArrow
 

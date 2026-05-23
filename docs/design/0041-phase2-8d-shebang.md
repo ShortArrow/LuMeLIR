@@ -1,6 +1,7 @@
 # 0041. Phase 2.8d: `#!` Shebang Line
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 

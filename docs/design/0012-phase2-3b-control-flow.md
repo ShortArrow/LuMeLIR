@@ -1,6 +1,7 @@
 # 0012. Phase 2.3b: `if`/`elseif`/`else` + `while` + Truthiness via `scf`
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-04-30
 - **Deciders:** ShortArrow
 

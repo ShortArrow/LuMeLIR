@@ -1,6 +1,7 @@
 # 0068. Phase 2.6c-tag-doc-consolidate: tagged-semantics SoT Doc
 
 - **Status:** Accepted
+- **Kind:** Architecture Decision
 - **Date:** 2026-05-05
 - **Deciders:** ShortArrow
 

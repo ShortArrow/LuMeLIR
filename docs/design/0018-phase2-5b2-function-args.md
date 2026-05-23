@@ -1,6 +1,7 @@
 # 0018. Phase 2.5b.2: Functions as Arguments via `func.call_indirect`
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-01
 - **Deciders:** ShortArrow
 

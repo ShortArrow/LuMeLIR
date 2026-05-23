@@ -1,6 +1,7 @@
 # 0038. Phase 2.7j: Long-Bracket Strings & Level-N Block Comments
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-01
 - **Deciders:** ShortArrow
 

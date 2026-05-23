@@ -1,6 +1,7 @@
 # 0047. Phase 2.9c: Strip Byte-Offset Suffix from Error Display
 
 - **Status:** Accepted
+- **Kind:** Refactor Memo
 - **Date:** 2026-05-03
 - **Deciders:** ShortArrow
 

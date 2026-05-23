@@ -1,6 +1,7 @@
 # 0090. Phase 2.devinfra-emit: CLI Pipeline-Stage Emission (`--emit <stage>`)
 
 - **Status:** Accepted
+- **Kind:** Refactor Memo
 - **Date:** 2026-05-10
 - **Deciders:** ShortArrow
 

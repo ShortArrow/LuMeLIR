@@ -1,6 +1,7 @@
 # 0096. Phase 2.6+-multi-segment-method-def: Multi-Segment Method-Def Parser Delta
 
 - **Status:** Accepted
+- **Kind:** Architecture Decision
 - **Date:** 2026-05-16
 - **Deciders:** ShortArrow
 

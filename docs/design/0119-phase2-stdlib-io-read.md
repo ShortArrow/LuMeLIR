@@ -1,6 +1,7 @@
 # 0119. Phase 2.7x-stdlib-io: `io.read([format])` line input
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-23 (commit `782dff0`)
 - **Deciders:** ShortArrow
 

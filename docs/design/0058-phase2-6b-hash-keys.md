@@ -1,6 +1,7 @@
 # 0058. Phase 2.6b-hash: String-Keyed Field Access `t.k` / `t["k"]`
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-04
 - **Deciders:** ShortArrow
 

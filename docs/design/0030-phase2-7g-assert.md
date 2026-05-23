@@ -1,6 +1,7 @@
 # 0030. Phase 2.7g: `assert(cond)` Builtin
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 

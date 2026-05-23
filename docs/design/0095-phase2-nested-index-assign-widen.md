@@ -1,6 +1,7 @@
 # 0095. Phase 2.6+-nested-index-assign-widen: Nested Index Target Widening with TAG_TABLE Runtime Narrow
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-16
 - **Deciders:** ShortArrow
 

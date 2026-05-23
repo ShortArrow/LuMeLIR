@@ -91,3 +91,53 @@ fn agents_md_adr_references_resolve() {
          (each missing ID needs a docs/design/{{id:04}}-*.md file)"
     );
 }
+
+#[test]
+fn adr_has_kind_header() {
+    // Every `docs/design/NNNN-*.md` declares a `**Kind:**` header so the
+    // 3-section index (Architecture Decision / Feature Memo / Refactor
+    // Memo) stays exhaustive. The Kind value itself is validated as a
+    // separate concern — here we only assert the header exists.
+    let allowed = ["Architecture Decision", "Feature Memo", "Refactor Memo"];
+    let mut missing: Vec<String> = Vec::new();
+    let mut invalid: Vec<(String, String)> = Vec::new();
+    for entry in fs::read_dir("docs/design").expect("read docs/design") {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".md") {
+            continue;
+        }
+        let prefix: String = name.chars().take(4).collect();
+        if prefix.parse::<u32>().is_err() {
+            // Non-ADR file (README.md, tagged-semantics.md) — skip.
+            continue;
+        }
+        let body = match fs::read_to_string(entry.path()) {
+            Ok(s) => s,
+            Err(_) => {
+                missing.push(name);
+                continue;
+            }
+        };
+        // Loose match for the `- **Kind:** <value>` header line.
+        let line = body
+            .lines()
+            .find(|line| line.trim_start().starts_with("- **Kind:**"));
+        match line {
+            None => missing.push(name),
+            Some(line) => {
+                let value = line.split("**Kind:**").nth(1).unwrap_or("").trim();
+                if !allowed.contains(&value) {
+                    invalid.push((name, value.to_string()));
+                }
+            }
+        }
+    }
+    assert!(
+        missing.is_empty() && invalid.is_empty(),
+        "ADR Kind header check failed.\n  missing header: {missing:?}\n  invalid value: {invalid:?}\n  allowed values: {allowed:?}"
+    );
+}

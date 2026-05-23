@@ -1,6 +1,7 @@
 # 0026. Phase 2.7c: `tostring` Builtin and Concat Auto-Coercion
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 

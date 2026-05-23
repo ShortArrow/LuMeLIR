@@ -1,6 +1,7 @@
 # 0055. Phase 2.6a-wr: Number Array Element Write `t[i] = v`
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-03
 - **Deciders:** ShortArrow
 

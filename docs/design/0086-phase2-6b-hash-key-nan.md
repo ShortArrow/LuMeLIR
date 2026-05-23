@@ -1,6 +1,7 @@
 # 0086. Phase 2.6b-hash-key-nan: Hash Key NaN Runtime Diagnostic
 
 - **Status:** Accepted (helper portion superseded by ADR 0087)
+- **Kind:** Feature Memo
 - **Date:** 2026-05-07
 - **Deciders:** ShortArrow
 

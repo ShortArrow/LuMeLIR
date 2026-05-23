@@ -1,6 +1,7 @@
 # 0080. Phase 2.8e-iter-pairs: `for k, v in pairs(t) do ...` Hash Iteration
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-06
 - **Deciders:** ShortArrow
 

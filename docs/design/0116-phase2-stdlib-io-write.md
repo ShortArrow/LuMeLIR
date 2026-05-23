@@ -1,6 +1,7 @@
 # 0116. Phase 2.7x-stdlib-io-write: `io.write(...)` variadic stdout
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-22 (commit `eb93d77`; follow-up fix `71cbbae`)
 - **Deciders:** ShortArrow
 

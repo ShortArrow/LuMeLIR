@@ -1,6 +1,7 @@
 # 0028. Phase 2.7e: `tonumber` Builtin with NaN Sentinel
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 

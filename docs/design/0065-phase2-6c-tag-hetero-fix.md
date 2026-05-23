@@ -1,6 +1,7 @@
 # 0065. Phase 2.6c-tag-hetero-fix: Inline Tagged Print + Eq Runtime Dispatch
 
 - **Status:** Accepted
+- **Kind:** Refactor Memo
 - **Date:** 2026-05-04
 - **Deciders:** ShortArrow
 

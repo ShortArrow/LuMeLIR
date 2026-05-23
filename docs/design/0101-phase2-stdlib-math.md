@@ -1,6 +1,7 @@
 # 0101. Phase 2.7q-stdlib-math: math.* Builtins (sqrt / floor / abs)
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-16
 - **Deciders:** ShortArrow
 

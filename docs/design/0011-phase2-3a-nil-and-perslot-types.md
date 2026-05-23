@@ -1,6 +1,7 @@
 # 0011. Phase 2.3a: `nil` Literal, Per-Slot Type Tracking, and Heterogeneous `==`
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-04-29
 - **Deciders:** ShortArrow
 

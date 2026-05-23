@@ -1,6 +1,7 @@
 # 0060. Phase 2.6c-tag-hash: Tagged Hash Entry Values + `t.k = nil` Soft Delete
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-04
 - **Deciders:** ShortArrow
 

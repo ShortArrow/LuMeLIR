@@ -1,6 +1,7 @@
 # 0088. Phase 2.6b-hash-lookup-miss: Hash Read Lookup Miss Reified as Nil-tagged TaggedValue
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-10
 - **Deciders:** ShortArrow
 

@@ -1,6 +1,7 @@
 # 0040. Phase 2.7l: `\u{XXXX}` Codepoint and `\z` Whitespace-Skip
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 

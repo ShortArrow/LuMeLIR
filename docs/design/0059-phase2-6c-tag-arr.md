@@ -1,6 +1,7 @@
 # 0059. Phase 2.6c-tag-arr: Tagged Array Slots + Hole Write
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-04
 - **Deciders:** ShortArrow
 

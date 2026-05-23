@@ -1,6 +1,7 @@
 # 0079. Phase 2.6b-hash-keys: Hash Key Kinds Expansion (Tagged-Key Plan E)
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-06
 - **Deciders:** ShortArrow
 

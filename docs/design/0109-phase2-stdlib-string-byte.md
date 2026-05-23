@@ -1,6 +1,7 @@
 # 0109. Phase 2.7q-stdlib-string: string.byte(s, i?) + 3rd Consumer of emit_normalize_sub_bounds
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-17
 - **Deciders:** ShortArrow
 

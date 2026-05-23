@@ -1,6 +1,7 @@
 # 0093. Phase 2.6+-method-arg-refine: MethodCall Arg Refinement via Pass-1 MethodDef Registration
 
 - **Status:** Accepted
+- **Kind:** Architecture Decision
 - **Date:** 2026-05-16
 - **Deciders:** ShortArrow
 

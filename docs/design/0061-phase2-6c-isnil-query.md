@@ -1,6 +1,7 @@
 # 0061. Phase 2.6c-isnil-query: Inline `t[i] == nil` / `t.k == nil` Non-Trapping Query
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-04
 - **Deciders:** ShortArrow
 

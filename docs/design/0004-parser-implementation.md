@@ -1,6 +1,7 @@
 # 0004. Parser Implementation: Hand-Written Recursive Descent with Pratt
 
 - **Status:** Accepted
+- **Kind:** Architecture Decision
 - **Date:** 2026-04-19
 - **Deciders:** ShortArrow
 

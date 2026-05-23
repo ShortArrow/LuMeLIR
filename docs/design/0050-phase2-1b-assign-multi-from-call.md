@@ -1,6 +1,7 @@
 # 0050. Phase 2.1b: Multi-Target Reassignment from a Multi-Result Call
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-03
 - **Deciders:** ShortArrow
 

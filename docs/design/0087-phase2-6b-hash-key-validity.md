@@ -1,6 +1,7 @@
 # 0087. Phase 2.6b-hash-key-validity: Probe Chokepoint Owns Hash-Key Runtime Validity Policy
 
 - **Status:** Accepted
+- **Kind:** Refactor Memo
 - **Date:** 2026-05-10
 - **Deciders:** ShortArrow
 

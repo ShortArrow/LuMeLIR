@@ -1,6 +1,7 @@
 # 0015. Phase 2.4: `break` via HIR-time Desugar to a Hidden Flag
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-04-30
 - **Deciders:** ShortArrow
 

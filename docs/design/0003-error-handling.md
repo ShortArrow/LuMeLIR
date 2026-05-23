@@ -1,6 +1,7 @@
 # 0003. Error Handling: `thiserror` in Library, `anyhow` at CLI Boundary
 
 - **Status:** Accepted
+- **Kind:** Architecture Decision
 - **Date:** 2026-04-19
 - **Deciders:** ShortArrow
 

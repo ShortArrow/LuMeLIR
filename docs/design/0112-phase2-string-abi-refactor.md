@@ -1,6 +1,7 @@
 # 0112. Phase 2.7u-string-abi-refactor: Boxed string object + string-alloc OOM consolidation
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-19
 - **Deciders:** ShortArrow
 - **Supersedes (ABI surface):** ADR 0024 (`!llvm.ptr` to NUL-term C-string)

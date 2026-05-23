@@ -1,6 +1,7 @@
 # 0114. Phase 2.7w-emit-f2i-gate-sweep: NaN/Inf/integer gate sweep + emit_trap_if consolidation
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-22
 - **Deciders:** ShortArrow
 

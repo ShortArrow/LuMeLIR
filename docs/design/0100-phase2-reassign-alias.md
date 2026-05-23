@@ -1,6 +1,7 @@
 # 0100. Phase 2.6+-reassign-alias: Re-Assignment Alias via StmtKind::Assign Extension + Helper Extract
 
 - **Status:** Accepted
+- **Kind:** Architecture Decision
 - **Date:** 2026-05-16
 - **Deciders:** ShortArrow
 

@@ -1,6 +1,7 @@
 # 0103. Phase 2.7q-stdlib-string: string.* Library Begin + Namespace Dispatch Generic
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-17
 - **Deciders:** ShortArrow
 

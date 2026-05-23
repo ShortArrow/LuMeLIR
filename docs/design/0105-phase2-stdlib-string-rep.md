@@ -1,6 +1,7 @@
 # 0105. Phase 2.7q-stdlib-string: string.rep (Fixed-Arity 2 Form)
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-17
 - **Deciders:** ShortArrow
 

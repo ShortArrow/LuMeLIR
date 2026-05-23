@@ -1,6 +1,7 @@
 # 0027. Phase 2.7d: Lexicographic String Comparison
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 

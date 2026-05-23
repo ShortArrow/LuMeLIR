@@ -1,6 +1,7 @@
 # 0017. Phase 2.5b: Anonymous Function Expressions + First-Class Function Values (HIR-Time Resolution)
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-04-30
 - **Deciders:** ShortArrow
 

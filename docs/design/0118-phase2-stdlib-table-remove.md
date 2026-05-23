@@ -1,6 +1,7 @@
 # 0118. Phase 2.7r-stdlib-table: `table.remove(t [, pos])` mutation primitive
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-23 (commit `4248891`)
 - **Deciders:** ShortArrow
 

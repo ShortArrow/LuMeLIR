@@ -1,6 +1,7 @@
 # 0094. Phase 2.6+-method-idx-call-refine: Index-Callee Call Arg Refinement + Helper Extract
 
 - **Status:** Accepted
+- **Kind:** Architecture Decision
 - **Date:** 2026-05-16
 - **Deciders:** ShortArrow
 

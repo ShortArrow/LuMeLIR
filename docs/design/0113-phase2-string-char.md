@@ -1,6 +1,7 @@
 # 0113. Phase 2.7v-stdlib-string-char: `string.char(...)` + NaN/Inf/integer gate
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-22
 - **Deciders:** ShortArrow
 

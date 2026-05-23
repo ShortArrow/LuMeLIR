@@ -1,6 +1,7 @@
 # 0053. Phase 2.6a-min: Empty Tables `{}` and `#t`
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-03
 - **Deciders:** ShortArrow
 

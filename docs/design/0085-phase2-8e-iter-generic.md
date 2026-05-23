@@ -1,6 +1,7 @@
 # 0085. Phase 2.8e-iter-generic: Generic-for Protocol Parser Sugar
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-07
 - **Deciders:** ShortArrow
 

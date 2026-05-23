@@ -1,6 +1,7 @@
 # 0048. Phase 2.0a: Auto-Declare Globals at Chunk Top Level
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-03
 - **Deciders:** ShortArrow
 

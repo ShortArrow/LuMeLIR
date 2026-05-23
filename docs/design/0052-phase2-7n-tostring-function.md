@@ -1,6 +1,7 @@
 # 0052. Phase 2.7n: `tostring(f)` for Function Values
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-03
 - **Deciders:** ShortArrow
 

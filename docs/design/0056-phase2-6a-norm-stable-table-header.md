@@ -1,6 +1,7 @@
 # 0056. Phase 2.6a-norm: Stable Table Header (Tidy First)
 
 - **Status:** Accepted
+- **Kind:** Refactor Memo
 - **Date:** 2026-05-04
 - **Deciders:** ShortArrow
 

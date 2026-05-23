@@ -1,6 +1,7 @@
 # 0049. Phase 2.1a: Multi-Target Reassignment `a, b = …`
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-03
 - **Deciders:** ShortArrow
 

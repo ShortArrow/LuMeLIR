@@ -1,6 +1,7 @@
 # 0002. Split into `lib.rs` + `main.rs` for Clean Architecture Layering
 
 - **Status:** Accepted
+- **Kind:** Architecture Decision
 - **Date:** 2026-04-19
 - **Deciders:** ShortArrow
 

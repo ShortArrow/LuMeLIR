@@ -1,6 +1,7 @@
 # 0074. Phase 2.6c-tag-locals-fn: Function-Return TaggedValue Widening
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-04
 - **Deciders:** ShortArrow
 

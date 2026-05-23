@@ -1,6 +1,7 @@
 # 0097. Phase 2.6+-multi-seg-call-refine: Multi-Segment Method-Call Refinement via Chain-Keyed method_funcs
 
 - **Status:** Accepted
+- **Kind:** Architecture Decision
 - **Date:** 2026-05-16
 - **Deciders:** ShortArrow
 

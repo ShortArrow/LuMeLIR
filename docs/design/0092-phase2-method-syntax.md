@@ -1,6 +1,7 @@
 # 0092. Phase 2.6+-methods: Method Colon Syntax Desugar over Index-Callee Calls
 
 - **Status:** Accepted
+- **Kind:** Architecture Decision
 - **Date:** 2026-05-16
 - **Deciders:** ShortArrow
 

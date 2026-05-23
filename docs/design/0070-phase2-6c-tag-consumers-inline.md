@@ -1,6 +1,7 @@
 # 0070. Phase 2.6c-tag-consumers-inline: Inline `type(t[k])` / `tostring(t[k])` Runtime Dispatch
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-05
 - **Deciders:** ShortArrow
 

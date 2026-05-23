@@ -1,6 +1,7 @@
 # 0007. Phase 2.0: `local` Bindings, Multi-Statement Programs, HIR Introduction
 
 - **Status:** Proposed
+- **Kind:** Feature Memo
 - **Date:** 2026-04-26
 - **Deciders:** ShortArrow
 

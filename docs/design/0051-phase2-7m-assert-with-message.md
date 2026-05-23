@@ -1,6 +1,7 @@
 # 0051. Phase 2.7m: `assert(cond, msg)` with Optional Custom Message
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-03
 - **Deciders:** ShortArrow
 

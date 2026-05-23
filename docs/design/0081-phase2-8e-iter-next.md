@@ -1,6 +1,7 @@
 # 0081. Phase 2.8e-iter-next: `next(t, k)` Builtin + ForPairs HIR-desugar
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-06
 - **Deciders:** ShortArrow
 

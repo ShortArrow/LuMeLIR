@@ -1,6 +1,7 @@
 # 0072. Phase 2.6c-tag-fn-tbl-call: Calling a Function Value Through a Tagged Slot
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-04
 - **Deciders:** ShortArrow
 

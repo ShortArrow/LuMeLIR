@@ -1,6 +1,7 @@
 # 0029. Phase 2.7f: `type(x)` Builtin
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 

@@ -1,6 +1,7 @@
 # 0082. Phase 2.5x-callee-dispatch: General Indirect-Call Re-Enablement (Plan B3)
 
 - **Status:** Accepted; supersedes ADR 0075 in part
+- **Kind:** Architecture Decision
 - **Date:** 2026-05-06
 - **Deciders:** ShortArrow
 

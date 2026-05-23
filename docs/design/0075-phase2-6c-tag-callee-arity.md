@@ -1,6 +1,7 @@
 # 0075. Phase 2.6c-tag-callee-arity: TaggedValue Indirect Call HIR-Reject
 
 - **Status:** Accepted; supersedes ADR 0072 in part
+- **Kind:** Feature Memo
 - **Date:** 2026-05-04
 - **Deciders:** ShortArrow
 

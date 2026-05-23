@@ -1,6 +1,7 @@
 # 0099. Phase 2.6+-multi-step-alias: Top-Level Multi-Step Alias Chain Resolution via Fixed-Point alias_map
 
 - **Status:** Accepted
+- **Kind:** Architecture Decision
 - **Date:** 2026-05-16
 - **Deciders:** ShortArrow
 

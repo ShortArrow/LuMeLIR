@@ -1,6 +1,7 @@
 # 0071. Phase 2.6c-tag-fn-tbl: Function and Table Values in Tagged Slots
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-05
 - **Deciders:** ShortArrow
 

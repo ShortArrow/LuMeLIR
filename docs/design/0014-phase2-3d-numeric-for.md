@@ -1,6 +1,7 @@
 # 0014. Phase 2.3d: Numeric `for` Loops via `scf.while` Desugar
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-04-30
 - **Deciders:** ShortArrow
 

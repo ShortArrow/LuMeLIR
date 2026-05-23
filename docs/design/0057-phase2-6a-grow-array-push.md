@@ -1,6 +1,7 @@
 # 0057. Phase 2.6a-grow: Table Array Push & Resize
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-04
 - **Deciders:** ShortArrow
 

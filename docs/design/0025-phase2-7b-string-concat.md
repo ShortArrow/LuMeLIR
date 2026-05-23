@@ -1,6 +1,7 @@
 # 0025. Phase 2.7b: String Concatenation `..` and Runtime Equality
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 

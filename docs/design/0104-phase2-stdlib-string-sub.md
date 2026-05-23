@@ -1,6 +1,7 @@
 # 0104. Phase 2.7q-stdlib-string: string.sub + Bounds-Normalization Helper
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-17
 - **Deciders:** ShortArrow
 

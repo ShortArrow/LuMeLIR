@@ -1,6 +1,7 @@
 # 0117. Phase 2.devinfra-stdout-fwrite: `emit_print_string_obj` printf → fwrite chokepoint swap
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-22 (commit `2f674a2`)
 - **Deciders:** ShortArrow
 

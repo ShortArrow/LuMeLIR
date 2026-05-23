@@ -1,6 +1,7 @@
 # 0069. Phase 2.6c-tag-defensive-trap: Trap on Unknown Tagged Slot Tag
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-05
 - **Deciders:** ShortArrow
 

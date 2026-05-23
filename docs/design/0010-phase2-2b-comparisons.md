@@ -1,6 +1,7 @@
 # 0010. Phase 2.2b: Comparison Operators and Boolean Literals
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-04-29
 - **Deciders:** ShortArrow
 

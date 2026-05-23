@@ -1,6 +1,7 @@
 # 0062. Phase 2.6c-tag-hash-hard: Hash Hard Tombstone via Sentinel Key
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-04
 - **Deciders:** ShortArrow
 

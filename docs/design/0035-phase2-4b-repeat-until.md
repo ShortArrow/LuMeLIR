@@ -1,6 +1,7 @@
 # 0035. Phase 2.4b: `repeat ... until cond` Loop
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 

@@ -1,6 +1,7 @@
 # 0005. MLIR Integration Environment: WSL2 (Arch Linux) Primary, Windows Native Best-Effort
 
 - **Status:** Accepted
+- **Kind:** Architecture Decision
 - **Date:** 2026-04-19
 - **Deciders:** ShortArrow
 

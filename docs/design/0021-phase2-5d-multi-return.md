@@ -1,6 +1,7 @@
 # 0021. Phase 2.5d: Multi-Value `return` and Multi-Binding `local`
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-04-29
 - **Deciders:** ShortArrow
 

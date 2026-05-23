@@ -1,6 +1,7 @@
 # 0019. Phase 2.5b.3: Functions as Return Values
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-04-29
 - **Deciders:** ShortArrow
 

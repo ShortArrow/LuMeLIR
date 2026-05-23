@@ -1,6 +1,7 @@
 # 0078. Phase 2.8e-iter-ipairs: `for k, v in ipairs(t) do ...` Sugar
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-06
 - **Deciders:** ShortArrow
 

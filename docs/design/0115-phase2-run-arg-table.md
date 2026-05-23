@@ -1,6 +1,7 @@
 # 0115. Phase 2.8f-run-arg-table: `arg` table for script CLI args
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-22 (commit `b053774`)
 - **Deciders:** ShortArrow
 

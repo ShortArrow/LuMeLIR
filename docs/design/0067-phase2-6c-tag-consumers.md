@@ -1,6 +1,7 @@
 # 0067. Phase 2.6c-tag-consumers: TaggedValue Runtime Dispatch for `type` and `tostring`
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-05
 - **Deciders:** ShortArrow
 

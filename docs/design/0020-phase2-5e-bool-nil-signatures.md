@@ -1,6 +1,7 @@
 # 0020. Phase 2.5e: Bool/Nil Parameters and Return Values
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-04-29
 - **Deciders:** ShortArrow
 

@@ -1,6 +1,7 @@
 # 0106. Phase 2.7r-stdlib-table: table.* Library Begin (table.concat arity 1)
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-17
 - **Deciders:** ShortArrow
 

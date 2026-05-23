@@ -1,6 +1,7 @@
 # 0083. Phase 2.5c-full: Closures (Plan B) — cell-ptr-first ABI for all user fns
 
 - **Status:** Accepted
+- **Kind:** Architecture Decision
 - **Date:** 2026-05-10 (Commits 1–3c landed across `e6b256f` → `ed34703`)
 - **Deciders:** ShortArrow
 - **Supersedes:** ADR 0044 (closure escape reject) in full

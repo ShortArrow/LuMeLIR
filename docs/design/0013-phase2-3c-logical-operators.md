@@ -1,6 +1,7 @@
 # 0013. Phase 2.3c: Short-Circuit `and` / `or` / `not`
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-04-30
 - **Deciders:** ShortArrow
 

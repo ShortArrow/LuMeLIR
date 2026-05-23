@@ -1,6 +1,7 @@
 # 0043. Phase 2.5c.2: Bool / Nil / String Upvalue Captures
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 

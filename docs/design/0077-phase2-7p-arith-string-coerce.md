@@ -1,6 +1,7 @@
 # 0077. Phase 2.7p-arith-string-coerce: String → Number Arithmetic Coercion
 
 - **Status:** Accepted (extended by ADR 0089 to runtime TaggedValue operands)
+- **Kind:** Feature Memo
 - **Date:** 2026-05-04
 - **Deciders:** ShortArrow
 

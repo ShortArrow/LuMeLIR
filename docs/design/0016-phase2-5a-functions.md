@@ -1,6 +1,7 @@
 # 0016. Phase 2.5a: Top-Level `local function` + `return` + Recursion
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-04-30
 - **Deciders:** ShortArrow
 

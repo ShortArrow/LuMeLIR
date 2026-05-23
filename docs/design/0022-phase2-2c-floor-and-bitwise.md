@@ -1,6 +1,7 @@
 # 0022. Phase 2.2c: Floor Division and Bitwise Operators
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 

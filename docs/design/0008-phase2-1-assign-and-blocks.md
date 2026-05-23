@@ -1,6 +1,7 @@
 # 0008. Phase 2.1: Reassignment and `do ... end` Block Scopes
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-04-29
 - **Deciders:** ShortArrow
 

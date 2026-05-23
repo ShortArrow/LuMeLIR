@@ -1,6 +1,7 @@
 # 0039. Phase 2.7k: Extended String Escapes
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 

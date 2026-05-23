@@ -1,6 +1,7 @@
 # 0054. Phase 2.6a-arr: Number Array Constructor + Integer Indexing Read
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-03
 - **Deciders:** ShortArrow
 

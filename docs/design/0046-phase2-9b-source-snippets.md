@@ -1,6 +1,7 @@
 # 0046. Phase 2.9b: Source-Snippet Caret Display
 
 - **Status:** Accepted
+- **Kind:** Refactor Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 

@@ -1,6 +1,7 @@
 # 0110. Phase 2.7t: Namespace Stdlib Arg-Kind Validation Policy
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-17
 - **Deciders:** ShortArrow
 

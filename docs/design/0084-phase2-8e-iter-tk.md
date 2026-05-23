@@ -1,6 +1,7 @@
 # 0084. Phase 2.8e-iter-tk: TaggedValue-Key IndexAssign + Index Read
 
 - **Status:** Accepted (read-side arms partially superseded by ADR 0087 / 0088)
+- **Kind:** Feature Memo
 - **Date:** 2026-05-06
 - **Deciders:** ShortArrow
 

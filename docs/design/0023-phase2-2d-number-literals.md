@@ -1,6 +1,7 @@
 # 0023. Phase 2.2d: Hex Integer, Decimal Float, and Scientific Number Literals
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 

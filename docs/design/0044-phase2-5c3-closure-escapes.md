@@ -1,6 +1,7 @@
 # 0044. Phase 2.5c.3: Static Rejection of Closure Escape
 
 - **Status:** **Superseded by ADR 0083 Commit 3c** (2026-05-10)
+- **Kind:** Refactor Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 

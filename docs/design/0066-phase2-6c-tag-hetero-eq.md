@@ -1,6 +1,7 @@
 # 0066. Phase 2.6c-tag-hetero-eq: IsNil Unification + Local-Local TaggedValue Eq
 
 - **Status:** Accepted
+- **Kind:** Refactor Memo
 - **Date:** 2026-05-05
 - **Deciders:** ShortArrow
 

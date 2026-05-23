@@ -1,6 +1,7 @@
 # 0034. Phase 2.8c: Block Comments `--[[ ... ]]`
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 

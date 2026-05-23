@@ -1,6 +1,7 @@
 # 0001. Lexer Implementation: Hand-Written
 
 - **Status:** Accepted
+- **Kind:** Architecture Decision
 - **Date:** 2026-04-19
 - **Deciders:** ShortArrow
 

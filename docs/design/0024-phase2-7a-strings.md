@@ -1,6 +1,7 @@
 # 0024. Phase 2.7a: String Literals, `print(string)`, and `#` Length
 
 - **Status:** Accepted (ABI surface superseded by ADR 0112)
+- **Kind:** Feature Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 

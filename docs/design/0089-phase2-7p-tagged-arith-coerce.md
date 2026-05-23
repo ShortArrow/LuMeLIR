@@ -1,6 +1,7 @@
 # 0089. Phase 2.7p-tagged-arith-coerce: TaggedValue Arith Operand Coercion Chokepoint
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-10
 - **Deciders:** ShortArrow
 

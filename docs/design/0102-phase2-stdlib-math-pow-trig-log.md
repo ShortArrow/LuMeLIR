@@ -1,6 +1,7 @@
 # 0102. Phase 2.7q-stdlib-math: math.* Continuation (pow / sin / cos / log / exp)
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-16
 - **Deciders:** ShortArrow
 

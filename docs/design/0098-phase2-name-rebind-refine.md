@@ -1,6 +1,7 @@
 # 0098. Phase 2.6+-name-rebind-refine: Top-Level Name-Rebind Refinement via Pass-1.5 alias_map
 
 - **Status:** Accepted
+- **Kind:** Architecture Decision
 - **Date:** 2026-05-16
 - **Deciders:** ShortArrow
 

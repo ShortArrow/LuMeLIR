@@ -1,6 +1,7 @@
 # 0091. Phase 2.6+-callee-norm: HIR Callee Normalization for Index-Callee Calls
 
 - **Status:** Accepted (plan v2, post-abort)
+- **Kind:** Architecture Decision
 - **Date:** 2026-05-14
 - **Deciders:** ShortArrow
 

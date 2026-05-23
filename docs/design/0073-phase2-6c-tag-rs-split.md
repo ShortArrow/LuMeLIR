@@ -1,6 +1,7 @@
 # 0073. Phase 2.6c-tag-rs-split: 2-Layer Codegen Module Split
 
 - **Status:** Accepted
+- **Kind:** Refactor Memo
 - **Date:** 2026-05-04
 - **Deciders:** ShortArrow
 

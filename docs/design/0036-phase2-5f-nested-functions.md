@@ -1,6 +1,7 @@
 # 0036. Phase 2.5f: Nested `local function` Definitions
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 

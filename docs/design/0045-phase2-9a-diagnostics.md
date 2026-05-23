@@ -1,6 +1,7 @@
 # 0045. Phase 2.9a: Line/Column Diagnostics at the CLI Boundary
 
 - **Status:** Accepted
+- **Kind:** Refactor Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 

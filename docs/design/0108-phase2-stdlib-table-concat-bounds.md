@@ -1,6 +1,7 @@
 # 0108. Phase 2.7r-stdlib-table: table.concat(t, sep, i, j) Full Spec + Cross-Namespace Bounds Helper Reuse
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-17
 - **Deciders:** ShortArrow
 

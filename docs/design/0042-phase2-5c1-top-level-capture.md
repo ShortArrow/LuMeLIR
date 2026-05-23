@@ -1,6 +1,7 @@
 # 0042. Phase 2.5c.1: Top-Level `local function` Captures Chunk Locals
 
 - **Status:** Accepted
+- **Kind:** Feature Memo
 - **Date:** 2026-05-02
 - **Deciders:** ShortArrow
 
