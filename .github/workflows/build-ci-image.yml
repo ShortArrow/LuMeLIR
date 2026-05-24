@@ -1,0 +1,44 @@
+name: Build CI image
+
+# Builds and pushes the CI image (Arch + AUR mlir) used by the
+# clippy-and-test job in ci.yml. See ADR 0132.
+#
+# Path-filtered: only triggers when the Dockerfile or this workflow
+# itself changes, so normal source pushes do NOT pay the ~1-2h
+# first-run MLIR source compile cost.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/docker/Dockerfile.ci'
+      - '.github/workflows/build-ci-image.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build & push ghcr.io image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180  # AUR mlir = MLIR 22 source compile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/docker/Dockerfile.ci
+          push: true
+          tags: |
+            ghcr.io/shortarrow/lumelir-ci:mlir-22
+            ghcr.io/shortarrow/lumelir-ci:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1.7
+# Mirrors CONTRIBUTING.md "Setup" (WSL2 Arch path) so what passes
+# locally also passes in CI. See ADR 0132 for the rationale and
+# ADR 0005 for the underlying MLIR environment decision.
+FROM archlinux:base-devel
+
+ARG BUILDER_UID=1001
+
+# Base deps + LLVM 22 system pkgs (mirrors CONTRIBUTING.md pacman list).
+RUN pacman -Syu --noconfirm \
+    && pacman -S --noconfirm \
+        git wget curl ca-certificates sudo \
+        llvm cmake ninja pkgconf clang zlib zstd libxml2 \
+        rustup \
+    && pacman -Scc --noconfirm
+
+# makepkg refuses to run as root, so we need a builder user for AUR work.
+RUN useradd -m -G wheel -u ${BUILDER_UID} builder \
+    && echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+USER builder
+WORKDIR /home/builder
+
+# paru (AUR helper, bin variant skips paru source compile).
+RUN git clone --depth 1 https://aur.archlinux.org/paru-bin.git \
+    && cd paru-bin && makepkg -si --noconfirm \
+    && cd .. && rm -rf paru-bin
+
+# MLIR via AUR. Builds MLIR 22 from source on first run; cached in image.
+RUN paru -S --noconfirm --skipreview mlir
+
+# Rust toolchain matching CONTRIBUTING.md "Setup".
+RUN rustup default stable \
+    && rustup component add clippy rustfmt
+
+ENV MLIR_SYS_220_PREFIX=/usr \
+    LLVM_SYS_220_PREFIX=/usr \
+    TABLEGEN_220_PREFIX=/usr
+
+CMD ["/bin/bash"]
