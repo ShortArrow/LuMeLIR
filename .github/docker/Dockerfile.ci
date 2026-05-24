@@ -41,9 +41,21 @@ RUN git clone --depth 1 https://aur.archlinux.org/mlir.git \
     && cd .. \
     && rm -rf mlir
 
-# Rust toolchain matching CONTRIBUTING.md "Setup".
+# Switch back to root for system-wide Rust install. GitHub Actions
+# forces container jobs to run as root (overriding any USER directive),
+# so the toolchain must live in a path that root can read by default.
+USER root
+
+# Rust toolchain installed system-wide. Any user (root, builder) finds
+# the toolchain via the env vars below. chmod a+w on the cache dirs
+# lets non-root users (like the AUR builder above, if needed) also
+# update them.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
 RUN rustup default stable \
-    && rustup component add clippy rustfmt
+    && rustup component add clippy rustfmt \
+    && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
 
 ENV MLIR_SYS_220_PREFIX=/usr \
     LLVM_SYS_220_PREFIX=/usr \
