@@ -39,7 +39,7 @@ jobs:
           echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-22 main" \
             | sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt-get update
-          sudo apt-get install -y llvm-22-dev libmlir-22-dev mlir-22-tools clang-22
+          sudo apt-get install -y llvm-22-dev libmlir-22-dev mlir-22-tools clang-22 libpolly-22-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
