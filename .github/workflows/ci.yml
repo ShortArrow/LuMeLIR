@@ -20,29 +20,20 @@ jobs:
   clippy-and-test:
     name: clippy + test (MLIR 22)
     runs-on: ubuntu-24.04
-    # MLIR install is iterating; flip to false once the apt step is
-    # demonstrably stable. See ADR 0124.
-    continue-on-error: true
-    env:
-      MLIR_SYS_220_PREFIX: /usr/lib/llvm-22
-      LLVM_SYS_220_PREFIX: /usr/lib/llvm-22
-      TABLEGEN_220_PREFIX: /usr/lib/llvm-22
+    # Runs inside the CI image built from .github/docker/Dockerfile.ci
+    # (see ADR 0132). MLIR 22 + Rust toolchain + env vars are baked in;
+    # this job just checks out the source, restores cargo cache, and
+    # runs the gate.
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ghcr.io/shortarrow/lumelir-ci:mlir-22
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install LLVM / MLIR 22 from apt.llvm.org
-        run: |
-          set -euo pipefail
-          sudo install -d -m 0755 /etc/apt/keyrings
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
-            | sudo gpg --dearmor -o /etc/apt/keyrings/llvm-snapshot.gpg
-          codename="$(lsb_release -cs)"
-          echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-22 main" \
-            | sudo tee /etc/apt/sources.list.d/llvm.list
-          sudo apt-get update
-          sudo apt-get install -y llvm-22-dev libmlir-22-dev mlir-22-tools clang-22 libpolly-22-dev
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --no-fail-fast
