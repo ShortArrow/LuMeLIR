@@ -21,13 +21,13 @@ RUN useradd -m -G wheel -u ${BUILDER_UID} builder \
 USER builder
 WORKDIR /home/builder
 
-# paru (AUR helper, bin variant skips paru source compile).
-RUN git clone --depth 1 https://aur.archlinux.org/paru-bin.git \
-    && cd paru-bin && makepkg -si --noconfirm \
-    && cd .. && rm -rf paru-bin
-
-# MLIR via AUR. Builds MLIR 22 from source on first run; cached in image.
-RUN paru -S --noconfirm --skipreview mlir
+# MLIR via AUR. makepkg is in base-devel; no AUR helper needed (helpers
+# like paru-bin break when libalpm gets upgraded under them).
+RUN git clone --depth 1 https://aur.archlinux.org/mlir.git \
+    && cd mlir \
+    && makepkg -si --noconfirm \
+    && cd .. \
+    && rm -rf mlir
 
 # Rust toolchain matching CONTRIBUTING.md "Setup".
 RUN rustup default stable \
