@@ -21,13 +21,23 @@ RUN useradd -m -G wheel -u ${BUILDER_UID} builder \
 USER builder
 WORKDIR /home/builder
 
+# Import LLVM upstream release signing key before makepkg so the
+# llvm-project tarball's PGP signature can be verified. Without this,
+# makepkg would fall back to sha256-only validation, which leaves a
+# gap if the AUR PKGBUILD itself were tampered with at recording time
+# (see ADR 0126 security policy).
+#
+# Key 316C56D064CACBA5 is the LLVM release signing key currently used
+# for the v22 line; if the AUR PKGBUILD pins additional valid keys
+# they should be added here.
+RUN gpg --keyserver hkps://keyserver.ubuntu.com \
+        --recv-keys 316C56D064CACBA5
+
 # MLIR via AUR. makepkg is in base-devel; no AUR helper needed (helpers
 # like paru-bin break when libalpm gets upgraded under them).
-# --skippgpcheck: LLVM upstream signing key isn't in the container keyring;
-# the AUR PKGBUILD's sha256sum already validates source integrity.
 RUN git clone --depth 1 https://aur.archlinux.org/mlir.git \
     && cd mlir \
-    && makepkg -si --noconfirm --skippgpcheck \
+    && makepkg -si --noconfirm \
     && cd .. \
     && rm -rf mlir
 
