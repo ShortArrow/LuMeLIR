@@ -104,7 +104,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-CI runs the same gate on every PR — see [ADR 0124](docs/design/0124-ci-cd-policy.md).
+CI runs the same gate on every PR — see [ADR 0124](docs/design/0124-ci-cd-policy.md). The MLIR-linked job runs inside [`ghcr.io/shortarrow/lumelir-ci:mlir-22`](.github/docker/Dockerfile.ci) (see [ADR 0132](docs/design/0132-ci-image-base-distro.md)).
 
 ## Commits & Pull Requests
 

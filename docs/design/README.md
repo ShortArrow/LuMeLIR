@@ -187,6 +187,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0129 — phase-tag-convention](0129-phase-tag-convention.md) — foundational
 - [0130 — commit-message-convention](0130-commit-message-convention.md) — foundational
 - [0131 — pr-discipline-code-review](0131-pr-discipline-code-review.md) — foundational
+- [0132 — ci-image-base-distro](0132-ci-image-base-distro.md) — foundational follow-up
 
 ### Feature Implementation Memos
 
