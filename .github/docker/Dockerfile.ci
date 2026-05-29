@@ -35,8 +35,16 @@ RUN gpg --keyserver hkps://keyserver.ubuntu.com \
 
 # MLIR via AUR. makepkg is in base-devel; no AUR helper needed (helpers
 # like paru-bin break when libalpm gets upgraded under them).
+#
+# Patch PKGBUILD to add -DMLIR_BUILD_MLIR_C_DYLIB=ON so libMLIR-C.so
+# gets built and installed. Without this, the AUR build emits only the
+# C++ MLIR dylib; mlir-sys 220 / melior 0.27 link against the C API
+# dylib and fail with `unable to find library -lMLIR-C`. The PKGBUILD
+# is not PGP-signed (only the upstream source is); modifying cmake
+# args does not weaken the integrity model.
 RUN git clone --depth 1 https://aur.archlinux.org/mlir.git \
     && cd mlir \
+    && sed -i 's|-B build -S .|-DMLIR_BUILD_MLIR_C_DYLIB=ON \\\n    -B build -S .|' PKGBUILD \
     && makepkg -si --noconfirm \
     && cd .. \
     && rm -rf mlir
