@@ -1482,6 +1482,15 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
                     // ADR 0149 — `__len`: (Table) → Number.
                     functions[fid.0].params[0].kind = ValueKind::Table;
                 }
+                "__index" if params.len() >= 2 => {
+                    // ADR 0150 — `__index` Function form:
+                    //   (Table, String) → Number.
+                    // Table-form (`mt.__index = some_table`) has
+                    // `value` = Ident chain, not FunctionExpr, so
+                    // doesn't enter this walk.
+                    functions[fid.0].params[0].kind = ValueKind::Table;
+                    functions[fid.0].params[1].kind = ValueKind::String;
+                }
                 _ => {}
             }
         }

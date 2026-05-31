@@ -50,7 +50,8 @@ use super::tagged::{
     emit_alloca_slot_for_kind, emit_print_tagged_local, emit_tag_and_payload_ptr,
     emit_tagged_eq_local_local, emit_tagged_unknown_tag_trap, emit_type_tagged_local,
     emit_value_slot_check_number, emit_value_slot_store_dispatched, emit_value_slot_store_nil,
-    emit_value_slot_store_table, policy_for_tag, policy_for_tagged_arith_operand,
+    emit_value_slot_store_number, emit_value_slot_store_table, policy_for_tag,
+    policy_for_tagged_arith_operand,
 };
 
 // =============================================================
@@ -5481,7 +5482,7 @@ fn emit_local_init_tagged<'a, 'c>(
             // same dst_slot when a chain entry is found; otherwise it
             // leaves dst_slot as Nil-tagged.
             emit_metatable_index_fallback_if_nil(
-                context, block, target_ptr, key_slot, dst_slot, types, loc,
+                context, block, target_ptr, key_slot, dst_slot, functions, types, loc,
             );
         }
         _ => unreachable!("IndexTagged key must be Number or String"),
@@ -5495,12 +5496,14 @@ fn emit_local_init_tagged<'a, 'c>(
 /// `emit_check_metatable_index`. Used at every chokepoint where a
 /// missing key should chain through `__index` (e.g. the
 /// `emit_local_init_tagged` hash arms).
+#[allow(clippy::too_many_arguments)]
 fn emit_metatable_index_fallback_if_nil<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     target_ptr: Value<'c, 'a>,
     user_search_key_slot: Value<'c, 'a>,
     dst_slot: Value<'c, 'a>,
+    functions: &[HirFunction],
     types: &Types<'c>,
     loc: Location<'c>,
 ) {
@@ -5533,6 +5536,7 @@ fn emit_metatable_index_fallback_if_nil<'a, 'c>(
         target_ptr,
         user_search_key_slot,
         dst_slot,
+        functions,
         types,
         loc,
     );
@@ -12176,12 +12180,14 @@ fn emit_io_read_runtime<'a, 'c>(
 /// resolve naturally; chains longer than the limit fall through to
 /// Nil (cycle detection is best-effort — a future ADR may move this
 /// to a runtime depth counter for full Lua-spec 2000-hop coverage).
+#[allow(clippy::too_many_arguments)]
 fn emit_check_metatable_index<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     target_ptr: Value<'c, 'a>,
     user_search_key_slot: Value<'c, 'a>,
     dst_slot: Value<'c, 'a>,
+    functions: &[HirFunction],
     types: &Types<'c>,
     loc: Location<'c>,
 ) {
@@ -12192,6 +12198,7 @@ fn emit_check_metatable_index<'a, 'c>(
         user_search_key_slot,
         dst_slot,
         METATABLE_INDEX_MAX_HOPS,
+        functions,
         types,
         loc,
     );
@@ -12213,6 +12220,7 @@ fn emit_check_metatable_index_with_depth<'a, 'c>(
     user_search_key_slot: Value<'c, 'a>,
     dst_slot: Value<'c, 'a>,
     remaining_hops: u32,
+    functions: &[HirFunction],
     types: &Types<'c>,
     loc: Location<'c>,
 ) {
@@ -12396,6 +12404,7 @@ fn emit_check_metatable_index_with_depth<'a, 'c>(
                 user_search_key_slot,
                 dst_slot,
                 remaining_hops - 1,
+                functions,
                 types,
                 loc,
             );
@@ -12418,8 +12427,9 @@ fn emit_check_metatable_index_with_depth<'a, 'c>(
         let table_else = Region::new();
         let table_else_blk = Block::new(&[]);
         {
-            // is_table == false. Either is_nil (no __index in mt) or
-            // unsupported kind (Function / Number / etc.).
+            // is_table == false. Either is_nil (no __index in mt),
+            // is_function (ADR 0150 Function form), or unsupported
+            // kind (Number / Bool / String / etc.).
             let nil_then = Region::new();
             let nil_then_blk = Block::new(&[]);
             nil_then_blk.append_operation(scf::r#yield(&[], loc));
@@ -12427,15 +12437,118 @@ fn emit_check_metatable_index_with_depth<'a, 'c>(
             let nil_else = Region::new();
             let nil_else_blk = Block::new(&[]);
             {
-                let msg = emit_addressof(
-                    context,
-                    &nil_else_blk,
-                    "s_metatable_index_unsupported_kind",
-                    types,
-                    loc,
-                );
-                emit_exit_with_message(context, &nil_else_blk, msg, types, loc);
-                nil_else_blk.append_operation(scf::r#yield(&[], loc));
+                // ADR 0150 — Function form. Filter candidates with
+                // sig (Table, String) → Number. Empty → trap as
+                // unsupported (matches ADR 0134 behaviour for the
+                // no-candidate case).
+                let index_candidates: Vec<FuncId> = functions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, f)| {
+                        let pks: Vec<ValueKind> = f.params.iter().map(|p| p.kind).collect();
+                        if pks == [ValueKind::Table, ValueKind::String]
+                            && f.ret_kinds == [ValueKind::Number]
+                        {
+                            Some(FuncId(i))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if index_candidates.is_empty() {
+                    let msg = emit_addressof(
+                        context,
+                        &nil_else_blk,
+                        "s_metatable_index_unsupported_kind",
+                        types,
+                        loc,
+                    );
+                    emit_exit_with_message(context, &nil_else_blk, msg, types, loc);
+                    nil_else_blk.append_operation(scf::r#yield(&[], loc));
+                } else {
+                    let tag_function = nil_else_blk
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let is_function: Value<'c, '_> = nil_else_blk
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Eq,
+                            index_tag,
+                            tag_function,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let fn_then = Region::new();
+                    let fn_then_blk = Block::new(&[]);
+                    {
+                        // Load user-supplied String key (ptr at
+                        // payload offset 8 of user_search_key_slot).
+                        let key_payload_ptr = emit_byte_offset_ptr(
+                            context,
+                            &fn_then_blk,
+                            user_search_key_slot,
+                            ARRAY_ELEM_OFF_VALUE,
+                            types,
+                            loc,
+                        );
+                        let key_ptr = emit_load(&fn_then_blk, key_payload_ptr, types.ptr, loc);
+                        let sig = IndirectSig {
+                            param_kinds: vec![ValueKind::Table, ValueKind::String],
+                            ret_kinds: vec![ValueKind::Number],
+                        };
+                        let results = emit_dispatch_chain_from_slot_ptr(
+                            context,
+                            &fn_then_blk,
+                            index_result_slot,
+                            &sig,
+                            &index_candidates,
+                            &[target_ptr, key_ptr],
+                            functions,
+                            types,
+                            loc,
+                        );
+                        emit_value_slot_store_number(
+                            context,
+                            &fn_then_blk,
+                            dst_slot,
+                            results[0],
+                            types,
+                            loc,
+                        );
+                        fn_then_blk.append_operation(scf::r#yield(&[], loc));
+                    }
+                    fn_then.append_block(fn_then_blk);
+                    let fn_else = Region::new();
+                    let fn_else_blk = Block::new(&[]);
+                    {
+                        let msg = emit_addressof(
+                            context,
+                            &fn_else_blk,
+                            "s_metatable_index_unsupported_kind",
+                            types,
+                            loc,
+                        );
+                        emit_exit_with_message(context, &fn_else_blk, msg, types, loc);
+                        fn_else_blk.append_operation(scf::r#yield(&[], loc));
+                    }
+                    fn_else.append_block(fn_else_blk);
+                    nil_else_blk.append_operation(scf::r#if(
+                        is_function,
+                        &[],
+                        fn_then,
+                        fn_else,
+                        loc,
+                    ));
+                    nil_else_blk.append_operation(scf::r#yield(&[], loc));
+                }
             }
             nil_else.append_block(nil_else_blk);
             table_else_blk.append_operation(scf::r#if(is_nil, &[], nil_then, nil_else, loc));
