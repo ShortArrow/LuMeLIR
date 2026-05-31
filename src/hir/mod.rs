@@ -302,6 +302,9 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // return kind. Truncates to the first result for
             // single-value position (Lua spec); MultiAssignFromCall
             // observes the full vector via `lower_local_multi`.
+            Callee::TableCall { sig, .. } => {
+                sig.ret_kinds.first().copied().unwrap_or(ValueKind::Number)
+            }
             Callee::IndirectDispatch { sig, .. } => {
                 sig.ret_kinds.first().copied().unwrap_or(ValueKind::Number)
             }
@@ -1445,6 +1448,13 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
                     //   (Table, Table) → Bool.
                     functions[fid.0].params[0].kind = ValueKind::Table;
                     functions[fid.0].params[1].kind = ValueKind::Table;
+                }
+                "__call" if !params.is_empty() => {
+                    // ADR 0146 — `__call`: first arg is `self`
+                    // (Table). Remaining params refine from the
+                    // rewritten call site via the standard ADR 0094
+                    // walker arm.
+                    functions[fid.0].params[0].kind = ValueKind::Table;
                 }
                 _ => {}
             }
@@ -3520,6 +3530,7 @@ impl LowerCtx {
                     // doesn't match `b.ret_kinds().len()`.
                     Callee::Builtin(b) => b.ret_kinds().to_vec(),
                     Callee::IndirectDispatch { sig, .. } => sig.ret_kinds.clone(),
+                    Callee::TableCall { sig, .. } => sig.ret_kinds.clone(),
                     Callee::Indirect(_) => {
                         return Err(HirError::ArityMismatch {
                             builtin: "multi-assign".to_owned(),
@@ -3749,6 +3760,7 @@ impl LowerCtx {
                 Callee::User { fid, .. } => self.functions[fid.0].ret_kinds.clone(),
                 Callee::Builtin(b) => b.ret_kinds().to_vec(),
                 Callee::IndirectDispatch { ref sig, .. } => sig.ret_kinds.clone(),
+                Callee::TableCall { ref sig, .. } => sig.ret_kinds.clone(),
                 Callee::Indirect(_) => {
                     return Err(HirError::ArityMismatch {
                         builtin: "local =".to_owned(),
@@ -4273,6 +4285,70 @@ impl LowerCtx {
         args: &[Expr],
         whole: &Expr,
     ) -> Result<HirExprKind, HirError> {
+        // ADR 0146 — Table-callable. `t(args)` where `t` resolves to
+        // a Table-kind Local lowers to `Callee::TableCall` carrying
+        // the receiver Local + sig + compile-time candidate set.
+        // Codegen probes `t.metatable.__call` directly (not via
+        // `__index` chain) and dispatches with `(t, args)`.
+        if let ExprKind::Ident(name) = &callee.kind
+            && let Some(local_id) = self.resolve(name)
+            && matches!(self.locals[local_id.0].kind, ValueKind::Table)
+        {
+            let lowered_args: Vec<HirExpr> = args
+                .iter()
+                .map(|a| self.lower_expr(a))
+                .collect::<Result<_, _>>()?;
+            // sig param_kinds = [Table (self), arg kinds...]
+            let mut param_kinds = vec![ValueKind::Table];
+            for a in &lowered_args {
+                param_kinds.push(infer_kind(a, &self.locals, &self.functions));
+            }
+            // Filter candidates: param_kinds match AND ret_kinds
+            // length 1. Take the first match's ret_kinds as
+            // canonical (ADR 0082 precedent).
+            let canonical_ret_kinds: Option<Vec<ValueKind>> = self
+                .functions
+                .iter()
+                .find(|f| {
+                    let pks: Vec<ValueKind> = f.params.iter().map(|p| p.kind).collect();
+                    pks == param_kinds && f.ret_kinds.len() == 1
+                })
+                .map(|f| f.ret_kinds.clone());
+            let ret_kinds = canonical_ret_kinds.unwrap_or_else(|| vec![ValueKind::Number]);
+            let sig = IndirectSig {
+                param_kinds: param_kinds.clone(),
+                ret_kinds: ret_kinds.clone(),
+            };
+            let candidates: Vec<FuncId> = self
+                .functions
+                .iter()
+                .enumerate()
+                .filter_map(|(i, f)| {
+                    let pks: Vec<ValueKind> = f.params.iter().map(|p| p.kind).collect();
+                    if pks == sig.param_kinds && f.ret_kinds == sig.ret_kinds {
+                        Some(FuncId(i))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if candidates.is_empty() {
+                return Err(HirError::IndirectCallNoCandidates {
+                    local_name: name.clone(),
+                    param_kinds,
+                    ret_kinds,
+                    offset: whole.span.start,
+                });
+            }
+            return Ok(HirExprKind::Call {
+                callee: Callee::TableCall {
+                    local_id,
+                    sig,
+                    candidates,
+                },
+                args: lowered_args,
+            });
+        }
         // Phase 2.7q-stdlib-math / -string (ADR 0101 / ADR 0102 /
         // ADR 0103): namespace builtin dispatch chokepoint, now
         // generic over math.* / string.* / future namespaces. Matches

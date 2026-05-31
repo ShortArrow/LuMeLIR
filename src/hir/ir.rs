@@ -327,6 +327,18 @@ pub enum Callee {
         sig: IndirectSig,
         candidates: Vec<FuncId>,
     },
+    /// ADR 0146 — Callable Table via `__call` metamethod. `t(args)`
+    /// where `t` is a Table-kind Local. Codegen loads
+    /// `t.metatable.__call` directly (not through `__index` chain
+    /// per Lua spec §3.4.10) and dispatches with `(t, args...)` —
+    /// the receiver Local becomes the implicit first arg `self`.
+    /// `sig.param_kinds[0]` is `Table` (the self slot); subsequent
+    /// kinds match the user-supplied args.
+    TableCall {
+        local_id: LocalId,
+        sig: IndirectSig,
+        candidates: Vec<FuncId>,
+    },
 }
 
 /// Phase 2.5x-callee-dispatch (ADR 0082): the static signature

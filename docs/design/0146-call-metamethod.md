@@ -27,33 +27,30 @@ Concrete restrictions:
 
 ## Decision
 
-### HIR rewrite
+### HIR
 
-`lower_call` adds an early arm BEFORE the existing namespace-builtin / ADR 0091 callee-classify path:
+**Initial plan** was a `t(args) → t.__call(t, args)` rewrite routing through ADR 0091 → 0082. Rejected on first probe: `t.__call` Index lookup goes through the `__index` metamethod chain (ADR 0134), so it doesn't find the `__call` slot on `t`'s metatable directly. Lua spec §3.4.10 specifies **direct metatable lookup**, not via `__index`.
+
+**Actual implementation**: new `Callee::TableCall { local_id, sig, candidates }` HIR variant.
+
+`lower_call` adds an early arm before the namespace-builtin / ADR 0091 path:
 
 ```rust
 if let ExprKind::Ident(name) = &callee.kind
     && let Some(local_id) = self.resolve(name)
     && matches!(self.locals[local_id.0].kind, ValueKind::Table)
 {
-    // Rewrite: t(args) → t.__call(t, args...)
-    let recv_expr = Expr::new(ExprKind::Ident(name.clone()), callee.span);
-    let key_expr = Expr::new(ExprKind::Str("__call".to_owned()), callee.span);
-    let index_callee = Expr::new(
-        ExprKind::Index {
-            target: Box::new(recv_expr.clone()),
-            key: Box::new(key_expr),
-        },
-        callee.span,
-    );
-    let mut new_args = Vec::with_capacity(args.len() + 1);
-    new_args.push(recv_expr);
-    new_args.extend_from_slice(args);
-    return self.lower_call(&index_callee, &new_args, whole);
+    let lowered_args = args.map(|a| self.lower_expr(a))?;
+    let param_kinds = [Table, ...infer_kind(arg) for arg in lowered_args];
+    let ret_kinds = find_first_matching_fn(param_kinds).ret_kinds || [Number];
+    let sig = IndirectSig { param_kinds, ret_kinds };
+    let candidates = filter_user_fns(sig);
+    if candidates.empty() { return IndirectCallNoCandidates; }
+    return Call { callee: TableCall { local_id, sig, candidates }, args: lowered_args };
 }
 ```
 
-The recursion routes through the existing ADR 0091 IndexCallee branch, which materialises `t.__call` to a synth local and dispatches via ADR 0082 with `(t, args)`.
+Function-kind Locals hit zero overhead (kind guard exits early).
 
 ### Metamethod-aware kind refinement
 
@@ -67,14 +64,28 @@ Unlike `__tostring` / `__concat` / `__eq`, `__call` arity varies. The walk force
 
 ### Codegen
 
-No codegen changes. The HIR rewrite reuses the existing ADR 0091 + 0082 dispatch chain.
+New `Callee::TableCall` emit arm calls `emit_table_call_via_metamethod`:
+
+1. Load `t_ptr = *t_slot`, `mt_ptr = *(t_ptr + TABLE_OFF_METATABLE)`.
+2. If `mt_ptr` is null → trap `s_call_non_function` (ADR 0082 reuse).
+3. Probe `mt["__call"]` via `emit_hash_lookup_into_tagged_slot(NilOnMissing)` into a tmp tagged slot.
+4. Tag check `TAG_FUNCTION` — mismatch → trap.
+5. Pre-lower args; prepend `t_ptr` as the implicit `self`.
+6. Dispatch via `emit_dispatch_chain_from_slot_ptr` (ADR 0142 helper reuse) with `sig`, `candidates`, `[t_ptr, args...]`.
+
+New module global `s_metatable_call_field_name` ("__call").
+
+### Refinement limitation
+
+Because the call site lowers to `Callee::TableCall` (not a `Call(Index(t, "__call"), [t, args])` AST shape), the ADR 0094 Pass-1.5 walker doesn't see it — extra args beyond `self` default to Number kind. String / Bool / etc. extra args are out of scope until a future ADR adds a Table-callable-aware walker arm.
 
 ## Alternatives considered
 
-- **New `Callee::TableCall` variant.** Rejected — the rewrite-to-Index form is HIR-only, zero codegen surface change.
+- **HIR rewrite `t(args) → t.__call(t, args)`.** Tried first; rejected after discovering `t.__call` Index goes through `__index` chain (ADR 0134), not direct metatable lookup. Lua spec §3.4.10 requires the direct lookup.
 - **Multi-segment receiver (`obj.inner(args)`).** Deferred — needs distinguishing "intermediate field access" from "callable Table".
 - **Variadic `__call`.** Deferred — the candidate filter would need per-call-site sig synthesis with arbitrary arity.
-- **Implicit `self` injection at codegen instead of HIR.** Rejected — HIR is the natural layer; codegen would need a per-call-site flag, breaking the existing IndirectDispatch ABI.
+- **Extra-arg refinement via Pass-1.5 walker.** Deferred — the `Callee::TableCall` shape isn't visible to the existing ADR 0094 arm. A follow-up ADR can add a Table-callable-aware walker arm to refine `__call`'s post-`self` params.
+- **AST-level rewrite (pre-Pass-1.5)** to make the call shape visible to the walker. Rejected — requires AST-level local-kind tracking that doesn't exist; would invert the lower / refinement order.
 
 ## Consequences
 

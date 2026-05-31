@@ -485,6 +485,15 @@ fn emit_fmt_global<'c>(
         "attempt to compare two table values\0",
         loc,
     );
+    // ADR 0146 — `__call` metamethod field name.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_call_field_name",
+        "__call\0",
+        loc,
+    );
     emit_string_global(
         context,
         module,
@@ -4233,6 +4242,10 @@ fn emit_multi_assign_from_call<'a, 'c>(
                 in_function_cell_ptr,
                 loc,
             )
+        }
+        Callee::TableCall { .. } => {
+            // ADR 0146 — multi-return `__call` deferred.
+            unreachable!("multi-return Callee::TableCall not supported (ADR 0146 scope)")
         }
     }
 }
@@ -9373,6 +9386,25 @@ fn emit_expr<'a, 'c>(
                 in_function_cell_ptr,
                 loc,
             ),
+            Callee::TableCall {
+                local_id: LocalId(idx),
+                sig,
+                candidates,
+            } => Ok(emit_table_call_via_metamethod(
+                context,
+                block,
+                slots[*idx],
+                sig,
+                candidates,
+                args,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
+            )?),
             Callee::Builtin(Builtin::SetMetatable) => {
                 // ADR 0134: setmetatable(t, mt) stores mt at t+32
                 // and returns t (Lua §6.1). Arg 0 is HIR-checked to
@@ -13532,6 +13564,164 @@ fn emit_tostring_table_via_metamethod<'a, 'c>(
         loc,
     ));
     outer_if.result(0).unwrap().into()
+}
+
+/// ADR 0146 — `t(args)` where `t` is a Table-kind Local. Probes
+/// `t.metatable.__call` directly (Lua §3.4.10 — direct metatable
+/// lookup, NOT through the `__index` chain) and dispatches with
+/// `(t, args...)` via `emit_dispatch_chain_from_slot_ptr` (ADR
+/// 0142 helper reuse). Missing metatable / metafield / non-Function
+/// tag traps with `s_call_non_function` (ADR 0082 reuse).
+#[allow(clippy::too_many_arguments)]
+fn emit_table_call_via_metamethod<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    t_slot: Value<'c, 'a>,
+    sig: &IndirectSig,
+    candidates: &[FuncId],
+    args: &[HirExpr],
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
+    loc: Location<'c>,
+) -> Result<Value<'c, 'a>, CodegenError> {
+    // Load the Table ptr from the receiver's slot.
+    let t_ptr = emit_load(block, t_slot, types.ptr, loc);
+    // Load mt_ptr from t + TABLE_OFF_METATABLE.
+    let mt_slot = emit_byte_offset_ptr(context, block, t_ptr, TABLE_OFF_METATABLE, types, loc);
+    let mt_ptr = emit_load(block, mt_slot, types.ptr, loc);
+    let mt_iv: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[mt_ptr])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint __call mt"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mt_missing: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            mt_iv,
+            zero_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let trap_then = Region::new();
+    let trap_then_blk = Block::new(&[]);
+    {
+        let msg = emit_addressof(context, &trap_then_blk, "s_call_non_function", types, loc);
+        emit_exit_with_message(context, &trap_then_blk, msg, types, loc);
+        trap_then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    trap_then.append_block(trap_then_blk);
+    let trap_else = Region::new();
+    let trap_else_blk = Block::new(&[]);
+    trap_else_blk.append_operation(scf::r#yield(&[], loc));
+    trap_else.append_block(trap_else_blk);
+    block.append_operation(scf::r#if(mt_missing, &[], trap_then, trap_else, loc));
+    // Probe mt["__call"] into a tmp tagged slot.
+    let field_str = emit_addressof(context, block, "s_metatable_call_field_name", types, loc);
+    let search_slot =
+        emit_build_search_key_slot(context, block, ValueKind::String, field_str, types, loc);
+    let probe_slot = emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
+    emit_value_slot_store_nil(context, block, probe_slot, types, loc);
+    emit_hash_lookup_into_tagged_slot(
+        context,
+        block,
+        mt_ptr,
+        search_slot,
+        probe_slot,
+        HashLookupOutcome::NilOnMissing,
+        types,
+        loc,
+    );
+    // Tag check TAG_FUNCTION — trap on miss.
+    let probe_tag = emit_load(block, probe_slot, types.i64, loc);
+    let tag_fn_const = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let tag_mismatch: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Ne,
+            probe_tag,
+            tag_fn_const,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mismatch_then = Region::new();
+    let mismatch_then_blk = Block::new(&[]);
+    {
+        let msg = emit_addressof(
+            context,
+            &mismatch_then_blk,
+            "s_call_non_function",
+            types,
+            loc,
+        );
+        emit_exit_with_message(context, &mismatch_then_blk, msg, types, loc);
+        mismatch_then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    mismatch_then.append_block(mismatch_then_blk);
+    let mismatch_else = Region::new();
+    let mismatch_else_blk = Block::new(&[]);
+    mismatch_else_blk.append_operation(scf::r#yield(&[], loc));
+    mismatch_else.append_block(mismatch_else_blk);
+    block.append_operation(scf::r#if(
+        tag_mismatch,
+        &[],
+        mismatch_then,
+        mismatch_else,
+        loc,
+    ));
+    // Pre-lower args: prepend `t_ptr` as `self`.
+    let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len() + 1);
+    arg_vals.push(t_ptr);
+    for a in args {
+        arg_vals.push(emit_expr(
+            context,
+            block,
+            a,
+            slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
+        )?);
+    }
+    // Dispatch.
+    let results = emit_dispatch_chain_from_slot_ptr(
+        context, block, probe_slot, sig, candidates, &arg_vals, functions, types, loc,
+    );
+    Ok(results[0])
 }
 
 /// ADR 0143 — `Table .. Table` consults the lhs metatable's

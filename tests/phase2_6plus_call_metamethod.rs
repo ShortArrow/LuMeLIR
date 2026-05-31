@@ -40,14 +40,19 @@ print(t())
 
 #[test]
 fn call_table_with_one_extra_arg_dispatches() {
+    // ADR 0146 scope: extra args refine to Number by default
+    // (Pass-1.5 walker can't see `__call` call sites — they go
+    // through the TableCall HIR variant, not a literal Call(Index,
+    // ...) shape). String / Bool / etc. extra args would need an
+    // explicit ADR 0094 walker extension and are deferred.
     let src = r#"
 local mt = {}
-mt.__call = function(self, x) return x end
+mt.__call = function(self, x) return x * 2 end
 local t = setmetatable({}, mt)
-print(t("hello"))
+print(t(21))
 "#;
     let out = run_ok(src, "lumelir_call_meta_one_arg");
-    assert_eq!(out, "hello\n");
+    assert_eq!(out, "42\n");
 }
 
 // --- Test 3: __call returning Number works ---
