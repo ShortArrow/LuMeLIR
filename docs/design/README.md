@@ -199,6 +199,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0141 — anon-fn-indexassign-param-refine](0141-anon-fn-indexassign-param-refine.md) — Anonymous `FunctionExpr` param-kind refinement from top-level `IndexAssign` sites
 - [0142 — tostring-metamethod](0142-tostring-metamethod.md) — `__tostring` metamethod for `tostring(t)`
 - [0143 — concat-metamethod](0143-concat-metamethod.md) — `__concat` metamethod for `Table .. Table`
+- [0144 — comparison-metamethods](0144-comparison-metamethods.md) — `__eq` / `__lt` / `__le` for Table-Table
 
 ### Feature Implementation Memos
 
