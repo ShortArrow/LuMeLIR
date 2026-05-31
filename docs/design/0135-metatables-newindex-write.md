@@ -154,7 +154,7 @@ Commit C3 (helper + extract + wiring): 1276 → 1288 (all green)
 
 ## Future work
 
-- ADR for `rawset(t, k, v)` (next).
+- ADR for `rawset(t, k, v)` (next). **RESOLVED by [ADR 0136](0136-raw-set-get-builtins.md) (2026-05-31)** (bundled with `rawget`, hash key only).
 - ADR for `__newindex = Function` form (after call ABI cleanup).
 - ADR for Number-key (array) `__newindex` (after the "missing key in array part" ABI decision).
 - Promote static unroll to runtime depth counter (Lua spec's 2000 cap) when a real workload needs it.
