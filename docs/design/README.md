@@ -195,6 +195,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0137 — raw-equal-len-builtins](0137-raw-equal-len-builtins.md) — `rawequal` / `rawlen` builtins (Table only)
 - [0138 — setmetatable-nil-clear](0138-setmetatable-nil-clear.md) — `setmetatable(t, nil)` metatable clear
 - [0139 — taggedvalue-key-newindex-wiring](0139-taggedvalue-key-newindex-wiring.md) — TaggedValue-key IndexAssign routes through `__newindex` helper
+- [0140 — metatable-field-hiding](0140-metatable-field-hiding.md) — `__metatable` field hiding (getmetatable + setmetatable protection)
 
 ### Feature Implementation Memos
 

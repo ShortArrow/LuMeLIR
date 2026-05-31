@@ -140,7 +140,7 @@ Commit C6 (__index dispatch impl): all 12 Green → 1276
 - ADR for `__index = Function` form (call-ABI integration).
 - Per-op ADRs for arithmetic / comparison / `__tostring` / `__concat` / `__call` metamethods.
 - `setmetatable(t, nil)` clear semantics. **RESOLVED by [ADR 0138](0138-setmetatable-nil-clear.md) (2026-05-31)**.
-- `__metatable` field hiding.
+- `__metatable` field hiding. **RESOLVED by [ADR 0140](0140-metatable-field-hiding.md) (2026-05-31)**.
 - Shared metatable + GC interaction (ties into the GC strategy ADR per [ADR 0133](0133-phase2-completion-criteria.md)).
 
 ## References
