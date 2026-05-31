@@ -617,6 +617,16 @@ fn emit_fmt_global<'c>(
         "__bnot\0",
         loc,
     );
+    // ADR 0149 — `__len` metamethod field name. No new trap —
+    // missing metafield silently falls back to raw length per spec.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_len_field_name",
+        "__len\0",
+        loc,
+    );
     emit_string_global(
         context,
         module,
@@ -8002,11 +8012,18 @@ fn emit_expr<'a, 'c>(
                     in_function_cell_ptr,
                     loc,
                 )?;
+                // ADR 0149 — Table operand probes `mt.__len` first;
+                // falls back to raw length on miss (Lua spec — no
+                // trap).
+                if matches!(kind, ValueKind::Table) {
+                    return Ok(emit_len_via_metamethod(
+                        context, block, v, functions, types, loc,
+                    ));
+                }
                 let len_i64 = match kind {
                     // ADR 0112: String value is a boxed object ptr;
                     // header `len` field is the truth source.
                     ValueKind::String => emit_string_obj_len(block, v, types, loc),
-                    ValueKind::Table => emit_load(block, v, types.i64, loc),
                     _ => unreachable!("HIR rejects #x for non-String/Table kinds"),
                 };
                 return Ok(emit_i2f(block, len_i64, types, loc));
@@ -14241,6 +14258,173 @@ fn emit_unary_arith_via_metamethod<'a, 'c>(
             emit_exit_with_message(context, &fn_else_blk, msg, types, loc);
             fn_else_blk.append_operation(scf::r#yield(&[zero_f64], loc));
         }
+        fn_else.append_block(fn_else_blk);
+        let inner =
+            null_else_blk.append_operation(scf::r#if(is_fn, &[types.f64], fn_then, fn_else, loc));
+        let inner_result: Value<'c, '_> = inner.result(0).unwrap().into();
+        null_else_blk.append_operation(scf::r#yield(&[inner_result], loc));
+    }
+    null_else.append_block(null_else_blk);
+    let outer = block.append_operation(scf::r#if(
+        mt_is_null,
+        &[types.f64],
+        null_then,
+        null_else,
+        loc,
+    ));
+    outer.result(0).unwrap().into()
+}
+
+/// ADR 0149 — `#t` consults `mt.__len`; falls back to raw length
+/// on every miss (Lua spec §3.4.7 — no trap). Unlike ADRs
+/// 0142 / 0143 / 0144 / 0147 / 0148, the missing-metamethod path
+/// is non-trapping; the raw-length fallback is the existing
+/// `emit_load(t + TABLE_OFF_LEN, i64)` + `emit_i2f`.
+fn emit_len_via_metamethod<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    t_ptr: Value<'c, 'a>,
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    // Compile-time candidate filter: (Table) → Number user fns.
+    let candidates: Vec<FuncId> = functions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            let pks: Vec<ValueKind> = f.params.iter().map(|p| p.kind).collect();
+            if pks == [ValueKind::Table] && f.ret_kinds == [ValueKind::Number] {
+                Some(FuncId(i))
+            } else {
+                None
+            }
+        })
+        .collect();
+    // Raw-length fallback: load i64 from t+0, sitofp to f64.
+    if candidates.is_empty() {
+        let len_i64 = emit_load(block, t_ptr, types.i64, loc);
+        return emit_i2f(block, len_i64, types, loc);
+    }
+    // Load mt_ptr and dispatch on null.
+    let mt_slot = emit_byte_offset_ptr(context, block, t_ptr, TABLE_OFF_METATABLE, types, loc);
+    let mt_ptr = emit_load(block, mt_slot, types.ptr, loc);
+    let mt_iv: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[mt_ptr])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint len mt"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mt_is_null: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            mt_iv,
+            zero_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    // scf.if(mt is null) { raw } else { probe }
+    let null_then = Region::new();
+    let null_then_blk = Block::new(&[]);
+    let raw_len_then_i64 = emit_load(&null_then_blk, t_ptr, types.i64, loc);
+    let raw_len_then = emit_i2f(&null_then_blk, raw_len_then_i64, types, loc);
+    null_then_blk.append_operation(scf::r#yield(&[raw_len_then], loc));
+    null_then.append_block(null_then_blk);
+    let null_else = Region::new();
+    let null_else_blk = Block::new(&[]);
+    {
+        let field_str = emit_addressof(
+            context,
+            &null_else_blk,
+            "s_metatable_len_field_name",
+            types,
+            loc,
+        );
+        let search_slot = emit_build_search_key_slot(
+            context,
+            &null_else_blk,
+            ValueKind::String,
+            field_str,
+            types,
+            loc,
+        );
+        let probe_slot =
+            emit_alloca_slot_for_kind(context, &null_else_blk, ValueKind::TaggedValue, types, loc);
+        emit_value_slot_store_nil(context, &null_else_blk, probe_slot, types, loc);
+        emit_hash_lookup_into_tagged_slot(
+            context,
+            &null_else_blk,
+            mt_ptr,
+            search_slot,
+            probe_slot,
+            HashLookupOutcome::NilOnMissing,
+            types,
+            loc,
+        );
+        let probe_tag = emit_load(&null_else_blk, probe_slot, types.i64, loc);
+        let tag_fn_const = null_else_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_fn: Value<'c, '_> = null_else_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                probe_tag,
+                tag_fn_const,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let fn_then = Region::new();
+        let fn_then_blk = Block::new(&[]);
+        {
+            let sig = IndirectSig {
+                param_kinds: vec![ValueKind::Table],
+                ret_kinds: vec![ValueKind::Number],
+            };
+            let results = emit_dispatch_chain_from_slot_ptr(
+                context,
+                &fn_then_blk,
+                probe_slot,
+                &sig,
+                &candidates,
+                &[t_ptr],
+                functions,
+                types,
+                loc,
+            );
+            fn_then_blk.append_operation(scf::r#yield(&[results[0]], loc));
+        }
+        fn_then.append_block(fn_then_blk);
+        let fn_else = Region::new();
+        let fn_else_blk = Block::new(&[]);
+        let raw_else_i64 = emit_load(&fn_else_blk, t_ptr, types.i64, loc);
+        let raw_else = emit_i2f(&fn_else_blk, raw_else_i64, types, loc);
+        fn_else_blk.append_operation(scf::r#yield(&[raw_else], loc));
         fn_else.append_block(fn_else_blk);
         let inner =
             null_else_blk.append_operation(scf::r#if(is_fn, &[types.f64], fn_then, fn_else, loc));
