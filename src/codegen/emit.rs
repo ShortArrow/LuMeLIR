@@ -415,6 +415,23 @@ fn emit_fmt_global<'c>(
         "attempt to assign through non-table '__newindex' metafield\0",
         loc,
     );
+    // ADR 0140 — `__metatable` field hiding (Lua §6.1).
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_field_name",
+        "__metatable\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_setmetatable_protected",
+        "cannot change a protected metatable\0",
+        loc,
+    );
     // Phase 2.5x-callee-dispatch (ADR 0082): runtime traps for the
     // indirect-dispatch chain. `s_call_non_function` fires when the
     // tagged-slot's tag is not TAG_FUNCTION (e.g. `local g = "s";
@@ -12611,10 +12628,42 @@ fn emit_hash_indexassign_with_newindex<'a, 'c>(
     block.append_operation(scf::r#if(not_handled, &[], raw_then, raw_else, loc));
 }
 
+/// ADR 0140 — probe `mt["__metatable"]` into a fresh TaggedValue
+/// tmp slot. Returns the slot ptr (Nil-tagged when the field is
+/// absent). Caller dispatches on the loaded tag.
+fn emit_probe_metatable_field<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    mt_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let field_str = emit_addressof(context, block, "s_metatable_field_name", types, loc);
+    let search_slot =
+        emit_build_search_key_slot(context, block, ValueKind::String, field_str, types, loc);
+    let out = emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
+    emit_value_slot_store_nil(context, block, out, types, loc);
+    emit_hash_lookup_into_tagged_slot(
+        context,
+        block,
+        mt_ptr,
+        search_slot,
+        out,
+        HashLookupOutcome::NilOnMissing,
+        types,
+        loc,
+    );
+    out
+}
+
 /// Phase 2.6+-metatables-index-read (ADR 0134): `setmetatable(t, mt)`
 /// stores `mt` at the table header's `metatable_ptr` slot (offset 32)
-/// and returns `t` unchanged per Lua §6.1. Both `t` and `mt` are
-/// HIR-checked to be `ValueKind::Table` before reaching codegen.
+/// and returns `t` unchanged per Lua §6.1.
+///
+/// ADR 0140 — if `t` already has a metatable and that metatable
+/// carries a non-nil `__metatable` field, trap with
+/// `s_setmetatable_protected` instead of storing. The Nil-clear form
+/// (ADR 0138) is subject to the same protection.
 fn emit_setmetatable_runtime<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
@@ -12625,6 +12674,94 @@ fn emit_setmetatable_runtime<'a, 'c>(
 ) -> Value<'c, 'a> {
     let metatable_slot =
         emit_byte_offset_ptr(context, block, t_ptr, TABLE_OFF_METATABLE, types, loc);
+    let cur_mt = emit_load(block, metatable_slot, types.ptr, loc);
+    let cur_mt_iv: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[cur_mt])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint cur_mt"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let cur_mt_present: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Ne,
+            cur_mt_iv,
+            zero_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        let probe_slot = emit_probe_metatable_field(context, &then_blk, cur_mt, types, loc);
+        let probe_tag = emit_load(&then_blk, probe_slot, types.i64, loc);
+        let tag_nil = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_protected: Value<'c, '_> = then_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Ne,
+                probe_tag,
+                tag_nil,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let trap_then = Region::new();
+        let trap_then_blk = Block::new(&[]);
+        let msg = emit_addressof(
+            context,
+            &trap_then_blk,
+            "s_setmetatable_protected",
+            types,
+            loc,
+        );
+        emit_exit_with_message(context, &trap_then_blk, msg, types, loc);
+        trap_then_blk.append_operation(scf::r#yield(&[], loc));
+        trap_then.append_block(trap_then_blk);
+        let trap_else = Region::new();
+        let trap_else_blk = Block::new(&[]);
+        trap_else_blk.append_operation(scf::r#yield(&[], loc));
+        trap_else.append_block(trap_else_blk);
+        then_blk.append_operation(scf::r#if(is_protected, &[], trap_then, trap_else, loc));
+        then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(
+        cur_mt_present,
+        &[],
+        then_region,
+        else_region,
+        loc,
+    ));
     emit_store(block, mt_ptr, metatable_slot, loc);
     t_ptr
 }
@@ -12682,8 +12819,59 @@ fn emit_getmetatable_runtime<'a, 'c>(
     then_region.append_block(then_blk);
     let else_region = Region::new();
     let else_blk = Block::new(&[]);
-    emit_value_slot_store_table(context, &else_blk, out_slot, mt_ptr, types, loc);
-    else_blk.append_operation(scf::r#yield(&[], loc));
+    {
+        // ADR 0140 — probe `mt["__metatable"]`. Non-Nil → raw 16-byte
+        // copy into out_slot (the protection field shadows the actual
+        // metatable). Nil → fall through to the existing Table-tagged
+        // metatable write.
+        let probe_slot = emit_probe_metatable_field(context, &else_blk, mt_ptr, types, loc);
+        let probe_tag = emit_load(&else_blk, probe_slot, types.i64, loc);
+        let tag_nil_e = else_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let probe_is_nil: Value<'c, '_> = else_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                probe_tag,
+                tag_nil_e,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let probe_nil_then = Region::new();
+        let probe_nil_then_blk = Block::new(&[]);
+        emit_value_slot_store_table(context, &probe_nil_then_blk, out_slot, mt_ptr, types, loc);
+        probe_nil_then_blk.append_operation(scf::r#yield(&[], loc));
+        probe_nil_then.append_block(probe_nil_then_blk);
+        let probe_nil_else = Region::new();
+        let probe_nil_else_blk = Block::new(&[]);
+        emit_copy_tagged_slot_16b(
+            context,
+            &probe_nil_else_blk,
+            probe_slot,
+            out_slot,
+            types,
+            loc,
+        );
+        probe_nil_else_blk.append_operation(scf::r#yield(&[], loc));
+        probe_nil_else.append_block(probe_nil_else_blk);
+        else_blk.append_operation(scf::r#if(
+            probe_is_nil,
+            &[],
+            probe_nil_then,
+            probe_nil_else,
+            loc,
+        ));
+        else_blk.append_operation(scf::r#yield(&[], loc));
+    }
     else_region.append_block(else_blk);
     block.append_operation(scf::r#if(is_null, &[], then_region, else_region, loc));
 }
