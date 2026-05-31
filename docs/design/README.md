@@ -194,6 +194,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0136 — raw-set-get-builtins](0136-raw-set-get-builtins.md) — `rawset` / `rawget` builtins (hash key only)
 - [0137 — raw-equal-len-builtins](0137-raw-equal-len-builtins.md) — `rawequal` / `rawlen` builtins (Table only)
 - [0138 — setmetatable-nil-clear](0138-setmetatable-nil-clear.md) — `setmetatable(t, nil)` metatable clear
+- [0139 — taggedvalue-key-newindex-wiring](0139-taggedvalue-key-newindex-wiring.md) — TaggedValue-key IndexAssign routes through `__newindex` helper
 
 ### Feature Implementation Memos
 
