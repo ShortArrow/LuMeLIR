@@ -272,6 +272,11 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // value position takes the TaggedValue (TableRemove
             // precedent).
             Callee::Builtin(Builtin::IoRead) => ValueKind::TaggedValue,
+            // ADR 0134 — setmetatable returns t (always a Table per
+            // the HIR kind check). getmetatable returns Table-or-nil
+            // → TaggedValue (TableRemove / IoRead precedent).
+            Callee::Builtin(Builtin::SetMetatable) => ValueKind::Table,
+            Callee::Builtin(Builtin::GetMetatable) => ValueKind::TaggedValue,
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.
@@ -4616,6 +4621,21 @@ impl LowerCtx {
                         offset: arg.span.start,
                     });
                 }
+            }
+            // ADR 0134 — metatables global builtins.
+            //   setmetatable(t, mt): both args must be Table. The
+            //     nil-clear form (`setmetatable(t, nil)`) is out of
+            //     scope per ADR 0134 Non-goals.
+            //   getmetatable(t): single Table arg.
+            if matches!(builtin, Builtin::SetMetatable | Builtin::GetMetatable)
+                && k != ValueKind::Table
+            {
+                return Err(HirError::TypeMismatch {
+                    op: builtin.name().to_owned(),
+                    lhs_kind: "table".to_owned(),
+                    rhs_kind: k.name().to_owned(),
+                    offset: arg.span.start,
+                });
             }
         }
         Ok(HirExprKind::Call {

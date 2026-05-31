@@ -50,7 +50,7 @@ use super::tagged::{
     emit_alloca_slot_for_kind, emit_print_tagged_local, emit_tag_and_payload_ptr,
     emit_tagged_eq_local_local, emit_tagged_unknown_tag_trap, emit_type_tagged_local,
     emit_value_slot_check_number, emit_value_slot_store_dispatched, emit_value_slot_store_nil,
-    policy_for_tag, policy_for_tagged_arith_operand,
+    emit_value_slot_store_table, policy_for_tag, policy_for_tagged_arith_operand,
 };
 
 // =============================================================
@@ -8065,6 +8065,31 @@ fn emit_expr<'a, 'c>(
                     )?;
                     return Ok(emit_type_tagged_local(context, block, tmp, types, loc));
                 }
+                // ADR 0134: inline `type(builtin())` where the builtin
+                // returns TaggedValue (GetMetatable / TableRemove /
+                // IoRead). The builtin emit arm already returns the
+                // tmp tagged-slot pointer, so we route it straight
+                // into the tagged dispatch.
+                if let HirExprKind::Call {
+                    callee: Callee::Builtin(b),
+                    ..
+                } = &args[0].kind
+                    && matches!(b.ret_kinds().first(), Some(ValueKind::TaggedValue))
+                {
+                    let tmp = emit_expr(
+                        context,
+                        block,
+                        &args[0],
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
+                    )?;
+                    return Ok(emit_type_tagged_local(context, block, tmp, types, loc));
+                }
                 if !matches!(
                     args[0].kind,
                     HirExprKind::FunctionRef(_) | HirExprKind::Local(_)
@@ -9039,6 +9064,60 @@ fn emit_expr<'a, 'c>(
                 in_function_cell_ptr,
                 loc,
             ),
+            Callee::Builtin(Builtin::SetMetatable) => {
+                // ADR 0134: setmetatable(t, mt) stores mt at t+32
+                // and returns t (Lua §6.1). Both args are HIR-checked
+                // to be Table kind.
+                let t_ptr = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let mt_ptr = emit_expr(
+                    context,
+                    block,
+                    &args[1],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                Ok(emit_setmetatable_runtime(
+                    context, block, t_ptr, mt_ptr, types, loc,
+                ))
+            }
+            Callee::Builtin(Builtin::GetMetatable) => {
+                // ADR 0134: getmetatable(t) loads metatable_ptr at
+                // t+32 and returns it as a TaggedValue via a tmp
+                // 16-byte slot (Nil-tagged when null, Table-tagged
+                // otherwise). TableRemove / IoRead precedent.
+                let t_ptr = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let out_slot =
+                    emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
+                emit_getmetatable_runtime(context, block, t_ptr, out_slot, types, loc);
+                Ok(out_slot)
+            }
         },
         HirExprKind::FunctionRef(FuncId(id)) => {
             // Phase 2.5b.3 / 2.5c-full Commit 2b (ADR 0083): a
@@ -11351,6 +11430,83 @@ fn emit_io_read_runtime<'a, 'c>(
     }
     line_region.append_block(line_blk);
     block.append_operation(scf::r#if(is_eof, &[], eof_region, line_region, loc));
+}
+
+/// Phase 2.6+-metatables-index-read (ADR 0134): `setmetatable(t, mt)`
+/// stores `mt` at the table header's `metatable_ptr` slot (offset 32)
+/// and returns `t` unchanged per Lua §6.1. Both `t` and `mt` are
+/// HIR-checked to be `ValueKind::Table` before reaching codegen.
+fn emit_setmetatable_runtime<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    t_ptr: Value<'c, 'a>,
+    mt_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let metatable_slot =
+        emit_byte_offset_ptr(context, block, t_ptr, TABLE_OFF_METATABLE, types, loc);
+    emit_store(block, mt_ptr, metatable_slot, loc);
+    t_ptr
+}
+
+/// Phase 2.6+-metatables-index-read (ADR 0134): `getmetatable(t)`
+/// loads `metatable_ptr` and writes a TaggedValue into `out_slot`.
+/// Null → Nil-tagged; non-null → Table-tagged. Consumer reads the
+/// tag from `out_slot` per the standard TaggedValue contract.
+fn emit_getmetatable_runtime<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    t_ptr: Value<'c, 'a>,
+    out_slot: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let metatable_slot =
+        emit_byte_offset_ptr(context, block, t_ptr, TABLE_OFF_METATABLE, types, loc);
+    let mt_ptr = emit_load(block, metatable_slot, types.ptr, loc);
+    let mt_iv: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[mt_ptr])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint metatable_ptr"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let is_null: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            mt_iv,
+            zero_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    emit_value_slot_store_nil(context, &then_blk, out_slot, types, loc);
+    then_blk.append_operation(scf::r#yield(&[], loc));
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    emit_value_slot_store_table(context, &else_blk, out_slot, mt_ptr, types, loc);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(is_null, &[], then_region, else_region, loc));
 }
 
 /// Phase 2.7r-stdlib-table (ADR 0106): pass-1 element dispatch

@@ -374,6 +374,21 @@ pub enum Builtin {
     /// `MultiAssignFromCall` is the only HIR shape that observes
     /// both result positions. Phase 2.8e-iter-next (ADR 0081).
     Next,
+    /// `setmetatable(t, mt)` — Lua 5.4 §6.1 metatable installation.
+    /// Stores `mt` at the table header's `metatable_ptr` slot
+    /// (offset 32, introduced by ADR 0134's header growth). Returns
+    /// `t` unchanged per Lua spec.
+    ///
+    /// Phase 2.6+-metatables-index-read (ADR 0134). The `nil` clear
+    /// form (`setmetatable(t, nil)`) is out of scope — HIR enforces
+    /// `[Table, Table]` and rejects nil at the second position.
+    SetMetatable,
+    /// `getmetatable(t)` — Lua 5.4 §6.1 metatable retrieval. Loads
+    /// `metatable_ptr` from `t`'s header and returns it as a
+    /// TaggedValue (Table when set, Nil when unset). The Lua spec
+    /// `__metatable` field hiding is out of scope. Phase
+    /// 2.6+-metatables-index-read (ADR 0134).
+    GetMetatable,
     /// `math.sqrt(x)` — square root via libm `sqrt`. Phase
     /// 2.7q-stdlib-math (ADR 0101). Dispatched at `lower_call` entry
     /// when the call shape is `Index{Ident("math"), Str("sqrt")}` AND
@@ -518,6 +533,9 @@ impl Builtin {
             "assert" => Some(Builtin::Assert),
             "error" => Some(Builtin::Error),
             "next" => Some(Builtin::Next),
+            // ADR 0134 — metatables global builtins.
+            "setmetatable" => Some(Builtin::SetMetatable),
+            "getmetatable" => Some(Builtin::GetMetatable),
             _ => None,
         }
     }
@@ -628,6 +646,9 @@ impl Builtin {
             Builtin::Assert => (1, 2),
             Builtin::Error => (1, 1),
             Builtin::Next => (2, 2),
+            // ADR 0134 — metatables global builtins.
+            Builtin::SetMetatable => (2, 2),
+            Builtin::GetMetatable => (1, 1),
             Builtin::MathSqrt | Builtin::MathFloor | Builtin::MathAbs => (1, 1),
             Builtin::MathPow => (2, 2),
             Builtin::MathSin | Builtin::MathCos | Builtin::MathLog | Builtin::MathExp => (1, 1),
@@ -671,6 +692,8 @@ impl Builtin {
             Builtin::Assert => "assert",
             Builtin::Error => "error",
             Builtin::Next => "next",
+            Builtin::SetMetatable => "setmetatable",
+            Builtin::GetMetatable => "getmetatable",
             Builtin::MathSqrt => "math.sqrt",
             Builtin::MathFloor => "math.floor",
             Builtin::MathAbs => "math.abs",
@@ -710,6 +733,10 @@ impl Builtin {
             Builtin::Assert => &[ValueKind::Bool],
             Builtin::Error => &[ValueKind::Number],
             Builtin::Next => &[ValueKind::TaggedValue, ValueKind::TaggedValue],
+            // ADR 0134 — setmetatable returns t (Table); getmetatable
+            // returns the metatable (Table) or nil → TaggedValue.
+            Builtin::SetMetatable => &[ValueKind::Table],
+            Builtin::GetMetatable => &[ValueKind::TaggedValue],
             Builtin::MathSqrt
             | Builtin::MathFloor
             | Builtin::MathAbs
@@ -773,7 +800,11 @@ impl Builtin {
             | Builtin::Type
             | Builtin::Assert
             | Builtin::Error
-            | Builtin::Next => &[],
+            | Builtin::Next
+            // ADR 0134 — global builtins; per-arg kind checks live
+            // in `lower_builtin_call` alongside Assert / Next.
+            | Builtin::SetMetatable
+            | Builtin::GetMetatable => &[],
             // math.* — all single-Number arg except pow (Number, Number).
             Builtin::MathSqrt
             | Builtin::MathFloor
