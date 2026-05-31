@@ -255,6 +255,7 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             | Callee::Builtin(Builtin::StringSub)
             | Callee::Builtin(Builtin::StringRep)
             | Callee::Builtin(Builtin::StringChar)
+            | Callee::Builtin(Builtin::StringFormat)
             | Callee::Builtin(Builtin::TableConcat) => ValueKind::String,
             // ADR 0111 — table.insert is void; expression-position
             // use synthesises a Number placeholder (same shape as
@@ -501,6 +502,56 @@ fn ast_max_return_arity(stmts: &[Stmt]) -> usize {
 /// `nil`, number literals, and unary-minus over them) are recognised
 /// — anything else falls back to `Number`, matching the historical
 /// default.
+/// ADR 0152 — single specifier from a `string.format` format
+/// string. `%%` is consumed during parsing and doesn't appear here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormatSpec {
+    /// `%d` — Number argument, printed via printf `%lld` after
+    /// `f2i` conversion (Lua semantics).
+    Decimal,
+    /// `%f` — Number argument, printed via printf `%g` (default
+    /// Lua representation).
+    Float,
+    /// `%s` — String argument; codegen passes the boxed-object data
+    /// ptr to printf `%s`.
+    Str,
+}
+
+/// ADR 0152 — minimum-scope `string.format` specifier parser.
+/// Accepts `%d`, `%f`, `%s`, and `%%`; rejects everything else
+/// (including width / precision / flag suffixes) with a static
+/// HIR-time error message.
+pub fn parse_format_specifiers(fmt: &str) -> Result<Vec<FormatSpec>, String> {
+    let mut out = Vec::new();
+    let bytes = fmt.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        if i + 1 >= bytes.len() {
+            return Err("dangling '%' at end of format string".to_owned());
+        }
+        match bytes[i + 1] {
+            b'd' => out.push(FormatSpec::Decimal),
+            b'f' => out.push(FormatSpec::Float),
+            b's' => out.push(FormatSpec::Str),
+            b'%' => {
+                // Literal `%`; consumes no arg.
+            }
+            other => {
+                return Err(format!(
+                    "unsupported format spec '%{}' (ADR 0152 scope: %d / %f / %s / %%)",
+                    char::from(other)
+                ));
+            }
+        }
+        i += 2;
+    }
+    Ok(out)
+}
+
 fn ast_arg_kind(expr: &Expr) -> ValueKind {
     match &expr.kind {
         ExprKind::Bool(_) => ValueKind::Bool,
@@ -5155,6 +5206,67 @@ impl LowerCtx {
                             offset: call_span.start,
                         });
                     }
+                }
+            }
+        }
+        // ADR 0152 — `string.format(fmt_lit, ...)` minimum-scope.
+        // Format string must be a static `Str` literal; specifiers
+        // are parsed and each non-fmt arg's static kind is
+        // validated against its slot.
+        if matches!(builtin, Builtin::StringFormat) {
+            let fmt = match &lowered_args[0].kind {
+                HirExprKind::Str(s) => s.clone(),
+                _ => {
+                    return Err(HirError::BuiltinArgKindMismatch {
+                        builtin: "string.format".to_owned(),
+                        arg_index: 1,
+                        expected: "static string literal".to_owned(),
+                        actual: "non-literal expression".to_owned(),
+                        offset: call_span.start,
+                    });
+                }
+            };
+            let specs =
+                parse_format_specifiers(&fmt).map_err(|msg| HirError::BuiltinArgKindMismatch {
+                    builtin: "string.format".to_owned(),
+                    arg_index: 1,
+                    expected: msg,
+                    actual: format!("\"{}\"", fmt.escape_default()),
+                    offset: call_span.start,
+                })?;
+            let arg_count = lowered_args.len() - 1;
+            if specs.len() != arg_count {
+                return Err(HirError::ArityMismatch {
+                    builtin: "string.format".to_owned(),
+                    expected: 1 + specs.len(),
+                    actual: lowered_args.len(),
+                    offset: call_span.start,
+                });
+            }
+            for (i, spec) in specs.iter().enumerate() {
+                let arg = &lowered_args[i + 1];
+                let actual = infer_kind(arg, &self.locals, &self.functions);
+                if matches!(actual, ValueKind::TaggedValue) {
+                    return Err(HirError::BuiltinArgKindMismatch {
+                        builtin: "string.format".to_owned(),
+                        arg_index: i + 2,
+                        expected: "static-kind value (ADR 0152 scope)".to_owned(),
+                        actual: "tagged value".to_owned(),
+                        offset: call_span.start,
+                    });
+                }
+                let expected_kind = match spec {
+                    FormatSpec::Decimal | FormatSpec::Float => ValueKind::Number,
+                    FormatSpec::Str => ValueKind::String,
+                };
+                if actual != expected_kind {
+                    return Err(HirError::BuiltinArgKindMismatch {
+                        builtin: "string.format".to_owned(),
+                        arg_index: i + 2,
+                        expected: expected_kind.name().to_owned(),
+                        actual: actual.name().to_owned(),
+                        offset: call_span.start,
+                    });
                 }
             }
         }

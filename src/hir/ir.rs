@@ -510,6 +510,16 @@ pub enum Builtin {
     /// SECOND (libm floor on finite x), f2i LAST (validated x).
     /// Phase 2.7v-stdlib-string-char (ADR 0113).
     StringChar,
+    /// `string.format(fmt, ...)` — Lua 5.4 §6.4 printf-style
+    /// formatter. ADR 0152 minimum-scope: format MUST be a static
+    /// `Str` literal at the call site; supported specifiers are
+    /// `%d` (Number → integer), `%f` (Number → float `%g`-style),
+    /// `%s` (String → boxed-object data ptr), and `%%` (literal
+    /// `%`). Width / precision / flag suffixes and other specifiers
+    /// (`%e` / `%g` / `%i` / `%u` / `%x` / `%X` / `%o` / `%q` /
+    /// `%c`) reject as `TypeMismatch` ("unsupported format spec").
+    /// 16-arg cap. Phase 2.7q-stdlib-string-format (ADR 0152).
+    StringFormat,
     /// `table.insert(list, [pos,] value)` — Lua 5.4 §6.8 array
     /// mutation. arity 2 (append) or 3 (positional insert with
     /// shift). The first **arity-sensitive** namespace builtin —
@@ -628,6 +638,7 @@ impl Builtin {
             "byte" => Some(Builtin::StringByte),
             // ADR 0113 — string.char (variadic byte-producer).
             "char" => Some(Builtin::StringChar),
+            "format" => Some(Builtin::StringFormat),
             _ => None,
         }
     }
@@ -719,6 +730,10 @@ impl Builtin {
             // ADR 0113 — string.char(...) variadic byte-producer.
             // Print precedent for variadic (0, usize::MAX).
             Builtin::StringChar => (0, usize::MAX),
+            // ADR 0152 — string.format(fmt, ...) variadic. Format
+            // arg is required (arity ≥ 1); 16-arg cap is enforced
+            // at lower time rather than via arity bounds.
+            Builtin::StringFormat => (1, 17),
             // ADR 0106/0107/0108 — table.concat(t [, sep [, i [, j]]]).
             // Lua 5.4 §6.8 full signature: arity 1 (default sep="",
             // i=1, j=#t), 2 (explicit sep), 3 (explicit i, default
@@ -769,6 +784,7 @@ impl Builtin {
             Builtin::StringRep => "string.rep",
             Builtin::StringByte => "string.byte",
             Builtin::StringChar => "string.char",
+            Builtin::StringFormat => "string.format",
             Builtin::TableConcat => "table.concat",
             Builtin::TableInsert => "table.insert",
             Builtin::TableRemove => "table.remove",
@@ -819,6 +835,7 @@ impl Builtin {
             | Builtin::StringSub
             | Builtin::StringRep
             | Builtin::StringChar
+            | Builtin::StringFormat
             | Builtin::TableConcat => &[ValueKind::String],
             // ADR 0111 — table.insert is void (Lua spec).
             Builtin::TableInsert => &[],
@@ -936,6 +953,13 @@ impl Builtin {
             // repetition. `expected_param_kind` handles this
             // builtin directly and bypasses the slice.
             Builtin::StringChar => &[],
+            // ADR 0152 — string.format is variadic with per-arg
+            // expected kind driven by the format specifier; HIR
+            // lower drives validation directly. The slice stays
+            // empty so the generic check is bypassed (Print
+            // precedent — the per-arg check lives in
+            // `lower_namespace_builtin_call`).
+            Builtin::StringFormat => &[],
             // ADR 0116 — io.write is variadic Number-or-String;
             // standard slice check uses TaggedValue sentinel
             // (any-accepted), followed by a IoWrite-specific
@@ -958,6 +982,10 @@ impl Builtin {
         match self {
             // Every position is Number, regardless of argc.
             Builtin::StringChar => Some(ValueKind::Number),
+            // ADR 0152 — per-arg kind is specifier-driven; HIR
+            // lower validates directly. Use the TaggedValue
+            // sentinel here to skip the standard kind check.
+            Builtin::StringFormat => Some(ValueKind::TaggedValue),
             // ADR 0116 — io.write accepts Number or String per
             // position. Use the TaggedValue sentinel to skip the
             // standard single-kind check; lower_namespace_builtin_call

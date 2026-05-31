@@ -9082,6 +9082,207 @@ fn emit_expr<'a, 'c>(
                     context, block, src, n_f64, types, loc,
                 ))
             }
+            Callee::Builtin(Builtin::StringFormat) => {
+                // ADR 0152 — `string.format(fmt_lit, ...)` minimum
+                // scope. HIR has validated specifiers + arg kinds;
+                // codegen transforms `%d` → `%lld` (since we pass
+                // i64 from f2i) and otherwise passes the format
+                // through. The transformed C-string lives in a
+                // stack alloca buffer.
+                let fmt_str = match &args[0].kind {
+                    HirExprKind::Str(s) => s.clone(),
+                    _ => unreachable!(
+                        "ADR 0152: string.format format arg must be Str literal (HIR-rejected)"
+                    ),
+                };
+                let mut c_fmt: Vec<u8> = Vec::with_capacity(fmt_str.len() + 16);
+                let bytes = fmt_str.as_bytes();
+                let mut i = 0;
+                while i < bytes.len() {
+                    if bytes[i] == b'%' && i + 1 < bytes.len() {
+                        match bytes[i + 1] {
+                            b'd' => {
+                                c_fmt.extend_from_slice(b"%lld");
+                            }
+                            other => {
+                                c_fmt.push(b'%');
+                                c_fmt.push(other);
+                            }
+                        }
+                        i += 2;
+                    } else {
+                        c_fmt.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+                c_fmt.push(0); // NUL terminator
+                // Alloca buf for the transformed format C-string.
+                let fmt_len_const = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, i64::try_from(c_fmt.len()).unwrap())
+                            .into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let i8_ty = IntegerType::new(context, 8).into();
+                let fmt_buf: Value<'c, '_> = block
+                    .append_operation(
+                        OperationBuilder::new("llvm.alloca", loc)
+                            .add_operands(&[fmt_len_const])
+                            .add_attributes(&[(
+                                Identifier::new(context, "elem_type"),
+                                TypeAttribute::new(i8_ty).into(),
+                            )])
+                            .add_results(&[types.ptr])
+                            .build()
+                            .expect("llvm.alloca fmt_buf"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                for (idx, byte) in c_fmt.iter().enumerate() {
+                    let dst = emit_byte_offset_ptr(
+                        context,
+                        block,
+                        fmt_buf,
+                        i64::try_from(idx).unwrap(),
+                        types,
+                        loc,
+                    );
+                    let b = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(i8_ty, i64::from(*byte)).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    emit_store(block, b, dst, loc);
+                }
+                // Build snprintf args: scratch buf (256 bytes), buf
+                // size, fmt_buf, per-arg lowered values transformed
+                // per specifier.
+                let scratch_size = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 256).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let scratch =
+                    emit_libc_call_ptr(context, block, "malloc", &[scratch_size], types, loc);
+                // Re-parse specifiers locally to know how to lower
+                // each arg.
+                let mut call_args: Vec<Value<'c, '_>> = Vec::new();
+                call_args.push(scratch);
+                call_args.push(scratch_size);
+                call_args.push(fmt_buf);
+                let mut spec_idx = 0;
+                let mut j = 0;
+                while j < bytes.len() {
+                    if bytes[j] == b'%' && j + 1 < bytes.len() {
+                        match bytes[j + 1] {
+                            b'd' => {
+                                let f = emit_expr(
+                                    context,
+                                    block,
+                                    &args[1 + spec_idx],
+                                    slots,
+                                    locals,
+                                    functions,
+                                    types,
+                                    params_len,
+                                    in_function_cell_ptr,
+                                    loc,
+                                )?;
+                                let as_i64 = emit_f2i(block, f, types, loc);
+                                call_args.push(as_i64);
+                                spec_idx += 1;
+                            }
+                            b'f' => {
+                                let f = emit_expr(
+                                    context,
+                                    block,
+                                    &args[1 + spec_idx],
+                                    slots,
+                                    locals,
+                                    functions,
+                                    types,
+                                    params_len,
+                                    in_function_cell_ptr,
+                                    loc,
+                                )?;
+                                call_args.push(f);
+                                spec_idx += 1;
+                            }
+                            b's' => {
+                                let str_ptr = emit_expr(
+                                    context,
+                                    block,
+                                    &args[1 + spec_idx],
+                                    slots,
+                                    locals,
+                                    functions,
+                                    types,
+                                    params_len,
+                                    in_function_cell_ptr,
+                                    loc,
+                                )?;
+                                let data_ptr =
+                                    emit_string_obj_data(context, block, str_ptr, types, loc);
+                                call_args.push(data_ptr);
+                                spec_idx += 1;
+                            }
+                            b'%' => {
+                                // Literal %, no arg.
+                            }
+                            _ => unreachable!("ADR 0152 HIR rejects unsupported specs"),
+                        }
+                        j += 2;
+                    } else {
+                        j += 1;
+                    }
+                }
+                // snprintf variadic call.
+                let snprintf_callee_ty =
+                    llvm::r#type::function(types.i32, &[types.ptr, types.i64, types.ptr], true);
+                let n = i32::try_from(call_args.len()).unwrap();
+                let snprintf_op = OperationBuilder::new("llvm.call", loc)
+                    .add_operands(&call_args)
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "callee"),
+                            FlatSymbolRefAttribute::new(context, "snprintf").into(),
+                        ),
+                        (
+                            Identifier::new(context, "var_callee_type"),
+                            TypeAttribute::new(snprintf_callee_ty).into(),
+                        ),
+                        (
+                            Identifier::new(context, "operandSegmentSizes"),
+                            DenseI32ArrayAttribute::new(context, &[n, 0]).into(),
+                        ),
+                        (
+                            Identifier::new(context, "op_bundle_sizes"),
+                            DenseI32ArrayAttribute::new(context, &[]).into(),
+                        ),
+                    ])
+                    .add_results(&[types.i32])
+                    .build()
+                    .expect("llvm.call @snprintf");
+                block.append_operation(snprintf_op);
+                let actual_len =
+                    emit_libc_call_i64(context, block, "strlen", &[scratch], types, loc);
+                Ok(emit_string_obj_from_bytes(
+                    context, block, scratch, actual_len, types, loc,
+                ))
+            }
             Callee::Builtin(Builtin::StringChar) => {
                 // Phase 2.7v-stdlib-string-char (ADR 0113):
                 // variadic byte-producer. Lowers each arg as f64,
