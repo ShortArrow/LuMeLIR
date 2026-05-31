@@ -277,6 +277,10 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // → TaggedValue (TableRemove / IoRead precedent).
             Callee::Builtin(Builtin::SetMetatable) => ValueKind::Table,
             Callee::Builtin(Builtin::GetMetatable) => ValueKind::TaggedValue,
+            // ADR 0136 — rawset returns t (Table); rawget returns
+            // TaggedValue (value-or-nil).
+            Callee::Builtin(Builtin::RawSet) => ValueKind::Table,
+            Callee::Builtin(Builtin::RawGet) => ValueKind::TaggedValue,
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.
@@ -4636,6 +4640,52 @@ impl LowerCtx {
                     rhs_kind: k.name().to_owned(),
                     offset: arg.span.start,
                 });
+            }
+            // ADR 0136 — raw set / get hash-key escape hatches.
+            //   rawset(t, k, v): arg 0 = Table; arg 1 = hash-eligible
+            //     key (String / Bool / Function / Table — Number
+            //     deferred with the array-OOB-widening ADR);
+            //     arg 2 = non-Nil value (Nil clear uses
+            //     `t[k] = nil` per ADR 0062).
+            //   rawget(t, k): arg 0 = Table; arg 1 = hash-eligible key.
+            if matches!(builtin, Builtin::RawSet | Builtin::RawGet) {
+                let arg_idx = lowered_args
+                    .iter()
+                    .position(|a| std::ptr::eq(a as *const _, arg as *const _))
+                    .unwrap_or(0);
+                if arg_idx == 0 && k != ValueKind::Table {
+                    return Err(HirError::TypeMismatch {
+                        op: builtin.name().to_owned(),
+                        lhs_kind: "table".to_owned(),
+                        rhs_kind: k.name().to_owned(),
+                        offset: arg.span.start,
+                    });
+                }
+                if arg_idx == 1
+                    && !matches!(
+                        k,
+                        ValueKind::String
+                            | ValueKind::Bool
+                            | ValueKind::Function(_)
+                            | ValueKind::Table
+                    )
+                {
+                    return Err(HirError::TypeMismatch {
+                        op: builtin.name().to_owned(),
+                        lhs_kind: "hash-eligible key (string, bool, function, or table)".to_owned(),
+                        rhs_kind: k.name().to_owned(),
+                        offset: arg.span.start,
+                    });
+                }
+                if matches!(builtin, Builtin::RawSet) && arg_idx == 2 && matches!(k, ValueKind::Nil)
+                {
+                    return Err(HirError::TypeMismatch {
+                        op: "rawset".to_owned(),
+                        lhs_kind: "non-nil value".to_owned(),
+                        rhs_kind: k.name().to_owned(),
+                        offset: arg.span.start,
+                    });
+                }
             }
         }
         Ok(HirExprKind::Call {

@@ -389,6 +389,23 @@ pub enum Builtin {
     /// `__metatable` field hiding is out of scope. Phase
     /// 2.6+-metatables-index-read (ADR 0134).
     GetMetatable,
+    /// `rawset(t, k, v)` — Lua 5.4 §6.1 escape hatch from the
+    /// `__newindex` metamethod chain. Writes `v` directly into `t`'s
+    /// hash storage regardless of any metatable. Hash-key only —
+    /// Number-key forms HIR-rejected per ADR 0136 (deferred with the
+    /// array-OOB-widening ADR); Nil value HIR-rejected because
+    /// `t[k] = nil` already bypasses `__newindex` via the ADR 0062
+    /// tombstone path. Returns `t` per Lua spec.
+    ///
+    /// Phase 2.6+-raw-set-get-builtins (ADR 0136).
+    RawSet,
+    /// `rawget(t, k)` — Lua 5.4 §6.1 escape hatch from the `__index`
+    /// metamethod chain. Reads `t`'s hash storage directly; returns
+    /// the value at `t[k]` as TaggedValue, or Nil when the key is
+    /// absent. Hash-key only per ADR 0136.
+    ///
+    /// Phase 2.6+-raw-set-get-builtins (ADR 0136).
+    RawGet,
     /// `math.sqrt(x)` — square root via libm `sqrt`. Phase
     /// 2.7q-stdlib-math (ADR 0101). Dispatched at `lower_call` entry
     /// when the call shape is `Index{Ident("math"), Str("sqrt")}` AND
@@ -536,6 +553,9 @@ impl Builtin {
             // ADR 0134 — metatables global builtins.
             "setmetatable" => Some(Builtin::SetMetatable),
             "getmetatable" => Some(Builtin::GetMetatable),
+            // ADR 0136 — raw set / get hash-key escape hatches.
+            "rawset" => Some(Builtin::RawSet),
+            "rawget" => Some(Builtin::RawGet),
             _ => None,
         }
     }
@@ -649,6 +669,8 @@ impl Builtin {
             // ADR 0134 — metatables global builtins.
             Builtin::SetMetatable => (2, 2),
             Builtin::GetMetatable => (1, 1),
+            Builtin::RawSet => (3, 3),
+            Builtin::RawGet => (2, 2),
             Builtin::MathSqrt | Builtin::MathFloor | Builtin::MathAbs => (1, 1),
             Builtin::MathPow => (2, 2),
             Builtin::MathSin | Builtin::MathCos | Builtin::MathLog | Builtin::MathExp => (1, 1),
@@ -694,6 +716,8 @@ impl Builtin {
             Builtin::Next => "next",
             Builtin::SetMetatable => "setmetatable",
             Builtin::GetMetatable => "getmetatable",
+            Builtin::RawSet => "rawset",
+            Builtin::RawGet => "rawget",
             Builtin::MathSqrt => "math.sqrt",
             Builtin::MathFloor => "math.floor",
             Builtin::MathAbs => "math.abs",
@@ -737,6 +761,10 @@ impl Builtin {
             // returns the metatable (Table) or nil → TaggedValue.
             Builtin::SetMetatable => &[ValueKind::Table],
             Builtin::GetMetatable => &[ValueKind::TaggedValue],
+            // ADR 0136 — rawset returns t (Table per Lua §6.1);
+            // rawget returns t[k] or Nil → TaggedValue.
+            Builtin::RawSet => &[ValueKind::Table],
+            Builtin::RawGet => &[ValueKind::TaggedValue],
             Builtin::MathSqrt
             | Builtin::MathFloor
             | Builtin::MathAbs
@@ -804,7 +832,11 @@ impl Builtin {
             // ADR 0134 — global builtins; per-arg kind checks live
             // in `lower_builtin_call` alongside Assert / Next.
             | Builtin::SetMetatable
-            | Builtin::GetMetatable => &[],
+            | Builtin::GetMetatable
+            // ADR 0136 — per-arg kind checks live in
+            // `lower_builtin_call` alongside SetMetatable.
+            | Builtin::RawSet
+            | Builtin::RawGet => &[],
             // math.* — all single-Number arg except pow (Number, Number).
             Builtin::MathSqrt
             | Builtin::MathFloor

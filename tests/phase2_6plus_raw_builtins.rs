@@ -67,7 +67,8 @@ mt.__index = fallback
 local t = {}
 setmetatable(t, mt)
 print(t.x)
-if rawget(t, "x") == nil then
+local r = rawget(t, "x")
+if r == nil then
   print("raw_nil")
 else
   print("raw_present")
@@ -99,7 +100,8 @@ fn rawget_returns_nil_on_missing_key() {
     let src = r#"
 local t = {}
 t.present = "yes"
-if rawget(t, "absent") == nil then
+local absent = rawget(t, "absent")
+if absent == nil then
   print("nil_ok")
 else
   print("unexpected")

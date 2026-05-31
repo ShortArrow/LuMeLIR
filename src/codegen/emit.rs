@@ -3559,6 +3559,7 @@ fn emit_stmt<'a, 'c>(
                                 value_v,
                                 value_kind,
                                 METATABLE_INDEX_MAX_HOPS,
+                                false,
                                 types,
                                 loc,
                             );
@@ -7767,6 +7768,31 @@ fn emit_expr<'a, 'c>(
                             emit_print_tagged_local(context, block, tmp, types, loc);
                             continue;
                         }
+                        // ADR 0134 / 0136: inline `print(builtin())` where
+                        // the builtin returns TaggedValue (GetMetatable /
+                        // TableRemove / IoRead / RawGet). The emit arm
+                        // already returns a tmp tagged-slot ptr.
+                        if let HirExprKind::Call {
+                            callee: Callee::Builtin(b),
+                            ..
+                        } = &a.kind
+                            && matches!(b.ret_kinds().first(), Some(ValueKind::TaggedValue))
+                        {
+                            let tmp = emit_expr(
+                                context,
+                                block,
+                                a,
+                                slots,
+                                locals,
+                                functions,
+                                types,
+                                params_len,
+                                in_function_cell_ptr,
+                                loc,
+                            )?;
+                            emit_print_tagged_local(context, block, tmp, types, loc);
+                            continue;
+                        }
                         let v = emit_expr(
                             context,
                             block,
@@ -9187,6 +9213,112 @@ fn emit_expr<'a, 'c>(
                 let out_slot =
                     emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
                 emit_getmetatable_runtime(context, block, t_ptr, out_slot, types, loc);
+                Ok(out_slot)
+            }
+            Callee::Builtin(Builtin::RawSet) => {
+                // ADR 0136: rawset(t, k, v) bypasses the __newindex
+                // chain by reusing emit_hash_indexassign_with_newindex
+                // with skip_metatable = true. Returns t (Lua §6.1).
+                let t_ptr = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let key_kind = infer_kind(&args[1], locals, functions);
+                let key_value = emit_expr(
+                    context,
+                    block,
+                    &args[1],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let value_kind = infer_kind(&args[2], locals, functions);
+                let value_v = emit_expr(
+                    context,
+                    block,
+                    &args[2],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let key_slot =
+                    emit_build_search_key_slot(context, block, key_kind, key_value, types, loc);
+                emit_hash_indexassign_with_newindex(
+                    context,
+                    block,
+                    t_ptr,
+                    key_slot,
+                    key_kind,
+                    key_value,
+                    value_v,
+                    value_kind,
+                    METATABLE_INDEX_MAX_HOPS,
+                    true,
+                    types,
+                    loc,
+                );
+                Ok(t_ptr)
+            }
+            Callee::Builtin(Builtin::RawGet) => {
+                // ADR 0136: rawget(t, k) bypasses the __index chain
+                // by calling emit_hash_lookup_into_tagged_slot with
+                // NilOnMissing directly — no fallback wrapper.
+                let t_ptr = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let key_kind = infer_kind(&args[1], locals, functions);
+                let key_value = emit_expr(
+                    context,
+                    block,
+                    &args[1],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let key_slot =
+                    emit_build_search_key_slot(context, block, key_kind, key_value, types, loc);
+                let out_slot =
+                    emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
+                emit_value_slot_store_nil(context, block, out_slot, types, loc);
+                emit_hash_lookup_into_tagged_slot(
+                    context,
+                    block,
+                    t_ptr,
+                    key_slot,
+                    out_slot,
+                    HashLookupOutcome::NilOnMissing,
+                    types,
+                    loc,
+                );
                 Ok(out_slot)
             }
         },
@@ -11819,6 +11951,11 @@ fn emit_hash_indexassign_with_newindex<'a, 'c>(
     value_v: Value<'c, 'a>,
     value_kind: ValueKind,
     remaining_hops: u32,
+    // ADR 0136 — when true, the `was_empty == true` branch skips the
+    // `__newindex` metatable probe and goes straight to the raw
+    // commit+write path. The IndexAssign call site passes `false`
+    // (preserves ADR 0135 semantics); `rawset` passes `true`.
+    skip_metatable: bool,
     types: &Types<'c>,
     loc: Location<'c>,
 ) {
@@ -11946,10 +12083,13 @@ fn emit_hash_indexassign_with_newindex<'a, 'c>(
     emit_store(block, i1_false, handled_slot, loc);
 
     // Metatable probe runs only in the was_empty branch (Lua §2.4 —
-    // overwrites of existing keys go direct).
+    // overwrites of existing keys go direct). ADR 0136: when
+    // `skip_metatable == true` (rawset), the probe is elided
+    // entirely and the was_empty branch is a no-op yield, so
+    // `handled` stays false and the raw commit+write path runs.
     let we_then = Region::new();
     let we_then_blk = Block::new(&[]);
-    {
+    if !skip_metatable {
         let mt_slot = emit_byte_offset_ptr(
             context,
             &we_then_blk,
@@ -12089,6 +12229,10 @@ fn emit_hash_indexassign_with_newindex<'a, 'c>(
                     value_v,
                     value_kind,
                     remaining_hops - 1,
+                    // ADR 0136: recursion through the metatable chain
+                    // never carries skip; the rawset escape hatch
+                    // applies only to the top-level write target.
+                    false,
                     types,
                     loc,
                 );
@@ -12139,6 +12283,9 @@ fn emit_hash_indexassign_with_newindex<'a, 'c>(
         mt_else_blk.append_operation(scf::r#yield(&[], loc));
         mt_else.append_block(mt_else_blk);
         we_then_blk.append_operation(scf::r#if(mt_present, &[], mt_then, mt_else, loc));
+        we_then_blk.append_operation(scf::r#yield(&[], loc));
+    } else {
+        // ADR 0136 rawset path: skip the metatable probe entirely.
         we_then_blk.append_operation(scf::r#yield(&[], loc));
     }
     we_then.append_block(we_then_blk);
