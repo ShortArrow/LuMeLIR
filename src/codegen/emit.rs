@@ -3803,6 +3803,7 @@ fn emit_stmt<'a, 'c>(
                                 value_kind,
                                 METATABLE_INDEX_MAX_HOPS,
                                 false,
+                                functions,
                                 types,
                                 loc,
                             );
@@ -4040,6 +4041,7 @@ fn emit_stmt<'a, 'c>(
                             value_kind_early,
                             METATABLE_INDEX_MAX_HOPS,
                             false,
+                            functions,
                             types,
                             loc,
                         );
@@ -9720,6 +9722,7 @@ fn emit_expr<'a, 'c>(
                     value_kind,
                     METATABLE_INDEX_MAX_HOPS,
                     true,
+                    functions,
                     types,
                     loc,
                 );
@@ -12627,6 +12630,10 @@ fn emit_hash_indexassign_with_newindex<'a, 'c>(
     // commit+write path. The IndexAssign call site passes `false`
     // (preserves ADR 0135 semantics); `rawset` passes `true`.
     skip_metatable: bool,
+    // ADR 0151 — module function table used by the Function-form
+    // `__newindex` arm to filter `(Table, String, Number) → ()`
+    // candidates at codegen time.
+    functions: &[HirFunction],
     types: &Types<'c>,
     loc: Location<'c>,
 ) {
@@ -12904,6 +12911,7 @@ fn emit_hash_indexassign_with_newindex<'a, 'c>(
                     // never carries skip; the rawset escape hatch
                     // applies only to the top-level write target.
                     false,
+                    functions,
                     types,
                     loc,
                 );
@@ -12930,15 +12938,136 @@ fn emit_hash_indexassign_with_newindex<'a, 'c>(
                 let nil_else = Region::new();
                 let nil_else_blk = Block::new(&[]);
                 {
-                    let msg = emit_addressof(
-                        context,
-                        &nil_else_blk,
-                        "s_metatable_newindex_unsupported_kind",
-                        types,
-                        loc,
-                    );
-                    emit_exit_with_message(context, &nil_else_blk, msg, types, loc);
-                    nil_else_blk.append_operation(scf::r#yield(&[], loc));
+                    // ADR 0151 — Function form. The chokepoint is
+                    // emitted statically for every IndexAssign that
+                    // routes through it, including ones whose
+                    // `value_v` is a non-Number ptr (e.g. the very
+                    // `mt.__newindex = function...` write that
+                    // produced this metamethod). Gate the dispatch
+                    // emission on `value_kind == Number` so the
+                    // MLIR verifier doesn't see ptr passed where the
+                    // `(Table, String, Number) → ()` candidate
+                    // expects f64.
+                    let nidx_candidates: Vec<FuncId> = if matches!(value_kind, ValueKind::Number) {
+                        functions
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, f)| {
+                                let pks: Vec<ValueKind> = f.params.iter().map(|p| p.kind).collect();
+                                if pks == [ValueKind::Table, ValueKind::String, ValueKind::Number]
+                                    && f.ret_kinds.is_empty()
+                                {
+                                    Some(FuncId(i))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    if nidx_candidates.is_empty() {
+                        let msg = emit_addressof(
+                            context,
+                            &nil_else_blk,
+                            "s_metatable_newindex_unsupported_kind",
+                            types,
+                            loc,
+                        );
+                        emit_exit_with_message(context, &nil_else_blk, msg, types, loc);
+                        nil_else_blk.append_operation(scf::r#yield(&[], loc));
+                    } else {
+                        let tag_function = nil_else_blk
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let is_function: Value<'c, '_> = nil_else_blk
+                            .append_operation(arith::cmpi(
+                                context,
+                                arith::CmpiPredicate::Eq,
+                                nidx_tag,
+                                tag_function,
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let fn_then = Region::new();
+                        let fn_then_blk = Block::new(&[]);
+                        {
+                            // Load String key ptr from key_slot payload.
+                            let key_payload_ptr = emit_byte_offset_ptr(
+                                context,
+                                &fn_then_blk,
+                                key_slot,
+                                ARRAY_ELEM_OFF_VALUE,
+                                types,
+                                loc,
+                            );
+                            let key_ptr = emit_load(&fn_then_blk, key_payload_ptr, types.ptr, loc);
+                            let sig = IndirectSig {
+                                param_kinds: vec![
+                                    ValueKind::Table,
+                                    ValueKind::String,
+                                    ValueKind::Number,
+                                ],
+                                ret_kinds: vec![],
+                            };
+                            let _ = emit_dispatch_chain_from_slot_ptr(
+                                context,
+                                &fn_then_blk,
+                                nidx_result_slot,
+                                &sig,
+                                &nidx_candidates,
+                                &[target_ptr, key_ptr, value_v],
+                                functions,
+                                types,
+                                loc,
+                            );
+                            // Mark handled so the raw commit+write
+                            // path is skipped (Lua spec — the user
+                            // metamethod owns the write).
+                            let i1_true = fn_then_blk
+                                .append_operation(arith::constant(
+                                    context,
+                                    IntegerAttribute::new(types.i1, 1).into(),
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            emit_store(&fn_then_blk, i1_true, handled_slot, loc);
+                            fn_then_blk.append_operation(scf::r#yield(&[], loc));
+                        }
+                        fn_then.append_block(fn_then_blk);
+                        let fn_else = Region::new();
+                        let fn_else_blk = Block::new(&[]);
+                        {
+                            let msg = emit_addressof(
+                                context,
+                                &fn_else_blk,
+                                "s_metatable_newindex_unsupported_kind",
+                                types,
+                                loc,
+                            );
+                            emit_exit_with_message(context, &fn_else_blk, msg, types, loc);
+                            fn_else_blk.append_operation(scf::r#yield(&[], loc));
+                        }
+                        fn_else.append_block(fn_else_blk);
+                        nil_else_blk.append_operation(scf::r#if(
+                            is_function,
+                            &[],
+                            fn_then,
+                            fn_else,
+                            loc,
+                        ));
+                        nil_else_blk.append_operation(scf::r#yield(&[], loc));
+                    }
                 }
                 nil_else.append_block(nil_else_blk);
                 table_else_blk.append_operation(scf::r#if(is_nil, &[], nil_then, nil_else, loc));

@@ -1491,6 +1491,15 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
                     functions[fid.0].params[0].kind = ValueKind::Table;
                     functions[fid.0].params[1].kind = ValueKind::String;
                 }
+                "__newindex" if params.len() >= 3 => {
+                    // ADR 0151 — `__newindex` Function form:
+                    //   (Table, String, Number) → void.
+                    // Table-form has `value` = Ident chain, doesn't
+                    // match.
+                    functions[fid.0].params[0].kind = ValueKind::Table;
+                    functions[fid.0].params[1].kind = ValueKind::String;
+                    functions[fid.0].params[2].kind = ValueKind::Number;
+                }
                 _ => {}
             }
         }
