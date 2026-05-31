@@ -202,6 +202,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0144 — comparison-metamethods](0144-comparison-metamethods.md) — `__eq` / `__lt` / `__le` for Table-Table
 - [0145 — gc-strategy](0145-gc-strategy.md) — Phase 2 leak, Phase 3 mark-and-sweep trigger (decision-only)
 - [0146 — call-metamethod](0146-call-metamethod.md) — `__call` metamethod (callable Table)
+- [0147 — arith-metamethods](0147-arith-metamethods.md) — Arithmetic metamethods (`__add` etc. + `__unm`) for Table
 
 ### Feature Implementation Memos
 
