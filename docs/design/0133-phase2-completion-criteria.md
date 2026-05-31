@@ -34,7 +34,7 @@ Phase 2 closes when each workstream below has an Architecture Decision recorded;
 | `pcall` / `error` value propagation | After [ADR 0134](0134-metatables-index-read.md) (error-table shape depends on metatables). |
 | `string.format` | Parallel side-track; no metatable dependency. |
 | `string` patterns (`find` / `match` / `gmatch` / `gsub`) | Parallel side-track; pattern engine is its own design surface. |
-| **GC strategy decision** | Before the first heap-allocated metatable lands (i.e. before `__newindex` or any shared-metatable ADR). [ADR 0134](0134-metatables-index-read.md) itself does NOT allocate new heap — `metatable_ptr` lives in the existing table header. |
+| **GC strategy decision** | **RESOLVED by [ADR 0145](0145-gc-strategy.md) (2026-05-31)**: Phase 2 = leak; Phase 3 = non-moving mark-and-sweep with 1 MB trigger. Decision-only ADR; implementation in a future Phase 3 ADR. |
 
 ## Alternatives considered
 

@@ -200,6 +200,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0142 — tostring-metamethod](0142-tostring-metamethod.md) — `__tostring` metamethod for `tostring(t)`
 - [0143 — concat-metamethod](0143-concat-metamethod.md) — `__concat` metamethod for `Table .. Table`
 - [0144 — comparison-metamethods](0144-comparison-metamethods.md) — `__eq` / `__lt` / `__le` for Table-Table
+- [0145 — gc-strategy](0145-gc-strategy.md) — Phase 2 leak, Phase 3 mark-and-sweep trigger (decision-only)
 
 ### Feature Implementation Memos
 
