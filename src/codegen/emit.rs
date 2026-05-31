@@ -396,6 +396,25 @@ fn emit_fmt_global<'c>(
         "attempt to index through non-table '__index' metafield\0",
         loc,
     );
+    // ADR 0135 — metatable `__newindex` runtime diagnostics + the
+    // canonical "__newindex" key used to probe the metatable.
+    // `s_metatable_chain_too_deep` is shared with ADR 0134 (above).
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_newindex_field_name",
+        "__newindex\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_newindex_unsupported_kind",
+        "attempt to assign through non-table '__newindex' metafield\0",
+        loc,
+    );
     // Phase 2.5x-callee-dispatch (ADR 0082): runtime traps for the
     // indirect-dispatch chain. `s_call_non_function` fires when the
     // tagged-slot's tag is not TAG_FUNCTION (e.g. `local g = "s";
@@ -3517,178 +3536,133 @@ fn emit_stmt<'a, 'c>(
                     )?;
                     let key_slot =
                         emit_build_search_key_slot(context, block, key_kind, key_value, types, loc);
-                    emit_hash_ensure_buf(context, block, target_ptr, types, loc);
-                    emit_hash_grow_if_needed(context, block, target_ptr, types, loc);
-                    let hash_buf_slot = emit_byte_offset_ptr(
-                        context,
-                        block,
-                        target_ptr,
-                        TABLE_OFF_HASH_BUF,
-                        types,
-                        loc,
-                    );
-                    let hash_buf = emit_load(block, hash_buf_slot, types.ptr, loc);
-                    let cap_slot =
-                        emit_byte_offset_ptr(context, block, hash_buf, HASH_OFF_CAP, types, loc);
-                    let cap = emit_load(block, cap_slot, types.i64, loc);
-                    let bucket = emit_hash_probe_for_insert(
-                        context, block, hash_buf, cap, key_slot, types, loc,
-                    );
-                    let entry_size = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let entries_off = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let bucket_off: Value<'c, 'a> = block
-                        .append_operation(arith::muli(bucket, entry_size, loc))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let entry_off: Value<'c, 'a> = block
-                        .append_operation(arith::addi(bucket_off, entries_off, loc))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let entry_ptr = emit_byte_offset_ptr_dynamic(
-                        context, block, hash_buf, entry_off, types, loc,
-                    );
-                    // Check whether the bucket was empty (= new key)
-                    // — if so, increment count and store the key.
-                    let cur_key = emit_load(block, entry_ptr, types.ptr, loc);
-                    let cur_key_i = block
-                        .append_operation(
-                            OperationBuilder::new("llvm.ptrtoint", loc)
-                                .add_operands(&[cur_key])
-                                .add_results(&[types.i64])
-                                .build()
-                                .expect("llvm.ptrtoint"),
-                        )
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let zero_i64 = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(types.i64, 0).into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let was_empty: Value<'c, 'a> = block
-                        .append_operation(arith::cmpi(
-                            context,
-                            arith::CmpiPredicate::Eq,
-                            cur_key_i,
-                            zero_i64,
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let value_slot_ptr = emit_byte_offset_ptr(
-                        context,
-                        block,
-                        entry_ptr,
-                        HASH_ENTRY_OFF_VALUE_SLOT,
-                        types,
-                        loc,
-                    );
                     let value_kind = infer_kind(value, locals, functions);
                     match value_kind {
-                        // Phase 2.6c-tag-hetero (ADR 0064) +
-                        // 2.6c-tag-fn-tbl (ADR 0071): Number /
-                        // Bool / String / Function / Table all
-                        // share the new-key + count++ path; only
-                        // the final tagged store helper differs.
-                        // Dispatch via
-                        // `emit_value_slot_store_dispatched`.
+                        // ADR 0135: non-Nil writes route through the
+                        // shared hash-insert helper which probes
+                        // `was_empty` and walks `mt["__newindex"]`
+                        // before committing. Existing-key overwrites
+                        // and missing-metatable cases fall through to
+                        // the same code as before.
                         ValueKind::Number
                         | ValueKind::Bool
                         | ValueKind::String
                         | ValueKind::Function(_)
                         | ValueKind::Table => {
-                            let new_key_then = Region::new();
-                            let new_key_blk = Block::new(&[]);
-                            {
-                                // Phase 2.6b-hash-keys (ADR 0079):
-                                // commit the key into entry+0 via
-                                // the kind-dispatched store; the
-                                // already-built search slot's
-                                // contents (tag + payload) are
-                                // re-emitted into the entry's
-                                // 16-byte key slot.
-                                emit_value_slot_store_dispatched(
-                                    context,
-                                    &new_key_blk,
-                                    entry_ptr,
-                                    key_value,
-                                    key_kind,
-                                    types,
-                                    loc,
-                                );
-                                let count_slot = emit_byte_offset_ptr(
-                                    context,
-                                    &new_key_blk,
-                                    hash_buf,
-                                    HASH_OFF_COUNT,
-                                    types,
-                                    loc,
-                                );
-                                let count = emit_load(&new_key_blk, count_slot, types.i64, loc);
-                                let one_inner = new_key_blk
-                                    .append_operation(arith::constant(
-                                        context,
-                                        IntegerAttribute::new(types.i64, 1).into(),
-                                        loc,
-                                    ))
-                                    .result(0)
-                                    .unwrap()
-                                    .into();
-                                let new_count: Value<'c, '_> = new_key_blk
-                                    .append_operation(arith::addi(count, one_inner, loc))
-                                    .result(0)
-                                    .unwrap()
-                                    .into();
-                                emit_store(&new_key_blk, new_count, count_slot, loc);
-                                new_key_blk.append_operation(scf::r#yield(&[], loc));
-                            }
-                            new_key_then.append_block(new_key_blk);
-                            let new_key_else = Region::new();
-                            let new_key_else_blk = Block::new(&[]);
-                            new_key_else_blk.append_operation(scf::r#yield(&[], loc));
-                            new_key_else.append_block(new_key_else_blk);
-                            block.append_operation(scf::r#if(
-                                was_empty,
-                                &[],
-                                new_key_then,
-                                new_key_else,
-                                loc,
-                            ));
-                            emit_value_slot_store_dispatched(
+                            emit_hash_indexassign_with_newindex(
                                 context,
                                 block,
-                                value_slot_ptr,
+                                target_ptr,
+                                key_slot,
+                                key_kind,
+                                key_value,
                                 value_v,
                                 value_kind,
+                                METATABLE_INDEX_MAX_HOPS,
                                 types,
                                 loc,
                             );
                         }
                         ValueKind::Nil => {
+                            // Hard tombstone path is unchanged; Lua
+                            // spec — assigning nil to a missing key
+                            // is a no-op, and `__newindex` does not
+                            // fire for nil-value deletes. Keep the
+                            // original inline logic.
+                            emit_hash_ensure_buf(context, block, target_ptr, types, loc);
+                            emit_hash_grow_if_needed(context, block, target_ptr, types, loc);
+                            let hash_buf_slot = emit_byte_offset_ptr(
+                                context,
+                                block,
+                                target_ptr,
+                                TABLE_OFF_HASH_BUF,
+                                types,
+                                loc,
+                            );
+                            let hash_buf = emit_load(block, hash_buf_slot, types.ptr, loc);
+                            let cap_slot = emit_byte_offset_ptr(
+                                context,
+                                block,
+                                hash_buf,
+                                HASH_OFF_CAP,
+                                types,
+                                loc,
+                            );
+                            let cap = emit_load(block, cap_slot, types.i64, loc);
+                            let bucket = emit_hash_probe_for_insert(
+                                context, block, hash_buf, cap, key_slot, types, loc,
+                            );
+                            let entry_size = block
+                                .append_operation(arith::constant(
+                                    context,
+                                    IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let entries_off = block
+                                .append_operation(arith::constant(
+                                    context,
+                                    IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let bucket_off: Value<'c, 'a> = block
+                                .append_operation(arith::muli(bucket, entry_size, loc))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let entry_off: Value<'c, 'a> = block
+                                .append_operation(arith::addi(bucket_off, entries_off, loc))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let entry_ptr = emit_byte_offset_ptr_dynamic(
+                                context, block, hash_buf, entry_off, types, loc,
+                            );
+                            let cur_key = emit_load(block, entry_ptr, types.ptr, loc);
+                            let cur_key_i = block
+                                .append_operation(
+                                    OperationBuilder::new("llvm.ptrtoint", loc)
+                                        .add_operands(&[cur_key])
+                                        .add_results(&[types.i64])
+                                        .build()
+                                        .expect("llvm.ptrtoint"),
+                                )
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let zero_i64 = block
+                                .append_operation(arith::constant(
+                                    context,
+                                    IntegerAttribute::new(types.i64, 0).into(),
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let was_empty: Value<'c, 'a> = block
+                                .append_operation(arith::cmpi(
+                                    context,
+                                    arith::CmpiPredicate::Eq,
+                                    cur_key_i,
+                                    zero_i64,
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let value_slot_ptr = emit_byte_offset_ptr(
+                                context,
+                                block,
+                                entry_ptr,
+                                HASH_ENTRY_OFF_VALUE_SLOT,
+                                types,
+                                loc,
+                            );
                             // Phase 2.6c-tag-hash-hard (ADR 0062),
                             // updated by 2.6b-hash-keys (ADR 0079):
                             // hard delete. When the key is present
@@ -11811,6 +11785,461 @@ fn emit_check_metatable_index_with_depth<'a, 'c>(
     mt_else_blk.append_operation(scf::r#yield(&[], loc));
     mt_else.append_block(mt_else_blk);
     block.append_operation(scf::r#if(mt_present, &[], mt_then, mt_else, loc));
+}
+
+/// Phase 2.6+-metatables-newindex-write (ADR 0135): write `key=value`
+/// into `target_ptr`'s hash, with metatable `__newindex` chain
+/// walking (Table form, hash key only) up to `remaining_hops` levels
+/// of Rust-side static recursion.
+///
+/// Caller pre-condition: `target_ptr` is a `ValueKind::Table` ptr.
+/// `key_slot` is a tagged 16-byte search key slot. `key_value` and
+/// `key_kind` are used when committing a new key (the slot's payload
+/// is re-emitted into the entry+0 16-byte key slot). `value_v` /
+/// `value_kind` must be non-Nil (the Nil tombstone delete path does
+/// not chain through metatables — Lua spec).
+///
+/// At each hop:
+///   1. probe target for key
+///   2. if key exists: raw overwrite (Lua §2.4 — no `__newindex`)
+///   3. if was_empty: probe target's metatable.`__newindex`:
+///      - Table → recurse on it (`remaining_hops - 1`)
+///      - Nil → raw commit + write to target
+///      - other → trap `s_metatable_newindex_unsupported_kind`
+///   4. `remaining_hops == 0` and chain still extends → trap
+///      `s_metatable_chain_too_deep` (shared with ADR 0134)
+#[allow(clippy::too_many_arguments)]
+fn emit_hash_indexassign_with_newindex<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    target_ptr: Value<'c, 'a>,
+    key_slot: Value<'c, 'a>,
+    key_kind: ValueKind,
+    key_value: Value<'c, 'a>,
+    value_v: Value<'c, 'a>,
+    value_kind: ValueKind,
+    remaining_hops: u32,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    if remaining_hops == 0 {
+        let msg = emit_addressof(context, block, "s_metatable_chain_too_deep", types, loc);
+        emit_exit_with_message(context, block, msg, types, loc);
+        return;
+    }
+
+    // Hash insert plumbing (mirrors the existing inline IndexAssign hash arm).
+    emit_hash_ensure_buf(context, block, target_ptr, types, loc);
+    emit_hash_grow_if_needed(context, block, target_ptr, types, loc);
+    let hash_buf_slot =
+        emit_byte_offset_ptr(context, block, target_ptr, TABLE_OFF_HASH_BUF, types, loc);
+    let hash_buf = emit_load(block, hash_buf_slot, types.ptr, loc);
+    let cap_slot = emit_byte_offset_ptr(context, block, hash_buf, HASH_OFF_CAP, types, loc);
+    let cap = emit_load(block, cap_slot, types.i64, loc);
+    let bucket = emit_hash_probe_for_insert(context, block, hash_buf, cap, key_slot, types, loc);
+    let entry_size = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let entries_off = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let bucket_off: Value<'c, '_> = block
+        .append_operation(arith::muli(bucket, entry_size, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let entry_total_off: Value<'c, '_> = block
+        .append_operation(arith::addi(bucket_off, entries_off, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let entry_ptr =
+        emit_byte_offset_ptr_dynamic(context, block, hash_buf, entry_total_off, types, loc);
+    let cur_key = emit_load(block, entry_ptr, types.ptr, loc);
+    let cur_key_i: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[cur_key])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint cur_key"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let was_empty: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            cur_key_i,
+            zero_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let value_slot_ptr = emit_byte_offset_ptr(
+        context,
+        block,
+        entry_ptr,
+        HASH_ENTRY_OFF_VALUE_SLOT,
+        types,
+        loc,
+    );
+
+    // Track whether the metatable chain handled this write so the
+    // raw commit+write below can skip when it did.
+    let one_i32 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i32, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let handled_slot: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.alloca", loc)
+                .add_operands(&[one_i32])
+                .add_attributes(&[(
+                    Identifier::new(context, "elem_type"),
+                    TypeAttribute::new(types.i1).into(),
+                )])
+                .add_results(&[types.ptr])
+                .build()
+                .expect("llvm.alloca i1"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let i1_false = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i1, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_store(block, i1_false, handled_slot, loc);
+
+    // Metatable probe runs only in the was_empty branch (Lua §2.4 —
+    // overwrites of existing keys go direct).
+    let we_then = Region::new();
+    let we_then_blk = Block::new(&[]);
+    {
+        let mt_slot = emit_byte_offset_ptr(
+            context,
+            &we_then_blk,
+            target_ptr,
+            TABLE_OFF_METATABLE,
+            types,
+            loc,
+        );
+        let mt = emit_load(&we_then_blk, mt_slot, types.ptr, loc);
+        let mt_iv: Value<'c, '_> = we_then_blk
+            .append_operation(
+                OperationBuilder::new("llvm.ptrtoint", loc)
+                    .add_operands(&[mt])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.ptrtoint mt"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let zero_inner = we_then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let mt_present: Value<'c, '_> = we_then_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Ne,
+                mt_iv,
+                zero_inner,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let mt_then = Region::new();
+        let mt_then_blk = Block::new(&[]);
+        {
+            let nidx_field_ptr = emit_addressof(
+                context,
+                &mt_then_blk,
+                "s_metatable_newindex_field_name",
+                types,
+                loc,
+            );
+            let nidx_search_slot = emit_build_search_key_slot(
+                context,
+                &mt_then_blk,
+                ValueKind::String,
+                nidx_field_ptr,
+                types,
+                loc,
+            );
+            let nidx_result_slot = emit_alloca_slot_for_kind(
+                context,
+                &mt_then_blk,
+                ValueKind::TaggedValue,
+                types,
+                loc,
+            );
+            emit_value_slot_store_nil(context, &mt_then_blk, nidx_result_slot, types, loc);
+            emit_hash_lookup_into_tagged_slot(
+                context,
+                &mt_then_blk,
+                mt,
+                nidx_search_slot,
+                nidx_result_slot,
+                HashLookupOutcome::NilOnMissing,
+                types,
+                loc,
+            );
+            let nidx_tag = emit_load(&mt_then_blk, nidx_result_slot, types.i64, loc);
+            let tag_table = mt_then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, TAG_TABLE).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let tag_nil = mt_then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let is_table: Value<'c, '_> = mt_then_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    nidx_tag,
+                    tag_table,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let is_nil: Value<'c, '_> = mt_then_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    nidx_tag,
+                    tag_nil,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let table_then = Region::new();
+            let table_then_blk = Block::new(&[]);
+            {
+                let payload_ptr = emit_byte_offset_ptr(
+                    context,
+                    &table_then_blk,
+                    nidx_result_slot,
+                    ARRAY_ELEM_OFF_VALUE,
+                    types,
+                    loc,
+                );
+                let nidx_table = emit_load(&table_then_blk, payload_ptr, types.ptr, loc);
+                emit_hash_indexassign_with_newindex(
+                    context,
+                    &table_then_blk,
+                    nidx_table,
+                    key_slot,
+                    key_kind,
+                    key_value,
+                    value_v,
+                    value_kind,
+                    remaining_hops - 1,
+                    types,
+                    loc,
+                );
+                let i1_true = table_then_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i1, 1).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                emit_store(&table_then_blk, i1_true, handled_slot, loc);
+                table_then_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            table_then.append_block(table_then_blk);
+            let table_else = Region::new();
+            let table_else_blk = Block::new(&[]);
+            {
+                let nil_then = Region::new();
+                let nil_then_blk = Block::new(&[]);
+                nil_then_blk.append_operation(scf::r#yield(&[], loc));
+                nil_then.append_block(nil_then_blk);
+                let nil_else = Region::new();
+                let nil_else_blk = Block::new(&[]);
+                {
+                    let msg = emit_addressof(
+                        context,
+                        &nil_else_blk,
+                        "s_metatable_newindex_unsupported_kind",
+                        types,
+                        loc,
+                    );
+                    emit_exit_with_message(context, &nil_else_blk, msg, types, loc);
+                    nil_else_blk.append_operation(scf::r#yield(&[], loc));
+                }
+                nil_else.append_block(nil_else_blk);
+                table_else_blk.append_operation(scf::r#if(is_nil, &[], nil_then, nil_else, loc));
+                table_else_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            table_else.append_block(table_else_blk);
+            mt_then_blk.append_operation(scf::r#if(is_table, &[], table_then, table_else, loc));
+            mt_then_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        mt_then.append_block(mt_then_blk);
+        let mt_else = Region::new();
+        let mt_else_blk = Block::new(&[]);
+        mt_else_blk.append_operation(scf::r#yield(&[], loc));
+        mt_else.append_block(mt_else_blk);
+        we_then_blk.append_operation(scf::r#if(mt_present, &[], mt_then, mt_else, loc));
+        we_then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    we_then.append_block(we_then_blk);
+    let we_else = Region::new();
+    let we_else_blk = Block::new(&[]);
+    we_else_blk.append_operation(scf::r#yield(&[], loc));
+    we_else.append_block(we_else_blk);
+    block.append_operation(scf::r#if(was_empty, &[], we_then, we_else, loc));
+
+    // Raw commit+write path: gated on `!handled` (the metatable
+    // chain didn't write).
+    let handled = emit_load(block, handled_slot, types.i1, loc);
+    let i1_one_outer = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i1, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let not_handled: Value<'c, '_> = block
+        .append_operation(arith::xori(handled, i1_one_outer, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let raw_then = Region::new();
+    let raw_then_blk = Block::new(&[]);
+    {
+        // Commit key + count++ only when was_empty AND !handled.
+        let we_inner = was_empty;
+        let we_inner_local =
+            unsafe { std::mem::transmute::<Value<'c, '_>, Value<'c, '_>>(we_inner) };
+        let commit_then = Region::new();
+        let commit_then_blk = Block::new(&[]);
+        {
+            emit_value_slot_store_dispatched(
+                context,
+                &commit_then_blk,
+                entry_ptr,
+                key_value,
+                key_kind,
+                types,
+                loc,
+            );
+            let count_slot = emit_byte_offset_ptr(
+                context,
+                &commit_then_blk,
+                hash_buf,
+                HASH_OFF_COUNT,
+                types,
+                loc,
+            );
+            let count = emit_load(&commit_then_blk, count_slot, types.i64, loc);
+            let one_inner = commit_then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let new_count: Value<'c, '_> = commit_then_blk
+                .append_operation(arith::addi(count, one_inner, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            emit_store(&commit_then_blk, new_count, count_slot, loc);
+            commit_then_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        commit_then.append_block(commit_then_blk);
+        let commit_else = Region::new();
+        let commit_else_blk = Block::new(&[]);
+        commit_else_blk.append_operation(scf::r#yield(&[], loc));
+        commit_else.append_block(commit_else_blk);
+        raw_then_blk.append_operation(scf::r#if(
+            we_inner_local,
+            &[],
+            commit_then,
+            commit_else,
+            loc,
+        ));
+        // Write value (always when !handled).
+        emit_value_slot_store_dispatched(
+            context,
+            &raw_then_blk,
+            value_slot_ptr,
+            value_v,
+            value_kind,
+            types,
+            loc,
+        );
+        raw_then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    raw_then.append_block(raw_then_blk);
+    let raw_else = Region::new();
+    let raw_else_blk = Block::new(&[]);
+    raw_else_blk.append_operation(scf::r#yield(&[], loc));
+    raw_else.append_block(raw_else_blk);
+    block.append_operation(scf::r#if(not_handled, &[], raw_then, raw_else, loc));
 }
 
 /// Phase 2.6+-metatables-index-read (ADR 0134): `setmetatable(t, mt)`
