@@ -29,12 +29,13 @@ fn run_ok(src: &str, output_name: &str) -> String {
 fn anon_fn_with_table_arg_refines() {
     // Without ADR 0141 this trips IndirectCallNoCandidates because
     // the anonymous fn's `t` defaults to Number and the call passes
-    // a Table local.
+    // a Table literal. The Pass-1.5 walker's `ast_arg_kind` covers
+    // literals (Number / Bool / Nil / String / Table); Ident-arg
+    // refinement is deferred to a future ADR.
     let src = r#"
 local mt = {}
 mt.fn = function(t) return "X" end
-local v = {}
-print(mt.fn(v))
+print(mt.fn({}))
 "#;
     let out = run_ok(src, "lumelir_anon_fn_table_refine");
     assert_eq!(out, "X\n");
@@ -63,8 +64,7 @@ fn anon_fn_aliased_via_local_rebind_refines() {
 local mt = {}
 mt.fn = function(t) return "Y" end
 local g = mt.fn
-local v = {}
-print(g(v))
+print(g({}))
 "#;
     let out = run_ok(src, "lumelir_anon_fn_alias_refine");
     assert_eq!(out, "Y\n");

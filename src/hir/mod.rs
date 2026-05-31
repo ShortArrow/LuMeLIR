@@ -549,6 +549,29 @@ fn extract_namespace_call(callee: &Expr) -> Option<(String, String)> {
     }
 }
 
+/// ADR 0141 — extract the chain prefix from an `IndexAssign` target
+/// (e.g. `mt` from `mt.fn = ...`, or `["mt", "outer"]` from
+/// `mt.outer.fn = ...`). Mirrors `extract_index_chain` but works on
+/// the **target** side of an IndexAssign — the final key is supplied
+/// separately by the IndexAssign stmt itself, so the chain returned
+/// here is the prefix that, combined with that key, indexes into
+/// `method_funcs`.
+fn extract_chain_from_target(target: &Expr) -> Option<Vec<String>> {
+    match &target.kind {
+        ExprKind::Ident(name) => Some(vec![name.clone()]),
+        ExprKind::Index { target: inner, key } => {
+            if let ExprKind::Str(seg) = &key.kind {
+                let mut prefix = extract_chain_from_target(inner)?;
+                prefix.push(seg.clone());
+                Some(prefix)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn extract_index_chain(callee: &Expr) -> Option<(Vec<String>, String)> {
     let (mut cur, method) = match &callee.kind {
         ExprKind::Index { target, key } => {
@@ -1313,6 +1336,27 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
             method_funcs.insert((receiver_chain.clone(), method.clone()), fid);
         }
     }
+    // ADR 0141 — Pass-1 walk for top-level
+    // `IndexAssign(target, Str(key), FunctionExpr(...))` shapes.
+    // Pre-allocate a FuncId per match (mirrors MethodDef pre-alloc
+    // pattern from ADR 0093) and register `(chain, key) → fid` in
+    // `method_funcs` via `or_insert` so existing MethodDef entries
+    // win on conflict. The pre-registered (chain, key) is picked up
+    // by `infer_user_function_param_kinds` (ADR 0094's Index-callee
+    // Call arm) below, refining `params[].kind` from the eventual
+    // call site BEFORE Pass-2 lowers the FunctionExpr body.
+    let mut anon_indexassign_func_ids: Vec<FuncId> = Vec::new();
+    for stmt in chunk {
+        if let StmtKind::IndexAssign { target, key, value } = &stmt.kind
+            && let ExprKind::Str(key_str) = &key.kind
+            && let ExprKind::FunctionExpr { params, .. } = &value.kind
+            && let Some(chain) = extract_chain_from_target(target)
+        {
+            let fid = alloc_method_signature(params, &mut functions, ParentScope::Chunk);
+            anon_indexassign_func_ids.push(fid);
+            method_funcs.entry((chain, key_str.clone())).or_insert(fid);
+        }
+    }
     // Phase 2.6+-name-rebind-refine (ADR 0098): pass-1.5 builds an
     // `alias_map: HashMap<String, FuncId>` from top-level
     // `StmtKind::Local`/`LocalMulti` whose RHS is an Index chain
@@ -1398,7 +1442,23 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
     }
     let mut stmts = Vec::new();
     let mut funcdef_seq: usize = 0;
+    // ADR 0141 — counter into `anon_indexassign_func_ids`. Consumed
+    // in source order by setting `ctx.pending_anon_funcdef_id` just
+    // before lowering a matching top-level IndexAssign stmt.
+    let mut anon_indexassign_seq: usize = 0;
     for s in chunk {
+        // ADR 0141 — top-level IndexAssign + FunctionExpr-value
+        // match → arm the next pre-allocated anon FuncId. The
+        // FunctionExpr arm of `lower_expr` consumes it instead of
+        // fresh-allocating, picking up the Pass-1.5-refined params.
+        if let StmtKind::IndexAssign { target, key, value } = &s.kind
+            && let ExprKind::Str(_) = &key.kind
+            && let ExprKind::FunctionExpr { .. } = &value.kind
+            && extract_chain_from_target(target).is_some()
+        {
+            ctx.pending_anon_funcdef_id = Some(anon_indexassign_func_ids[anon_indexassign_seq]);
+            anon_indexassign_seq += 1;
+        }
         if let StmtKind::FunctionDef {
             name, params, body, ..
         } = &s.kind
@@ -1439,6 +1499,17 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
             continue;
         }
         stmts.push(ctx.lower_stmt(s)?);
+        // ADR 0141 — `pending_anon_funcdef_id` is set only when this
+        // stmt was the matching IndexAssign shape; lower_stmt's
+        // recursive lower_expr must have consumed it in the
+        // FunctionExpr arm. A leftover means the FunctionExpr was
+        // skipped (e.g. value side-effect changed) — surface a panic
+        // so the desync is caught immediately rather than silently
+        // shifting the source-order alignment.
+        debug_assert!(
+            ctx.pending_anon_funcdef_id.is_none(),
+            "ADR 0141: pre-allocated anon FuncId not consumed by FunctionExpr lowering",
+        );
     }
     // ctx.functions accumulates anonymous functions registered during
     // lowering of `local f = function() ... end` (Phase 2.5b, ADR 0017).
@@ -1748,6 +1819,16 @@ struct LowerCtx {
     /// when multiple Index-callee Calls land in the same surrounding
     /// scope.
     callee_seq: usize,
+    /// ADR 0141 — Pre-allocated FuncId for the next FunctionExpr to
+    /// be lowered, if it is the immediate value of a top-level
+    /// `IndexAssign(chain, Str(key), FunctionExpr)`. Set by the
+    /// chunk-level Pass-2 walker before invoking `lower_stmt`;
+    /// consumed by the FunctionExpr arm of `lower_expr` (None →
+    /// fresh-allocate as before). The Pass-1 walk allocates these
+    /// IDs in source order and registers `(chain, key) → fid` in
+    /// `method_funcs` so `infer_user_function_param_kinds` (ADR
+    /// 0094 Index-callee Call arm) refines them in place.
+    pending_anon_funcdef_id: Option<FuncId>,
 }
 
 impl LowerCtx {
@@ -1774,6 +1855,7 @@ impl LowerCtx {
             containing_fn: None,
             pending_pre_stmts: Vec::new(),
             callee_seq: 0,
+            pending_anon_funcdef_id: None,
         }
     }
 
@@ -3906,36 +3988,52 @@ impl LowerCtx {
                 }
             }
             ExprKind::FunctionExpr { params, body } => {
-                // Register a fresh HirFunction with `name = ""` and
-                // mangled `user_anon_<idx>` (ADR 0017). The body is
-                // lowered in a separate LowerCtx so it has its own
-                // scope/locals/break-stack.
-                let id = FuncId(self.functions.len());
-                let mangled = format!("user_anon_{}", id.0);
-                let parent_scope = self.current_parent_scope();
-                self.functions.push(HirFunction {
-                    name: String::new(),
-                    mangled_name: mangled,
-                    params: params
-                        .iter()
-                        .map(|p| LocalInfo {
-                            name: p.clone(),
-                            kind: ValueKind::Number,
-                            func_id: None,
-                            is_captured: false,
-                        })
-                        .collect(),
-                    upvalues: Vec::new(),
-                    locals: Vec::new(),
-                    body: Vec::new(),
-                    ret_kinds: Vec::new(),
-                    parent_scope,
-                });
-                // Anonymous functions have no caller-name to scan
-                // for call-site arg kinds; default to Number for all
-                // params. Body-pre-scan still upgrades to Function
-                // when needed.
-                let external_kinds = vec![ValueKind::Number; params.len()];
+                // ADR 0141 — if Pass-2 chunk walker armed a
+                // pre-allocated FuncId for this FunctionExpr (top-
+                // level `IndexAssign(chain, Str(key), FunctionExpr)`
+                // shape), consume it. The HirFunction was already
+                // pushed by Pass-1's `alloc_method_signature`, and
+                // `infer_user_function_param_kinds` (ADR 0094) has
+                // since refined `params[].kind` from the call site.
+                // Seed `external_kinds` from those refined kinds so
+                // the body lowers with the correct param shapes.
+                //
+                // Otherwise (None), fall through to the original
+                // fresh-allocate path with `Number`-default kinds —
+                // unchanged for non-IndexAssign FunctionExpr uses
+                // (`local g = function...`, table constructor, arg
+                // position, etc.).
+                let id = if let Some(pre_fid) = self.pending_anon_funcdef_id.take() {
+                    pre_fid
+                } else {
+                    let id = FuncId(self.functions.len());
+                    let mangled = format!("user_anon_{}", id.0);
+                    let parent_scope = self.current_parent_scope();
+                    self.functions.push(HirFunction {
+                        name: String::new(),
+                        mangled_name: mangled,
+                        params: params
+                            .iter()
+                            .map(|p| LocalInfo {
+                                name: p.clone(),
+                                kind: ValueKind::Number,
+                                func_id: None,
+                                is_captured: false,
+                            })
+                            .collect(),
+                        upvalues: Vec::new(),
+                        locals: Vec::new(),
+                        body: Vec::new(),
+                        ret_kinds: Vec::new(),
+                        parent_scope,
+                    });
+                    id
+                };
+                // ADR 0141 — pre-allocated path uses the refined
+                // kinds; fresh-alloc path uses the historical Number
+                // default.
+                let external_kinds: Vec<ValueKind> =
+                    self.functions[id.0].params.iter().map(|p| p.kind).collect();
                 // Phase 2.5c-min: the body can capture the
                 // currently-visible bindings from this LowerCtx.
                 let outer_visible = self.outer_visible_snapshot();
