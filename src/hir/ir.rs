@@ -406,6 +406,23 @@ pub enum Builtin {
     ///
     /// Phase 2.6+-raw-set-get-builtins (ADR 0136).
     RawGet,
+    /// `rawequal(t1, t2)` — Lua 5.4 §6.1 escape hatch from the
+    /// `__eq` metamethod chain. Today functionally identical to `==`
+    /// (the `__eq` metamethod is deferred per ADR 0133); included
+    /// for spec parity and forward-compat. Table operand only per
+    /// ADR 0137 — String / Number / Bool / Function operand surface
+    /// arrives with the `__eq` ADR.
+    ///
+    /// Phase 2.6+-raw-equal-len-builtins (ADR 0137).
+    RawEqual,
+    /// `rawlen(t)` — Lua 5.4 §6.1 escape hatch from the `__len`
+    /// metamethod chain. Today functionally identical to `#t` (the
+    /// `__len` metamethod is deferred per ADR 0133); included for
+    /// spec parity and forward-compat. Table operand only per
+    /// ADR 0137 — String operand arrives with the `__len` ADR.
+    ///
+    /// Phase 2.6+-raw-equal-len-builtins (ADR 0137).
+    RawLen,
     /// `math.sqrt(x)` — square root via libm `sqrt`. Phase
     /// 2.7q-stdlib-math (ADR 0101). Dispatched at `lower_call` entry
     /// when the call shape is `Index{Ident("math"), Str("sqrt")}` AND
@@ -556,6 +573,9 @@ impl Builtin {
             // ADR 0136 — raw set / get hash-key escape hatches.
             "rawset" => Some(Builtin::RawSet),
             "rawget" => Some(Builtin::RawGet),
+            // ADR 0137 — raw equal / len Lua spec parity.
+            "rawequal" => Some(Builtin::RawEqual),
+            "rawlen" => Some(Builtin::RawLen),
             _ => None,
         }
     }
@@ -671,6 +691,8 @@ impl Builtin {
             Builtin::GetMetatable => (1, 1),
             Builtin::RawSet => (3, 3),
             Builtin::RawGet => (2, 2),
+            Builtin::RawEqual => (2, 2),
+            Builtin::RawLen => (1, 1),
             Builtin::MathSqrt | Builtin::MathFloor | Builtin::MathAbs => (1, 1),
             Builtin::MathPow => (2, 2),
             Builtin::MathSin | Builtin::MathCos | Builtin::MathLog | Builtin::MathExp => (1, 1),
@@ -718,6 +740,8 @@ impl Builtin {
             Builtin::GetMetatable => "getmetatable",
             Builtin::RawSet => "rawset",
             Builtin::RawGet => "rawget",
+            Builtin::RawEqual => "rawequal",
+            Builtin::RawLen => "rawlen",
             Builtin::MathSqrt => "math.sqrt",
             Builtin::MathFloor => "math.floor",
             Builtin::MathAbs => "math.abs",
@@ -765,6 +789,9 @@ impl Builtin {
             // rawget returns t[k] or Nil → TaggedValue.
             Builtin::RawSet => &[ValueKind::Table],
             Builtin::RawGet => &[ValueKind::TaggedValue],
+            // ADR 0137 — rawequal returns Bool; rawlen returns Number.
+            Builtin::RawEqual => &[ValueKind::Bool],
+            Builtin::RawLen => &[ValueKind::Number],
             Builtin::MathSqrt
             | Builtin::MathFloor
             | Builtin::MathAbs
@@ -836,7 +863,11 @@ impl Builtin {
             // ADR 0136 — per-arg kind checks live in
             // `lower_builtin_call` alongside SetMetatable.
             | Builtin::RawSet
-            | Builtin::RawGet => &[],
+            | Builtin::RawGet
+            // ADR 0137 — per-arg kind checks live in
+            // `lower_builtin_call`.
+            | Builtin::RawEqual
+            | Builtin::RawLen => &[],
             // math.* — all single-Number arg except pow (Number, Number).
             Builtin::MathSqrt
             | Builtin::MathFloor

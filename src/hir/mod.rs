@@ -281,6 +281,9 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // TaggedValue (value-or-nil).
             Callee::Builtin(Builtin::RawSet) => ValueKind::Table,
             Callee::Builtin(Builtin::RawGet) => ValueKind::TaggedValue,
+            // ADR 0137 — rawequal returns Bool; rawlen returns Number.
+            Callee::Builtin(Builtin::RawEqual) => ValueKind::Bool,
+            Callee::Builtin(Builtin::RawLen) => ValueKind::Number,
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.
@@ -4686,6 +4689,19 @@ impl LowerCtx {
                         offset: arg.span.start,
                     });
                 }
+            }
+            // ADR 0137 — raw equal / len Lua spec parity.
+            //   rawequal(t1, t2): both args must be Table (broader
+            //     operand surface lands with the `__eq` ADR).
+            //   rawlen(t): arg 0 must be Table (String arrives with
+            //     the `__len` ADR).
+            if matches!(builtin, Builtin::RawEqual | Builtin::RawLen) && k != ValueKind::Table {
+                return Err(HirError::TypeMismatch {
+                    op: builtin.name().to_owned(),
+                    lhs_kind: "table".to_owned(),
+                    rhs_kind: k.name().to_owned(),
+                    offset: arg.span.start,
+                });
             }
         }
         Ok(HirExprKind::Call {

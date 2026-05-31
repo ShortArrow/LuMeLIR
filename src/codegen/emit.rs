@@ -9321,6 +9321,94 @@ fn emit_expr<'a, 'c>(
                 );
                 Ok(out_slot)
             }
+            Callee::Builtin(Builtin::RawEqual) => {
+                // ADR 0137: rawequal(t1, t2) — ptr equality on the
+                // two Table args (Lua §3.4.4 — distinct tables are
+                // never equal regardless of contents).
+                let lhs_ptr = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let rhs_ptr = emit_expr(
+                    context,
+                    block,
+                    &args[1],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let lhs_i: Value<'c, '_> = block
+                    .append_operation(
+                        OperationBuilder::new("llvm.ptrtoint", loc)
+                            .add_operands(&[lhs_ptr])
+                            .add_results(&[types.i64])
+                            .build()
+                            .expect("llvm.ptrtoint rawequal lhs"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let rhs_i: Value<'c, '_> = block
+                    .append_operation(
+                        OperationBuilder::new("llvm.ptrtoint", loc)
+                            .add_operands(&[rhs_ptr])
+                            .add_results(&[types.i64])
+                            .build()
+                            .expect("llvm.ptrtoint rawequal rhs"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let eq: Value<'c, '_> = block
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Eq,
+                        lhs_i,
+                        rhs_i,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                Ok(eq)
+            }
+            Callee::Builtin(Builtin::RawLen) => {
+                // ADR 0137: rawlen(t) — load i64 length from header
+                // offset 0 and sitofp to f64 (Number kind contract).
+                let t_ptr = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let len_slot =
+                    emit_byte_offset_ptr(context, block, t_ptr, TABLE_OFF_LEN, types, loc);
+                let len_i64 = emit_load(block, len_slot, types.i64, loc);
+                let len_f64: Value<'c, '_> = block
+                    .append_operation(arith::sitofp(len_i64, types.f64, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                Ok(len_f64)
+            }
         },
         HirExprKind::FunctionRef(FuncId(id)) => {
             // Phase 2.5b.3 / 2.5c-full Commit 2b (ADR 0083): a
