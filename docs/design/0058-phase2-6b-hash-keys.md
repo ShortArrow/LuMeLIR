@@ -214,6 +214,6 @@ of LIC-2.6a-arr-2.
   `self` parameter handling. A separate phase that needs
   Function-kind values in tables, which is downstream of
   tagged values.
-- **`__index` / `__newindex` metatables** — far out of scope. **`__index` read-path Table form RESOLVED by [ADR 0134](0134-metatables-index-read.md) (2026-05-31);** `__newindex` write-path and Function-form `__index` deferred per [ADR 0133](0133-phase2-completion-criteria.md).
+- **`__index` / `__newindex` metatables** — far out of scope. **`__index` read-path Table form RESOLVED by [ADR 0134](0134-metatables-index-read.md) (2026-05-31)**; **`__newindex` write-path (hash key, Table form) RESOLVED by [ADR 0135](0135-metatables-newindex-write.md) (2026-05-31)**; Function-form and Number-key (array) `__newindex` deferred per [ADR 0133](0133-phase2-completion-criteria.md).
 - **Resize-down on heavy delete** — pending delete itself.
 - **Initial cap tuning** — premature.

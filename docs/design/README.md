@@ -190,6 +190,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0132 — ci-image-base-distro](0132-ci-image-base-distro.md) — foundational follow-up
 - [0133 — phase2-completion-criteria](0133-phase2-completion-criteria.md) — Phase 2 scope freeze
 - [0134 — metatables-index-read](0134-metatables-index-read.md) — Metatables `__index` Table read-path
+- [0135 — metatables-newindex-write](0135-metatables-newindex-write.md) — Metatables `__newindex` Table write-path
 
 ### Feature Implementation Memos
 

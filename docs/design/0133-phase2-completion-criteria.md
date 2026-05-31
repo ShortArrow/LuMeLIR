@@ -24,7 +24,7 @@ Phase 2 closes when each workstream below has an Architecture Decision recorded;
 
 | Workstream | Hard trigger / dependency |
 |---|---|
-| `__newindex` write-path | After [ADR 0134](0134-metatables-index-read.md) ABI lands. |
+| `__newindex` write-path | [ADR 0135](0135-metatables-newindex-write.md) — Table form, hash key only. Function-form and Number-key (array) `__newindex` remain separate ADRs. |
 | `__index = Function` form | After [ADR 0134](0134-metatables-index-read.md) + call-ABI cleanup. |
 | Arithmetic metamethods (`__add` / `__sub` / `__mul` / `__div` / `__mod` / `__pow` / `__unm` / `__idiv` / `__band` / `__bor` / `__bxor` / `__bnot` / `__shl` / `__shr`) | After [ADR 0134](0134-metatables-index-read.md); one ADR per op (or per family). |
 | Comparison metamethods (`__eq` / `__lt` / `__le`) | After [ADR 0134](0134-metatables-index-read.md). |

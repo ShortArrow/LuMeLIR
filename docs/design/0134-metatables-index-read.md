@@ -136,7 +136,7 @@ Commit C6 (__index dispatch impl): all 12 Green → 1276
 
 ## Future work
 
-- ADR for `__newindex` write-path (next).
+- ADR for `__newindex` write-path (next). **RESOLVED by [ADR 0135](0135-metatables-newindex-write.md) (2026-05-31)** for the hash-key Table form. Function-form `__newindex`, Number-key (array) `__newindex`, and `rawset` builtin remain deferred per ADR 0133.
 - ADR for `__index = Function` form (call-ABI integration).
 - Per-op ADRs for arithmetic / comparison / `__tostring` / `__concat` / `__call` metamethods.
 - `setmetatable(t, nil)` clear semantics.
