@@ -188,6 +188,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0130 — commit-message-convention](0130-commit-message-convention.md) — foundational
 - [0131 — pr-discipline-code-review](0131-pr-discipline-code-review.md) — foundational
 - [0132 — ci-image-base-distro](0132-ci-image-base-distro.md) — foundational follow-up
+- [0133 — phase2-completion-criteria](0133-phase2-completion-criteria.md) — Phase 2 scope freeze
 
 ### Feature Implementation Memos
 
