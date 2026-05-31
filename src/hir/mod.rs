@@ -1468,6 +1468,16 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
                     // ADR 0147 — `__unm`: (Table) → Number.
                     functions[fid.0].params[0].kind = ValueKind::Table;
                 }
+                "__band" | "__bor" | "__bxor" | "__shl" | "__shr" if params.len() >= 2 => {
+                    // ADR 0148 — bitwise binary metamethods:
+                    //   (Table, Table) → Number.
+                    functions[fid.0].params[0].kind = ValueKind::Table;
+                    functions[fid.0].params[1].kind = ValueKind::Table;
+                }
+                "__bnot" if !params.is_empty() => {
+                    // ADR 0148 — `__bnot`: (Table) → Number.
+                    functions[fid.0].params[0].kind = ValueKind::Table;
+                }
                 _ => {}
             }
         }
@@ -3876,11 +3886,11 @@ impl LowerCtx {
                         // Number at the HIR layer. The Local
                         // read site emits a tag check that traps
                         // when the actual value is Nil.
-                        // ADR 0147 — Table-Table arith routes through
-                        // the metamethod helper at codegen. The 7
-                        // non-bitwise arith ops accept (Table, Table);
-                        // bitwise stays Number-only (interacts with
-                        // ADR 0114 integer gate — separate ADR).
+                        // ADR 0147 / 0148 — Table-Table arith /
+                        // bitwise routes through the metamethod
+                        // helper at codegen. All 12 binary ops in
+                        // this arm (7 arith + 5 bitwise) accept
+                        // (Table, Table).
                         let arith_table_ok = matches!(
                             op,
                             BinOp::Add
@@ -3890,6 +3900,11 @@ impl LowerCtx {
                                 | BinOp::Mod
                                 | BinOp::Pow
                                 | BinOp::FloorDiv
+                                | BinOp::BitAnd
+                                | BinOp::BitOr
+                                | BinOp::BitXor
+                                | BinOp::Shl
+                                | BinOp::Shr
                         ) && lk == ValueKind::Table
                             && rk == ValueKind::Table;
                         if !arith_table_ok

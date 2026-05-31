@@ -567,6 +567,56 @@ fn emit_fmt_global<'c>(
         "attempt to perform arithmetic on a table value\0",
         loc,
     );
+    // ADR 0148 — bitwise metamethods field names. Trap message
+    // shared with ADR 0147 (`s_arith_no_metamethod`).
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_band_field_name",
+        "__band\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_bor_field_name",
+        "__bor\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_bxor_field_name",
+        "__bxor\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_shl_field_name",
+        "__shl\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_shr_field_name",
+        "__shr\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_bnot_field_name",
+        "__bnot\0",
+        loc,
+    );
     emit_string_global(
         context,
         module,
@@ -7961,10 +8011,11 @@ fn emit_expr<'a, 'c>(
                 };
                 return Ok(emit_i2f(block, len_i64, types, loc));
             }
-            // ADR 0147 — Table operand `-t` routes through `__unm`
-            // metamethod helper. Must precede the existing arith
-            // unary path so a Table ptr doesn't reach `emit_unary`.
-            if matches!(op, UnaryOp::Neg)
+            // ADR 0147 / 0148 — Table operand `-t` / `~t` routes
+            // through `__unm` / `__bnot` metamethod helper. Must
+            // precede the existing arith unary path so a Table ptr
+            // doesn't reach `emit_unary`.
+            if matches!(op, UnaryOp::Neg | UnaryOp::BitNot)
                 && infer_kind(operand, locals, functions) == ValueKind::Table
             {
                 let t_ptr = emit_expr(
@@ -7979,14 +8030,13 @@ fn emit_expr<'a, 'c>(
                     in_function_cell_ptr,
                     loc,
                 )?;
+                let field = match op {
+                    UnaryOp::Neg => "s_metatable_unm_field_name",
+                    UnaryOp::BitNot => "s_metatable_bnot_field_name",
+                    _ => unreachable!(),
+                };
                 return Ok(emit_unary_arith_via_metamethod(
-                    context,
-                    block,
-                    "s_metatable_unm_field_name",
-                    t_ptr,
-                    functions,
-                    types,
-                    loc,
+                    context, block, field, t_ptr, functions, types, loc,
                 ));
             }
             // Phase 2.7p-tagged-arith-coerce (ADR 0089): TaggedValue
@@ -13854,6 +13904,12 @@ fn arith_metamethod_field_name(op: BinOp) -> Option<&'static str> {
         BinOp::Mod => Some("s_metatable_mod_field_name"),
         BinOp::Pow => Some("s_metatable_pow_field_name"),
         BinOp::FloorDiv => Some("s_metatable_idiv_field_name"),
+        // ADR 0148 — bitwise metamethods, same helper.
+        BinOp::BitAnd => Some("s_metatable_band_field_name"),
+        BinOp::BitOr => Some("s_metatable_bor_field_name"),
+        BinOp::BitXor => Some("s_metatable_bxor_field_name"),
+        BinOp::Shl => Some("s_metatable_shl_field_name"),
+        BinOp::Shr => Some("s_metatable_shr_field_name"),
         _ => None,
     }
 }
