@@ -22,7 +22,7 @@ users hit the wall on day-1 with their existing code.
 
 Full Lua globals require a tagged-value table (`_ENV`),
 metatables, and dynamic typing. That's a Phase-2.6+ structural
-project. But a useful **subset** falls out cheaply: treat a
+project. (**Partial RESOLVED by [ADR 0134](0134-metatables-index-read.md) (2026-05-31)** — read-path `__index` Table form. `__newindex` write-path and `_ENV` table still pending per [ADR 0133](0133-phase2-completion-criteria.md) deferral table.) But a useful **subset** falls out cheaply: treat a
 top-level bare assignment as syntactic sugar for `local`.
 
 ## Decision
