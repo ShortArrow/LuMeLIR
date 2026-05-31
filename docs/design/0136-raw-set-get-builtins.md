@@ -135,7 +135,7 @@ Commit C3 (HIR + codegen impl):  1287 → 1295 (all green)
 
 ## Future work
 
-- ADR for `rawequal(t1, t2)` and `rawlen(t)` (separate, smaller).
+- ADR for `rawequal(t1, t2)` and `rawlen(t)` (separate, smaller). **RESOLVED by [ADR 0137](0137-raw-equal-len-builtins.md) (2026-05-31)** for the Table operand form.
 - Number-key `raw*` forms — bundled with the array-OOB-widening ADR (which also unblocks 0134 test 7 and 0135 test 9).
 - TaggedValue-key `raw*` — bundled with the TaggedValue-key IndexAssign arm wiring (0135 test 9 follow-up).
 - Same `skip_metatable` pattern for `__index` chokepoint if a `rawindex`-style escape needs it (no canonical Lua builtin, so probably not).

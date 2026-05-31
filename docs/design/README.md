@@ -192,6 +192,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0134 — metatables-index-read](0134-metatables-index-read.md) — Metatables `__index` Table read-path
 - [0135 — metatables-newindex-write](0135-metatables-newindex-write.md) — Metatables `__newindex` Table write-path
 - [0136 — raw-set-get-builtins](0136-raw-set-get-builtins.md) — `rawset` / `rawget` builtins (hash key only)
+- [0137 — raw-equal-len-builtins](0137-raw-equal-len-builtins.md) — `rawequal` / `rawlen` builtins (Table only)
 
 ### Feature Implementation Memos
 
