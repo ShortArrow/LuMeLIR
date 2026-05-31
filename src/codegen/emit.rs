@@ -9163,8 +9163,8 @@ fn emit_expr<'a, 'c>(
             ),
             Callee::Builtin(Builtin::SetMetatable) => {
                 // ADR 0134: setmetatable(t, mt) stores mt at t+32
-                // and returns t (Lua §6.1). Both args are HIR-checked
-                // to be Table kind.
+                // and returns t (Lua §6.1). Arg 0 is HIR-checked to
+                // be Table. ADR 0138 widens arg 1 to {Table, Nil}.
                 let t_ptr = emit_expr(
                     context,
                     block,
@@ -9177,18 +9177,35 @@ fn emit_expr<'a, 'c>(
                     in_function_cell_ptr,
                     loc,
                 )?;
-                let mt_ptr = emit_expr(
-                    context,
-                    block,
-                    &args[1],
-                    slots,
-                    locals,
-                    functions,
-                    types,
-                    params_len,
-                    in_function_cell_ptr,
-                    loc,
-                )?;
+                let arg1_kind = infer_kind(&args[1], locals, functions);
+                let mt_ptr = if matches!(arg1_kind, ValueKind::Nil) {
+                    // ADR 0138: nil-clear emits a typed null ptr via
+                    // llvm.mlir.zero and skips emit_expr (Nil literal
+                    // emits i1(0), not a ptr).
+                    block
+                        .append_operation(
+                            OperationBuilder::new("llvm.mlir.zero", loc)
+                                .add_results(&[types.ptr])
+                                .build()
+                                .expect("llvm.mlir.zero ptr"),
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into()
+                } else {
+                    emit_expr(
+                        context,
+                        block,
+                        &args[1],
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
+                    )?
+                };
                 Ok(emit_setmetatable_runtime(
                     context, block, t_ptr, mt_ptr, types, loc,
                 ))

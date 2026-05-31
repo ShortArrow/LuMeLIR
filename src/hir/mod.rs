@@ -4631,18 +4631,29 @@ impl LowerCtx {
             }
             // ADR 0134 — metatables global builtins.
             //   setmetatable(t, mt): both args must be Table. The
-            //     nil-clear form (`setmetatable(t, nil)`) is out of
-            //     scope per ADR 0134 Non-goals.
+            //     nil-clear form (`setmetatable(t, nil)`) per ADR 0138
+            //     widens arg 1 to accept Nil. Arg 0 stays Table.
             //   getmetatable(t): single Table arg.
-            if matches!(builtin, Builtin::SetMetatable | Builtin::GetMetatable)
-                && k != ValueKind::Table
-            {
-                return Err(HirError::TypeMismatch {
-                    op: builtin.name().to_owned(),
-                    lhs_kind: "table".to_owned(),
-                    rhs_kind: k.name().to_owned(),
-                    offset: arg.span.start,
-                });
+            if matches!(builtin, Builtin::SetMetatable | Builtin::GetMetatable) {
+                let arg_idx = lowered_args
+                    .iter()
+                    .position(|a| std::ptr::eq(a as *const _, arg as *const _))
+                    .unwrap_or(0);
+                let allow_nil_at_arg1 = matches!(builtin, Builtin::SetMetatable) && arg_idx == 1;
+                let ok = k == ValueKind::Table || (allow_nil_at_arg1 && k == ValueKind::Nil);
+                if !ok {
+                    let expected = if allow_nil_at_arg1 {
+                        "table or nil"
+                    } else {
+                        "table"
+                    };
+                    return Err(HirError::TypeMismatch {
+                        op: builtin.name().to_owned(),
+                        lhs_kind: expected.to_owned(),
+                        rhs_kind: k.name().to_owned(),
+                        offset: arg.span.start,
+                    });
+                }
             }
             // ADR 0136 — raw set / get hash-key escape hatches.
             //   rawset(t, k, v): arg 0 = Table; arg 1 = hash-eligible
