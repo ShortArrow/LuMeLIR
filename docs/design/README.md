@@ -203,6 +203,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0145 — gc-strategy](0145-gc-strategy.md) — Phase 2 leak, Phase 3 mark-and-sweep trigger (decision-only)
 - [0146 — call-metamethod](0146-call-metamethod.md) — `__call` metamethod (callable Table)
 - [0147 — arith-metamethods](0147-arith-metamethods.md) — Arithmetic metamethods (`__add` etc. + `__unm`) for Table
+- [0148 — bitwise-metamethods](0148-bitwise-metamethods.md) — Bitwise metamethods (`__band` etc. + `__bnot`) for Table
 
 ### Feature Implementation Memos
 
