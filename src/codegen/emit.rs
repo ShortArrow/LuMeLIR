@@ -54,28 +54,31 @@ use super::tagged::{
 };
 
 // =============================================================
-// Phase 2.6a-norm (ADR 0056): stable table header layout.
+// Phase 2.6a-norm (ADR 0056) + 2.6+-metatables-index-read (ADR 0134):
+// stable table header layout.
 //
 // `ValueKind::Table` is `!llvm.ptr` pointing at a heap-allocated
-// header. The header is 32 bytes and **never moves** for the
+// header. The header is 40 bytes and **never moves** for the
 // lifetime of the table value — `local b = a` aliases stay valid
 // even when the inner buffers are reallocated by future grow /
 // hash sub-phases. The contract:
 //
 // ```text
 // table value (!llvm.ptr)
-//   → header [32 bytes, malloc'd, stable]
+//   → header [40 bytes, malloc'd, stable]
 //        offset 0  : i64 length          ← `#t` reads here (frozen)
 //        offset 8  : i64 capacity        ← grow updates (2.6a-grow)
-//        offset 16 : !llvm.ptr array_buf ← f64 elem buffer (frozen offset)
-//        offset 24 : !llvm.ptr hash_buf  ← null today; 2.6b lights it up
+//        offset 16 : !llvm.ptr array_buf ← f64 / tagged elem buffer (frozen)
+//        offset 24 : !llvm.ptr hash_buf  ← null until first hash-key write
+//        offset 32 : !llvm.ptr metatable_ptr ← null until setmetatable (ADR 0134)
 //
-//   array_buf (!llvm.ptr) → [f64 elem₀][f64 elem₁]…[f64 elem_{cap-1}]
+//   array_buf (!llvm.ptr) → [16-byte tagged slot]×capacity
 // ```
 //
 // **Frozen offsets** (will never move; depend on these):
 //   - 0  (length)
 //   - 16 (array_buf)
+//   - 32 (metatable_ptr)
 //
 // **Mutable offsets** (may relocate as the layout grows):
 //   - 8  (capacity)
@@ -86,7 +89,8 @@ const TABLE_OFF_LEN: i64 = 0;
 const TABLE_OFF_CAP: i64 = 8;
 const TABLE_OFF_ARRAY_BUF: i64 = 16;
 const TABLE_OFF_HASH_BUF: i64 = 24;
-const TABLE_HEADER_SIZE: i64 = 32;
+const TABLE_OFF_METATABLE: i64 = 32;
+const TABLE_HEADER_SIZE: i64 = 40;
 
 // =============================================================
 // Phase 2.6b-hash (ADR 0058): hash_buf layout for string-keyed
@@ -7082,6 +7086,11 @@ fn emit_expr<'a, 'c>(
             let hash_buf_slot =
                 emit_byte_offset_ptr(context, block, header_ptr, TABLE_OFF_HASH_BUF, types, loc);
             emit_store(block, null_hash, hash_buf_slot, loc);
+            // Step 4: metatable_ptr = null (ADR 0134; setmetatable populates).
+            let null_metatable = emit_null_ptr(context, block, types, loc);
+            let metatable_slot =
+                emit_byte_offset_ptr(context, block, header_ptr, TABLE_OFF_METATABLE, types, loc);
+            emit_store(block, null_metatable, metatable_slot, loc);
             // Phase 2.6c-tag-hetero (ADR 0064): store each element
             // as a tagged slot, dispatching on its static kind.
             // Number → {Number, f64}, Bool → {Bool, i64-zext},
