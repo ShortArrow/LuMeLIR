@@ -207,6 +207,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0149 — len-metamethod](0149-len-metamethod.md) — `__len` metamethod for `#t`
 - [0150 — index-function-form](0150-index-function-form.md) — `__index = Function` form (static-String key, Number return)
 - [0151 — newindex-function-form](0151-newindex-function-form.md) — `__newindex = Function` form (static-String key, Number value)
+- [0152 — string-format](0152-string-format.md) — `string.format` minimum subset (`%d` / `%s` / `%f` / `%%`)
 
 ### Feature Implementation Memos
 
