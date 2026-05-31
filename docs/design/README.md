@@ -193,6 +193,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0135 — metatables-newindex-write](0135-metatables-newindex-write.md) — Metatables `__newindex` Table write-path
 - [0136 — raw-set-get-builtins](0136-raw-set-get-builtins.md) — `rawset` / `rawget` builtins (hash key only)
 - [0137 — raw-equal-len-builtins](0137-raw-equal-len-builtins.md) — `rawequal` / `rawlen` builtins (Table only)
+- [0138 — setmetatable-nil-clear](0138-setmetatable-nil-clear.md) — `setmetatable(t, nil)` metatable clear
 
 ### Feature Implementation Memos
 
