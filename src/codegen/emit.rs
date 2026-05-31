@@ -433,6 +433,23 @@ fn emit_fmt_global<'c>(
         "__tostring\0",
         loc,
     );
+    // ADR 0143 — `__concat` metamethod field name + trap message.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_concat_field_name",
+        "__concat\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_concat_no_metamethod",
+        "attempt to concatenate a table value (no '__concat' metamethod)\0",
+        loc,
+    );
     emit_string_global(
         context,
         module,
@@ -7711,6 +7728,18 @@ fn emit_expr<'a, 'c>(
             // path. Concat is always String; Eq/Ne dispatches on the
             // operand kind so the runtime path is `strcmp`.
             if matches!(op, BinOp::Concat) {
+                // ADR 0143 — Table-Table concat goes through the
+                // `__concat` metamethod instead of `emit_concat`
+                // (which expects two String ptrs). HIR rejects the
+                // mixed Table/non-Table case, so the only Table-
+                // involving shape reaching codegen is Table-Table.
+                let lkk = infer_kind(lhs, locals, functions);
+                let rkk = infer_kind(rhs, locals, functions);
+                if lkk == ValueKind::Table && rkk == ValueKind::Table {
+                    return Ok(emit_concat_via_metamethod(
+                        context, block, lhs_val, rhs_val, functions, types, loc,
+                    ));
+                }
                 return Ok(emit_concat(context, block, lhs_val, rhs_val, types, loc));
             }
             if matches!(
@@ -13454,6 +13483,212 @@ fn emit_tostring_table_via_metamethod<'a, 'c>(
         loc,
     ));
     outer_if.result(0).unwrap().into()
+}
+
+/// ADR 0143 — `Table .. Table` consults the lhs metatable's
+/// `__concat` field. Function-form only, returns String.
+/// Falls back to a runtime trap (`s_concat_no_metamethod`) when the
+/// metatable is null, the field is absent / non-Function, or no
+/// compile-time `(Table, Table) → String` candidate exists.
+fn emit_concat_via_metamethod<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    lhs_t: Value<'c, 'a>,
+    rhs_t: Value<'c, 'a>,
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let candidates: Vec<FuncId> = functions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            let pks: Vec<ValueKind> = f.params.iter().map(|p| p.kind).collect();
+            if pks == [ValueKind::Table, ValueKind::Table] && f.ret_kinds == [ValueKind::String] {
+                Some(FuncId(i))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if candidates.is_empty() {
+        let msg = emit_addressof(context, block, "s_concat_no_metamethod", types, loc);
+        emit_exit_with_message(context, block, msg, types, loc);
+        // Unreachable result for type checking — yield a null ptr.
+        return block
+            .append_operation(
+                OperationBuilder::new("llvm.mlir.zero", loc)
+                    .add_results(&[types.ptr])
+                    .build()
+                    .expect("llvm.mlir.zero concat-no-cand"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+    }
+    let mt_slot = emit_byte_offset_ptr(context, block, lhs_t, TABLE_OFF_METATABLE, types, loc);
+    let mt_ptr = emit_load(block, mt_slot, types.ptr, loc);
+    let mt_iv: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[mt_ptr])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint concat mt"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mt_is_null: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            mt_iv,
+            zero_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    // scf.if returning a ptr.
+    let null_then = Region::new();
+    let null_then_blk = Block::new(&[]);
+    {
+        let msg = emit_addressof(
+            context,
+            &null_then_blk,
+            "s_concat_no_metamethod",
+            types,
+            loc,
+        );
+        emit_exit_with_message(context, &null_then_blk, msg, types, loc);
+        let zero_ptr = null_then_blk
+            .append_operation(
+                OperationBuilder::new("llvm.mlir.zero", loc)
+                    .add_results(&[types.ptr])
+                    .build()
+                    .expect("llvm.mlir.zero concat null mt"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        null_then_blk.append_operation(scf::r#yield(&[zero_ptr], loc));
+    }
+    null_then.append_block(null_then_blk);
+    let null_else = Region::new();
+    let null_else_blk = Block::new(&[]);
+    {
+        let field_str = emit_addressof(
+            context,
+            &null_else_blk,
+            "s_metatable_concat_field_name",
+            types,
+            loc,
+        );
+        let search_slot = emit_build_search_key_slot(
+            context,
+            &null_else_blk,
+            ValueKind::String,
+            field_str,
+            types,
+            loc,
+        );
+        let probe_slot =
+            emit_alloca_slot_for_kind(context, &null_else_blk, ValueKind::TaggedValue, types, loc);
+        emit_value_slot_store_nil(context, &null_else_blk, probe_slot, types, loc);
+        emit_hash_lookup_into_tagged_slot(
+            context,
+            &null_else_blk,
+            mt_ptr,
+            search_slot,
+            probe_slot,
+            HashLookupOutcome::NilOnMissing,
+            types,
+            loc,
+        );
+        let probe_tag = emit_load(&null_else_blk, probe_slot, types.i64, loc);
+        let tag_fn_const = null_else_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_fn: Value<'c, '_> = null_else_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                probe_tag,
+                tag_fn_const,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let fn_then = Region::new();
+        let fn_then_blk = Block::new(&[]);
+        {
+            let sig = IndirectSig {
+                param_kinds: vec![ValueKind::Table, ValueKind::Table],
+                ret_kinds: vec![ValueKind::String],
+            };
+            let results = emit_dispatch_chain_from_slot_ptr(
+                context,
+                &fn_then_blk,
+                probe_slot,
+                &sig,
+                &candidates,
+                &[lhs_t, rhs_t],
+                functions,
+                types,
+                loc,
+            );
+            fn_then_blk.append_operation(scf::r#yield(&[results[0]], loc));
+        }
+        fn_then.append_block(fn_then_blk);
+        let fn_else = Region::new();
+        let fn_else_blk = Block::new(&[]);
+        {
+            let msg = emit_addressof(context, &fn_else_blk, "s_concat_no_metamethod", types, loc);
+            emit_exit_with_message(context, &fn_else_blk, msg, types, loc);
+            let zero_ptr = fn_else_blk
+                .append_operation(
+                    OperationBuilder::new("llvm.mlir.zero", loc)
+                        .add_results(&[types.ptr])
+                        .build()
+                        .expect("llvm.mlir.zero concat non-fn"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            fn_else_blk.append_operation(scf::r#yield(&[zero_ptr], loc));
+        }
+        fn_else.append_block(fn_else_blk);
+        let inner =
+            null_else_blk.append_operation(scf::r#if(is_fn, &[types.ptr], fn_then, fn_else, loc));
+        let inner_result: Value<'c, '_> = inner.result(0).unwrap().into();
+        null_else_blk.append_operation(scf::r#yield(&[inner_result], loc));
+    }
+    null_else.append_block(null_else_blk);
+    let outer = block.append_operation(scf::r#if(
+        mt_is_null,
+        &[types.ptr],
+        null_then,
+        null_else,
+        loc,
+    ));
+    outer.result(0).unwrap().into()
 }
 
 /// Phase 2.7e (ADR 0028): convert `value` (of static `kind`) into a

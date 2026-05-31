@@ -408,10 +408,15 @@ fn wrap_with_broken_guard(stmt: HirStmt, broken_id: LocalId) -> HirStmt {
 fn coerce_to_string(expr: HirExpr, kind: ValueKind, offset: usize) -> Result<HirExpr, HirError> {
     match kind {
         ValueKind::String => Ok(expr),
-        // Phase 2.6a-min (ADR 0053): table concat needs `__tostring`
-        // metatable resolution which doesn't exist yet — reject for
-        // symmetry with Function-kind concat rejection.
-        ValueKind::Function(_) | ValueKind::Table => Err(HirError::TypeMismatch {
+        // ADR 0143 — Table operand is now permitted; codegen routes
+        // Table-Table Concat through `emit_concat_via_metamethod`
+        // which probes `mt.__concat`. Mixed Table/String operand
+        // shapes are still rejected here (a follow-up ADR widens).
+        // Return the expr as-is — no auto-wrap with `tostring`.
+        ValueKind::Table => Ok(expr),
+        // Function-kind concat still rejects (no useful String repr
+        // until a future ADR adds `__tostring(Function)`).
+        ValueKind::Function(_) => Err(HirError::TypeMismatch {
             op: "..".to_owned(),
             lhs_kind: "string".to_owned(),
             rhs_kind: kind.name().to_owned(),
@@ -1425,10 +1430,18 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
             && let ExprKind::FunctionExpr { params, .. } = &value.kind
             && let Some(chain) = extract_chain_from_target(target)
             && let Some(&fid) = method_funcs.get(&(chain, key_str.clone()))
-            && !params.is_empty()
-            && key_str == "__tostring"
         {
-            functions[fid.0].params[0].kind = ValueKind::Table;
+            match key_str.as_str() {
+                "__tostring" if !params.is_empty() => {
+                    functions[fid.0].params[0].kind = ValueKind::Table;
+                }
+                "__concat" if params.len() >= 2 => {
+                    // ADR 0143 — `__concat`: (Table, Table) → String.
+                    functions[fid.0].params[0].kind = ValueKind::Table;
+                    functions[fid.0].params[1].kind = ValueKind::Table;
+                }
+                _ => {}
+            }
         }
     }
 
@@ -3979,6 +3992,21 @@ impl LowerCtx {
                     BinOp::Concat => {
                         let lhs_coerced = coerce_to_string(lhs_hir, lk, expr.span.start)?;
                         let rhs_coerced = coerce_to_string(rhs_hir, rk, expr.span.start)?;
+                        // ADR 0143 — mixed-operand `Table .. String`
+                        // / `String .. Table` deferred. Reject any
+                        // shape where exactly one side is Table.
+                        let lkc = infer_kind(&lhs_coerced, &self.locals, &self.functions);
+                        let rkc = infer_kind(&rhs_coerced, &self.locals, &self.functions);
+                        let table_sides =
+                            (lkc == ValueKind::Table) as u8 + (rkc == ValueKind::Table) as u8;
+                        if table_sides == 1 {
+                            return Err(HirError::TypeMismatch {
+                                op: "..".to_owned(),
+                                lhs_kind: "matching kinds (both string or both table)".to_owned(),
+                                rhs_kind: format!("{} vs {}", lkc.name(), rkc.name()),
+                                offset: expr.span.start,
+                            });
+                        }
                         HirExprKind::BinOp {
                             op: *op,
                             lhs: Box::new(lhs_coerced),
