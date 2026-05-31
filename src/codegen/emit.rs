@@ -494,6 +494,79 @@ fn emit_fmt_global<'c>(
         "__call\0",
         loc,
     );
+    // ADR 0147 — arith metamethods field names + trap message.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_add_field_name",
+        "__add\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_sub_field_name",
+        "__sub\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_mul_field_name",
+        "__mul\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_div_field_name",
+        "__div\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_mod_field_name",
+        "__mod\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_pow_field_name",
+        "__pow\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_idiv_field_name",
+        "__idiv\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_unm_field_name",
+        "__unm\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_arith_no_metamethod",
+        "attempt to perform arithmetic on a table value\0",
+        loc,
+    );
     emit_string_global(
         context,
         module,
@@ -7817,6 +7890,23 @@ fn emit_expr<'a, 'c>(
                     context, block, *op, lhs_val, rhs_val, types, loc,
                 ));
             }
+            // ADR 0147 — Table-Table arith routes through the
+            // per-op metamethod helper. Map op → field-name global.
+            if let Some(field_global) = arith_metamethod_field_name(*op)
+                && infer_kind(lhs, locals, functions) == ValueKind::Table
+                && infer_kind(rhs, locals, functions) == ValueKind::Table
+            {
+                return Ok(emit_arith_via_metamethod(
+                    context,
+                    block,
+                    field_global,
+                    lhs_val,
+                    rhs_val,
+                    functions,
+                    types,
+                    loc,
+                ));
+            }
             emit_binop(context, block, *op, lhs_val, rhs_val, types, loc)
         }
         HirExprKind::UnaryOp { op, operand } => {
@@ -7870,6 +7960,34 @@ fn emit_expr<'a, 'c>(
                     _ => unreachable!("HIR rejects #x for non-String/Table kinds"),
                 };
                 return Ok(emit_i2f(block, len_i64, types, loc));
+            }
+            // ADR 0147 — Table operand `-t` routes through `__unm`
+            // metamethod helper. Must precede the existing arith
+            // unary path so a Table ptr doesn't reach `emit_unary`.
+            if matches!(op, UnaryOp::Neg)
+                && infer_kind(operand, locals, functions) == ValueKind::Table
+            {
+                let t_ptr = emit_expr(
+                    context,
+                    block,
+                    operand,
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                return Ok(emit_unary_arith_via_metamethod(
+                    context,
+                    block,
+                    "s_metatable_unm_field_name",
+                    t_ptr,
+                    functions,
+                    types,
+                    loc,
+                ));
             }
             // Phase 2.7p-tagged-arith-coerce (ADR 0089): TaggedValue
             // unary arith routes through the same chokepoint as the
@@ -13722,6 +13840,366 @@ fn emit_table_call_via_metamethod<'a, 'c>(
         context, block, probe_slot, sig, candidates, &arg_vals, functions, types, loc,
     );
     Ok(results[0])
+}
+
+/// ADR 0147 — map a BinOp to its metamethod-field-name module
+/// global. Returns None for non-arith / bitwise ops so the caller
+/// can fall through to the existing emit path.
+fn arith_metamethod_field_name(op: BinOp) -> Option<&'static str> {
+    match op {
+        BinOp::Add => Some("s_metatable_add_field_name"),
+        BinOp::Sub => Some("s_metatable_sub_field_name"),
+        BinOp::Mul => Some("s_metatable_mul_field_name"),
+        BinOp::Div => Some("s_metatable_div_field_name"),
+        BinOp::Mod => Some("s_metatable_mod_field_name"),
+        BinOp::Pow => Some("s_metatable_pow_field_name"),
+        BinOp::FloorDiv => Some("s_metatable_idiv_field_name"),
+        _ => None,
+    }
+}
+
+/// ADR 0147 — Table-Table binary arith via metatable metamethod.
+/// Mirrors the ADR 0143 / 0144 helpers: load lhs's `mt_ptr`
+/// (null → trap), probe `mt[<__op>]` (non-Function → trap), dispatch
+/// via `emit_dispatch_chain_from_slot_ptr` with sig
+/// `(Table, Table) → Number`.
+#[allow(clippy::too_many_arguments)]
+fn emit_arith_via_metamethod<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    field_global: &str,
+    lhs_t: Value<'c, 'a>,
+    rhs_t: Value<'c, 'a>,
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let candidates: Vec<FuncId> = functions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            let pks: Vec<ValueKind> = f.params.iter().map(|p| p.kind).collect();
+            if pks == [ValueKind::Table, ValueKind::Table] && f.ret_kinds == [ValueKind::Number] {
+                Some(FuncId(i))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let zero_f64 = block
+        .append_operation(arith::constant(
+            context,
+            FloatAttribute::new(context, types.f64, 0.0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    if candidates.is_empty() {
+        let msg = emit_addressof(context, block, "s_arith_no_metamethod", types, loc);
+        emit_exit_with_message(context, block, msg, types, loc);
+        return zero_f64;
+    }
+    let mt_slot = emit_byte_offset_ptr(context, block, lhs_t, TABLE_OFF_METATABLE, types, loc);
+    let mt_ptr = emit_load(block, mt_slot, types.ptr, loc);
+    let mt_iv: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[mt_ptr])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint arith mt"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mt_is_null: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            mt_iv,
+            zero_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let null_then = Region::new();
+    let null_then_blk = Block::new(&[]);
+    {
+        let msg = emit_addressof(context, &null_then_blk, "s_arith_no_metamethod", types, loc);
+        emit_exit_with_message(context, &null_then_blk, msg, types, loc);
+        null_then_blk.append_operation(scf::r#yield(&[zero_f64], loc));
+    }
+    null_then.append_block(null_then_blk);
+    let null_else = Region::new();
+    let null_else_blk = Block::new(&[]);
+    {
+        let field_str = emit_addressof(context, &null_else_blk, field_global, types, loc);
+        let search_slot = emit_build_search_key_slot(
+            context,
+            &null_else_blk,
+            ValueKind::String,
+            field_str,
+            types,
+            loc,
+        );
+        let probe_slot =
+            emit_alloca_slot_for_kind(context, &null_else_blk, ValueKind::TaggedValue, types, loc);
+        emit_value_slot_store_nil(context, &null_else_blk, probe_slot, types, loc);
+        emit_hash_lookup_into_tagged_slot(
+            context,
+            &null_else_blk,
+            mt_ptr,
+            search_slot,
+            probe_slot,
+            HashLookupOutcome::NilOnMissing,
+            types,
+            loc,
+        );
+        let probe_tag = emit_load(&null_else_blk, probe_slot, types.i64, loc);
+        let tag_fn_const = null_else_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_fn: Value<'c, '_> = null_else_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                probe_tag,
+                tag_fn_const,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let fn_then = Region::new();
+        let fn_then_blk = Block::new(&[]);
+        {
+            let sig = IndirectSig {
+                param_kinds: vec![ValueKind::Table, ValueKind::Table],
+                ret_kinds: vec![ValueKind::Number],
+            };
+            let results = emit_dispatch_chain_from_slot_ptr(
+                context,
+                &fn_then_blk,
+                probe_slot,
+                &sig,
+                &candidates,
+                &[lhs_t, rhs_t],
+                functions,
+                types,
+                loc,
+            );
+            fn_then_blk.append_operation(scf::r#yield(&[results[0]], loc));
+        }
+        fn_then.append_block(fn_then_blk);
+        let fn_else = Region::new();
+        let fn_else_blk = Block::new(&[]);
+        {
+            let msg = emit_addressof(context, &fn_else_blk, "s_arith_no_metamethod", types, loc);
+            emit_exit_with_message(context, &fn_else_blk, msg, types, loc);
+            fn_else_blk.append_operation(scf::r#yield(&[zero_f64], loc));
+        }
+        fn_else.append_block(fn_else_blk);
+        let inner =
+            null_else_blk.append_operation(scf::r#if(is_fn, &[types.f64], fn_then, fn_else, loc));
+        let inner_result: Value<'c, '_> = inner.result(0).unwrap().into();
+        null_else_blk.append_operation(scf::r#yield(&[inner_result], loc));
+    }
+    null_else.append_block(null_else_blk);
+    let outer = block.append_operation(scf::r#if(
+        mt_is_null,
+        &[types.f64],
+        null_then,
+        null_else,
+        loc,
+    ));
+    outer.result(0).unwrap().into()
+}
+
+/// ADR 0147 — Table unary arith via metatable metamethod
+/// (`__unm`). Same shape as `emit_arith_via_metamethod` but with
+/// sig `(Table) → Number` and arg list `[t]`.
+fn emit_unary_arith_via_metamethod<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    field_global: &str,
+    t_ptr: Value<'c, 'a>,
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let candidates: Vec<FuncId> = functions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            let pks: Vec<ValueKind> = f.params.iter().map(|p| p.kind).collect();
+            if pks == [ValueKind::Table] && f.ret_kinds == [ValueKind::Number] {
+                Some(FuncId(i))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let zero_f64 = block
+        .append_operation(arith::constant(
+            context,
+            FloatAttribute::new(context, types.f64, 0.0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    if candidates.is_empty() {
+        let msg = emit_addressof(context, block, "s_arith_no_metamethod", types, loc);
+        emit_exit_with_message(context, block, msg, types, loc);
+        return zero_f64;
+    }
+    let mt_slot = emit_byte_offset_ptr(context, block, t_ptr, TABLE_OFF_METATABLE, types, loc);
+    let mt_ptr = emit_load(block, mt_slot, types.ptr, loc);
+    let mt_iv: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[mt_ptr])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint unm mt"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mt_is_null: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            mt_iv,
+            zero_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let null_then = Region::new();
+    let null_then_blk = Block::new(&[]);
+    {
+        let msg = emit_addressof(context, &null_then_blk, "s_arith_no_metamethod", types, loc);
+        emit_exit_with_message(context, &null_then_blk, msg, types, loc);
+        null_then_blk.append_operation(scf::r#yield(&[zero_f64], loc));
+    }
+    null_then.append_block(null_then_blk);
+    let null_else = Region::new();
+    let null_else_blk = Block::new(&[]);
+    {
+        let field_str = emit_addressof(context, &null_else_blk, field_global, types, loc);
+        let search_slot = emit_build_search_key_slot(
+            context,
+            &null_else_blk,
+            ValueKind::String,
+            field_str,
+            types,
+            loc,
+        );
+        let probe_slot =
+            emit_alloca_slot_for_kind(context, &null_else_blk, ValueKind::TaggedValue, types, loc);
+        emit_value_slot_store_nil(context, &null_else_blk, probe_slot, types, loc);
+        emit_hash_lookup_into_tagged_slot(
+            context,
+            &null_else_blk,
+            mt_ptr,
+            search_slot,
+            probe_slot,
+            HashLookupOutcome::NilOnMissing,
+            types,
+            loc,
+        );
+        let probe_tag = emit_load(&null_else_blk, probe_slot, types.i64, loc);
+        let tag_fn_const = null_else_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_fn: Value<'c, '_> = null_else_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                probe_tag,
+                tag_fn_const,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let fn_then = Region::new();
+        let fn_then_blk = Block::new(&[]);
+        {
+            let sig = IndirectSig {
+                param_kinds: vec![ValueKind::Table],
+                ret_kinds: vec![ValueKind::Number],
+            };
+            let results = emit_dispatch_chain_from_slot_ptr(
+                context,
+                &fn_then_blk,
+                probe_slot,
+                &sig,
+                &candidates,
+                &[t_ptr],
+                functions,
+                types,
+                loc,
+            );
+            fn_then_blk.append_operation(scf::r#yield(&[results[0]], loc));
+        }
+        fn_then.append_block(fn_then_blk);
+        let fn_else = Region::new();
+        let fn_else_blk = Block::new(&[]);
+        {
+            let msg = emit_addressof(context, &fn_else_blk, "s_arith_no_metamethod", types, loc);
+            emit_exit_with_message(context, &fn_else_blk, msg, types, loc);
+            fn_else_blk.append_operation(scf::r#yield(&[zero_f64], loc));
+        }
+        fn_else.append_block(fn_else_blk);
+        let inner =
+            null_else_blk.append_operation(scf::r#if(is_fn, &[types.f64], fn_then, fn_else, loc));
+        let inner_result: Value<'c, '_> = inner.result(0).unwrap().into();
+        null_else_blk.append_operation(scf::r#yield(&[inner_result], loc));
+    }
+    null_else.append_block(null_else_blk);
+    let outer = block.append_operation(scf::r#if(
+        mt_is_null,
+        &[types.f64],
+        null_then,
+        null_else,
+        loc,
+    ));
+    outer.result(0).unwrap().into()
 }
 
 /// ADR 0143 — `Table .. Table` consults the lhs metatable's

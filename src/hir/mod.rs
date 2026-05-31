@@ -1456,6 +1456,18 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
                     // walker arm.
                     functions[fid.0].params[0].kind = ValueKind::Table;
                 }
+                "__add" | "__sub" | "__mul" | "__div" | "__mod" | "__pow" | "__idiv"
+                    if params.len() >= 2 =>
+                {
+                    // ADR 0147 — arith binary metamethods:
+                    //   (Table, Table) → Number.
+                    functions[fid.0].params[0].kind = ValueKind::Table;
+                    functions[fid.0].params[1].kind = ValueKind::Table;
+                }
+                "__unm" if !params.is_empty() => {
+                    // ADR 0147 — `__unm`: (Table) → Number.
+                    functions[fid.0].params[0].kind = ValueKind::Table;
+                }
                 _ => {}
             }
         }
@@ -3864,7 +3876,25 @@ impl LowerCtx {
                         // Number at the HIR layer. The Local
                         // read site emits a tag check that traps
                         // when the actual value is Nil.
-                        if !(is_number_compatible(lk) && is_number_compatible(rk)) {
+                        // ADR 0147 — Table-Table arith routes through
+                        // the metamethod helper at codegen. The 7
+                        // non-bitwise arith ops accept (Table, Table);
+                        // bitwise stays Number-only (interacts with
+                        // ADR 0114 integer gate — separate ADR).
+                        let arith_table_ok = matches!(
+                            op,
+                            BinOp::Add
+                                | BinOp::Sub
+                                | BinOp::Mul
+                                | BinOp::Div
+                                | BinOp::Mod
+                                | BinOp::Pow
+                                | BinOp::FloorDiv
+                        ) && lk == ValueKind::Table
+                            && rk == ValueKind::Table;
+                        if !arith_table_ok
+                            && (!is_number_compatible(lk) || !is_number_compatible(rk))
+                        {
                             return Err(HirError::TypeMismatch {
                                 op: binop_symbol(*op).to_owned(),
                                 lhs_kind: lk.name().to_owned(),
