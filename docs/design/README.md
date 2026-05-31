@@ -206,6 +206,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0148 — bitwise-metamethods](0148-bitwise-metamethods.md) — Bitwise metamethods (`__band` etc. + `__bnot`) for Table
 - [0149 — len-metamethod](0149-len-metamethod.md) — `__len` metamethod for `#t`
 - [0150 — index-function-form](0150-index-function-form.md) — `__index = Function` form (static-String key, Number return)
+- [0151 — newindex-function-form](0151-newindex-function-form.md) — `__newindex = Function` form (static-String key, Number value)
 
 ### Feature Implementation Memos
 
