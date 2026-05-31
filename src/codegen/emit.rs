@@ -92,6 +92,14 @@ const TABLE_OFF_HASH_BUF: i64 = 24;
 const TABLE_OFF_METATABLE: i64 = 32;
 const TABLE_HEADER_SIZE: i64 = 40;
 
+// ADR 0134 — maximum number of `__index` hops emitted per chokepoint
+// call. Each hop adds one nested scf.if to the generated MLIR, so this
+// trades binary size for chain coverage. 8 covers every Lua idiom seen
+// in this project's test corpus; longer chains fall through to Nil
+// (cycle detection beyond this limit is deferred to a future ADR that
+// switches to a runtime depth counter).
+const METATABLE_INDEX_MAX_HOPS: u32 = 8;
+
 // =============================================================
 // Phase 2.6b-hash (ADR 0058): hash_buf layout for string-keyed
 // fields. Lazy-allocated on first `t.k = v`. Open addressing
@@ -360,6 +368,32 @@ fn emit_fmt_global<'c>(
         i8_type,
         "s_arith_on_non_numeric",
         "attempt to perform arithmetic on a non-numeric value\0",
+        loc,
+    );
+    // ADR 0134 — metatable `__index` runtime diagnostics + the
+    // canonical "__index" key used to probe the metatable.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_index_field_name",
+        "__index\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_chain_too_deep",
+        "'__index' chain too long; possible loop\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_index_unsupported_kind",
+        "attempt to index through non-table '__index' metafield\0",
         loc,
     );
     // Phase 2.5x-callee-dispatch (ADR 0082): runtime traps for the
@@ -5147,10 +5181,73 @@ fn emit_local_init_tagged<'a, 'c>(
                 types,
                 loc,
             );
+            // ADR 0134: after a Nil-on-miss result, fall through to the
+            // metatable's `__index` chain. The helper writes into the
+            // same dst_slot when a chain entry is found; otherwise it
+            // leaves dst_slot as Nil-tagged.
+            emit_metatable_index_fallback_if_nil(
+                context, block, target_ptr, key_slot, dst_slot, types, loc,
+            );
         }
         _ => unreachable!("IndexTagged key must be Number or String"),
     }
     Ok(())
+}
+
+/// Phase 2.6+-metatables-index-read (ADR 0134): post-lookup
+/// metatable fallback. Checks if `dst_slot` carries Nil tag (i.e.
+/// the lookup just missed) and, if so, invokes
+/// `emit_check_metatable_index`. Used at every chokepoint where a
+/// missing key should chain through `__index` (e.g. the
+/// `emit_local_init_tagged` hash arms).
+fn emit_metatable_index_fallback_if_nil<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    target_ptr: Value<'c, 'a>,
+    user_search_key_slot: Value<'c, 'a>,
+    dst_slot: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let dst_tag = emit_load(block, dst_slot, types.i64, loc);
+    let tag_nil = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, TAG_NIL).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let is_nil: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            dst_tag,
+            tag_nil,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    emit_check_metatable_index(
+        context,
+        &then_blk,
+        target_ptr,
+        user_search_key_slot,
+        dst_slot,
+        types,
+        loc,
+    );
+    then_blk.append_operation(scf::r#yield(&[], loc));
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(is_nil, &[], then_region, else_region, loc));
 }
 
 /// Phase 2.6c-tag-fn-tbl Tidy First (post-ADR 0070): rule-of-
@@ -11430,6 +11527,290 @@ fn emit_io_read_runtime<'a, 'c>(
     }
     line_region.append_block(line_blk);
     block.append_operation(scf::r#if(is_eof, &[], eof_region, line_region, loc));
+}
+
+/// Phase 2.6+-metatables-index-read (ADR 0134): top-level entry to
+/// the `__index` chain lookup chokepoint. Walks up to
+/// `METATABLE_INDEX_MAX_HOPS` levels via Rust-side recursion (each
+/// hop emits one nested scf.if). Multi-hop chains within the limit
+/// resolve naturally; chains longer than the limit fall through to
+/// Nil (cycle detection is best-effort — a future ADR may move this
+/// to a runtime depth counter for full Lua-spec 2000-hop coverage).
+fn emit_check_metatable_index<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    target_ptr: Value<'c, 'a>,
+    user_search_key_slot: Value<'c, 'a>,
+    dst_slot: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    emit_check_metatable_index_with_depth(
+        context,
+        block,
+        target_ptr,
+        user_search_key_slot,
+        dst_slot,
+        METATABLE_INDEX_MAX_HOPS,
+        types,
+        loc,
+    );
+}
+
+/// Phase 2.6+-metatables-index-read (ADR 0134): one hop of the
+/// `__index` chain, with `remaining_hops` more allowed. Each call
+/// emits a nested `scf.if` tree:
+/// - mt is null → write nothing (dst stays Nil).
+/// - `mt["__index"]` is Nil → write nothing (dst stays Nil).
+/// - `mt["__index"]` is Table → look up user_key in the table; if
+///   missing recurse with `remaining_hops - 1`.
+/// - any other tag → trap `s_metatable_index_unsupported_kind`.
+#[allow(clippy::too_many_arguments)]
+fn emit_check_metatable_index_with_depth<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    target_ptr: Value<'c, 'a>,
+    user_search_key_slot: Value<'c, 'a>,
+    dst_slot: Value<'c, 'a>,
+    remaining_hops: u32,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    if remaining_hops == 0 {
+        // Chain budget exhausted while the chain is still extending —
+        // this branch is only reached after the prior hop saw a Table
+        // `__index` and a missing key. Trap with the chain-too-long
+        // diagnostic; cycle detection is best-effort within the static
+        // unroll limit (ADR 0134 defers a true runtime-counter check
+        // to a follow-up ADR).
+        let msg = emit_addressof(context, block, "s_metatable_chain_too_deep", types, loc);
+        emit_exit_with_message(context, block, msg, types, loc);
+        return;
+    }
+    // Load metatable_ptr at offset 32.
+    let mt_slot_addr =
+        emit_byte_offset_ptr(context, block, target_ptr, TABLE_OFF_METATABLE, types, loc);
+    let mt = emit_load(block, mt_slot_addr, types.ptr, loc);
+    let mt_iv: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[mt])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint metatable_ptr"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mt_present: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Ne,
+            mt_iv,
+            zero_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mt_then = Region::new();
+    let mt_then_blk = Block::new(&[]);
+    {
+        // Build the "__index" search key slot from the global string.
+        let index_field_ptr = emit_addressof(
+            context,
+            &mt_then_blk,
+            "s_metatable_index_field_name",
+            types,
+            loc,
+        );
+        let index_search_key_slot = emit_build_search_key_slot(
+            context,
+            &mt_then_blk,
+            ValueKind::String,
+            index_field_ptr,
+            types,
+            loc,
+        );
+        // Probe mt for "__index" — raw lookup (no metatable fallback;
+        // Lua spec §3.4.5: only `__index` on the original table chains).
+        let index_result_slot =
+            emit_alloca_slot_for_kind(context, &mt_then_blk, ValueKind::TaggedValue, types, loc);
+        emit_value_slot_store_nil(context, &mt_then_blk, index_result_slot, types, loc);
+        emit_hash_lookup_into_tagged_slot(
+            context,
+            &mt_then_blk,
+            mt,
+            index_search_key_slot,
+            index_result_slot,
+            HashLookupOutcome::NilOnMissing,
+            types,
+            loc,
+        );
+        let index_tag = emit_load(&mt_then_blk, index_result_slot, types.i64, loc);
+        let tag_table = mt_then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_TABLE).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let tag_nil = mt_then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_table: Value<'c, '_> = mt_then_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                index_tag,
+                tag_table,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_nil: Value<'c, '_> = mt_then_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                index_tag,
+                tag_nil,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        // scf.if is_table { lookup key in __index_table } else { if is_nil noop else trap }
+        let table_then = Region::new();
+        let table_then_blk = Block::new(&[]);
+        {
+            // Extract __index_table ptr from payload (offset 8).
+            let payload_ptr = emit_byte_offset_ptr(
+                context,
+                &table_then_blk,
+                index_result_slot,
+                ARRAY_ELEM_OFF_VALUE,
+                types,
+                loc,
+            );
+            let index_table = emit_load(&table_then_blk, payload_ptr, types.ptr, loc);
+            // Look up user_key in __index_table (raw, no fallback).
+            emit_hash_lookup_into_tagged_slot(
+                context,
+                &table_then_blk,
+                index_table,
+                user_search_key_slot,
+                dst_slot,
+                HashLookupOutcome::NilOnMissing,
+                types,
+                loc,
+            );
+            // Multi-hop chain: if the key wasn't in __index_table
+            // either, recurse on __index_table's metatable. The
+            // remaining hop budget bounds the static unroll size and
+            // gives a deterministic answer for cyclic chains.
+            let chain_tag = emit_load(&table_then_blk, dst_slot, types.i64, loc);
+            let chain_tag_nil = table_then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let chain_is_nil: Value<'c, '_> = table_then_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    chain_tag,
+                    chain_tag_nil,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let chain_then = Region::new();
+            let chain_then_blk = Block::new(&[]);
+            emit_check_metatable_index_with_depth(
+                context,
+                &chain_then_blk,
+                index_table,
+                user_search_key_slot,
+                dst_slot,
+                remaining_hops - 1,
+                types,
+                loc,
+            );
+            chain_then_blk.append_operation(scf::r#yield(&[], loc));
+            chain_then.append_block(chain_then_blk);
+            let chain_else = Region::new();
+            let chain_else_blk = Block::new(&[]);
+            chain_else_blk.append_operation(scf::r#yield(&[], loc));
+            chain_else.append_block(chain_else_blk);
+            table_then_blk.append_operation(scf::r#if(
+                chain_is_nil,
+                &[],
+                chain_then,
+                chain_else,
+                loc,
+            ));
+            table_then_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        table_then.append_block(table_then_blk);
+        let table_else = Region::new();
+        let table_else_blk = Block::new(&[]);
+        {
+            // is_table == false. Either is_nil (no __index in mt) or
+            // unsupported kind (Function / Number / etc.).
+            let nil_then = Region::new();
+            let nil_then_blk = Block::new(&[]);
+            nil_then_blk.append_operation(scf::r#yield(&[], loc));
+            nil_then.append_block(nil_then_blk);
+            let nil_else = Region::new();
+            let nil_else_blk = Block::new(&[]);
+            {
+                let msg = emit_addressof(
+                    context,
+                    &nil_else_blk,
+                    "s_metatable_index_unsupported_kind",
+                    types,
+                    loc,
+                );
+                emit_exit_with_message(context, &nil_else_blk, msg, types, loc);
+                nil_else_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            nil_else.append_block(nil_else_blk);
+            table_else_blk.append_operation(scf::r#if(is_nil, &[], nil_then, nil_else, loc));
+            table_else_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        table_else.append_block(table_else_blk);
+        mt_then_blk.append_operation(scf::r#if(is_table, &[], table_then, table_else, loc));
+        mt_then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    mt_then.append_block(mt_then_blk);
+    let mt_else = Region::new();
+    let mt_else_blk = Block::new(&[]);
+    mt_else_blk.append_operation(scf::r#yield(&[], loc));
+    mt_else.append_block(mt_else_blk);
+    block.append_operation(scf::r#if(mt_present, &[], mt_then, mt_else, loc));
 }
 
 /// Phase 2.6+-metatables-index-read (ADR 0134): `setmetatable(t, mt)`

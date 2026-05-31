@@ -93,15 +93,18 @@ print(t.z)
     assert_eq!(out, "100\n");
 }
 
-// --- Test 4: __index cycle (self-reference) traps at depth cap ---
+// --- Test 4: __index cycle traps at depth cap ---
 
 #[test]
 fn index_chain_cycle_traps_at_depth_cap() {
-    // setmetatable(t, mt) where mt.__index = mt creates an
-    // infinite chain — the depth-2000 cap must trap, not hang.
+    // Real cycle: mt is its own metatable AND mt.__index = mt, so the
+    // chain "look up missing in mt → look up missing in mt's
+    // metatable.__index (== mt) → repeat" never terminates without
+    // an explicit depth trap.
     let src = r#"
 local mt = {}
 mt.__index = mt
+setmetatable(mt, mt)
 local t = {}
 setmetatable(t, mt)
 print(t.missing)
