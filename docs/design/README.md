@@ -196,6 +196,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0138 — setmetatable-nil-clear](0138-setmetatable-nil-clear.md) — `setmetatable(t, nil)` metatable clear
 - [0139 — taggedvalue-key-newindex-wiring](0139-taggedvalue-key-newindex-wiring.md) — TaggedValue-key IndexAssign routes through `__newindex` helper
 - [0140 — metatable-field-hiding](0140-metatable-field-hiding.md) — `__metatable` field hiding (getmetatable + setmetatable protection)
+- [0141 — anon-fn-indexassign-param-refine](0141-anon-fn-indexassign-param-refine.md) — Anonymous `FunctionExpr` param-kind refinement from top-level `IndexAssign` sites
 
 ### Feature Implementation Memos
 
