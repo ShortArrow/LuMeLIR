@@ -3356,18 +3356,40 @@ fn emit_stmt<'a, 'c>(
                 loc,
             )?;
             let key_kind = infer_kind(key, locals, functions);
-            let value_v = emit_expr(
-                context,
-                block,
-                value,
-                slots,
-                locals,
-                functions,
-                types,
-                params_len,
-                in_function_cell_ptr,
-                loc,
-            )?;
+            let value_kind_peek = infer_kind(value, locals, functions);
+            // ADR 0138-M: a TaggedValue value Local cannot be lowered
+            // through `emit_expr` (it would trap on non-Number tag).
+            // For TaggedValue-key + TaggedValue-value writes, leave
+            // `value_v` as a placeholder — the TaggedValue-key arm
+            // substitutes `slots[idx]` before calling the helper.
+            let value_v = if matches!(key_kind, ValueKind::TaggedValue)
+                && matches!(value_kind_peek, ValueKind::TaggedValue)
+            {
+                // Placeholder f64 — never consumed (TaggedValue-key arm
+                // overrides this with the source slot ptr before use).
+                block
+                    .append_operation(arith::constant(
+                        context,
+                        FloatAttribute::new(context, types.f64, 0.0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into()
+            } else {
+                emit_expr(
+                    context,
+                    block,
+                    value,
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?
+            };
             match key_kind {
                 ValueKind::Number => {
                     // Phase 2.6c-tag-arr (ADR 0059): hole-write
@@ -3753,6 +3775,55 @@ fn emit_stmt<'a, 'c>(
                             ));
                         }
                     };
+                    let value_kind_early = infer_kind(value, locals, functions);
+                    if !matches!(value_kind_early, ValueKind::Nil) {
+                        // ADR 0138-M: route non-Nil writes through the
+                        // shared `__newindex`-aware helper. The helper
+                        // handles TaggedValue key + value via raw
+                        // 16-byte slot copy, so the `pairs`-body idiom
+                        // `dst[k] = v` correctly fires the metatable
+                        // probe in the was_empty branch (ADR 0135
+                        // test 9) and preserves Lua §2.4 for existing
+                        // keys. The Nil-value soft-delete branch
+                        // below stays inline — Lua spec, `t[k] = nil`
+                        // does not consult `__newindex`.
+                        //
+                        // TaggedValue value source must be a Local —
+                        // emit_expr on a TaggedValue Local traps on
+                        // non-Number, but the helper needs the slot
+                        // ptr to do a raw 16-byte copy. Substitute
+                        // `slots[idx]` for `value_v` in that case.
+                        let value_v_for_helper =
+                            if matches!(value_kind_early, ValueKind::TaggedValue) {
+                                match &value.kind {
+                                    HirExprKind::Local(LocalId(idx)) => slots[*idx],
+                                    _ => {
+                                        return Err(CodegenError::UnsupportedExpr(
+                                            "TaggedValue-value IndexAssign requires `Local` value \
+                                         (ADR 0138-M scope)"
+                                                .to_owned(),
+                                        ));
+                                    }
+                                }
+                            } else {
+                                value_v
+                            };
+                        emit_hash_indexassign_with_newindex(
+                            context,
+                            block,
+                            target_ptr,
+                            search_key_slot,
+                            ValueKind::TaggedValue,
+                            search_key_slot,
+                            value_v_for_helper,
+                            value_kind_early,
+                            METATABLE_INDEX_MAX_HOPS,
+                            false,
+                            types,
+                            loc,
+                        );
+                        return Ok(());
+                    }
                     // Hash path — same structure as the static-key
                     // arm above, but: (a) the search-key slot is the
                     // TaggedValue local's slot rather than a freshly
@@ -12045,6 +12116,30 @@ fn emit_check_metatable_index_with_depth<'a, 'c>(
 ///      - other → trap `s_metatable_newindex_unsupported_kind`
 ///   4. `remaining_hops == 0` and chain still extends → trap
 ///      `s_metatable_chain_too_deep` (shared with ADR 0134)
+///
+/// Raw 16-byte tagged-slot copy: load tag (i64) at offset 0 and
+/// payload (i64) at offset 8 from `src_slot`, store to `dst_slot`.
+/// Used for TaggedValue key / value commits in the hash IndexAssign
+/// helper below — concrete kinds go through
+/// `emit_value_slot_store_dispatched` (per-kind store helpers in
+/// `tagged.rs`), but TaggedValue has no concrete kind so the raw
+/// copy preserves whatever discriminator the source slot holds.
+fn emit_copy_tagged_slot_16b<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    src_slot: Value<'c, 'a>,
+    dst_slot: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let tag = emit_load(block, src_slot, types.i64, loc);
+    emit_store(block, tag, dst_slot, loc);
+    let src_pay = emit_byte_offset_ptr(context, block, src_slot, ARRAY_ELEM_OFF_VALUE, types, loc);
+    let dst_pay = emit_byte_offset_ptr(context, block, dst_slot, ARRAY_ELEM_OFF_VALUE, types, loc);
+    let pay = emit_load(block, src_pay, types.i64, loc);
+    emit_store(block, pay, dst_pay, loc);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_hash_indexassign_with_newindex<'a, 'c>(
     context: &'c Context,
@@ -12427,15 +12522,31 @@ fn emit_hash_indexassign_with_newindex<'a, 'c>(
         let commit_then = Region::new();
         let commit_then_blk = Block::new(&[]);
         {
-            emit_value_slot_store_dispatched(
-                context,
-                &commit_then_blk,
-                entry_ptr,
-                key_value,
-                key_kind,
-                types,
-                loc,
-            );
+            // ADR 0084 / 0138-M: TaggedValue key commits via raw
+            // 16-byte slot copy (tag + payload words); concrete kinds
+            // use the per-kind dispatched store. `key_value` for the
+            // TaggedValue case is the source slot ptr itself (HIR
+            // Local of TaggedValue kind lowers to `slots[idx]`).
+            if matches!(key_kind, ValueKind::TaggedValue) {
+                emit_copy_tagged_slot_16b(
+                    context,
+                    &commit_then_blk,
+                    key_slot,
+                    entry_ptr,
+                    types,
+                    loc,
+                );
+            } else {
+                emit_value_slot_store_dispatched(
+                    context,
+                    &commit_then_blk,
+                    entry_ptr,
+                    key_value,
+                    key_kind,
+                    types,
+                    loc,
+                );
+            }
             let count_slot = emit_byte_offset_ptr(
                 context,
                 &commit_then_blk,
@@ -12474,16 +12585,22 @@ fn emit_hash_indexassign_with_newindex<'a, 'c>(
             commit_else,
             loc,
         ));
-        // Write value (always when !handled).
-        emit_value_slot_store_dispatched(
-            context,
-            &raw_then_blk,
-            value_slot_ptr,
-            value_v,
-            value_kind,
-            types,
-            loc,
-        );
+        // Write value (always when !handled). TaggedValue source uses
+        // raw 16-byte copy (value_v is the source slot ptr); concrete
+        // kinds use the dispatched store.
+        if matches!(value_kind, ValueKind::TaggedValue) {
+            emit_copy_tagged_slot_16b(context, &raw_then_blk, value_v, value_slot_ptr, types, loc);
+        } else {
+            emit_value_slot_store_dispatched(
+                context,
+                &raw_then_blk,
+                value_slot_ptr,
+                value_v,
+                value_kind,
+                types,
+                loc,
+            );
+        }
         raw_then_blk.append_operation(scf::r#yield(&[], loc));
     }
     raw_then.append_block(raw_then_blk);

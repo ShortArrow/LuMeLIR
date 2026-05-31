@@ -3102,6 +3102,11 @@ impl LowerCtx {
                 // semantics; every other key kind takes the hash
                 // path and accepts `nil` as the soft-delete /
                 // hard-tombstone signal.
+                // ADR 0138-M: TaggedValue value accepted for hash
+                // keys (Number array path still rejects — array slots
+                // need a concrete kind for grow-extend). The
+                // TaggedValue value commit at codegen routes through
+                // `emit_copy_tagged_slot_16b`.
                 let value_kind_ok = matches!(
                     value_kind,
                     ValueKind::Number
@@ -3110,7 +3115,7 @@ impl LowerCtx {
                         | ValueKind::Function(_)
                         | ValueKind::Table
                 ) || (key_kind != ValueKind::Number
-                    && value_kind == ValueKind::Nil);
+                    && matches!(value_kind, ValueKind::Nil | ValueKind::TaggedValue));
                 if !value_kind_ok {
                     return Err(HirError::TypeMismatch {
                         op: "[]=".to_owned(),
