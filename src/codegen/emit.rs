@@ -450,6 +450,41 @@ fn emit_fmt_global<'c>(
         "attempt to concatenate a table value (no '__concat' metamethod)\0",
         loc,
     );
+    // ADR 0144 — comparison metamethod field names + missing-meta
+    // trap (Lua spec error for `<` / `<=` on tables without `__lt` /
+    // `__le`).
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_eq_field_name",
+        "__eq\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_lt_field_name",
+        "__lt\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_le_field_name",
+        "__le\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_cmp_no_metamethod",
+        "attempt to compare two table values\0",
+        loc,
+    );
     emit_string_global(
         context,
         module,
@@ -7742,6 +7777,20 @@ fn emit_expr<'a, 'c>(
                 }
                 return Ok(emit_concat(context, block, lhs_val, rhs_val, types, loc));
             }
+            // ADR 0144 — Table-Table comparisons route through the
+            // metamethod helper. Must precede the String arm below
+            // so a Table operand doesn't get treated as a String
+            // ptr.
+            if matches!(
+                op,
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+            ) && infer_kind(lhs, locals, functions) == ValueKind::Table
+                && infer_kind(rhs, locals, functions) == ValueKind::Table
+            {
+                return Ok(emit_table_cmp_via_metamethod(
+                    context, block, *op, lhs_val, rhs_val, functions, types, loc,
+                ));
+            }
             if matches!(
                 op,
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
@@ -13684,6 +13733,490 @@ fn emit_concat_via_metamethod<'a, 'c>(
     let outer = block.append_operation(scf::r#if(
         mt_is_null,
         &[types.ptr],
+        null_then,
+        null_else,
+        loc,
+    ));
+    outer.result(0).unwrap().into()
+}
+
+/// ADR 0144 — Table-Table comparisons via `__eq` / `__lt` / `__le`
+/// metamethods. Eq does a ptr-equality short-circuit (aliased
+/// tables → true) before probing. Lt / Le trap when the metamethod
+/// is absent (Lua spec). Gt swaps operands to Lt(rhs, lhs); Ge
+/// swaps to Le(rhs, lhs); Ne is the complement of Eq.
+#[allow(clippy::too_many_arguments)]
+fn emit_table_cmp_via_metamethod<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    op: BinOp,
+    lhs_t: Value<'c, 'a>,
+    rhs_t: Value<'c, 'a>,
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    // Swap Gt → Lt and Ge → Le; collapse Ne to "not Eq".
+    let (effective_op, eff_lhs, eff_rhs, negate) = match op {
+        BinOp::Eq => (BinOp::Eq, lhs_t, rhs_t, false),
+        BinOp::Ne => (BinOp::Eq, lhs_t, rhs_t, true),
+        BinOp::Lt => (BinOp::Lt, lhs_t, rhs_t, false),
+        BinOp::Le => (BinOp::Le, lhs_t, rhs_t, false),
+        BinOp::Gt => (BinOp::Lt, rhs_t, lhs_t, false),
+        BinOp::Ge => (BinOp::Le, rhs_t, lhs_t, false),
+        _ => unreachable!("emit_table_cmp_via_metamethod called with non-comparison op"),
+    };
+    let raw_result = match effective_op {
+        BinOp::Eq => {
+            emit_table_eq_via_metamethod(context, block, eff_lhs, eff_rhs, functions, types, loc)
+        }
+        BinOp::Lt => emit_table_ordering_via_metamethod(
+            context,
+            block,
+            "s_metatable_lt_field_name",
+            eff_lhs,
+            eff_rhs,
+            functions,
+            types,
+            loc,
+        ),
+        BinOp::Le => emit_table_ordering_via_metamethod(
+            context,
+            block,
+            "s_metatable_le_field_name",
+            eff_lhs,
+            eff_rhs,
+            functions,
+            types,
+            loc,
+        ),
+        _ => unreachable!(),
+    };
+    if negate {
+        let one_i1 = block
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i1, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        block
+            .append_operation(arith::xori(raw_result, one_i1, loc))
+            .result(0)
+            .unwrap()
+            .into()
+    } else {
+        raw_result
+    }
+}
+
+/// ADR 0144 — `__eq` dispatch: ptr-equality short-circuit, else
+/// probe `lhs.metatable.__eq`. Missing metafield or empty candidate
+/// set → false (Lua spec: distinct tables without `__eq` are
+/// non-equal).
+fn emit_table_eq_via_metamethod<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    lhs_t: Value<'c, 'a>,
+    rhs_t: Value<'c, 'a>,
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let lhs_i: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[lhs_t])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint eq lhs"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let rhs_i: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[rhs_t])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint eq rhs"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let ptr_eq: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            lhs_i,
+            rhs_i,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let false_i1 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i1, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let true_i1 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i1, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    // scf.if(ptr_eq) → true; else probe metatable, fall back to false.
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    then_blk.append_operation(scf::r#yield(&[true_i1], loc));
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    {
+        let candidates: Vec<FuncId> = functions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| {
+                let pks: Vec<ValueKind> = f.params.iter().map(|p| p.kind).collect();
+                if pks == [ValueKind::Table, ValueKind::Table] && f.ret_kinds == [ValueKind::Bool] {
+                    Some(FuncId(i))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if candidates.is_empty() {
+            else_blk.append_operation(scf::r#yield(&[false_i1], loc));
+        } else {
+            let mt_slot =
+                emit_byte_offset_ptr(context, &else_blk, lhs_t, TABLE_OFF_METATABLE, types, loc);
+            let mt_ptr = emit_load(&else_blk, mt_slot, types.ptr, loc);
+            let mt_iv: Value<'c, '_> = else_blk
+                .append_operation(
+                    OperationBuilder::new("llvm.ptrtoint", loc)
+                        .add_operands(&[mt_ptr])
+                        .add_results(&[types.i64])
+                        .build()
+                        .expect("llvm.ptrtoint eq mt"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let zero_i64 = else_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 0).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let mt_is_null: Value<'c, '_> = else_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    mt_iv,
+                    zero_i64,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let null_then = Region::new();
+            let null_then_blk = Block::new(&[]);
+            null_then_blk.append_operation(scf::r#yield(&[false_i1], loc));
+            null_then.append_block(null_then_blk);
+            let null_else = Region::new();
+            let null_else_blk = Block::new(&[]);
+            {
+                let field_str = emit_addressof(
+                    context,
+                    &null_else_blk,
+                    "s_metatable_eq_field_name",
+                    types,
+                    loc,
+                );
+                let search_slot = emit_build_search_key_slot(
+                    context,
+                    &null_else_blk,
+                    ValueKind::String,
+                    field_str,
+                    types,
+                    loc,
+                );
+                let probe_slot = emit_alloca_slot_for_kind(
+                    context,
+                    &null_else_blk,
+                    ValueKind::TaggedValue,
+                    types,
+                    loc,
+                );
+                emit_value_slot_store_nil(context, &null_else_blk, probe_slot, types, loc);
+                emit_hash_lookup_into_tagged_slot(
+                    context,
+                    &null_else_blk,
+                    mt_ptr,
+                    search_slot,
+                    probe_slot,
+                    HashLookupOutcome::NilOnMissing,
+                    types,
+                    loc,
+                );
+                let probe_tag = emit_load(&null_else_blk, probe_slot, types.i64, loc);
+                let tag_fn_const = null_else_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let is_fn: Value<'c, '_> = null_else_blk
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Eq,
+                        probe_tag,
+                        tag_fn_const,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let fn_then = Region::new();
+                let fn_then_blk = Block::new(&[]);
+                {
+                    let sig = IndirectSig {
+                        param_kinds: vec![ValueKind::Table, ValueKind::Table],
+                        ret_kinds: vec![ValueKind::Bool],
+                    };
+                    let results = emit_dispatch_chain_from_slot_ptr(
+                        context,
+                        &fn_then_blk,
+                        probe_slot,
+                        &sig,
+                        &candidates,
+                        &[lhs_t, rhs_t],
+                        functions,
+                        types,
+                        loc,
+                    );
+                    fn_then_blk.append_operation(scf::r#yield(&[results[0]], loc));
+                }
+                fn_then.append_block(fn_then_blk);
+                let fn_else = Region::new();
+                let fn_else_blk = Block::new(&[]);
+                fn_else_blk.append_operation(scf::r#yield(&[false_i1], loc));
+                fn_else.append_block(fn_else_blk);
+                let inner = null_else_blk.append_operation(scf::r#if(
+                    is_fn,
+                    &[types.i1],
+                    fn_then,
+                    fn_else,
+                    loc,
+                ));
+                let inner_result: Value<'c, '_> = inner.result(0).unwrap().into();
+                null_else_blk.append_operation(scf::r#yield(&[inner_result], loc));
+            }
+            null_else.append_block(null_else_blk);
+            let probe_if = else_blk.append_operation(scf::r#if(
+                mt_is_null,
+                &[types.i1],
+                null_then,
+                null_else,
+                loc,
+            ));
+            let probe_result: Value<'c, '_> = probe_if.result(0).unwrap().into();
+            else_blk.append_operation(scf::r#yield(&[probe_result], loc));
+        }
+    }
+    else_region.append_block(else_blk);
+    let outer = block.append_operation(scf::r#if(
+        ptr_eq,
+        &[types.i1],
+        then_region,
+        else_region,
+        loc,
+    ));
+    outer.result(0).unwrap().into()
+}
+
+/// ADR 0144 — `__lt` / `__le` dispatch. No ptr-equality short-
+/// circuit (Lua spec doesn't apply it to ordering). Missing
+/// metatable / metafield / candidate → trap `s_cmp_no_metamethod`.
+#[allow(clippy::too_many_arguments)]
+fn emit_table_ordering_via_metamethod<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    field_global: &str,
+    lhs_t: Value<'c, 'a>,
+    rhs_t: Value<'c, 'a>,
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let candidates: Vec<FuncId> = functions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            let pks: Vec<ValueKind> = f.params.iter().map(|p| p.kind).collect();
+            if pks == [ValueKind::Table, ValueKind::Table] && f.ret_kinds == [ValueKind::Bool] {
+                Some(FuncId(i))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let false_i1 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i1, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    if candidates.is_empty() {
+        let msg = emit_addressof(context, block, "s_cmp_no_metamethod", types, loc);
+        emit_exit_with_message(context, block, msg, types, loc);
+        return false_i1;
+    }
+    let mt_slot = emit_byte_offset_ptr(context, block, lhs_t, TABLE_OFF_METATABLE, types, loc);
+    let mt_ptr = emit_load(block, mt_slot, types.ptr, loc);
+    let mt_iv: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[mt_ptr])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint cmp mt"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mt_is_null: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            mt_iv,
+            zero_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let null_then = Region::new();
+    let null_then_blk = Block::new(&[]);
+    {
+        let msg = emit_addressof(context, &null_then_blk, "s_cmp_no_metamethod", types, loc);
+        emit_exit_with_message(context, &null_then_blk, msg, types, loc);
+        null_then_blk.append_operation(scf::r#yield(&[false_i1], loc));
+    }
+    null_then.append_block(null_then_blk);
+    let null_else = Region::new();
+    let null_else_blk = Block::new(&[]);
+    {
+        let field_str = emit_addressof(context, &null_else_blk, field_global, types, loc);
+        let search_slot = emit_build_search_key_slot(
+            context,
+            &null_else_blk,
+            ValueKind::String,
+            field_str,
+            types,
+            loc,
+        );
+        let probe_slot =
+            emit_alloca_slot_for_kind(context, &null_else_blk, ValueKind::TaggedValue, types, loc);
+        emit_value_slot_store_nil(context, &null_else_blk, probe_slot, types, loc);
+        emit_hash_lookup_into_tagged_slot(
+            context,
+            &null_else_blk,
+            mt_ptr,
+            search_slot,
+            probe_slot,
+            HashLookupOutcome::NilOnMissing,
+            types,
+            loc,
+        );
+        let probe_tag = emit_load(&null_else_blk, probe_slot, types.i64, loc);
+        let tag_fn_const = null_else_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_fn: Value<'c, '_> = null_else_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                probe_tag,
+                tag_fn_const,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let fn_then = Region::new();
+        let fn_then_blk = Block::new(&[]);
+        {
+            let sig = IndirectSig {
+                param_kinds: vec![ValueKind::Table, ValueKind::Table],
+                ret_kinds: vec![ValueKind::Bool],
+            };
+            let results = emit_dispatch_chain_from_slot_ptr(
+                context,
+                &fn_then_blk,
+                probe_slot,
+                &sig,
+                &candidates,
+                &[lhs_t, rhs_t],
+                functions,
+                types,
+                loc,
+            );
+            fn_then_blk.append_operation(scf::r#yield(&[results[0]], loc));
+        }
+        fn_then.append_block(fn_then_blk);
+        let fn_else = Region::new();
+        let fn_else_blk = Block::new(&[]);
+        {
+            let msg = emit_addressof(context, &fn_else_blk, "s_cmp_no_metamethod", types, loc);
+            emit_exit_with_message(context, &fn_else_blk, msg, types, loc);
+            fn_else_blk.append_operation(scf::r#yield(&[false_i1], loc));
+        }
+        fn_else.append_block(fn_else_blk);
+        let inner =
+            null_else_blk.append_operation(scf::r#if(is_fn, &[types.i1], fn_then, fn_else, loc));
+        let inner_result: Value<'c, '_> = inner.result(0).unwrap().into();
+        null_else_blk.append_operation(scf::r#yield(&[inner_result], loc));
+    }
+    null_else.append_block(null_else_blk);
+    let outer = block.append_operation(scf::r#if(
+        mt_is_null,
+        &[types.i1],
         null_then,
         null_else,
         loc,

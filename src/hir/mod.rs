@@ -1440,6 +1440,12 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
                     functions[fid.0].params[0].kind = ValueKind::Table;
                     functions[fid.0].params[1].kind = ValueKind::Table;
                 }
+                "__eq" | "__lt" | "__le" if params.len() >= 2 => {
+                    // ADR 0144 — comparison metamethods:
+                    //   (Table, Table) → Bool.
+                    functions[fid.0].params[0].kind = ValueKind::Table;
+                    functions[fid.0].params[1].kind = ValueKind::Table;
+                }
                 _ => {}
             }
         }
@@ -3865,8 +3871,11 @@ impl LowerCtx {
                     // from "Number only" to "Number-Number or
                     // String-String"; cross-kind still rejects.
                     BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                        // ADR 0144 — Table-Table accepted; codegen
+                        // routes through `__lt` / `__le` metamethod.
                         let ok = (is_number_compatible(lk) && is_number_compatible(rk))
-                            || (lk == ValueKind::String && rk == ValueKind::String);
+                            || (lk == ValueKind::String && rk == ValueKind::String)
+                            || (lk == ValueKind::Table && rk == ValueKind::Table);
                         if !ok {
                             return Err(HirError::TypeMismatch {
                                 op: binop_symbol(*op).to_owned(),
