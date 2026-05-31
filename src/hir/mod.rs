@@ -1355,6 +1355,10 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
             let fid = alloc_method_signature(params, &mut functions, ParentScope::Chunk);
             anon_indexassign_func_ids.push(fid);
             method_funcs.entry((chain, key_str.clone())).or_insert(fid);
+            // ADR 0142 — metamethod-aware kind refinement runs
+            // AFTER Pass-1.5 below (the walker overwrites pre-pass
+            // settings via its seen-flag default), so the forced
+            // `__tostring` shape lives in the second walk.
         }
     }
     // Phase 2.6+-name-rebind-refine (ADR 0098): pass-1.5 builds an
@@ -1407,6 +1411,24 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
     for (i, kinds) in inferred.iter().enumerate() {
         for (j, k) in kinds.iter().enumerate() {
             functions[i].params[j].kind = *k;
+        }
+    }
+    // ADR 0142 — metamethod-aware refinement (Lua spec shapes).
+    // Pass-1.5 walker just overwrote `params[].kind` with its
+    // (seen-flag default `[Number;arity]`) inference. For metamethod
+    // slots (`__tostring` etc.) the call site is invisible to the
+    // walker (it appears as a Builtin call, not as `Call(Index(...),
+    // ...)`), so re-apply the spec-driven kinds here.
+    for stmt in chunk {
+        if let StmtKind::IndexAssign { target, key, value } = &stmt.kind
+            && let ExprKind::Str(key_str) = &key.kind
+            && let ExprKind::FunctionExpr { params, .. } = &value.kind
+            && let Some(chain) = extract_chain_from_target(target)
+            && let Some(&fid) = method_funcs.get(&(chain, key_str.clone()))
+            && !params.is_empty()
+            && key_str == "__tostring"
+        {
+            functions[fid.0].params[0].kind = ValueKind::Table;
         }
     }
 

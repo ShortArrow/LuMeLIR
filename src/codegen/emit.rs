@@ -424,6 +424,15 @@ fn emit_fmt_global<'c>(
         "__metatable\0",
         loc,
     );
+    // ADR 0142 — `__tostring` metamethod field name.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_metatable_tostring_field_name",
+        "__tostring\0",
+        loc,
+    );
     emit_string_global(
         context,
         module,
@@ -4317,8 +4326,51 @@ fn emit_indirect_dispatch_chain_in_block<'a, 'c>(
     in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<Vec<Value<'c, 'a>>, CodegenError> {
-    // ===== Step 1: tag check =====
+    // Pre-lower args once, then delegate to the slot-ptr variant.
+    // ADR 0142 — split allows callers (e.g. `__tostring` metamethod
+    // dispatch) to start from a tmp tagged slot loaded by a hash
+    // probe, with their own pre-lowered Value args.
     let slot_ptr = slots[slot_idx];
+    let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
+    for a in args {
+        arg_vals.push(emit_expr(
+            context,
+            block,
+            a,
+            slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
+        )?);
+    }
+    Ok(emit_dispatch_chain_from_slot_ptr(
+        context, block, slot_ptr, sig, candidates, &arg_vals, functions, types, loc,
+    ))
+}
+
+/// ADR 0142 — Tidy First extract of the slot-load → tag-check →
+/// dispatch-chain portion of `emit_indirect_dispatch_chain_in_block`.
+/// Takes a `Value<ptr>` slot ptr (so callers can supply a tmp tagged
+/// slot from a hash probe) and pre-lowered arg values. Used by the
+/// existing IndirectDispatch path (after computing `slot_ptr =
+/// slots[slot_idx]` and lowering args) and by `__tostring` metamethod
+/// dispatch (this ADR's first new consumer).
+#[allow(clippy::too_many_arguments)]
+fn emit_dispatch_chain_from_slot_ptr<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    slot_ptr: Value<'c, 'a>,
+    sig: &IndirectSig,
+    candidates: &[FuncId],
+    arg_vals: &[Value<'c, 'a>],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Vec<Value<'c, 'a>> {
+    // ===== Step 1: tag check =====
     let tag = emit_load(block, slot_ptr, types.i64, loc);
     let tag_function_const = block
         .append_operation(arith::constant(
@@ -4366,38 +4418,20 @@ fn emit_indirect_dispatch_chain_in_block<'a, 'c>(
     let cell_ptr = emit_load(block, payload_ptr, types.ptr, loc);
     let loaded_ptr = super::closure::emit_load_closure_fn_ptr(context, block, cell_ptr, types, loc);
 
-    // ===== Step 3: evaluate args once =====
-    let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
-    for a in args {
-        arg_vals.push(emit_expr(
-            context,
-            block,
-            a,
-            slots,
-            locals,
-            functions,
-            types,
-            params_len,
-            in_function_cell_ptr,
-            loc,
-        )?);
-    }
-
-    // ===== Step 4: dispatch chain =====
+    // ===== Step 3: dispatch chain (args pre-lowered by caller) =====
     let result_types = ret_mlir_types(context, &sig.ret_kinds, types);
-    let chain_op_results = emit_dispatch_chain_recursive(
+    emit_dispatch_chain_recursive(
         context,
         block,
         loaded_ptr,
         cell_ptr,
         candidates,
-        &arg_vals,
+        arg_vals,
         functions,
         &result_types,
         types,
         loc,
-    );
-    Ok(chain_op_results)
+    )
 }
 
 /// Phase 2.5x-callee-dispatch (ADR 0082): recursively build the
@@ -8090,6 +8124,18 @@ fn emit_expr<'a, 'c>(
                     in_function_cell_ptr,
                     loc,
                 )?;
+                // ADR 0142 — `tostring(t)` for static Table operand
+                // probes `mt.__tostring` and dispatches through the
+                // ADR 0082 closure-cell chain (via the slot-ptr
+                // helper extracted by this ADR). Falls back to the
+                // "table" literal when mt is null, the field is
+                // absent / non-Function, or no compile-time
+                // candidate matches.
+                if kind == ValueKind::Table {
+                    return Ok(emit_tostring_table_via_metamethod(
+                        context, block, arg_val, functions, types, loc,
+                    ));
+                }
                 Ok(emit_tostring(context, block, arg_val, kind, types, loc))
             }
             // Phase 2.7e (ADR 0028): `tonumber(x)`. Number identity
@@ -13223,13 +13269,13 @@ fn emit_tostring<'a, 'c>(
         // already registered for `type(f)` so we don't bloat the
         // module with a near-duplicate string.
         ValueKind::Function(_) => emit_addressof(context, block, "s_typename_function", types, loc),
-        // Phase 2.6a-min (ADR 0053): tables don't yet flow through
-        // `tostring` — HIR rejects this path. The arm exists only
-        // for exhaustiveness.
-        ValueKind::Table => unreachable!(
-            "Table-kind tostring is rejected at HIR-time \
-             (FunctionUsedAsValue analogue) — should not reach codegen"
-        ),
+        // ADR 0142 — `tostring(t)` for Table operand is now routed
+        // by the ToString emit arm into `emit_tostring_table_via_
+        // metamethod` (it needs `functions: &[HirFunction]` for
+        // candidate filtering, which this helper does not receive).
+        // Reaching this arm means a caller bypassed that routing —
+        // surface as a placeholder "table" rather than panicking.
+        ValueKind::Table => emit_addressof(context, block, "s_typename_table", types, loc),
         // Phase 2.6c-tag-locals (ADR 0063): the upstream Local
         // read already extracted f64 (trapping on Nil) before
         // tostring sees the value, so dispatch as Number.
@@ -13237,6 +13283,177 @@ fn emit_tostring<'a, 'c>(
             emit_tostring(context, block, value, ValueKind::Number, types, loc)
         }
     }
+}
+
+/// ADR 0142 — `tostring(t)` for static Table operand. Probes the
+/// metatable's `__tostring` field; if present and a Function,
+/// dispatches via the ADR 0082 closure-cell chain (through this
+/// ADR's new `emit_dispatch_chain_from_slot_ptr` helper) with the
+/// `t` ptr as the sole arg. Falls back to the "table" literal when
+/// any of (mt null, field absent, field non-Function, candidate set
+/// empty) hold — matching Lua's default representation behaviour.
+fn emit_tostring_table_via_metamethod<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    t_ptr: Value<'c, 'a>,
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    // Compile-time candidate set: all user fns with sig
+    // `(Table) → String`. Empty → no dispatch possible, always fall
+    // back to the literal.
+    let table_to_string_candidates: Vec<FuncId> = functions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            let pks: Vec<ValueKind> = f.params.iter().map(|p| p.kind).collect();
+            if pks == [ValueKind::Table] && f.ret_kinds == [ValueKind::String] {
+                Some(FuncId(i))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let fallback_ptr = emit_addressof(context, block, "s_typename_table", types, loc);
+    if table_to_string_candidates.is_empty() {
+        // Probe still runs (so user code observing side effects sees
+        // the same metatable read), but the dispatch path is unused.
+        // Actually skipping the probe is fine — Lua's `tostring(t)`
+        // has no observable side-effects when there's no candidate.
+        return fallback_ptr;
+    }
+    // Load mt_ptr from t + TABLE_OFF_METATABLE.
+    let mt_slot = emit_byte_offset_ptr(context, block, t_ptr, TABLE_OFF_METATABLE, types, loc);
+    let mt_ptr = emit_load(block, mt_slot, types.ptr, loc);
+    let mt_iv: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[mt_ptr])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint mt"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mt_is_null: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            mt_iv,
+            zero_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    // scf.if returning a ptr: null mt → fallback; non-null → probe.
+    let null_then = Region::new();
+    let null_then_blk = Block::new(&[]);
+    null_then_blk.append_operation(scf::r#yield(&[fallback_ptr], loc));
+    null_then.append_block(null_then_blk);
+    let null_else = Region::new();
+    let null_else_blk = Block::new(&[]);
+    {
+        let field_str = emit_addressof(
+            context,
+            &null_else_blk,
+            "s_metatable_tostring_field_name",
+            types,
+            loc,
+        );
+        let search_slot = emit_build_search_key_slot(
+            context,
+            &null_else_blk,
+            ValueKind::String,
+            field_str,
+            types,
+            loc,
+        );
+        let probe_slot =
+            emit_alloca_slot_for_kind(context, &null_else_blk, ValueKind::TaggedValue, types, loc);
+        emit_value_slot_store_nil(context, &null_else_blk, probe_slot, types, loc);
+        emit_hash_lookup_into_tagged_slot(
+            context,
+            &null_else_blk,
+            mt_ptr,
+            search_slot,
+            probe_slot,
+            HashLookupOutcome::NilOnMissing,
+            types,
+            loc,
+        );
+        let probe_tag = emit_load(&null_else_blk, probe_slot, types.i64, loc);
+        let tag_fn_const = null_else_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_fn: Value<'c, '_> = null_else_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                probe_tag,
+                tag_fn_const,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let fn_then = Region::new();
+        let fn_then_blk = Block::new(&[]);
+        {
+            let sig = IndirectSig {
+                param_kinds: vec![ValueKind::Table],
+                ret_kinds: vec![ValueKind::String],
+            };
+            let results = emit_dispatch_chain_from_slot_ptr(
+                context,
+                &fn_then_blk,
+                probe_slot,
+                &sig,
+                &table_to_string_candidates,
+                &[t_ptr],
+                functions,
+                types,
+                loc,
+            );
+            fn_then_blk.append_operation(scf::r#yield(&[results[0]], loc));
+        }
+        fn_then.append_block(fn_then_blk);
+        let fn_else = Region::new();
+        let fn_else_blk = Block::new(&[]);
+        let fallback_inner = emit_addressof(context, &fn_else_blk, "s_typename_table", types, loc);
+        fn_else_blk.append_operation(scf::r#yield(&[fallback_inner], loc));
+        fn_else.append_block(fn_else_blk);
+        let inner_if =
+            null_else_blk.append_operation(scf::r#if(is_fn, &[types.ptr], fn_then, fn_else, loc));
+        let inner_result: Value<'c, '_> = inner_if.result(0).unwrap().into();
+        null_else_blk.append_operation(scf::r#yield(&[inner_result], loc));
+    }
+    null_else.append_block(null_else_blk);
+    let outer_if = block.append_operation(scf::r#if(
+        mt_is_null,
+        &[types.ptr],
+        null_then,
+        null_else,
+        loc,
+    ));
+    outer_if.result(0).unwrap().into()
 }
 
 /// Phase 2.7e (ADR 0028): convert `value` (of static `kind`) into a
