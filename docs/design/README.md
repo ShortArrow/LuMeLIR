@@ -221,6 +221,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0163 — gc-finaliser](0163-gc-finaliser.md) — Phase 3 GC step 7: `__gc` finaliser hook (decision-only)
 - [0164 — gc-weak-tables](0164-gc-weak-tables.md) — Phase 3 GC step 8: weak tables `__mode` (decision-only)
 - [0165 — number-key-index-array-oob-fallback](0165-number-key-index-array-oob-fallback.md) — Single-hop Table-form `__index` fallback for Number-key array OOB (closes ADR 0134 test 7)
+- [0166 — index-function-form-number-key](0166-index-function-form-number-key.md) — Function-form `__index` for Number key (ADR 0150 sibling)
 
 ### Feature Implementation Memos
 
