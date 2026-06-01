@@ -213,6 +213,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0155 — string-patterns-strategy](0155-string-patterns-strategy.md) — `string` patterns (Phase 3 trigger, decision-only)
 - [0156 — gc-architecture-v1](0156-gc-architecture-v1.md) — Phase 3 GC architecture v1 (data structures + algorithm; decision-only)
 - [0157 — gc-allocator-wrapper](0157-gc-allocator-wrapper.md) — Phase 3 GC step 1: `emit_gc_alloc` + string-obj migration + `collectgarbage("count")`
+- [0158 — gc-migrate-remaining-types](0158-gc-migrate-remaining-types.md) — Phase 3 GC step 2: migrate 8 remaining allocator sites
 
 ### Feature Implementation Memos
 
