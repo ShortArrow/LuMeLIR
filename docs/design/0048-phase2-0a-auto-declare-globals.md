@@ -22,7 +22,7 @@ users hit the wall on day-1 with their existing code.
 
 Full Lua globals require a tagged-value table (`_ENV`),
 metatables, and dynamic typing. That's a Phase-2.6+ structural
-project. (**Partial RESOLVED by [ADR 0134](0134-metatables-index-read.md) (2026-05-31)** — read-path `__index` Table form. `__newindex` write-path and `_ENV` table still pending per [ADR 0133](0133-phase2-completion-criteria.md) deferral table.) But a useful **subset** falls out cheaply: treat a
+project. (**Partial RESOLVED by [ADR 0134](0134-metatables-index-read.md) (2026-05-31)** — read-path `__index` Table form; `__newindex` write-path RESOLVED by ADRs [0135](0135-metatables-newindex-write.md) / [0151](0151-newindex-function-form.md); `_ENV` strategy **RESOLVED by [ADR 0154](0154-env-true-globals-strategy.md) (2026-06-01)** as a Phase 3 trigger.) But a useful **subset** falls out cheaply: treat a
 top-level bare assignment as syntactic sugar for `local`.
 
 ## Decision

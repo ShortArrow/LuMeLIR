@@ -24,16 +24,16 @@ Phase 2 closes when each workstream below has an Architecture Decision recorded;
 
 | Workstream | Hard trigger / dependency |
 |---|---|
-| `__newindex` write-path | [ADR 0135](0135-metatables-newindex-write.md) — Table form, hash key only. Function-form and Number-key (array) `__newindex` remain separate ADRs. |
-| `__index = Function` form | After [ADR 0134](0134-metatables-index-read.md) + call-ABI cleanup. |
-| Arithmetic metamethods (`__add` / `__sub` / `__mul` / `__div` / `__mod` / `__pow` / `__unm` / `__idiv` / `__band` / `__bor` / `__bxor` / `__bnot` / `__shl` / `__shr`) | After [ADR 0134](0134-metatables-index-read.md); one ADR per op (or per family). |
-| Comparison metamethods (`__eq` / `__lt` / `__le`) | After [ADR 0134](0134-metatables-index-read.md). |
-| `__tostring` / `__concat` | After [ADR 0134](0134-metatables-index-read.md). Closes the rejection at `src/hir/mod.rs:399`. |
-| `__call` | After [ADR 0134](0134-metatables-index-read.md). Closes the future-work note at `src/hir/mod.rs:1731`. |
-| `_ENV` / true globals | After `__newindex`; supersedes [ADR 0048](0048-phase2-0a-auto-declare-globals.md). |
-| `pcall` / `error` value propagation | After [ADR 0134](0134-metatables-index-read.md) (error-table shape depends on metatables). |
-| `string.format` | Parallel side-track; no metatable dependency. |
-| `string` patterns (`find` / `match` / `gmatch` / `gsub`) | Parallel side-track; pattern engine is its own design surface. |
+| `__newindex` write-path | **RESOLVED**: Table form [ADR 0135](0135-metatables-newindex-write.md); Function form [ADR 0151](0151-newindex-function-form.md). Number-key (array) `__newindex` remains a separate ADR. |
+| `__index = Function` form | **RESOLVED by [ADR 0150](0150-index-function-form.md) (2026-05-31)**. |
+| Arithmetic metamethods (`__add` / `__sub` / `__mul` / `__div` / `__mod` / `__pow` / `__unm` / `__idiv` / `__band` / `__bor` / `__bxor` / `__bnot` / `__shl` / `__shr`) | **RESOLVED**: arith [ADR 0147](0147-arith-metamethods.md), bitwise [ADR 0148](0148-bitwise-metamethods.md). |
+| Comparison metamethods (`__eq` / `__lt` / `__le`) | **RESOLVED by [ADR 0144](0144-comparison-metamethods.md) (2026-05-31)**. |
+| `__tostring` / `__concat` | **RESOLVED**: `__tostring` [ADR 0142](0142-tostring-metamethod.md), `__concat` [ADR 0143](0143-concat-metamethod.md). |
+| `__call` | **RESOLVED by [ADR 0146](0146-call-metamethod.md) (2026-05-31)**. |
+| `_ENV` / true globals | **RESOLVED by [ADR 0154](0154-env-true-globals-strategy.md) (2026-06-01)** as Phase 3 trigger (decision-only). |
+| `pcall` / `error` value propagation | **RESOLVED by [ADR 0153](0153-pcall-error-strategy.md) (2026-06-01)** as Phase 3 trigger (decision-only). |
+| `string.format` | **RESOLVED by [ADR 0152](0152-string-format.md) (2026-06-01)** (minimum-scope `%d` / `%f` / `%s` / `%%`). |
+| `string` patterns (`find` / `match` / `gmatch` / `gsub`) | **RESOLVED by [ADR 0155](0155-string-patterns-strategy.md) (2026-06-01)** as Phase 3 trigger (decision-only). |
 | **GC strategy decision** | **RESOLVED by [ADR 0145](0145-gc-strategy.md) (2026-05-31)**: Phase 2 = leak; Phase 3 = non-moving mark-and-sweep with 1 MB trigger. Decision-only ADR; implementation in a future Phase 3 ADR. |
 
 ## Alternatives considered

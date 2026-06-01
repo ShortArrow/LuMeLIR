@@ -208,6 +208,9 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0150 — index-function-form](0150-index-function-form.md) — `__index = Function` form (static-String key, Number return)
 - [0151 — newindex-function-form](0151-newindex-function-form.md) — `__newindex = Function` form (static-String key, Number value)
 - [0152 — string-format](0152-string-format.md) — `string.format` minimum subset (`%d` / `%s` / `%f` / `%%`)
+- [0153 — pcall-error-strategy](0153-pcall-error-strategy.md) — `pcall` / `error` value propagation (Phase 3 trigger, decision-only)
+- [0154 — env-true-globals-strategy](0154-env-true-globals-strategy.md) — `_ENV` / true globals (Phase 3 trigger, decision-only)
+- [0155 — string-patterns-strategy](0155-string-patterns-strategy.md) — `string` patterns (Phase 3 trigger, decision-only)
 
 ### Feature Implementation Memos
 
