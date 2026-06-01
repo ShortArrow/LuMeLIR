@@ -5455,7 +5455,7 @@ fn emit_local_init_tagged<'a, 'c>(
             // __index deferred to a future ADR.
             emit_value_slot_store_nil(context, &then_blk, dst_slot, types, loc);
             emit_number_key_metatable_index_fallback(
-                context, &then_blk, target_ptr, key_i, dst_slot, types, loc,
+                context, &then_blk, target_ptr, key_i, dst_slot, functions, types, loc,
             );
             then_blk.append_operation(scf::r#yield(&[], loc));
             then_region.append_block(then_blk);
@@ -5608,12 +5608,14 @@ fn emit_metatable_index_fallback_if_nil<'a, 'c>(
 /// via the array path and copies the 16-byte tagged slot into
 /// `dst_slot`. Misses everywhere else leave dst_slot Nil. Multi-
 /// hop chains and Function-form Number-key `__index` deferred.
+#[allow(clippy::too_many_arguments)]
 fn emit_number_key_metatable_index_fallback<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     target_ptr: Value<'c, 'a>,
     key_i: Value<'c, 'a>,
     dst_slot: Value<'c, 'a>,
+    functions: &[HirFunction],
     types: &Types<'c>,
     loc: Location<'c>,
 ) {
@@ -5791,7 +5793,89 @@ fn emit_number_key_metatable_index_fallback<'a, 'c>(
         table_then.append_block(table_then_blk);
         let table_else = Region::new();
         let table_else_blk = Block::new(&[]);
-        table_else_blk.append_operation(scf::r#yield(&[], loc));
+        {
+            // ADR 0166 — Function-form Number-key __index. Filter
+            // candidates with sig (Table, Number) → Number. Empty
+            // → no-op (dst stays Nil).
+            let candidates: Vec<FuncId> = functions
+                .iter()
+                .enumerate()
+                .filter_map(|(i, f)| {
+                    let pks: Vec<ValueKind> = f.params.iter().map(|p| p.kind).collect();
+                    if pks == [ValueKind::Table, ValueKind::Number]
+                        && f.ret_kinds == [ValueKind::Number]
+                    {
+                        Some(FuncId(i))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if candidates.is_empty() {
+                table_else_blk.append_operation(scf::r#yield(&[], loc));
+            } else {
+                let tag_fn_const = table_else_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let is_function: Value<'c, '_> = table_else_blk
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Eq,
+                        probe_tag,
+                        tag_fn_const,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let fn_then = Region::new();
+                let fn_then_blk = Block::new(&[]);
+                {
+                    let key_f: Value<'c, '_> = fn_then_blk
+                        .append_operation(arith::sitofp(key_i, types.f64, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let sig = IndirectSig {
+                        param_kinds: vec![ValueKind::Table, ValueKind::Number],
+                        ret_kinds: vec![ValueKind::Number],
+                    };
+                    let results = emit_dispatch_chain_from_slot_ptr(
+                        context,
+                        &fn_then_blk,
+                        probe_slot,
+                        &sig,
+                        &candidates,
+                        &[target_ptr, key_f],
+                        functions,
+                        types,
+                        loc,
+                    );
+                    emit_value_slot_store_number(
+                        context,
+                        &fn_then_blk,
+                        dst_slot,
+                        results[0],
+                        types,
+                        loc,
+                    );
+                    fn_then_blk.append_operation(scf::r#yield(&[], loc));
+                }
+                fn_then.append_block(fn_then_blk);
+                let fn_else = Region::new();
+                let fn_else_blk = Block::new(&[]);
+                fn_else_blk.append_operation(scf::r#yield(&[], loc));
+                fn_else.append_block(fn_else_blk);
+                table_else_blk.append_operation(scf::r#if(is_function, &[], fn_then, fn_else, loc));
+                table_else_blk.append_operation(scf::r#yield(&[], loc));
+            }
+        }
         table_else.append_block(table_else_blk);
         then_blk.append_operation(scf::r#if(is_table, &[], table_then, table_else, loc));
         then_blk.append_operation(scf::r#yield(&[], loc));
