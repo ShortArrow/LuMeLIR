@@ -220,6 +220,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0162 — gc-auto-trigger](0162-gc-auto-trigger.md) — Phase 3 GC step 6: 1 MiB automatic trigger (decision-only)
 - [0163 — gc-finaliser](0163-gc-finaliser.md) — Phase 3 GC step 7: `__gc` finaliser hook (decision-only)
 - [0164 — gc-weak-tables](0164-gc-weak-tables.md) — Phase 3 GC step 8: weak tables `__mode` (decision-only)
+- [0165 — number-key-index-array-oob-fallback](0165-number-key-index-array-oob-fallback.md) — Single-hop Table-form `__index` fallback for Number-key array OOB (closes ADR 0134 test 7)
 
 ### Feature Implementation Memos
 

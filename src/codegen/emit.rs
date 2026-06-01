@@ -5445,7 +5445,18 @@ fn emit_local_init_tagged<'a, 'c>(
                 .into();
             let then_region = Region::new();
             let then_blk = Block::new(&[]);
+            // ADR 0134 test 7 fix: array OOB writes Nil to dst_slot
+            // then probes the metatable chain for Table-form
+            // `__index`. Single-hop Number-key fallback covers
+            // `local t = {1,2,3}; setmetatable(t, mt); mt.__index =
+            // fallback; t[5]` — when `fallback` has the key in its
+            // array part, the value is copied raw 16-byte into
+            // dst_slot. Multi-hop / Function-form Number-key
+            // __index deferred to a future ADR.
             emit_value_slot_store_nil(context, &then_blk, dst_slot, types, loc);
+            emit_number_key_metatable_index_fallback(
+                context, &then_blk, target_ptr, key_i, dst_slot, types, loc,
+            );
             then_blk.append_operation(scf::r#yield(&[], loc));
             then_region.append_block(then_blk);
             let else_region = Region::new();
@@ -5591,6 +5602,208 @@ fn emit_metatable_index_fallback_if_nil<'a, 'c>(
 /// Phase 2.6c-tag-fn-tbl Tidy First (post-ADR 0070): rule-of-
 /// three extract for the inline `Index → tmp tagged slot →
 /// consumer` pattern shared by `Builtin::Print` (ADR 0065),
+/// ADR 0134 test 7 fix — Number-key OOB `__index` Table-form
+/// fallback. Single-hop only: when `t[i]` is out of bounds AND
+/// `t.metatable.__index` is a Table, looks up `__index_table[i]`
+/// via the array path and copies the 16-byte tagged slot into
+/// `dst_slot`. Misses everywhere else leave dst_slot Nil. Multi-
+/// hop chains and Function-form Number-key `__index` deferred.
+fn emit_number_key_metatable_index_fallback<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    target_ptr: Value<'c, 'a>,
+    key_i: Value<'c, 'a>,
+    dst_slot: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let mt_slot = emit_byte_offset_ptr(context, block, target_ptr, TABLE_OFF_METATABLE, types, loc);
+    let mt_ptr = emit_load(block, mt_slot, types.ptr, loc);
+    let mt_iv: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[mt_ptr])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint mt"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let mt_present: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Ne,
+            mt_iv,
+            zero_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        let field_ptr = emit_addressof(
+            context,
+            &then_blk,
+            "s_metatable_index_field_name",
+            types,
+            loc,
+        );
+        let search_slot = emit_build_search_key_slot(
+            context,
+            &then_blk,
+            ValueKind::String,
+            field_ptr,
+            types,
+            loc,
+        );
+        let probe_slot =
+            emit_alloca_slot_for_kind(context, &then_blk, ValueKind::TaggedValue, types, loc);
+        emit_value_slot_store_nil(context, &then_blk, probe_slot, types, loc);
+        emit_hash_lookup_into_tagged_slot(
+            context,
+            &then_blk,
+            mt_ptr,
+            search_slot,
+            probe_slot,
+            HashLookupOutcome::NilOnMissing,
+            types,
+            loc,
+        );
+        let probe_tag = emit_load(&then_blk, probe_slot, types.i64, loc);
+        let tag_table_const = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_TABLE).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_table: Value<'c, '_> = then_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                probe_tag,
+                tag_table_const,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let table_then = Region::new();
+        let table_then_blk = Block::new(&[]);
+        {
+            let payload_ptr = emit_byte_offset_ptr(
+                context,
+                &table_then_blk,
+                probe_slot,
+                ARRAY_ELEM_OFF_VALUE,
+                types,
+                loc,
+            );
+            let index_table = emit_load(&table_then_blk, payload_ptr, types.ptr, loc);
+            let len_i = emit_load(&table_then_blk, index_table, types.i64, loc);
+            let one_inner = table_then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let too_small_inner: Value<'c, '_> = table_then_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Slt,
+                    key_i,
+                    one_inner,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let too_big_inner: Value<'c, '_> = table_then_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Sgt,
+                    key_i,
+                    len_i,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let oob_inner: Value<'c, '_> = table_then_blk
+                .append_operation(arith::ori(too_small_inner, too_big_inner, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let copy_then = Region::new();
+            let copy_then_blk = Block::new(&[]);
+            copy_then_blk.append_operation(scf::r#yield(&[], loc));
+            copy_then.append_block(copy_then_blk);
+            let copy_else = Region::new();
+            let copy_else_blk = Block::new(&[]);
+            {
+                let array_buf =
+                    emit_table_array_buf(context, &copy_else_blk, index_table, types, loc);
+                let elem_ptr =
+                    emit_array_elem_ptr(context, &copy_else_blk, array_buf, key_i, types, loc);
+                let tag = emit_load(&copy_else_blk, elem_ptr, types.i64, loc);
+                emit_store(&copy_else_blk, tag, dst_slot, loc);
+                let src_val_ptr = emit_byte_offset_ptr(
+                    context,
+                    &copy_else_blk,
+                    elem_ptr,
+                    ARRAY_ELEM_OFF_VALUE,
+                    types,
+                    loc,
+                );
+                let dst_val_ptr = emit_byte_offset_ptr(
+                    context,
+                    &copy_else_blk,
+                    dst_slot,
+                    ARRAY_ELEM_OFF_VALUE,
+                    types,
+                    loc,
+                );
+                let payload = emit_load(&copy_else_blk, src_val_ptr, types.i64, loc);
+                emit_store(&copy_else_blk, payload, dst_val_ptr, loc);
+                copy_else_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            copy_else.append_block(copy_else_blk);
+            table_then_blk.append_operation(scf::r#if(oob_inner, &[], copy_then, copy_else, loc));
+            table_then_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        table_then.append_block(table_then_blk);
+        let table_else = Region::new();
+        let table_else_blk = Block::new(&[]);
+        table_else_blk.append_operation(scf::r#yield(&[], loc));
+        table_else.append_block(table_else_blk);
+        then_blk.append_operation(scf::r#if(is_table, &[], table_then, table_else, loc));
+        then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(mt_present, &[], then_region, else_region, loc));
+}
+
 /// `Builtin::Type`, `Builtin::ToString` (ADR 0067 / 0070).
 /// Allocates a 16-byte `TaggedValue` slot, fills it via the
 /// non-trapping `emit_local_init_tagged`, and returns the slot
