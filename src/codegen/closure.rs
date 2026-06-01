@@ -162,7 +162,8 @@ use melior::{
 use crate::hir::ValueKind;
 
 use super::callabi::emit_pack_struct;
-use super::primitive::{Types, emit_byte_offset_ptr, emit_libc_call_ptr, emit_load, emit_store};
+use super::primitive::{Types, emit_byte_offset_ptr, emit_gc_alloc, emit_load, emit_store};
+use super::tagged::{GC_TYPE_CLOSURE_CELL, GC_TYPE_UPVALUE_BOX};
 
 // ============================================================
 // Layout constants — referenced from `closure.rs` helpers; ADR
@@ -233,7 +234,8 @@ pub(crate) fn emit_allocate_closure_cell<'a, 'c>(
         .result(0)
         .unwrap()
         .into();
-    emit_libc_call_ptr(context, block, "malloc", &[size_const], types, loc)
+    // ADR 0158 — closure cell via gc_alloc.
+    emit_gc_alloc(context, block, size_const, GC_TYPE_CLOSURE_CELL, types, loc)
 }
 
 /// Phase 2.5c-full (ADR 0083) Commit 2b: load `cell.fn_ptr` (offset
@@ -334,7 +336,8 @@ pub(crate) fn emit_allocate_upvalue_box<'a, 'c>(
         .result(0)
         .unwrap()
         .into();
-    emit_libc_call_ptr(context, block, "malloc", &[size_const], types, loc)
+    // ADR 0158 — upvalue box via gc_alloc.
+    emit_gc_alloc(context, block, size_const, GC_TYPE_UPVALUE_BOX, types, loc)
 }
 
 /// Phase 2.5c-full (ADR 0083) Commit 3: load the value stored in an

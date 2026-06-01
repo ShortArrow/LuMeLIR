@@ -38,20 +38,20 @@ use super::callabi::{
 use super::error::CodegenError;
 use super::primitive::{
     Types, emit_addressof, emit_byte_offset_ptr, emit_byte_offset_ptr_dynamic,
-    emit_exit_with_message, emit_libc_call_f64, emit_libc_call_i32, emit_libc_call_i64,
-    emit_libc_call_ptr, emit_libc_call_void, emit_load, emit_print_string_obj, emit_printf,
-    emit_store, emit_string_obj_alloc, emit_string_obj_compare, emit_string_obj_data,
+    emit_exit_with_message, emit_gc_alloc, emit_libc_call_f64, emit_libc_call_i32,
+    emit_libc_call_i64, emit_libc_call_ptr, emit_libc_call_void, emit_load, emit_print_string_obj,
+    emit_printf, emit_store, emit_string_obj_alloc, emit_string_obj_compare, emit_string_obj_data,
     emit_string_obj_eq, emit_string_obj_finalize_nul, emit_string_obj_from_bytes,
     emit_string_obj_hash, emit_string_obj_len,
 };
 use super::tagged::{
-    ARRAY_ELEM_OFF_VALUE, ARRAY_ELEM_SIZE, HashKeyValidityPolicy, TAG_BOOL, TAG_DELETED,
-    TAG_FUNCTION, TAG_NIL, TAG_NUMBER, TAG_STRING, TAG_TABLE, TaggedArithOperandPlan,
-    emit_alloca_slot_for_kind, emit_print_tagged_local, emit_tag_and_payload_ptr,
-    emit_tagged_eq_local_local, emit_tagged_unknown_tag_trap, emit_type_tagged_local,
-    emit_value_slot_check_number, emit_value_slot_store_dispatched, emit_value_slot_store_nil,
-    emit_value_slot_store_number, emit_value_slot_store_table, policy_for_tag,
-    policy_for_tagged_arith_operand,
+    ARRAY_ELEM_OFF_VALUE, ARRAY_ELEM_SIZE, GC_TYPE_ARRAY_BUF, GC_TYPE_HASH_BUF,
+    GC_TYPE_SCRATCH_BUF, GC_TYPE_TABLE, HashKeyValidityPolicy, TAG_BOOL, TAG_DELETED, TAG_FUNCTION,
+    TAG_NIL, TAG_NUMBER, TAG_STRING, TAG_TABLE, TaggedArithOperandPlan, emit_alloca_slot_for_kind,
+    emit_print_tagged_local, emit_tag_and_payload_ptr, emit_tagged_eq_local_local,
+    emit_tagged_unknown_tag_trap, emit_type_tagged_local, emit_value_slot_check_number,
+    emit_value_slot_store_dispatched, emit_value_slot_store_nil, emit_value_slot_store_number,
+    emit_value_slot_store_table, policy_for_tag, policy_for_tagged_arith_operand,
 };
 
 // =============================================================
@@ -5863,7 +5863,8 @@ fn emit_table_grow_if_needed<'a, 'c>(
             .result(0)
             .unwrap()
             .into();
-        let new_buf = emit_libc_call_ptr(context, &then_blk, "malloc", &[new_size], types, loc);
+        // ADR 0158 — Array buf grow via gc_alloc.
+        let new_buf = emit_gc_alloc(context, &then_blk, new_size, GC_TYPE_ARRAY_BUF, types, loc);
         // Conditional copy + free: only when cap > 0 (i.e. there
         // was a previous non-null array_buf).
         let zero_i64 = then_blk
@@ -5922,7 +5923,13 @@ fn emit_table_grow_if_needed<'a, 'c>(
                 types,
                 loc,
             );
-            emit_libc_call_void(context, &copy_blk, "free", &[old_buf], loc);
+            // ADR 0158 — the old buf was allocated via `emit_gc_alloc`
+            // (since the migration), so its user-visible ptr is
+            // `raw + 16`. Calling `free(old_buf)` would corrupt
+            // the heap. Per ADR 0145's Phase 2 leak strategy
+            // (sweep arrives in ADR 0161), simply leave the old
+            // payload in the `g_gc_head` linked list — the future
+            // sweep will reclaim it when it becomes WHITE.
             copy_blk.append_operation(scf::r#yield(&[], loc));
         }
         copy_then.append_block(copy_blk);
@@ -6014,7 +6021,8 @@ fn emit_hash_ensure_buf<'a, 'c>(
             .result(0)
             .unwrap()
             .into();
-        let new_buf = emit_libc_call_ptr(context, &then_blk, "malloc", &[size_const], types, loc);
+        // ADR 0158 — Hash buf initial alloc via gc_alloc.
+        let new_buf = emit_gc_alloc(context, &then_blk, size_const, GC_TYPE_HASH_BUF, types, loc);
         // Initialize header.cap and header.count
         let cap_const = then_blk
             .append_operation(arith::constant(
@@ -6948,7 +6956,8 @@ fn emit_hash_grow_if_needed<'a, 'c>(
             .result(0)
             .unwrap()
             .into();
-        let new_buf = emit_libc_call_ptr(context, &then_blk, "malloc", &[total_size], types, loc);
+        // ADR 0158 — Hash buf regrow via gc_alloc.
+        let new_buf = emit_gc_alloc(context, &then_blk, total_size, GC_TYPE_HASH_BUF, types, loc);
         // header init (cap and count=count; count stays since
         // every old entry will be reinserted)
         let new_cap_slot =
@@ -7328,8 +7337,8 @@ fn emit_hash_grow_if_needed<'a, 'c>(
             loc,
         );
         then_blk.append_operation(rehash_while);
-        // Free old buf, install new buf in header.
-        emit_libc_call_void(context, &then_blk, "free", &[hash_buf], loc);
+        // ADR 0158 — old hash buf is now `raw + 16` via gc_alloc;
+        // skipping `free` here, sweep (ADR 0161) reclaims later.
         let header_hash_slot = emit_byte_offset_ptr(
             context,
             &then_blk,
@@ -7477,8 +7486,8 @@ fn emit_expr<'a, 'c>(
                 .result(0)
                 .unwrap()
                 .into();
-            let header_ptr =
-                emit_libc_call_ptr(context, block, "malloc", &[header_size], types, loc);
+            // ADR 0158 — Table header via gc_alloc.
+            let header_ptr = emit_gc_alloc(context, block, header_size, GC_TYPE_TABLE, types, loc);
             // length + capacity (both = elem_count for a freshly-
             // constructed array; capacity tracking lands in 2.6a-grow).
             let len_const = block
@@ -7511,7 +7520,8 @@ fn emit_expr<'a, 'c>(
                     .result(0)
                     .unwrap()
                     .into();
-                emit_libc_call_ptr(context, block, "malloc", &[buf_bytes], types, loc)
+                // ADR 0158 — Array buf ctor via gc_alloc.
+                emit_gc_alloc(context, block, buf_bytes, GC_TYPE_ARRAY_BUF, types, loc)
             };
             let array_buf_slot =
                 emit_byte_offset_ptr(context, block, header_ptr, TABLE_OFF_ARRAY_BUF, types, loc);
@@ -9212,8 +9222,15 @@ fn emit_expr<'a, 'c>(
                     .result(0)
                     .unwrap()
                     .into();
-                let scratch =
-                    emit_libc_call_ptr(context, block, "malloc", &[scratch_size], types, loc);
+                // ADR 0158 — snprintf scratch via gc_alloc.
+                let scratch = emit_gc_alloc(
+                    context,
+                    block,
+                    scratch_size,
+                    GC_TYPE_SCRATCH_BUF,
+                    types,
+                    loc,
+                );
                 // Re-parse specifiers locally to know how to lower
                 // each arg.
                 let mut call_args: Vec<Value<'c, '_>> = Vec::new();
@@ -14042,7 +14059,8 @@ fn emit_tostring<'a, 'c>(
                 .result(0)
                 .unwrap()
                 .into();
-            let buf = emit_libc_call_ptr(context, block, "malloc", &[buf_size], types, loc);
+            // ADR 0158 — tostring(Number) scratch via gc_alloc.
+            let buf = emit_gc_alloc(context, block, buf_size, GC_TYPE_SCRATCH_BUF, types, loc);
             let fmt_ptr = emit_addressof(context, block, "fmt_tostring_g", types, loc);
             // snprintf is variadic — needs the same callee_type
             // attribute pattern as printf.
