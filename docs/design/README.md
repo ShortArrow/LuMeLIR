@@ -211,6 +211,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0153 — pcall-error-strategy](0153-pcall-error-strategy.md) — `pcall` / `error` value propagation (Phase 3 trigger, decision-only)
 - [0154 — env-true-globals-strategy](0154-env-true-globals-strategy.md) — `_ENV` / true globals (Phase 3 trigger, decision-only)
 - [0155 — string-patterns-strategy](0155-string-patterns-strategy.md) — `string` patterns (Phase 3 trigger, decision-only)
+- [0156 — gc-architecture-v1](0156-gc-architecture-v1.md) — Phase 3 GC architecture v1 (data structures + algorithm; decision-only)
 
 ### Feature Implementation Memos
 
