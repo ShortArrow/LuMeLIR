@@ -212,6 +212,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0154 — env-true-globals-strategy](0154-env-true-globals-strategy.md) — `_ENV` / true globals (Phase 3 trigger, decision-only)
 - [0155 — string-patterns-strategy](0155-string-patterns-strategy.md) — `string` patterns (Phase 3 trigger, decision-only)
 - [0156 — gc-architecture-v1](0156-gc-architecture-v1.md) — Phase 3 GC architecture v1 (data structures + algorithm; decision-only)
+- [0157 — gc-allocator-wrapper](0157-gc-allocator-wrapper.md) — Phase 3 GC step 1: `emit_gc_alloc` + string-obj migration + `collectgarbage("count")`
 
 ### Feature Implementation Memos
 
