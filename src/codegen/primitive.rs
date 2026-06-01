@@ -353,6 +353,117 @@ pub(crate) fn emit_libc_call_with_result<'a, 'c>(
 ///
 /// Returns the allocated ptr (non-null in successful path; trap
 /// diverges on null).
+/// ADR 0157 — Phase 3 GC step 1 allocator wrapper. Emits a malloc
+/// of `payload_size + GC_HEADER_SIZE`, null-traps via `s_gc_oom`,
+/// inits the 16-byte GC header (mark=0 WHITE, type_tag, padding=0,
+/// payload_size as u32, next=load(g_gc_head)), atomically pushes
+/// to `g_gc_head`, accumulates bytes into `g_gc_total_bytes`, and
+/// returns the user-visible payload ptr (`raw + GC_HEADER_SIZE`).
+///
+/// `g_gc_head` is declared as an i64 module global (holding the
+/// ptrtoint of the head ptr) to avoid initializer-region
+/// complexity for ptr globals — the helper bridges the
+/// ptr ↔ i64 representation locally.
+pub(crate) fn emit_gc_alloc<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    payload_size: Value<'c, 'a>,
+    type_tag: u8,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    use crate::codegen::tagged::{
+        GC_HEADER_OFF_MARK, GC_HEADER_OFF_NEXT, GC_HEADER_OFF_SIZE, GC_HEADER_OFF_TYPE_TAG,
+        GC_HEADER_SIZE,
+    };
+    let header_size_const = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, GC_HEADER_SIZE).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let total_size: Value<'c, 'a> = block
+        .append_operation(arith::addi(payload_size, header_size_const, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let raw = emit_alloc_with_oom_check(context, block, total_size, "s_gc_oom", types, loc);
+    // Header init: mark=0, type_tag, padding=0, size, next=load(g_gc_head).
+    let mark_ptr = emit_byte_offset_ptr(context, block, raw, GC_HEADER_OFF_MARK, types, loc);
+    let mark_zero_i8 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i8, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_store(block, mark_zero_i8, mark_ptr, loc);
+    let type_tag_ptr =
+        emit_byte_offset_ptr(context, block, raw, GC_HEADER_OFF_TYPE_TAG, types, loc);
+    let type_tag_const = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i8, i64::from(type_tag)).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_store(block, type_tag_const, type_tag_ptr, loc);
+    let size_ptr = emit_byte_offset_ptr(context, block, raw, GC_HEADER_OFF_SIZE, types, loc);
+    let size_u32: Value<'c, 'a> = block
+        .append_operation(arith::trunci(payload_size, types.i32, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_store(block, size_u32, size_ptr, loc);
+    // Load g_gc_head (as i64), inttoptr → store at next slot.
+    let head_addr = emit_addressof(context, block, "g_gc_head", types, loc);
+    let head_iv = emit_load(block, head_addr, types.i64, loc);
+    let head_ptr_val: Value<'c, 'a> = block
+        .append_operation(
+            OperationBuilder::new("llvm.inttoptr", loc)
+                .add_operands(&[head_iv])
+                .add_results(&[types.ptr])
+                .build()
+                .expect("llvm.inttoptr gc head"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let next_ptr = emit_byte_offset_ptr(context, block, raw, GC_HEADER_OFF_NEXT, types, loc);
+    emit_store(block, head_ptr_val, next_ptr, loc);
+    // Push: g_gc_head = ptrtoint(raw).
+    let raw_iv: Value<'c, 'a> = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[raw])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint gc raw"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    emit_store(block, raw_iv, head_addr, loc);
+    // total_bytes += total_size.
+    let bytes_addr = emit_addressof(context, block, "g_gc_total_bytes", types, loc);
+    let old_bytes = emit_load(block, bytes_addr, types.i64, loc);
+    let new_bytes: Value<'c, 'a> = block
+        .append_operation(arith::addi(old_bytes, total_size, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_store(block, new_bytes, bytes_addr, loc);
+    // Return payload ptr = raw + GC_HEADER_SIZE.
+    emit_byte_offset_ptr(context, block, raw, GC_HEADER_SIZE, types, loc)
+}
+
 pub(crate) fn emit_alloc_with_oom_check<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
@@ -504,7 +615,19 @@ pub(crate) fn emit_string_obj_alloc<'a, 'c>(
         .result(0)
         .unwrap()
         .into();
-    let s_ptr = emit_alloc_with_oom_check(context, block, total_size, "s_alloc_oom", types, loc);
+    // ADR 0157 — Phase 3 GC step 1: route through `emit_gc_alloc`
+    // so every string object is tracked in `g_gc_head`. Returns the
+    // user-visible payload ptr (i.e. raw + GC_HEADER_SIZE); the
+    // string-object layout offsets (len at +0, data at +8) stay
+    // correct relative to this ptr.
+    let s_ptr = emit_gc_alloc(
+        context,
+        block,
+        total_size,
+        crate::codegen::tagged::GC_TYPE_STRING_OBJ,
+        types,
+        loc,
+    );
     // Store len at offset 0 (header).
     emit_store(block, len_i64, s_ptr, loc);
     s_ptr

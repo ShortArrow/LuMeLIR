@@ -68,6 +68,27 @@ pub(crate) const TAG_TABLE: i64 = 5;
 // `HASH_DELETED_KEY=1` (retired by ADR 0079).
 pub(crate) const TAG_DELETED: i64 = 6;
 
+// ADR 0156 / 0157 — Phase 3 GC header layout. Every GC-managed
+// allocation is prefixed with a 16-byte header:
+//   offset 0: u8  mark        (0=WHITE / 1=GREY / 2=BLACK)
+//   offset 1: u8  type_tag    (one of GC_TYPE_*)
+//   offset 2: u16 padding     (reserved for weak-flag bits etc.)
+//   offset 4: u32 payload_size
+//   offset 8: ptr next        (singly-linked global list `g_gc_head`)
+pub(crate) const GC_HEADER_SIZE: i64 = 16;
+pub(crate) const GC_HEADER_OFF_MARK: i64 = 0;
+pub(crate) const GC_HEADER_OFF_TYPE_TAG: i64 = 1;
+pub(crate) const GC_HEADER_OFF_SIZE: i64 = 4;
+pub(crate) const GC_HEADER_OFF_NEXT: i64 = 8;
+
+pub(crate) const GC_TYPE_TABLE: u8 = 1;
+pub(crate) const GC_TYPE_HASH_BUF: u8 = 2;
+pub(crate) const GC_TYPE_ARRAY_BUF: u8 = 3;
+pub(crate) const GC_TYPE_STRING_OBJ: u8 = 4;
+pub(crate) const GC_TYPE_CLOSURE_CELL: u8 = 5;
+pub(crate) const GC_TYPE_UPVALUE_BOX: u8 = 6;
+pub(crate) const GC_TYPE_SCRATCH_BUF: u8 = 7;
+
 // =============================================================
 // Phase 2.6b-hash-key-validity (ADR 0087): runtime validity
 // policy for a hash search-key tag.

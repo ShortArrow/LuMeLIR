@@ -170,7 +170,7 @@ pub(crate) fn emit_module_unverified<'c>(
         string_pool,
     };
 
-    emit_fmt_global(context, &module, i8_type, loc);
+    emit_fmt_global(context, &module, i8_type, &types, loc);
     emit_user_string_globals(context, &module, i8_type, &types, loc);
     emit_printf_decl(context, &module, &types, loc);
     // Phase 2.devinfra-stdout-fwrite (ADR 0117): binary-safe
@@ -227,6 +227,7 @@ fn emit_fmt_global<'c>(
     context: &'c Context,
     module: &Module<'c>,
     i8_type: Type<'c>,
+    types: &Types<'c>,
     loc: Location<'c>,
 ) {
     // Phase 2.7u-string-abi-refactor (ADR 0112): format strings
@@ -860,6 +861,17 @@ fn emit_fmt_global<'c>(
         "out of memory\0",
         loc,
     );
+    // ADR 0157 — Phase 3 GC step 1 globals.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_gc_oom",
+        "out of memory: GC alloc failed\0",
+        loc,
+    );
+    emit_mutable_i64_global(context, module, types, "g_gc_head", 0, loc);
+    emit_mutable_i64_global(context, module, types, "g_gc_total_bytes", 0, loc);
 }
 
 /// Emit a **raw C-string global** (NUL-terminated `[N x i8]`).
@@ -868,6 +880,31 @@ fn emit_fmt_global<'c>(
 /// boxed-object header.
 ///
 /// `value` must include the trailing `\0` (existing convention).
+/// ADR 0157 — emit a mutable `i64`-typed module global with the
+/// given initial value. Used for Phase 3 GC bookkeeping globals
+/// (`g_gc_head` as i64 holding the ptrtoint of the next head;
+/// `g_gc_total_bytes` for telemetry).
+fn emit_mutable_i64_global<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    types: &Types<'c>,
+    name: &str,
+    init: i64,
+    loc: Location<'c>,
+) {
+    let global_op = GlobalOperationBuilder::new(context, loc)
+        .initializer(Region::new())
+        .global_type(TypeAttribute::new(types.i64))
+        .sym_name(StringAttribute::new(context, name))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::Internal,
+        ))
+        .value(IntegerAttribute::new(types.i64, init).into())
+        .build();
+    module.body().append_operation(global_op.into());
+}
+
 fn emit_cstr_global<'c>(
     context: &'c Context,
     module: &Module<'c>,
@@ -10062,6 +10099,47 @@ fn emit_expr<'a, 'c>(
                     .unwrap()
                     .into();
                 Ok(len_f64)
+            }
+            Callee::Builtin(Builtin::CollectGarbage) => {
+                // ADR 0157 — Phase 3 GC step 1 builtin.
+                //   0 args: no-op stub returning 0.0 (mark/sweep
+                //           land in ADRs 0159 + 0161).
+                //   1 arg = Str("count"): load `g_gc_total_bytes`,
+                //           sitofp → f64, divide by 1024.0, return.
+                if args.is_empty() {
+                    let zero = block
+                        .append_operation(arith::constant(
+                            context,
+                            FloatAttribute::new(context, types.f64, 0.0).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    return Ok(zero);
+                }
+                let bytes_addr = emit_addressof(context, block, "g_gc_total_bytes", types, loc);
+                let bytes_i64 = emit_load(block, bytes_addr, types.i64, loc);
+                let bytes_f64: Value<'c, '_> = block
+                    .append_operation(arith::sitofp(bytes_i64, types.f64, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let kb_divisor = block
+                    .append_operation(arith::constant(
+                        context,
+                        FloatAttribute::new(context, types.f64, 1024.0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let kb: Value<'c, '_> = block
+                    .append_operation(arith::divf(bytes_f64, kb_divisor, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                Ok(kb)
             }
         },
         HirExprKind::FunctionRef(FuncId(id)) => {

@@ -285,6 +285,8 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // ADR 0137 — rawequal returns Bool; rawlen returns Number.
             Callee::Builtin(Builtin::RawEqual) => ValueKind::Bool,
             Callee::Builtin(Builtin::RawLen) => ValueKind::Number,
+            // ADR 0157 — collectgarbage returns Number.
+            Callee::Builtin(Builtin::CollectGarbage) => ValueKind::Number,
             // User function: look up its declared return kind. Phase
             // 2.5a forces this to Number when present; void calls
             // never appear in expression position legally.
@@ -5069,6 +5071,31 @@ impl LowerCtx {
                     rhs_kind: k.name().to_owned(),
                     offset: arg.span.start,
                 });
+            }
+        }
+        // ADR 0157 — collectgarbage option validation. 0-arg form is
+        // OK. 1-arg form must be the static String literal `"count"`;
+        // other options (`"stop"` / `"restart"` / `"step"` /
+        // `"setpause"` / `"setstepmul"` / etc.) reject.
+        if matches!(builtin, Builtin::CollectGarbage) && lowered_args.len() == 1 {
+            match &lowered_args[0].kind {
+                HirExprKind::Str(s) if s == "count" => {}
+                HirExprKind::Str(s) => {
+                    return Err(HirError::TypeMismatch {
+                        op: "collectgarbage".to_owned(),
+                        lhs_kind: "\"count\" (ADR 0157 scope)".to_owned(),
+                        rhs_kind: format!("\"{}\"", s.escape_default()),
+                        offset: lowered_args[0].span.start,
+                    });
+                }
+                _ => {
+                    return Err(HirError::TypeMismatch {
+                        op: "collectgarbage".to_owned(),
+                        lhs_kind: "static string literal \"count\"".to_owned(),
+                        rhs_kind: "non-literal expression".to_owned(),
+                        offset: lowered_args[0].span.start,
+                    });
+                }
             }
         }
         Ok(HirExprKind::Call {

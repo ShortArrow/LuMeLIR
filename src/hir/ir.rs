@@ -418,6 +418,13 @@ pub enum Builtin {
     ///
     /// Phase 2.6+-raw-set-get-builtins (ADR 0136).
     RawGet,
+    /// `collectgarbage([opt])` — Lua 5.4 §6.1 GC entry point.
+    /// ADR 0157 scope: 0-arg form runs a full collection (Phase 3
+    /// no-op stub returning 0 until ADRs 0159 + 0161 land mark /
+    /// sweep); 1-arg form must be `Str("count")` and returns
+    /// `g_gc_total_bytes / 1024` as Number. Other options reject
+    /// HIR-level.
+    CollectGarbage,
     /// `rawequal(t1, t2)` — Lua 5.4 §6.1 escape hatch from the
     /// `__eq` metamethod chain. Today functionally identical to `==`
     /// (the `__eq` metamethod is deferred per ADR 0133); included
@@ -598,6 +605,8 @@ impl Builtin {
             // ADR 0137 — raw equal / len Lua spec parity.
             "rawequal" => Some(Builtin::RawEqual),
             "rawlen" => Some(Builtin::RawLen),
+            // ADR 0157 — Phase 3 GC step 1: collectgarbage builtin.
+            "collectgarbage" => Some(Builtin::CollectGarbage),
             _ => None,
         }
     }
@@ -716,6 +725,8 @@ impl Builtin {
             Builtin::RawGet => (2, 2),
             Builtin::RawEqual => (2, 2),
             Builtin::RawLen => (1, 1),
+            // ADR 0157 — collectgarbage() / collectgarbage("count").
+            Builtin::CollectGarbage => (0, 1),
             Builtin::MathSqrt | Builtin::MathFloor | Builtin::MathAbs => (1, 1),
             Builtin::MathPow => (2, 2),
             Builtin::MathSin | Builtin::MathCos | Builtin::MathLog | Builtin::MathExp => (1, 1),
@@ -769,6 +780,7 @@ impl Builtin {
             Builtin::RawGet => "rawget",
             Builtin::RawEqual => "rawequal",
             Builtin::RawLen => "rawlen",
+            Builtin::CollectGarbage => "collectgarbage",
             Builtin::MathSqrt => "math.sqrt",
             Builtin::MathFloor => "math.floor",
             Builtin::MathAbs => "math.abs",
@@ -820,6 +832,9 @@ impl Builtin {
             // ADR 0137 — rawequal returns Bool; rawlen returns Number.
             Builtin::RawEqual => &[ValueKind::Bool],
             Builtin::RawLen => &[ValueKind::Number],
+            // ADR 0157 — collectgarbage returns Number (count
+            // value in KB for "count" form; 0 for no-op stub).
+            Builtin::CollectGarbage => &[ValueKind::Number],
             Builtin::MathSqrt
             | Builtin::MathFloor
             | Builtin::MathAbs
@@ -896,7 +911,9 @@ impl Builtin {
             // ADR 0137 — per-arg kind checks live in
             // `lower_builtin_call`.
             | Builtin::RawEqual
-            | Builtin::RawLen => &[],
+            | Builtin::RawLen
+            // ADR 0157 — per-arg validation in `lower_builtin_call`.
+            | Builtin::CollectGarbage => &[],
             // math.* — all single-Number arg except pow (Number, Number).
             Builtin::MathSqrt
             | Builtin::MathFloor
