@@ -214,6 +214,12 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0156 — gc-architecture-v1](0156-gc-architecture-v1.md) — Phase 3 GC architecture v1 (data structures + algorithm; decision-only)
 - [0157 — gc-allocator-wrapper](0157-gc-allocator-wrapper.md) — Phase 3 GC step 1: `emit_gc_alloc` + string-obj migration + `collectgarbage("count")`
 - [0158 — gc-migrate-remaining-types](0158-gc-migrate-remaining-types.md) — Phase 3 GC step 2: migrate 8 remaining allocator sites
+- [0159 — gc-mark-phase](0159-gc-mark-phase.md) — Phase 3 GC step 3: mark phase design (decision-only)
+- [0160 — gc-stack-walk](0160-gc-stack-walk.md) — Phase 3 GC step 4: alloca-slot stack walk (decision-only)
+- [0161 — gc-sweep-phase](0161-gc-sweep-phase.md) — Phase 3 GC step 5: sweep phase design (decision-only)
+- [0162 — gc-auto-trigger](0162-gc-auto-trigger.md) — Phase 3 GC step 6: 1 MiB automatic trigger (decision-only)
+- [0163 — gc-finaliser](0163-gc-finaliser.md) — Phase 3 GC step 7: `__gc` finaliser hook (decision-only)
+- [0164 — gc-weak-tables](0164-gc-weak-tables.md) — Phase 3 GC step 8: weak tables `__mode` (decision-only)
 
 ### Feature Implementation Memos
 
