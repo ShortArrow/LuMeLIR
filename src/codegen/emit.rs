@@ -3685,7 +3685,6 @@ fn emit_stmt<'a, 'c>(
                         .into();
                     emit_trap_if(context, block, is_nan, "s_table_index_nan", types, loc);
                     let key_i = emit_f2i(block, key_f, types, loc);
-                    let length_i = emit_load(block, target_ptr, types.i64, loc);
                     // Lower bound: key >= 1 (else trap; same
                     // diagnostic as before via s_table_oob).
                     let one = block
@@ -3722,441 +3721,21 @@ fn emit_stmt<'a, 'c>(
                     lower_else_blk.append_operation(scf::r#yield(&[], loc));
                     lower_else.append_block(lower_else_blk);
                     block.append_operation(scf::r#if(too_small, &[], lower_then, lower_else, loc));
-                    // ADR 0168 — Number-key __newindex Table form
-                    // routing (key > length case). Allocate an
-                    // i64 sentinel (0 = no route). When `key > length`
-                    // AND `mt.__newindex` is Table, store the inner
-                    // table ptr's integer value. Then scf.if dispatches
-                    // to `emit_array_index_assign_at` on inner vs outer.
+                    // ADR 0170 — depth-bounded recursive routing
+                    // (extends ADR 0168 / 0169 to multi-hop).
                     let value_kind = infer_kind(value, locals, functions);
-                    let one_alloca = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(types.i64, 1).into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let route_iv_slot: Value<'c, 'a> = block
-                        .append_operation(
-                            OperationBuilder::new("llvm.alloca", loc)
-                                .add_operands(&[one_alloca])
-                                .add_attributes(&[(
-                                    Identifier::new(context, "elem_type"),
-                                    TypeAttribute::new(types.i64).into(),
-                                )])
-                                .add_results(&[types.ptr])
-                                .build()
-                                .expect("llvm.alloca route_iv"),
-                        )
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let zero_iv = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(types.i64, 0).into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    emit_store(block, zero_iv, route_iv_slot, loc);
-                    // ADR 0169 — `handled_by_fn_slot` (i1 sentinel)
-                    // = true when Function-form __newindex callee
-                    // has executed. Gates the final "else outer
-                    // write" branch.
-                    let handled_by_fn_slot: Value<'c, 'a> = block
-                        .append_operation(
-                            OperationBuilder::new("llvm.alloca", loc)
-                                .add_operands(&[one_alloca])
-                                .add_attributes(&[(
-                                    Identifier::new(context, "elem_type"),
-                                    TypeAttribute::new(types.i1).into(),
-                                )])
-                                .add_results(&[types.ptr])
-                                .build()
-                                .expect("llvm.alloca handled_by_fn"),
-                        )
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let false_i1 = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(types.i1, 0).into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    emit_store(block, false_i1, handled_by_fn_slot, loc);
-                    // ADR 0169 — Function-form candidates filter.
-                    // Gated Rust-time on value_kind == Number.
-                    let fn_candidates: Vec<FuncId> = if matches!(value_kind, ValueKind::Number) {
-                        functions
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(i, f)| {
-                                let pks: Vec<ValueKind> = f.params.iter().map(|p| p.kind).collect();
-                                if pks == [ValueKind::Table, ValueKind::Number, ValueKind::Number]
-                                    && f.ret_kinds.is_empty()
-                                {
-                                    Some(FuncId(i))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    let key_high: Value<'c, 'a> = block
-                        .append_operation(arith::cmpi(
-                            context,
-                            arith::CmpiPredicate::Sgt,
-                            key_i,
-                            length_i,
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let high_then = Region::new();
-                    let high_then_blk = Block::new(&[]);
-                    {
-                        let mt_slot_addr = emit_byte_offset_ptr(
-                            context,
-                            &high_then_blk,
-                            target_ptr,
-                            TABLE_OFF_METATABLE,
-                            types,
-                            loc,
-                        );
-                        let mt_ptr = emit_load(&high_then_blk, mt_slot_addr, types.ptr, loc);
-                        let mt_iv: Value<'c, '_> = high_then_blk
-                            .append_operation(
-                                OperationBuilder::new("llvm.ptrtoint", loc)
-                                    .add_operands(&[mt_ptr])
-                                    .add_results(&[types.i64])
-                                    .build()
-                                    .expect("llvm.ptrtoint mt"),
-                            )
-                            .result(0)
-                            .unwrap()
-                            .into();
-                        let zero_i64 = high_then_blk
-                            .append_operation(arith::constant(
-                                context,
-                                IntegerAttribute::new(types.i64, 0).into(),
-                                loc,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into();
-                        let mt_present: Value<'c, '_> = high_then_blk
-                            .append_operation(arith::cmpi(
-                                context,
-                                arith::CmpiPredicate::Ne,
-                                mt_iv,
-                                zero_i64,
-                                loc,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into();
-                        let mt_then = Region::new();
-                        let mt_then_blk = Block::new(&[]);
-                        {
-                            let field_ptr = emit_addressof(
-                                context,
-                                &mt_then_blk,
-                                "s_metatable_newindex_field_name",
-                                types,
-                                loc,
-                            );
-                            let search_slot = emit_build_search_key_slot(
-                                context,
-                                &mt_then_blk,
-                                ValueKind::String,
-                                field_ptr,
-                                types,
-                                loc,
-                            );
-                            let probe_slot = emit_alloca_slot_for_kind(
-                                context,
-                                &mt_then_blk,
-                                ValueKind::TaggedValue,
-                                types,
-                                loc,
-                            );
-                            emit_value_slot_store_nil(
-                                context,
-                                &mt_then_blk,
-                                probe_slot,
-                                types,
-                                loc,
-                            );
-                            emit_hash_lookup_into_tagged_slot(
-                                context,
-                                &mt_then_blk,
-                                mt_ptr,
-                                search_slot,
-                                probe_slot,
-                                HashLookupOutcome::NilOnMissing,
-                                types,
-                                loc,
-                            );
-                            let probe_tag = emit_load(&mt_then_blk, probe_slot, types.i64, loc);
-                            let tag_table_const = mt_then_blk
-                                .append_operation(arith::constant(
-                                    context,
-                                    IntegerAttribute::new(types.i64, TAG_TABLE).into(),
-                                    loc,
-                                ))
-                                .result(0)
-                                .unwrap()
-                                .into();
-                            let is_table: Value<'c, '_> = mt_then_blk
-                                .append_operation(arith::cmpi(
-                                    context,
-                                    arith::CmpiPredicate::Eq,
-                                    probe_tag,
-                                    tag_table_const,
-                                    loc,
-                                ))
-                                .result(0)
-                                .unwrap()
-                                .into();
-                            let tab_then = Region::new();
-                            let tab_then_blk = Block::new(&[]);
-                            {
-                                let payload_ptr = emit_byte_offset_ptr(
-                                    context,
-                                    &tab_then_blk,
-                                    probe_slot,
-                                    ARRAY_ELEM_OFF_VALUE,
-                                    types,
-                                    loc,
-                                );
-                                let inner_target =
-                                    emit_load(&tab_then_blk, payload_ptr, types.ptr, loc);
-                                let inner_iv: Value<'c, '_> = tab_then_blk
-                                    .append_operation(
-                                        OperationBuilder::new("llvm.ptrtoint", loc)
-                                            .add_operands(&[inner_target])
-                                            .add_results(&[types.i64])
-                                            .build()
-                                            .expect("llvm.ptrtoint inner"),
-                                    )
-                                    .result(0)
-                                    .unwrap()
-                                    .into();
-                                emit_store(&tab_then_blk, inner_iv, route_iv_slot, loc);
-                                tab_then_blk.append_operation(scf::r#yield(&[], loc));
-                            }
-                            tab_then.append_block(tab_then_blk);
-                            let tab_else = Region::new();
-                            let tab_else_blk = Block::new(&[]);
-                            tab_else_blk.append_operation(scf::r#yield(&[], loc));
-                            tab_else.append_block(tab_else_blk);
-                            mt_then_blk.append_operation(scf::r#if(
-                                is_table,
-                                &[],
-                                tab_then,
-                                tab_else,
-                                loc,
-                            ));
-                            // ADR 0169 — Function-form arm. Gated
-                            // Rust-time on non-empty fn_candidates.
-                            if !fn_candidates.is_empty() {
-                                let tag_fn_const = mt_then_blk
-                                    .append_operation(arith::constant(
-                                        context,
-                                        IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
-                                        loc,
-                                    ))
-                                    .result(0)
-                                    .unwrap()
-                                    .into();
-                                let is_fn: Value<'c, '_> = mt_then_blk
-                                    .append_operation(arith::cmpi(
-                                        context,
-                                        arith::CmpiPredicate::Eq,
-                                        probe_tag,
-                                        tag_fn_const,
-                                        loc,
-                                    ))
-                                    .result(0)
-                                    .unwrap()
-                                    .into();
-                                let fn_then_region = Region::new();
-                                let fn_then_blk = Block::new(&[]);
-                                {
-                                    let key_f: Value<'c, '_> = fn_then_blk
-                                        .append_operation(arith::sitofp(key_i, types.f64, loc))
-                                        .result(0)
-                                        .unwrap()
-                                        .into();
-                                    let sig = IndirectSig {
-                                        param_kinds: vec![
-                                            ValueKind::Table,
-                                            ValueKind::Number,
-                                            ValueKind::Number,
-                                        ],
-                                        ret_kinds: vec![],
-                                    };
-                                    let _ = emit_dispatch_chain_from_slot_ptr(
-                                        context,
-                                        &fn_then_blk,
-                                        probe_slot,
-                                        &sig,
-                                        &fn_candidates,
-                                        &[target_ptr, key_f, value_v],
-                                        functions,
-                                        types,
-                                        loc,
-                                    );
-                                    let true_i1 = fn_then_blk
-                                        .append_operation(arith::constant(
-                                            context,
-                                            IntegerAttribute::new(types.i1, 1).into(),
-                                            loc,
-                                        ))
-                                        .result(0)
-                                        .unwrap()
-                                        .into();
-                                    emit_store(&fn_then_blk, true_i1, handled_by_fn_slot, loc);
-                                    fn_then_blk.append_operation(scf::r#yield(&[], loc));
-                                }
-                                fn_then_region.append_block(fn_then_blk);
-                                let fn_else_region = Region::new();
-                                let fn_else_blk = Block::new(&[]);
-                                fn_else_blk.append_operation(scf::r#yield(&[], loc));
-                                fn_else_region.append_block(fn_else_blk);
-                                mt_then_blk.append_operation(scf::r#if(
-                                    is_fn,
-                                    &[],
-                                    fn_then_region,
-                                    fn_else_region,
-                                    loc,
-                                ));
-                            }
-                            mt_then_blk.append_operation(scf::r#yield(&[], loc));
-                        }
-                        mt_then.append_block(mt_then_blk);
-                        let mt_else = Region::new();
-                        let mt_else_blk = Block::new(&[]);
-                        mt_else_blk.append_operation(scf::r#yield(&[], loc));
-                        mt_else.append_block(mt_else_blk);
-                        high_then_blk.append_operation(scf::r#if(
-                            mt_present,
-                            &[],
-                            mt_then,
-                            mt_else,
-                            loc,
-                        ));
-                        high_then_blk.append_operation(scf::r#yield(&[], loc));
-                    }
-                    high_then.append_block(high_then_blk);
-                    let high_else = Region::new();
-                    let high_else_blk = Block::new(&[]);
-                    high_else_blk.append_operation(scf::r#yield(&[], loc));
-                    high_else.append_block(high_else_blk);
-                    block.append_operation(scf::r#if(key_high, &[], high_then, high_else, loc));
-                    let route_iv = emit_load(block, route_iv_slot, types.i64, loc);
-                    let zero_iv2 = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(types.i64, 0).into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let should_route: Value<'c, 'a> = block
-                        .append_operation(arith::cmpi(
-                            context,
-                            arith::CmpiPredicate::Ne,
-                            route_iv,
-                            zero_iv2,
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let route_then = Region::new();
-                    let route_then_blk = Block::new(&[]);
-                    {
-                        let inner_target: Value<'c, '_> = route_then_blk
-                            .append_operation(
-                                OperationBuilder::new("llvm.inttoptr", loc)
-                                    .add_operands(&[route_iv])
-                                    .add_results(&[types.ptr])
-                                    .build()
-                                    .expect("llvm.inttoptr inner"),
-                            )
-                            .result(0)
-                            .unwrap()
-                            .into();
-                        emit_array_index_assign_at(
-                            context,
-                            &route_then_blk,
-                            inner_target,
-                            key_i,
-                            value_v,
-                            value_kind,
-                            types,
-                            loc,
-                        );
-                        route_then_blk.append_operation(scf::r#yield(&[], loc));
-                    }
-                    route_then.append_block(route_then_blk);
-                    let route_else = Region::new();
-                    let route_else_blk = Block::new(&[]);
-                    {
-                        // ADR 0169 — check handled_by_fn before
-                        // falling through to outer write.
-                        let handled_by_fn =
-                            emit_load(&route_else_blk, handled_by_fn_slot, types.i1, loc);
-                        let hb_then = Region::new();
-                        let hb_then_blk = Block::new(&[]);
-                        hb_then_blk.append_operation(scf::r#yield(&[], loc));
-                        hb_then.append_block(hb_then_blk);
-                        let hb_else = Region::new();
-                        let hb_else_blk = Block::new(&[]);
-                        {
-                            emit_array_index_assign_at(
-                                context,
-                                &hb_else_blk,
-                                target_ptr,
-                                key_i,
-                                value_v,
-                                value_kind,
-                                types,
-                                loc,
-                            );
-                            hb_else_blk.append_operation(scf::r#yield(&[], loc));
-                        }
-                        hb_else.append_block(hb_else_blk);
-                        route_else_blk.append_operation(scf::r#if(
-                            handled_by_fn,
-                            &[],
-                            hb_then,
-                            hb_else,
-                            loc,
-                        ));
-                        route_else_blk.append_operation(scf::r#yield(&[], loc));
-                    }
-                    route_else.append_block(route_else_blk);
-                    block.append_operation(scf::r#if(
-                        should_route,
-                        &[],
-                        route_then,
-                        route_else,
+                    emit_number_key_indexassign_routed(
+                        context,
+                        block,
+                        target_ptr,
+                        key_i,
+                        value_v,
+                        value_kind,
+                        METATABLE_INDEX_MAX_HOPS,
+                        functions,
+                        types,
                         loc,
-                    ));
+                    );
                 }
                 // Phase 2.6b-hash-keys (ADR 0079): every non-Number
                 // hash-eligible kind (String / Bool / Function /
@@ -6506,6 +6085,421 @@ fn emit_array_index_assign_at<'a, 'c>(
     ));
     let elem_ptr = emit_array_elem_ptr(context, block, array_buf, key_i, types, loc);
     emit_value_slot_store_dispatched(context, block, elem_ptr, value_v, value_kind, types, loc);
+}
+
+/// ADR 0170 — depth-bounded recursive routing for Number-key
+/// `t[i] = v` with `mt.__newindex`. Subsumes ADR 0168 (Table form
+/// single-hop) and ADR 0169 (Function form). When `key > length`
+/// AND `mt.__newindex` is Table → recurse on inner with
+/// `remaining_hops - 1`. Function form fires terminal at any hop.
+/// Budget exhaustion (depth == 0) → raw write on the current
+/// `target_ptr` (the inner-most reached table).
+#[allow(clippy::too_many_arguments)]
+fn emit_number_key_indexassign_routed<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    target_ptr: Value<'c, 'a>,
+    key_i: Value<'c, 'a>,
+    value_v: Value<'c, 'a>,
+    value_kind: ValueKind,
+    remaining_hops: u32,
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    if remaining_hops == 0 {
+        emit_array_index_assign_at(
+            context, block, target_ptr, key_i, value_v, value_kind, types, loc,
+        );
+        return;
+    }
+    let length_i = emit_load(block, target_ptr, types.i64, loc);
+    let one_alloca = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let route_iv_slot: Value<'c, 'a> = block
+        .append_operation(
+            OperationBuilder::new("llvm.alloca", loc)
+                .add_operands(&[one_alloca])
+                .add_attributes(&[(
+                    Identifier::new(context, "elem_type"),
+                    TypeAttribute::new(types.i64).into(),
+                )])
+                .add_results(&[types.ptr])
+                .build()
+                .expect("llvm.alloca route_iv"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_iv = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_store(block, zero_iv, route_iv_slot, loc);
+    let handled_by_fn_slot: Value<'c, 'a> = block
+        .append_operation(
+            OperationBuilder::new("llvm.alloca", loc)
+                .add_operands(&[one_alloca])
+                .add_attributes(&[(
+                    Identifier::new(context, "elem_type"),
+                    TypeAttribute::new(types.i1).into(),
+                )])
+                .add_results(&[types.ptr])
+                .build()
+                .expect("llvm.alloca handled_by_fn"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let false_i1 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i1, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_store(block, false_i1, handled_by_fn_slot, loc);
+    let fn_candidates: Vec<FuncId> = if matches!(value_kind, ValueKind::Number) {
+        functions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| {
+                let pks: Vec<ValueKind> = f.params.iter().map(|p| p.kind).collect();
+                if pks == [ValueKind::Table, ValueKind::Number, ValueKind::Number]
+                    && f.ret_kinds.is_empty()
+                {
+                    Some(FuncId(i))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let key_high: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Sgt,
+            key_i,
+            length_i,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let high_then = Region::new();
+    let high_then_blk = Block::new(&[]);
+    {
+        let mt_slot_addr = emit_byte_offset_ptr(
+            context,
+            &high_then_blk,
+            target_ptr,
+            TABLE_OFF_METATABLE,
+            types,
+            loc,
+        );
+        let mt_ptr = emit_load(&high_then_blk, mt_slot_addr, types.ptr, loc);
+        let mt_iv: Value<'c, '_> = high_then_blk
+            .append_operation(
+                OperationBuilder::new("llvm.ptrtoint", loc)
+                    .add_operands(&[mt_ptr])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.ptrtoint mt"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let zero_i64 = high_then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let mt_present: Value<'c, '_> = high_then_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Ne,
+                mt_iv,
+                zero_i64,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let mt_then = Region::new();
+        let mt_then_blk = Block::new(&[]);
+        {
+            let field_ptr = emit_addressof(
+                context,
+                &mt_then_blk,
+                "s_metatable_newindex_field_name",
+                types,
+                loc,
+            );
+            let search_slot = emit_build_search_key_slot(
+                context,
+                &mt_then_blk,
+                ValueKind::String,
+                field_ptr,
+                types,
+                loc,
+            );
+            let probe_slot = emit_alloca_slot_for_kind(
+                context,
+                &mt_then_blk,
+                ValueKind::TaggedValue,
+                types,
+                loc,
+            );
+            emit_value_slot_store_nil(context, &mt_then_blk, probe_slot, types, loc);
+            emit_hash_lookup_into_tagged_slot(
+                context,
+                &mt_then_blk,
+                mt_ptr,
+                search_slot,
+                probe_slot,
+                HashLookupOutcome::NilOnMissing,
+                types,
+                loc,
+            );
+            let probe_tag = emit_load(&mt_then_blk, probe_slot, types.i64, loc);
+            let tag_table_const = mt_then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, TAG_TABLE).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let is_table: Value<'c, '_> = mt_then_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    probe_tag,
+                    tag_table_const,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let tab_then = Region::new();
+            let tab_then_blk = Block::new(&[]);
+            {
+                let payload_ptr = emit_byte_offset_ptr(
+                    context,
+                    &tab_then_blk,
+                    probe_slot,
+                    ARRAY_ELEM_OFF_VALUE,
+                    types,
+                    loc,
+                );
+                let inner_target = emit_load(&tab_then_blk, payload_ptr, types.ptr, loc);
+                let inner_iv: Value<'c, '_> = tab_then_blk
+                    .append_operation(
+                        OperationBuilder::new("llvm.ptrtoint", loc)
+                            .add_operands(&[inner_target])
+                            .add_results(&[types.i64])
+                            .build()
+                            .expect("llvm.ptrtoint inner"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                emit_store(&tab_then_blk, inner_iv, route_iv_slot, loc);
+                tab_then_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            tab_then.append_block(tab_then_blk);
+            let tab_else = Region::new();
+            let tab_else_blk = Block::new(&[]);
+            tab_else_blk.append_operation(scf::r#yield(&[], loc));
+            tab_else.append_block(tab_else_blk);
+            mt_then_blk.append_operation(scf::r#if(is_table, &[], tab_then, tab_else, loc));
+            if !fn_candidates.is_empty() {
+                let tag_fn_const = mt_then_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let is_fn: Value<'c, '_> = mt_then_blk
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Eq,
+                        probe_tag,
+                        tag_fn_const,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let fn_then_region = Region::new();
+                let fn_then_blk = Block::new(&[]);
+                {
+                    let key_f: Value<'c, '_> = fn_then_blk
+                        .append_operation(arith::sitofp(key_i, types.f64, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let sig = IndirectSig {
+                        param_kinds: vec![ValueKind::Table, ValueKind::Number, ValueKind::Number],
+                        ret_kinds: vec![],
+                    };
+                    let _ = emit_dispatch_chain_from_slot_ptr(
+                        context,
+                        &fn_then_blk,
+                        probe_slot,
+                        &sig,
+                        &fn_candidates,
+                        &[target_ptr, key_f, value_v],
+                        functions,
+                        types,
+                        loc,
+                    );
+                    let true_i1 = fn_then_blk
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i1, 1).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    emit_store(&fn_then_blk, true_i1, handled_by_fn_slot, loc);
+                    fn_then_blk.append_operation(scf::r#yield(&[], loc));
+                }
+                fn_then_region.append_block(fn_then_blk);
+                let fn_else_region = Region::new();
+                let fn_else_blk = Block::new(&[]);
+                fn_else_blk.append_operation(scf::r#yield(&[], loc));
+                fn_else_region.append_block(fn_else_blk);
+                mt_then_blk.append_operation(scf::r#if(
+                    is_fn,
+                    &[],
+                    fn_then_region,
+                    fn_else_region,
+                    loc,
+                ));
+            }
+            mt_then_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        mt_then.append_block(mt_then_blk);
+        let mt_else = Region::new();
+        let mt_else_blk = Block::new(&[]);
+        mt_else_blk.append_operation(scf::r#yield(&[], loc));
+        mt_else.append_block(mt_else_blk);
+        high_then_blk.append_operation(scf::r#if(mt_present, &[], mt_then, mt_else, loc));
+        high_then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    high_then.append_block(high_then_blk);
+    let high_else = Region::new();
+    let high_else_blk = Block::new(&[]);
+    high_else_blk.append_operation(scf::r#yield(&[], loc));
+    high_else.append_block(high_else_blk);
+    block.append_operation(scf::r#if(key_high, &[], high_then, high_else, loc));
+    let route_iv = emit_load(block, route_iv_slot, types.i64, loc);
+    let zero_iv2 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let should_route: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Ne,
+            route_iv,
+            zero_iv2,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let route_then = Region::new();
+    let route_then_blk = Block::new(&[]);
+    {
+        let inner_target: Value<'c, '_> = route_then_blk
+            .append_operation(
+                OperationBuilder::new("llvm.inttoptr", loc)
+                    .add_operands(&[route_iv])
+                    .add_results(&[types.ptr])
+                    .build()
+                    .expect("llvm.inttoptr inner"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        // ADR 0170 — recurse on inner with depth-1 so the inner
+        // table's own `__newindex` chain participates.
+        emit_number_key_indexassign_routed(
+            context,
+            &route_then_blk,
+            inner_target,
+            key_i,
+            value_v,
+            value_kind,
+            remaining_hops - 1,
+            functions,
+            types,
+            loc,
+        );
+        route_then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    route_then.append_block(route_then_blk);
+    let route_else = Region::new();
+    let route_else_blk = Block::new(&[]);
+    {
+        let handled_by_fn = emit_load(&route_else_blk, handled_by_fn_slot, types.i1, loc);
+        let hb_then = Region::new();
+        let hb_then_blk = Block::new(&[]);
+        hb_then_blk.append_operation(scf::r#yield(&[], loc));
+        hb_then.append_block(hb_then_blk);
+        let hb_else = Region::new();
+        let hb_else_blk = Block::new(&[]);
+        {
+            emit_array_index_assign_at(
+                context,
+                &hb_else_blk,
+                target_ptr,
+                key_i,
+                value_v,
+                value_kind,
+                types,
+                loc,
+            );
+            hb_else_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        hb_else.append_block(hb_else_blk);
+        route_else_blk.append_operation(scf::r#if(handled_by_fn, &[], hb_then, hb_else, loc));
+        route_else_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    route_else.append_block(route_else_blk);
+    block.append_operation(scf::r#if(should_route, &[], route_then, route_else, loc));
 }
 
 /// Phase 2.6c-tag-arr (ADR 0059): fill slots `[from_idx, to_idx)`
