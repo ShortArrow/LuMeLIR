@@ -226,6 +226,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0168 — newindex-number-key-table-form](0168-newindex-number-key-table-form.md) — Single-hop Table-form `__newindex` for Number key (key > length case)
 - [0169 — newindex-function-form-number-key](0169-newindex-function-form-number-key.md) — Function-form `__newindex` for Number key (ADR 0151 mirror, ADR 0166 sibling)
 - [0170 — multi-hop-number-key-newindex](0170-multi-hop-number-key-newindex.md) — Multi-hop Table-form `__newindex` for Number key (ADR 0167 mirror)
+- [0171 — newindex-mid-array-nil-trigger](0171-newindex-mid-array-nil-trigger.md) — Mid-array `TAG_NIL` slot also triggers Number-key `__newindex`
 
 ### Feature Implementation Memos
 
