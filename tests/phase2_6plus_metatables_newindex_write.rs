@@ -190,14 +190,14 @@ t.missing = 1
     );
 }
 
-// --- Test 8: Number-key array write bypasses metatable ---
+// --- Test 8: Number-key array write routes through __newindex (ADR 0168) ---
 
 #[test]
-fn number_key_array_write_does_not_consult_newindex() {
-    // Per ADR 0135 Non-goals, array (Number-key) writes preserve
-    // ADR 0057 grow-extend semantics. With a metatable __newindex
-    // set, `t[5] = v` should STILL store directly into `t`'s array
-    // part, NOT into the metatable's storage.
+fn number_key_array_write_routes_via_newindex() {
+    // ADR 0135 deferred Number-key __newindex; ADR 0168 closes the
+    // single-hop Table-form case for `key > length`. Lua spec §2.4:
+    // `t[5] = v` with `5 > #t` AND `mt.__newindex = storage` (Table)
+    // → storage[5] = v, t left unchanged. t[5] reads nil.
     let src = r#"
 local storage = {}
 local mt = {}
@@ -205,10 +205,11 @@ mt.__newindex = storage
 local t = {1, 2, 3}
 setmetatable(t, mt)
 t[5] = 555
+print(storage[5])
 print(t[5])
 "#;
-    let out = run_ok(src, "lumelir_newindex_number_key_bypass");
-    assert_eq!(out, "555\n");
+    let out = run_ok(src, "lumelir_newindex_number_key_routes");
+    assert_eq!(out, "555\nnil\n");
 }
 
 // --- Test 9: TaggedValue-key __newindex (pairs body idiom) ---

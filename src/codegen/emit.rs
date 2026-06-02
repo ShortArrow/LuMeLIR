@@ -3722,33 +3722,48 @@ fn emit_stmt<'a, 'c>(
                     lower_else_blk.append_operation(scf::r#yield(&[], loc));
                     lower_else.append_block(lower_else_blk);
                     block.append_operation(scf::r#if(too_small, &[], lower_then, lower_else, loc));
-                    // Grow array_buf to cover key (uses cap*16
-                    // sizing internally — 2.6a-grow updated below).
-                    emit_table_grow_if_needed(
-                        context, block, target_ptr, key_i, length_i, types, loc,
-                    );
-                    // Gap fill: emit_array_fill_nil iterates
-                    // `[length+1, key)` (1-based, half-open) marking
-                    // each slot Nil-tagged. No-op when key ≤ length+1
-                    // (the runtime cmpi inside its loop is the
-                    // base-case guard).
-                    let array_buf = emit_table_array_buf(context, block, target_ptr, types, loc);
-                    let length_plus_one: Value<'c, 'a> = block
-                        .append_operation(arith::addi(length_i, one, loc))
+                    // ADR 0168 — Number-key __newindex Table form
+                    // routing (key > length case). Allocate an
+                    // i64 sentinel (0 = no route). When `key > length`
+                    // AND `mt.__newindex` is Table, store the inner
+                    // table ptr's integer value. Then scf.if dispatches
+                    // to `emit_array_index_assign_at` on inner vs outer.
+                    let value_kind = infer_kind(value, locals, functions);
+                    let one_alloca = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 1).into(),
+                            loc,
+                        ))
                         .result(0)
                         .unwrap()
                         .into();
-                    emit_array_fill_nil(
-                        context,
-                        block,
-                        array_buf,
-                        length_plus_one,
-                        key_i,
-                        types,
-                        loc,
-                    );
-                    // Length update: if key > length, length = key.
-                    let push_grew_len: Value<'c, 'a> = block
+                    let route_iv_slot: Value<'c, 'a> = block
+                        .append_operation(
+                            OperationBuilder::new("llvm.alloca", loc)
+                                .add_operands(&[one_alloca])
+                                .add_attributes(&[(
+                                    Identifier::new(context, "elem_type"),
+                                    TypeAttribute::new(types.i64).into(),
+                                )])
+                                .add_results(&[types.ptr])
+                                .build()
+                                .expect("llvm.alloca route_iv"),
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let zero_iv = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 0).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    emit_store(block, zero_iv, route_iv_slot, loc);
+                    let key_high: Value<'c, 'a> = block
                         .append_operation(arith::cmpi(
                             context,
                             arith::CmpiPredicate::Sgt,
@@ -3759,41 +3774,244 @@ fn emit_stmt<'a, 'c>(
                         .result(0)
                         .unwrap()
                         .into();
-                    let len_then_region = Region::new();
-                    let len_then_blk = Block::new(&[]);
+                    let high_then = Region::new();
+                    let high_then_blk = Block::new(&[]);
                     {
-                        let len_slot_inner = emit_byte_offset_ptr(
+                        let mt_slot_addr = emit_byte_offset_ptr(
                             context,
-                            &len_then_blk,
+                            &high_then_blk,
                             target_ptr,
-                            TABLE_OFF_LEN,
+                            TABLE_OFF_METATABLE,
                             types,
                             loc,
                         );
-                        emit_store(&len_then_blk, key_i, len_slot_inner, loc);
-                        len_then_blk.append_operation(scf::r#yield(&[], loc));
+                        let mt_ptr = emit_load(&high_then_blk, mt_slot_addr, types.ptr, loc);
+                        let mt_iv: Value<'c, '_> = high_then_blk
+                            .append_operation(
+                                OperationBuilder::new("llvm.ptrtoint", loc)
+                                    .add_operands(&[mt_ptr])
+                                    .add_results(&[types.i64])
+                                    .build()
+                                    .expect("llvm.ptrtoint mt"),
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let zero_i64 = high_then_blk
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(types.i64, 0).into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let mt_present: Value<'c, '_> = high_then_blk
+                            .append_operation(arith::cmpi(
+                                context,
+                                arith::CmpiPredicate::Ne,
+                                mt_iv,
+                                zero_i64,
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let mt_then = Region::new();
+                        let mt_then_blk = Block::new(&[]);
+                        {
+                            let field_ptr = emit_addressof(
+                                context,
+                                &mt_then_blk,
+                                "s_metatable_newindex_field_name",
+                                types,
+                                loc,
+                            );
+                            let search_slot = emit_build_search_key_slot(
+                                context,
+                                &mt_then_blk,
+                                ValueKind::String,
+                                field_ptr,
+                                types,
+                                loc,
+                            );
+                            let probe_slot = emit_alloca_slot_for_kind(
+                                context,
+                                &mt_then_blk,
+                                ValueKind::TaggedValue,
+                                types,
+                                loc,
+                            );
+                            emit_value_slot_store_nil(
+                                context,
+                                &mt_then_blk,
+                                probe_slot,
+                                types,
+                                loc,
+                            );
+                            emit_hash_lookup_into_tagged_slot(
+                                context,
+                                &mt_then_blk,
+                                mt_ptr,
+                                search_slot,
+                                probe_slot,
+                                HashLookupOutcome::NilOnMissing,
+                                types,
+                                loc,
+                            );
+                            let probe_tag = emit_load(&mt_then_blk, probe_slot, types.i64, loc);
+                            let tag_table_const = mt_then_blk
+                                .append_operation(arith::constant(
+                                    context,
+                                    IntegerAttribute::new(types.i64, TAG_TABLE).into(),
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let is_table: Value<'c, '_> = mt_then_blk
+                                .append_operation(arith::cmpi(
+                                    context,
+                                    arith::CmpiPredicate::Eq,
+                                    probe_tag,
+                                    tag_table_const,
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let tab_then = Region::new();
+                            let tab_then_blk = Block::new(&[]);
+                            {
+                                let payload_ptr = emit_byte_offset_ptr(
+                                    context,
+                                    &tab_then_blk,
+                                    probe_slot,
+                                    ARRAY_ELEM_OFF_VALUE,
+                                    types,
+                                    loc,
+                                );
+                                let inner_target =
+                                    emit_load(&tab_then_blk, payload_ptr, types.ptr, loc);
+                                let inner_iv: Value<'c, '_> = tab_then_blk
+                                    .append_operation(
+                                        OperationBuilder::new("llvm.ptrtoint", loc)
+                                            .add_operands(&[inner_target])
+                                            .add_results(&[types.i64])
+                                            .build()
+                                            .expect("llvm.ptrtoint inner"),
+                                    )
+                                    .result(0)
+                                    .unwrap()
+                                    .into();
+                                emit_store(&tab_then_blk, inner_iv, route_iv_slot, loc);
+                                tab_then_blk.append_operation(scf::r#yield(&[], loc));
+                            }
+                            tab_then.append_block(tab_then_blk);
+                            let tab_else = Region::new();
+                            let tab_else_blk = Block::new(&[]);
+                            tab_else_blk.append_operation(scf::r#yield(&[], loc));
+                            tab_else.append_block(tab_else_blk);
+                            mt_then_blk.append_operation(scf::r#if(
+                                is_table,
+                                &[],
+                                tab_then,
+                                tab_else,
+                                loc,
+                            ));
+                            mt_then_blk.append_operation(scf::r#yield(&[], loc));
+                        }
+                        mt_then.append_block(mt_then_blk);
+                        let mt_else = Region::new();
+                        let mt_else_blk = Block::new(&[]);
+                        mt_else_blk.append_operation(scf::r#yield(&[], loc));
+                        mt_else.append_block(mt_else_blk);
+                        high_then_blk.append_operation(scf::r#if(
+                            mt_present,
+                            &[],
+                            mt_then,
+                            mt_else,
+                            loc,
+                        ));
+                        high_then_blk.append_operation(scf::r#yield(&[], loc));
                     }
-                    len_then_region.append_block(len_then_blk);
-                    let len_else_region = Region::new();
-                    let len_else_blk = Block::new(&[]);
-                    len_else_blk.append_operation(scf::r#yield(&[], loc));
-                    len_else_region.append_block(len_else_blk);
+                    high_then.append_block(high_then_blk);
+                    let high_else = Region::new();
+                    let high_else_blk = Block::new(&[]);
+                    high_else_blk.append_operation(scf::r#yield(&[], loc));
+                    high_else.append_block(high_else_blk);
+                    block.append_operation(scf::r#if(key_high, &[], high_then, high_else, loc));
+                    let route_iv = emit_load(block, route_iv_slot, types.i64, loc);
+                    let zero_iv2 = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 0).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let should_route: Value<'c, 'a> = block
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Ne,
+                            route_iv,
+                            zero_iv2,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let route_then = Region::new();
+                    let route_then_blk = Block::new(&[]);
+                    {
+                        let inner_target: Value<'c, '_> = route_then_blk
+                            .append_operation(
+                                OperationBuilder::new("llvm.inttoptr", loc)
+                                    .add_operands(&[route_iv])
+                                    .add_results(&[types.ptr])
+                                    .build()
+                                    .expect("llvm.inttoptr inner"),
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        emit_array_index_assign_at(
+                            context,
+                            &route_then_blk,
+                            inner_target,
+                            key_i,
+                            value_v,
+                            value_kind,
+                            types,
+                            loc,
+                        );
+                        route_then_blk.append_operation(scf::r#yield(&[], loc));
+                    }
+                    route_then.append_block(route_then_blk);
+                    let route_else = Region::new();
+                    let route_else_blk = Block::new(&[]);
+                    {
+                        emit_array_index_assign_at(
+                            context,
+                            &route_else_blk,
+                            target_ptr,
+                            key_i,
+                            value_v,
+                            value_kind,
+                            types,
+                            loc,
+                        );
+                        route_else_blk.append_operation(scf::r#yield(&[], loc));
+                    }
+                    route_else.append_block(route_else_blk);
                     block.append_operation(scf::r#if(
-                        push_grew_len,
+                        should_route,
                         &[],
-                        len_then_region,
-                        len_else_region,
+                        route_then,
+                        route_else,
                         loc,
                     ));
-                    // Phase 2.6c-tag-hetero (ADR 0064): tagged
-                    // store dispatched on value kind. Number /
-                    // Bool / String land in the same 16-byte slot.
-                    let value_kind = infer_kind(value, locals, functions);
-                    let elem_ptr =
-                        emit_array_elem_ptr(context, block, array_buf, key_i, types, loc);
-                    emit_value_slot_store_dispatched(
-                        context, block, elem_ptr, value_v, value_kind, types, loc,
-                    );
                 }
                 // Phase 2.6b-hash-keys (ADR 0079): every non-Number
                 // hash-eligible kind (String / Bool / Function /
@@ -6059,6 +6277,90 @@ fn emit_call_user_into_tagged_tmp<'a, 'c>(
         loc,
     )?;
     Ok(tmp)
+}
+
+/// ADR 0168 — extracted array-extending write. Loads `target_ptr`'s
+/// current length, grows the array_buf if needed, gap-fills any
+/// intermediate slots with TAG_NIL, updates `len` when `key_i >
+/// length`, and stores `value_v` (of `value_kind`) at `key_i`.
+/// Caller is responsible for `key_i >= 1` trap and (when routing
+/// through `__newindex`) for picking the right `target_ptr`.
+#[allow(clippy::too_many_arguments)]
+fn emit_array_index_assign_at<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    target_ptr: Value<'c, 'a>,
+    key_i: Value<'c, 'a>,
+    value_v: Value<'c, 'a>,
+    value_kind: ValueKind,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let length_i = emit_load(block, target_ptr, types.i64, loc);
+    let one = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_table_grow_if_needed(context, block, target_ptr, key_i, length_i, types, loc);
+    let array_buf = emit_table_array_buf(context, block, target_ptr, types, loc);
+    let length_plus_one: Value<'c, '_> = block
+        .append_operation(arith::addi(length_i, one, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    emit_array_fill_nil(
+        context,
+        block,
+        array_buf,
+        length_plus_one,
+        key_i,
+        types,
+        loc,
+    );
+    let push_grew_len: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Sgt,
+            key_i,
+            length_i,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let len_then_region = Region::new();
+    let len_then_blk = Block::new(&[]);
+    {
+        let len_slot_inner = emit_byte_offset_ptr(
+            context,
+            &len_then_blk,
+            target_ptr,
+            TABLE_OFF_LEN,
+            types,
+            loc,
+        );
+        emit_store(&len_then_blk, key_i, len_slot_inner, loc);
+        len_then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    len_then_region.append_block(len_then_blk);
+    let len_else_region = Region::new();
+    let len_else_blk = Block::new(&[]);
+    len_else_blk.append_operation(scf::r#yield(&[], loc));
+    len_else_region.append_block(len_else_blk);
+    block.append_operation(scf::r#if(
+        push_grew_len,
+        &[],
+        len_then_region,
+        len_else_region,
+        loc,
+    ));
+    let elem_ptr = emit_array_elem_ptr(context, block, array_buf, key_i, types, loc);
+    emit_value_slot_store_dispatched(context, block, elem_ptr, value_v, value_kind, types, loc);
 }
 
 /// Phase 2.6c-tag-arr (ADR 0059): fill slots `[from_idx, to_idx)`
