@@ -6202,6 +6202,68 @@ fn emit_number_key_indexassign_routed<'a, 'c>(
         .result(0)
         .unwrap()
         .into();
+    // ADR 0171 — mid-array TAG_NIL slot also triggers __newindex.
+    // Load elem tag inside scf.if(!key_high) so the load is safe.
+    let probe_then_region = Region::new();
+    let probe_then_blk = Block::new(&[]);
+    {
+        let false_i1 = probe_then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i1, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        probe_then_blk.append_operation(scf::r#yield(&[false_i1], loc));
+    }
+    probe_then_region.append_block(probe_then_blk);
+    let probe_else_region = Region::new();
+    let probe_else_blk = Block::new(&[]);
+    {
+        let array_buf = emit_table_array_buf(context, &probe_else_blk, target_ptr, types, loc);
+        let elem_ptr = emit_array_elem_ptr(context, &probe_else_blk, array_buf, key_i, types, loc);
+        let tag = emit_load(&probe_else_blk, elem_ptr, types.i64, loc);
+        let tag_nil_const = probe_else_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_nil: Value<'c, '_> = probe_else_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                tag,
+                tag_nil_const,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        probe_else_blk.append_operation(scf::r#yield(&[is_nil], loc));
+    }
+    probe_else_region.append_block(probe_else_blk);
+    let probe_mid_nil: Value<'c, 'a> = block
+        .append_operation(scf::r#if(
+            key_high,
+            &[types.i1],
+            probe_then_region,
+            probe_else_region,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let trigger: Value<'c, 'a> = block
+        .append_operation(arith::ori(key_high, probe_mid_nil, loc))
+        .result(0)
+        .unwrap()
+        .into();
     let high_then = Region::new();
     let high_then_blk = Block::new(&[]);
     {
@@ -6418,7 +6480,7 @@ fn emit_number_key_indexassign_routed<'a, 'c>(
     let high_else_blk = Block::new(&[]);
     high_else_blk.append_operation(scf::r#yield(&[], loc));
     high_else.append_block(high_else_blk);
-    block.append_operation(scf::r#if(key_high, &[], high_then, high_else, loc));
+    block.append_operation(scf::r#if(trigger, &[], high_then, high_else, loc));
     let route_iv = emit_load(block, route_iv_slot, types.i64, loc);
     let zero_iv2 = block
         .append_operation(arith::constant(
