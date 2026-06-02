@@ -5455,7 +5455,15 @@ fn emit_local_init_tagged<'a, 'c>(
             // __index deferred to a future ADR.
             emit_value_slot_store_nil(context, &then_blk, dst_slot, types, loc);
             emit_number_key_metatable_index_fallback(
-                context, &then_blk, target_ptr, key_i, dst_slot, functions, types, loc,
+                context,
+                &then_blk,
+                target_ptr,
+                key_i,
+                dst_slot,
+                METATABLE_INDEX_MAX_HOPS,
+                functions,
+                types,
+                loc,
             );
             then_blk.append_operation(scf::r#yield(&[], loc));
             then_region.append_block(then_blk);
@@ -5615,10 +5623,16 @@ fn emit_number_key_metatable_index_fallback<'a, 'c>(
     target_ptr: Value<'c, 'a>,
     key_i: Value<'c, 'a>,
     dst_slot: Value<'c, 'a>,
+    remaining_hops: u32,
     functions: &[HirFunction],
     types: &Types<'c>,
     loc: Location<'c>,
 ) {
+    // ADR 0167 — depth-bounded recursion. Budget exhausted → noop
+    // (dst stays Nil per the Number-key "missing → Nil" contract).
+    if remaining_hops == 0 {
+        return;
+    }
     let mt_slot = emit_byte_offset_ptr(context, block, target_ptr, TABLE_OFF_METATABLE, types, loc);
     let mt_ptr = emit_load(block, mt_slot, types.ptr, loc);
     let mt_iv: Value<'c, '_> = block
@@ -5755,7 +5769,22 @@ fn emit_number_key_metatable_index_fallback<'a, 'c>(
                 .into();
             let copy_then = Region::new();
             let copy_then_blk = Block::new(&[]);
-            copy_then_blk.append_operation(scf::r#yield(&[], loc));
+            {
+                // ADR 0167 — OOB at this hop: recurse into the next
+                // metatable using `index_table` as the new target.
+                emit_number_key_metatable_index_fallback(
+                    context,
+                    &copy_then_blk,
+                    index_table,
+                    key_i,
+                    dst_slot,
+                    remaining_hops - 1,
+                    functions,
+                    types,
+                    loc,
+                );
+                copy_then_blk.append_operation(scf::r#yield(&[], loc));
+            }
             copy_then.append_block(copy_then_blk);
             let copy_else = Region::new();
             let copy_else_blk = Block::new(&[]);
