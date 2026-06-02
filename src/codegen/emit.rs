@@ -3763,6 +3763,55 @@ fn emit_stmt<'a, 'c>(
                         .unwrap()
                         .into();
                     emit_store(block, zero_iv, route_iv_slot, loc);
+                    // ADR 0169 — `handled_by_fn_slot` (i1 sentinel)
+                    // = true when Function-form __newindex callee
+                    // has executed. Gates the final "else outer
+                    // write" branch.
+                    let handled_by_fn_slot: Value<'c, 'a> = block
+                        .append_operation(
+                            OperationBuilder::new("llvm.alloca", loc)
+                                .add_operands(&[one_alloca])
+                                .add_attributes(&[(
+                                    Identifier::new(context, "elem_type"),
+                                    TypeAttribute::new(types.i1).into(),
+                                )])
+                                .add_results(&[types.ptr])
+                                .build()
+                                .expect("llvm.alloca handled_by_fn"),
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let false_i1 = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i1, 0).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    emit_store(block, false_i1, handled_by_fn_slot, loc);
+                    // ADR 0169 — Function-form candidates filter.
+                    // Gated Rust-time on value_kind == Number.
+                    let fn_candidates: Vec<FuncId> = if matches!(value_kind, ValueKind::Number) {
+                        functions
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, f)| {
+                                let pks: Vec<ValueKind> = f.params.iter().map(|p| p.kind).collect();
+                                if pks == [ValueKind::Table, ValueKind::Number, ValueKind::Number]
+                                    && f.ret_kinds.is_empty()
+                                {
+                                    Some(FuncId(i))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     let key_high: Value<'c, 'a> = block
                         .append_operation(arith::cmpi(
                             context,
@@ -3919,6 +3968,81 @@ fn emit_stmt<'a, 'c>(
                                 tab_else,
                                 loc,
                             ));
+                            // ADR 0169 — Function-form arm. Gated
+                            // Rust-time on non-empty fn_candidates.
+                            if !fn_candidates.is_empty() {
+                                let tag_fn_const = mt_then_blk
+                                    .append_operation(arith::constant(
+                                        context,
+                                        IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
+                                        loc,
+                                    ))
+                                    .result(0)
+                                    .unwrap()
+                                    .into();
+                                let is_fn: Value<'c, '_> = mt_then_blk
+                                    .append_operation(arith::cmpi(
+                                        context,
+                                        arith::CmpiPredicate::Eq,
+                                        probe_tag,
+                                        tag_fn_const,
+                                        loc,
+                                    ))
+                                    .result(0)
+                                    .unwrap()
+                                    .into();
+                                let fn_then_region = Region::new();
+                                let fn_then_blk = Block::new(&[]);
+                                {
+                                    let key_f: Value<'c, '_> = fn_then_blk
+                                        .append_operation(arith::sitofp(key_i, types.f64, loc))
+                                        .result(0)
+                                        .unwrap()
+                                        .into();
+                                    let sig = IndirectSig {
+                                        param_kinds: vec![
+                                            ValueKind::Table,
+                                            ValueKind::Number,
+                                            ValueKind::Number,
+                                        ],
+                                        ret_kinds: vec![],
+                                    };
+                                    let _ = emit_dispatch_chain_from_slot_ptr(
+                                        context,
+                                        &fn_then_blk,
+                                        probe_slot,
+                                        &sig,
+                                        &fn_candidates,
+                                        &[target_ptr, key_f, value_v],
+                                        functions,
+                                        types,
+                                        loc,
+                                    );
+                                    let true_i1 = fn_then_blk
+                                        .append_operation(arith::constant(
+                                            context,
+                                            IntegerAttribute::new(types.i1, 1).into(),
+                                            loc,
+                                        ))
+                                        .result(0)
+                                        .unwrap()
+                                        .into();
+                                    emit_store(&fn_then_blk, true_i1, handled_by_fn_slot, loc);
+                                    fn_then_blk.append_operation(scf::r#yield(&[], loc));
+                                }
+                                fn_then_region.append_block(fn_then_blk);
+                                let fn_else_region = Region::new();
+                                let fn_else_blk = Block::new(&[]);
+                                fn_else_blk.append_operation(scf::r#yield(&[], loc));
+                                fn_else_region.append_block(fn_else_blk);
+                                mt_then_blk.append_operation(scf::r#if(
+                                    is_fn,
+                                    &[],
+                                    fn_then_region,
+                                    fn_else_region,
+                                    loc,
+                                ));
+                            }
                             mt_then_blk.append_operation(scf::r#yield(&[], loc));
                         }
                         mt_then.append_block(mt_then_blk);
@@ -3992,16 +4116,37 @@ fn emit_stmt<'a, 'c>(
                     let route_else = Region::new();
                     let route_else_blk = Block::new(&[]);
                     {
-                        emit_array_index_assign_at(
-                            context,
-                            &route_else_blk,
-                            target_ptr,
-                            key_i,
-                            value_v,
-                            value_kind,
-                            types,
+                        // ADR 0169 — check handled_by_fn before
+                        // falling through to outer write.
+                        let handled_by_fn =
+                            emit_load(&route_else_blk, handled_by_fn_slot, types.i1, loc);
+                        let hb_then = Region::new();
+                        let hb_then_blk = Block::new(&[]);
+                        hb_then_blk.append_operation(scf::r#yield(&[], loc));
+                        hb_then.append_block(hb_then_blk);
+                        let hb_else = Region::new();
+                        let hb_else_blk = Block::new(&[]);
+                        {
+                            emit_array_index_assign_at(
+                                context,
+                                &hb_else_blk,
+                                target_ptr,
+                                key_i,
+                                value_v,
+                                value_kind,
+                                types,
+                                loc,
+                            );
+                            hb_else_blk.append_operation(scf::r#yield(&[], loc));
+                        }
+                        hb_else.append_block(hb_else_blk);
+                        route_else_blk.append_operation(scf::r#if(
+                            handled_by_fn,
+                            &[],
+                            hb_then,
+                            hb_else,
                             loc,
-                        );
+                        ));
                         route_else_blk.append_operation(scf::r#yield(&[], loc));
                     }
                     route_else.append_block(route_else_blk);
