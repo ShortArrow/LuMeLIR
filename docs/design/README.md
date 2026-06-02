@@ -222,6 +222,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0164 — gc-weak-tables](0164-gc-weak-tables.md) — Phase 3 GC step 8: weak tables `__mode` (decision-only)
 - [0165 — number-key-index-array-oob-fallback](0165-number-key-index-array-oob-fallback.md) — Single-hop Table-form `__index` fallback for Number-key array OOB (closes ADR 0134 test 7)
 - [0166 — index-function-form-number-key](0166-index-function-form-number-key.md) — Function-form `__index` for Number key (ADR 0150 sibling)
+- [0167 — multi-hop-number-key-index](0167-multi-hop-number-key-index.md) — Multi-hop Table-form `__index` for Number key (ADR 0134 depth-recursion mirror)
 
 ### Feature Implementation Memos
 
