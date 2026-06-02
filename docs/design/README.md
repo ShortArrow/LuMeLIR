@@ -224,6 +224,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0166 — index-function-form-number-key](0166-index-function-form-number-key.md) — Function-form `__index` for Number key (ADR 0150 sibling)
 - [0167 — multi-hop-number-key-index](0167-multi-hop-number-key-index.md) — Multi-hop Table-form `__index` for Number key (ADR 0134 depth-recursion mirror)
 - [0168 — newindex-number-key-table-form](0168-newindex-number-key-table-form.md) — Single-hop Table-form `__newindex` for Number key (key > length case)
+- [0169 — newindex-function-form-number-key](0169-newindex-function-form-number-key.md) — Function-form `__newindex` for Number key (ADR 0151 mirror, ADR 0166 sibling)
 
 ### Feature Implementation Memos
 
