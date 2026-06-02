@@ -223,6 +223,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0165 — number-key-index-array-oob-fallback](0165-number-key-index-array-oob-fallback.md) — Single-hop Table-form `__index` fallback for Number-key array OOB (closes ADR 0134 test 7)
 - [0166 — index-function-form-number-key](0166-index-function-form-number-key.md) — Function-form `__index` for Number key (ADR 0150 sibling)
 - [0167 — multi-hop-number-key-index](0167-multi-hop-number-key-index.md) — Multi-hop Table-form `__index` for Number key (ADR 0134 depth-recursion mirror)
+- [0168 — newindex-number-key-table-form](0168-newindex-number-key-table-form.md) — Single-hop Table-form `__newindex` for Number key (key > length case)
 
 ### Feature Implementation Memos
 
