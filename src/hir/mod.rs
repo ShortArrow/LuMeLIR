@@ -5046,7 +5046,12 @@ impl LowerCtx {
                     );
                     let rawset_number_ok =
                         matches!(builtin, Builtin::RawSet) && matches!(k, ValueKind::Number);
-                    if !(hash_ok || rawset_number_ok) {
+                    // ADR 0173 — rawget Number-key arm allocates a
+                    // TaggedValue out-slot, sidestepping the f64 ABI
+                    // issue ADR 0136 cited.
+                    let rawget_number_ok =
+                        matches!(builtin, Builtin::RawGet) && matches!(k, ValueKind::Number);
+                    if !(hash_ok || rawset_number_ok || rawget_number_ok) {
                         return Err(HirError::TypeMismatch {
                             op: builtin.name().to_owned(),
                             lhs_kind: "hash-eligible key (string, bool, function, or table)"

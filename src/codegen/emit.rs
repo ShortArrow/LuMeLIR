@@ -10884,21 +10884,93 @@ fn emit_expr<'a, 'c>(
                     in_function_cell_ptr,
                     loc,
                 )?;
-                let key_slot =
-                    emit_build_search_key_slot(context, block, key_kind, key_value, types, loc);
                 let out_slot =
                     emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
                 emit_value_slot_store_nil(context, block, out_slot, types, loc);
-                emit_hash_lookup_into_tagged_slot(
-                    context,
-                    block,
-                    t_ptr,
-                    key_slot,
-                    out_slot,
-                    HashLookupOutcome::NilOnMissing,
-                    types,
-                    loc,
-                );
+                if matches!(key_kind, ValueKind::Number) {
+                    // ADR 0173 — Number-key raw array read; no trap on
+                    // OOB, no __index consult.
+                    let is_nan: Value<'c, '_> = block
+                        .append_operation(arith::cmpf(
+                            context,
+                            CmpfPredicate::Une,
+                            key_value,
+                            key_value,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    emit_trap_if(context, block, is_nan, "s_table_index_nan", types, loc);
+                    let key_i = emit_f2i(block, key_value, types, loc);
+                    let length_i = emit_load(block, t_ptr, types.i64, loc);
+                    let one = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 1).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let ge_one: Value<'c, '_> = block
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Sge,
+                            key_i,
+                            one,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let le_len: Value<'c, '_> = block
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Sle,
+                            key_i,
+                            length_i,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let in_range: Value<'c, '_> = block
+                        .append_operation(arith::andi(ge_one, le_len, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let then_region = Region::new();
+                    let then_blk = Block::new(&[]);
+                    {
+                        let array_buf = emit_table_array_buf(context, &then_blk, t_ptr, types, loc);
+                        let elem_ptr =
+                            emit_array_elem_ptr(context, &then_blk, array_buf, key_i, types, loc);
+                        emit_copy_tagged_slot_16b(
+                            context, &then_blk, elem_ptr, out_slot, types, loc,
+                        );
+                        then_blk.append_operation(scf::r#yield(&[], loc));
+                    }
+                    then_region.append_block(then_blk);
+                    let else_region = Region::new();
+                    let else_blk = Block::new(&[]);
+                    else_blk.append_operation(scf::r#yield(&[], loc));
+                    else_region.append_block(else_blk);
+                    block.append_operation(scf::r#if(in_range, &[], then_region, else_region, loc));
+                } else {
+                    let key_slot =
+                        emit_build_search_key_slot(context, block, key_kind, key_value, types, loc);
+                    emit_hash_lookup_into_tagged_slot(
+                        context,
+                        block,
+                        t_ptr,
+                        key_slot,
+                        out_slot,
+                        HashLookupOutcome::NilOnMissing,
+                        types,
+                        loc,
+                    );
+                }
                 Ok(out_slot)
             }
             Callee::Builtin(Builtin::RawEqual) => {

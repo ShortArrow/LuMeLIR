@@ -150,7 +150,10 @@ rawset(t, 1, 100)
 print(t[1])
 "#;
     let out = compile_and_run(src, "lumelir_rawset_number_key_ok");
-    assert!(out.status.success(), "rawset Number-key now accepted: {out:?}");
+    assert!(
+        out.status.success(),
+        "rawset Number-key now accepted: {out:?}"
+    );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "100\n");
 }
 
