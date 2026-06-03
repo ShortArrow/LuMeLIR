@@ -5051,7 +5051,13 @@ impl LowerCtx {
                     // issue ADR 0136 cited.
                     let rawget_number_ok =
                         matches!(builtin, Builtin::RawGet) && matches!(k, ValueKind::Number);
-                    if !(hash_ok || rawset_number_ok || rawget_number_ok) {
+                    // ADR 0174 — rawget Local(TaggedValue) key.
+                    // Non-Local TaggedValue stays rejected.
+                    let rawget_tagged_local_ok = matches!(builtin, Builtin::RawGet)
+                        && matches!(k, ValueKind::TaggedValue)
+                        && matches!(arg.kind, HirExprKind::Local(_));
+                    if !(hash_ok || rawset_number_ok || rawget_number_ok || rawget_tagged_local_ok)
+                    {
                         return Err(HirError::TypeMismatch {
                             op: builtin.name().to_owned(),
                             lhs_kind: "hash-eligible key (string, bool, function, or table)"

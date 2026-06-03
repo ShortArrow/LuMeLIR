@@ -31,31 +31,33 @@ fn rawget_tagged_local_key_string_tag() {
 local t = {}
 t.x = 10
 t.y = 20
-local got
 for k, v in pairs(t) do
-  got = rawget(t, k)
+  print(rawget(t, k))
 end
-print(got)
 "#;
     let out = run_ok(src, "lumelir_rawget_tagged_str");
-    // Hash iteration order is non-deterministic; either 10 or 20
-    // must surface, never nil.
-    let v = out.trim();
-    assert!(v == "10" || v == "20", "got: {v:?}");
+    // Hash iteration emits both 10 and 20 (order non-deterministic).
+    let lines: Vec<&str> = out.trim().split('\n').collect();
+    assert_eq!(lines.len(), 2, "got: {out:?}");
+    let mut sorted = lines.clone();
+    sorted.sort();
+    assert_eq!(sorted, vec!["10", "20"], "got: {out:?}");
 }
 
 // --- Test 2: rawget with Number-tag from runtime tagged local ---
 
 #[test]
 fn rawget_tagged_local_key_number_tag() {
-    // Tagged local carrying a Number value at runtime; rawget(t, k)
-    // dispatches to the Number arm and returns t[k].
+    // box holds an iterator whose values are Number; pairs-body
+    // binds them as TaggedValue/Number. rawget(t, k) must dispatch
+    // into the Number arm and return t[k].
     let src = r#"
 local t = {10, 20, 30}
-local box = {n = 2}
-local k
-for _, kv in pairs(box) do k = kv end
-print(rawget(t, k))
+local box = {}
+box.n = 2
+for kk, v in pairs(box) do
+  print(rawget(t, v))
+end
 "#;
     let out = run_ok(src, "lumelir_rawget_tagged_num");
     assert_eq!(out, "20\n");
@@ -65,6 +67,11 @@ print(rawget(t, k))
 
 #[test]
 fn rawget_tagged_local_key_bypasses_index() {
+    // `t.z` (static-String Index) consults __index and returns
+    // "from_mt". `rawget(t, k_tagged)` where k_tagged carries
+    // String "z" at runtime must NOT consult __index — returns
+    // nil. (`t[v]` with TaggedValue key has its own deferral; we
+    // sidestep it here.)
     let src = r#"
 local fallback = {}
 fallback.z = "from_mt"
@@ -72,15 +79,16 @@ local mt = {}
 mt.__index = fallback
 local t = {}
 setmetatable(t, mt)
-local box = {a = "z"}
-local k
-for _, kv in pairs(box) do k = kv end
-print(t[k])
-local raw = rawget(t, k)
-if raw == nil then
-  print("raw_nil")
-else
-  print("raw_present")
+print(t.z)
+local box = {}
+box.a = "z"
+for kk, v in pairs(box) do
+  local raw = rawget(t, v)
+  if raw == nil then
+    print("raw_nil")
+  else
+    print("raw_present")
+  end
 end
 "#;
     let out = run_ok(src, "lumelir_rawget_tagged_bypass");
