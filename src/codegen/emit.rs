@@ -10753,8 +10753,10 @@ fn emit_expr<'a, 'c>(
             }
             Callee::Builtin(Builtin::RawSet) => {
                 // ADR 0136: rawset(t, k, v) bypasses the __newindex
-                // chain by reusing emit_hash_indexassign_with_newindex
-                // with skip_metatable = true. Returns t (Lua §6.1).
+                // chain. Hash-key arm reuses emit_hash_indexassign_with_newindex
+                // with skip_metatable = true. ADR 0172: Number-key arm
+                // calls emit_array_index_assign_at directly (the raw
+                // array-write primitive). Returns t (Lua §6.1).
                 let t_ptr = emit_expr(
                     context,
                     block,
@@ -10793,23 +10795,64 @@ fn emit_expr<'a, 'c>(
                     in_function_cell_ptr,
                     loc,
                 )?;
-                let key_slot =
-                    emit_build_search_key_slot(context, block, key_kind, key_value, types, loc);
-                emit_hash_indexassign_with_newindex(
-                    context,
-                    block,
-                    t_ptr,
-                    key_slot,
-                    key_kind,
-                    key_value,
-                    value_v,
-                    value_kind,
-                    METATABLE_INDEX_MAX_HOPS,
-                    true,
-                    functions,
-                    types,
-                    loc,
-                );
+                if matches!(key_kind, ValueKind::Number) {
+                    // ADR 0172 — Number-key raw array write.
+                    let is_nan: Value<'c, '_> = block
+                        .append_operation(arith::cmpf(
+                            context,
+                            CmpfPredicate::Une,
+                            key_value,
+                            key_value,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    emit_trap_if(context, block, is_nan, "s_table_index_nan", types, loc);
+                    let key_i = emit_f2i(block, key_value, types, loc);
+                    let one = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 1).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let too_small: Value<'c, '_> = block
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Slt,
+                            key_i,
+                            one,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    emit_trap_if(context, block, too_small, "s_table_oob", types, loc);
+                    emit_array_index_assign_at(
+                        context, block, t_ptr, key_i, value_v, value_kind, types, loc,
+                    );
+                } else {
+                    let key_slot =
+                        emit_build_search_key_slot(context, block, key_kind, key_value, types, loc);
+                    emit_hash_indexassign_with_newindex(
+                        context,
+                        block,
+                        t_ptr,
+                        key_slot,
+                        key_kind,
+                        key_value,
+                        value_v,
+                        value_kind,
+                        METATABLE_INDEX_MAX_HOPS,
+                        true,
+                        functions,
+                        types,
+                        loc,
+                    );
+                }
                 Ok(t_ptr)
             }
             Callee::Builtin(Builtin::RawGet) => {

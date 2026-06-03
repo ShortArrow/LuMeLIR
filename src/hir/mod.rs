@@ -5033,21 +5033,28 @@ impl LowerCtx {
                         offset: arg.span.start,
                     });
                 }
-                if arg_idx == 1
-                    && !matches!(
+                if arg_idx == 1 {
+                    // ADR 0172 — `rawset` additionally accepts Number key
+                    // (delegates to array raw-write). `rawget` Number-key
+                    // still needs the TaggedValue Index ABI shift.
+                    let hash_ok = matches!(
                         k,
                         ValueKind::String
                             | ValueKind::Bool
                             | ValueKind::Function(_)
                             | ValueKind::Table
-                    )
-                {
-                    return Err(HirError::TypeMismatch {
-                        op: builtin.name().to_owned(),
-                        lhs_kind: "hash-eligible key (string, bool, function, or table)".to_owned(),
-                        rhs_kind: k.name().to_owned(),
-                        offset: arg.span.start,
-                    });
+                    );
+                    let rawset_number_ok =
+                        matches!(builtin, Builtin::RawSet) && matches!(k, ValueKind::Number);
+                    if !(hash_ok || rawset_number_ok) {
+                        return Err(HirError::TypeMismatch {
+                            op: builtin.name().to_owned(),
+                            lhs_kind: "hash-eligible key (string, bool, function, or table)"
+                                .to_owned(),
+                            rhs_kind: k.name().to_owned(),
+                            offset: arg.span.start,
+                        });
+                    }
                 }
                 if matches!(builtin, Builtin::RawSet) && arg_idx == 2 && matches!(k, ValueKind::Nil)
                 {

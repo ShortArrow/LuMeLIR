@@ -138,24 +138,20 @@ print(rawget(t, "k"))
     assert_eq!(out, "11\n");
 }
 
-// --- Test 7: rawset Number-key form is HIR-rejected ---
+// --- Test 7: rawset Number-key — ADR 0136 deferral closed by ADR 0172 ---
 
 #[test]
-fn rawset_number_key_is_rejected() {
+fn rawset_number_key_is_accepted() {
+    // ADR 0136 originally HIR-rejected this; ADR 0172 wires it to
+    // the raw array-write primitive (`emit_array_index_assign_at`).
     let src = r#"
 local t = {}
 rawset(t, 1, 100)
+print(t[1])
 "#;
-    let result = std::panic::catch_unwind(|| compile_and_run(src, "lumelir_rawset_number_key"));
-    match result {
-        Err(_) => {}
-        Ok(out) => {
-            assert!(
-                !out.status.success(),
-                "Number-key rawset must be rejected (HIR or runtime), but binary exited 0: {out:?}"
-            );
-        }
-    }
+    let out = compile_and_run(src, "lumelir_rawset_number_key_ok");
+    assert!(out.status.success(), "rawset Number-key now accepted: {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "100\n");
 }
 
 // --- Test 8: rawset Nil value is HIR-rejected ---
