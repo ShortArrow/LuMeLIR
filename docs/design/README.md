@@ -231,6 +231,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0173 — rawget-number-key](0173-rawget-number-key.md) — `rawget(t, n)` with Number key (TaggedValue out-slot, OOB → nil)
 - [0174 — rawget-tagged-key](0174-rawget-tagged-key.md) — `rawget(t, k)` with `Local(TaggedValue)` key (runtime tag dispatch)
 - [0175 — rawset-tagged-key](0175-rawset-tagged-key.md) — `rawset(t, k, v)` with `Local(TaggedValue)` key, non-TaggedValue value
+- [0176 — rawset-tagged-key-tagged-value](0176-rawset-tagged-key-tagged-value.md) — Full pairs-body `rawset(t, k, v)` with both key + value `Local(TaggedValue)`
 
 ### Feature Implementation Memos
 
