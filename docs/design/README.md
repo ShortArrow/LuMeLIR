@@ -230,6 +230,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0172 — rawset-number-key](0172-rawset-number-key.md) — `rawset(t, n, v)` with Number key (ADR 0136 deferral, write side only)
 - [0173 — rawget-number-key](0173-rawget-number-key.md) — `rawget(t, n)` with Number key (TaggedValue out-slot, OOB → nil)
 - [0174 — rawget-tagged-key](0174-rawget-tagged-key.md) — `rawget(t, k)` with `Local(TaggedValue)` key (runtime tag dispatch)
+- [0175 — rawset-tagged-key](0175-rawset-tagged-key.md) — `rawset(t, k, v)` with `Local(TaggedValue)` key, non-TaggedValue value
 
 ### Feature Implementation Memos
 
