@@ -10770,10 +10770,11 @@ fn emit_expr<'a, 'c>(
                     loc,
                 )?;
                 let key_kind = infer_kind(&args[1], locals, functions);
-                let key_value = emit_expr(
+                let value_kind = infer_kind(&args[2], locals, functions);
+                let value_v = emit_expr(
                     context,
                     block,
-                    &args[1],
+                    &args[2],
                     slots,
                     locals,
                     functions,
@@ -10782,11 +10783,146 @@ fn emit_expr<'a, 'c>(
                     in_function_cell_ptr,
                     loc,
                 )?;
-                let value_kind = infer_kind(&args[2], locals, functions);
-                let value_v = emit_expr(
+                // ADR 0175 — Local(TaggedValue) key: dispatch at
+                // runtime on the source slot's tag. Value side is
+                // restricted to non-TaggedValue (HIR rejects TaggedValue
+                // value when key is TaggedValue here).
+                if matches!(key_kind, ValueKind::TaggedValue) {
+                    let local_idx = match &args[1].kind {
+                        HirExprKind::Local(LocalId(i)) => *i,
+                        _ => unreachable!("ADR 0175 HIR guard ensures Local(TaggedValue) only"),
+                    };
+                    let source_slot = slots[local_idx];
+                    let tag = emit_load(block, source_slot, types.i64, loc);
+                    let tag_num_const = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, TAG_NUMBER).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let is_num: Value<'c, '_> = block
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Eq,
+                            tag,
+                            tag_num_const,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let num_then = Region::new();
+                    let num_then_blk = Block::new(&[]);
+                    {
+                        let pay_ptr = emit_byte_offset_ptr(
+                            context,
+                            &num_then_blk,
+                            source_slot,
+                            ARRAY_ELEM_OFF_VALUE,
+                            types,
+                            loc,
+                        );
+                        let pay_i64 = emit_load(&num_then_blk, pay_ptr, types.i64, loc);
+                        let key_f64: Value<'c, '_> = num_then_blk
+                            .append_operation(
+                                OperationBuilder::new("arith.bitcast", loc)
+                                    .add_operands(&[pay_i64])
+                                    .add_results(&[types.f64])
+                                    .build()
+                                    .expect("arith.bitcast f64"),
+                            )
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let is_nan: Value<'c, '_> = num_then_blk
+                            .append_operation(arith::cmpf(
+                                context,
+                                CmpfPredicate::Une,
+                                key_f64,
+                                key_f64,
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        emit_trap_if(
+                            context,
+                            &num_then_blk,
+                            is_nan,
+                            "s_table_index_nan",
+                            types,
+                            loc,
+                        );
+                        let key_i = emit_f2i(&num_then_blk, key_f64, types, loc);
+                        let one = num_then_blk
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(types.i64, 1).into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let too_small: Value<'c, '_> = num_then_blk
+                            .append_operation(arith::cmpi(
+                                context,
+                                arith::CmpiPredicate::Slt,
+                                key_i,
+                                one,
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        emit_trap_if(context, &num_then_blk, too_small, "s_table_oob", types, loc);
+                        emit_array_index_assign_at(
+                            context,
+                            &num_then_blk,
+                            t_ptr,
+                            key_i,
+                            value_v,
+                            value_kind,
+                            types,
+                            loc,
+                        );
+                        num_then_blk.append_operation(scf::r#yield(&[], loc));
+                    }
+                    num_then.append_block(num_then_blk);
+                    let num_else = Region::new();
+                    let num_else_blk = Block::new(&[]);
+                    {
+                        // Hash-eligible tag: pass source slot
+                        // directly as search_key_slot. ADR 0139
+                        // convention — key_kind = TaggedValue tells
+                        // the helper to treat key_value as a slot ptr.
+                        emit_hash_indexassign_with_newindex(
+                            context,
+                            &num_else_blk,
+                            t_ptr,
+                            source_slot,
+                            ValueKind::TaggedValue,
+                            source_slot,
+                            value_v,
+                            value_kind,
+                            METATABLE_INDEX_MAX_HOPS,
+                            true,
+                            functions,
+                            types,
+                            loc,
+                        );
+                        num_else_blk.append_operation(scf::r#yield(&[], loc));
+                    }
+                    num_else.append_block(num_else_blk);
+                    block.append_operation(scf::r#if(is_num, &[], num_then, num_else, loc));
+                    return Ok(t_ptr);
+                }
+                let key_value = emit_expr(
                     context,
                     block,
-                    &args[2],
+                    &args[1],
                     slots,
                     locals,
                     functions,

@@ -5056,7 +5056,15 @@ impl LowerCtx {
                     let rawget_tagged_local_ok = matches!(builtin, Builtin::RawGet)
                         && matches!(k, ValueKind::TaggedValue)
                         && matches!(arg.kind, HirExprKind::Local(_));
-                    if !(hash_ok || rawset_number_ok || rawget_number_ok || rawget_tagged_local_ok)
+                    // ADR 0175 — rawset Local(TaggedValue) key.
+                    let rawset_tagged_local_ok = matches!(builtin, Builtin::RawSet)
+                        && matches!(k, ValueKind::TaggedValue)
+                        && matches!(arg.kind, HirExprKind::Local(_));
+                    if !(hash_ok
+                        || rawset_number_ok
+                        || rawget_number_ok
+                        || rawget_tagged_local_ok
+                        || rawset_tagged_local_ok)
                     {
                         return Err(HirError::TypeMismatch {
                             op: builtin.name().to_owned(),
@@ -5075,6 +5083,34 @@ impl LowerCtx {
                         rhs_kind: k.name().to_owned(),
                         offset: arg.span.start,
                     });
+                }
+                // ADR 0175 — when rawset's key is Local(TaggedValue),
+                // value must be non-TaggedValue. TaggedValue value
+                // is deferred to a sibling ADR.
+                if matches!(builtin, Builtin::RawSet)
+                    && arg_idx == 2
+                    && matches!(k, ValueKind::TaggedValue)
+                {
+                    let key_is_tagged_local = lowered_args
+                        .get(1)
+                        .map(|key_arg| {
+                            matches!(key_arg.kind, HirExprKind::Local(_))
+                                && matches!(
+                                    infer_kind(key_arg, &self.locals, &self.functions),
+                                    ValueKind::TaggedValue
+                                )
+                        })
+                        .unwrap_or(false);
+                    if key_is_tagged_local {
+                        return Err(HirError::TypeMismatch {
+                            op: "rawset".to_owned(),
+                            lhs_kind:
+                                "non-tagged value (Number/String/Bool/Function/Table); TaggedValue value deferred"
+                                    .to_owned(),
+                            rhs_kind: k.name().to_owned(),
+                            offset: arg.span.start,
+                        });
+                    }
                 }
             }
             // ADR 0137 — raw equal / len Lua spec parity.
