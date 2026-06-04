@@ -5348,102 +5348,11 @@ fn emit_local_init_tagged<'a, 'c>(
                 .into();
             emit_trap_if(context, block, is_nan, "s_table_index_nan", types, loc);
             let key_i = emit_f2i(block, key_f, types, loc);
-            let length_i = emit_load(block, target_ptr, types.i64, loc);
-            let one = block
-                .append_operation(arith::constant(
-                    context,
-                    IntegerAttribute::new(types.i64, 1).into(),
-                    loc,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            let too_small: Value<'c, 'a> = block
-                .append_operation(arith::cmpi(
-                    context,
-                    arith::CmpiPredicate::Slt,
-                    key_i,
-                    one,
-                    loc,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            let too_big: Value<'c, 'a> = block
-                .append_operation(arith::cmpi(
-                    context,
-                    arith::CmpiPredicate::Sgt,
-                    key_i,
-                    length_i,
-                    loc,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            let oob: Value<'c, 'a> = block
-                .append_operation(arith::ori(too_small, too_big, loc))
-                .result(0)
-                .unwrap()
-                .into();
-            let then_region = Region::new();
-            let then_blk = Block::new(&[]);
-            // ADR 0134 test 7 fix: array OOB writes Nil to dst_slot
-            // then probes the metatable chain for Table-form
-            // `__index`. Single-hop Number-key fallback covers
-            // `local t = {1,2,3}; setmetatable(t, mt); mt.__index =
-            // fallback; t[5]` — when `fallback` has the key in its
-            // array part, the value is copied raw 16-byte into
-            // dst_slot. Multi-hop / Function-form Number-key
-            // __index deferred to a future ADR.
-            emit_value_slot_store_nil(context, &then_blk, dst_slot, types, loc);
-            emit_number_key_metatable_index_fallback(
-                context,
-                &then_blk,
-                target_ptr,
-                key_i,
-                dst_slot,
-                METATABLE_INDEX_MAX_HOPS,
-                functions,
-                types,
-                loc,
+            // ADR 0177 — extracted shared dispatch (in-range copy
+            // or OOB __index fallback).
+            emit_indextagged_number_key_dispatch(
+                context, block, target_ptr, key_i, dst_slot, functions, types, loc,
             );
-            then_blk.append_operation(scf::r#yield(&[], loc));
-            then_region.append_block(then_blk);
-            let else_region = Region::new();
-            let else_blk = Block::new(&[]);
-            {
-                let array_buf = emit_table_array_buf(context, &else_blk, target_ptr, types, loc);
-                let elem_ptr =
-                    emit_array_elem_ptr(context, &else_blk, array_buf, key_i, types, loc);
-                // Copy the 16-byte tagged slot verbatim — the
-                // source already lives as `{tag, value}` (ADR
-                // 0059), and Nil-tagged source maps to Nil-
-                // tagged local slot directly.
-                let tag = emit_load(&else_blk, elem_ptr, types.i64, loc);
-                emit_store(&else_blk, tag, dst_slot, loc);
-                let src_value_ptr = emit_byte_offset_ptr(
-                    context,
-                    &else_blk,
-                    elem_ptr,
-                    ARRAY_ELEM_OFF_VALUE,
-                    types,
-                    loc,
-                );
-                let dst_value_ptr = emit_byte_offset_ptr(
-                    context,
-                    &else_blk,
-                    dst_slot,
-                    ARRAY_ELEM_OFF_VALUE,
-                    types,
-                    loc,
-                );
-                // Phase 2.6c-tag-hetero (ADR 0064): raw i64 copy.
-                let payload = emit_load(&else_blk, src_value_ptr, types.i64, loc);
-                emit_store(&else_blk, payload, dst_value_ptr, loc);
-                else_blk.append_operation(scf::r#yield(&[], loc));
-            }
-            else_region.append_block(else_blk);
-            block.append_operation(scf::r#if(oob, &[], then_region, else_region, loc));
         }
         // Phase 2.6b-hash-keys (ADR 0079) / 2.6b-hash-lookup-miss
         // (ADR 0088): every non-Number hash-eligible kind shares the
@@ -5485,9 +5394,249 @@ fn emit_local_init_tagged<'a, 'c>(
                 context, block, target_ptr, key_slot, dst_slot, functions, types, loc,
             );
         }
-        _ => unreachable!("IndexTagged key must be Number or String"),
+        // ADR 0177 — Local(TaggedValue) key: runtime tag dispatch.
+        ValueKind::TaggedValue => {
+            let source_slot = match &key.kind {
+                HirExprKind::Local(LocalId(idx)) => slots[*idx],
+                _ => {
+                    return Err(CodegenError::UnsupportedExpr(
+                        "IndexTagged TaggedValue key requires `Local` source (ADR 0177 scope)"
+                            .to_owned(),
+                    ));
+                }
+            };
+            let tag = emit_load(block, source_slot, types.i64, loc);
+            // Lua §3.4.10: indexing with nil is a runtime error.
+            let tag_nil_const = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let is_nil: Value<'c, 'a> = block
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    tag,
+                    tag_nil_const,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            emit_trap_if(context, block, is_nil, "s_table_index_nil", types, loc);
+            let tag_num_const = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, TAG_NUMBER).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let is_num: Value<'c, 'a> = block
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    tag,
+                    tag_num_const,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let num_then = Region::new();
+            let num_then_blk = Block::new(&[]);
+            {
+                let pay_ptr = emit_byte_offset_ptr(
+                    context,
+                    &num_then_blk,
+                    source_slot,
+                    ARRAY_ELEM_OFF_VALUE,
+                    types,
+                    loc,
+                );
+                let pay_i64 = emit_load(&num_then_blk, pay_ptr, types.i64, loc);
+                let key_f64: Value<'c, '_> = num_then_blk
+                    .append_operation(
+                        OperationBuilder::new("arith.bitcast", loc)
+                            .add_operands(&[pay_i64])
+                            .add_results(&[types.f64])
+                            .build()
+                            .expect("arith.bitcast f64"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let is_nan: Value<'c, '_> = num_then_blk
+                    .append_operation(arith::cmpf(
+                        context,
+                        CmpfPredicate::Une,
+                        key_f64,
+                        key_f64,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                emit_trap_if(
+                    context,
+                    &num_then_blk,
+                    is_nan,
+                    "s_table_index_nan",
+                    types,
+                    loc,
+                );
+                let key_i = emit_f2i(&num_then_blk, key_f64, types, loc);
+                emit_indextagged_number_key_dispatch(
+                    context,
+                    &num_then_blk,
+                    target_ptr,
+                    key_i,
+                    dst_slot,
+                    functions,
+                    types,
+                    loc,
+                );
+                num_then_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            num_then.append_block(num_then_blk);
+            let num_else = Region::new();
+            let num_else_blk = Block::new(&[]);
+            {
+                // Hash-eligible tag (String/Bool/Function/Table).
+                // Source slot already (tag, payload).
+                emit_hash_lookup_into_tagged_slot(
+                    context,
+                    &num_else_blk,
+                    target_ptr,
+                    source_slot,
+                    dst_slot,
+                    HashLookupOutcome::NilOnMissing,
+                    types,
+                    loc,
+                );
+                emit_metatable_index_fallback_if_nil(
+                    context,
+                    &num_else_blk,
+                    target_ptr,
+                    source_slot,
+                    dst_slot,
+                    functions,
+                    types,
+                    loc,
+                );
+                num_else_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            num_else.append_block(num_else_blk);
+            block.append_operation(scf::r#if(is_num, &[], num_then, num_else, loc));
+        }
+        _ => unreachable!("IndexTagged key must be Number, String, or TaggedValue"),
     }
     Ok(())
+}
+
+/// ADR 0177 — extracted helper shared by the Number-key arm and
+/// the TaggedValue-key arm's Number-tag branch in
+/// `emit_local_init_tagged`. Runs the in-range copy + OOB
+/// __index fallback (ADR 0165/0167) dispatch after `key_i` is
+/// available (caller does NaN trap + f2i).
+#[allow(clippy::too_many_arguments)]
+fn emit_indextagged_number_key_dispatch<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    target_ptr: Value<'c, 'a>,
+    key_i: Value<'c, 'a>,
+    dst_slot: Value<'c, 'a>,
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let length_i = emit_load(block, target_ptr, types.i64, loc);
+    let one = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let too_small: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Slt,
+            key_i,
+            one,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let too_big: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Sgt,
+            key_i,
+            length_i,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let oob: Value<'c, 'a> = block
+        .append_operation(arith::ori(too_small, too_big, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    emit_value_slot_store_nil(context, &then_blk, dst_slot, types, loc);
+    emit_number_key_metatable_index_fallback(
+        context,
+        &then_blk,
+        target_ptr,
+        key_i,
+        dst_slot,
+        METATABLE_INDEX_MAX_HOPS,
+        functions,
+        types,
+        loc,
+    );
+    then_blk.append_operation(scf::r#yield(&[], loc));
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    {
+        let array_buf = emit_table_array_buf(context, &else_blk, target_ptr, types, loc);
+        let elem_ptr = emit_array_elem_ptr(context, &else_blk, array_buf, key_i, types, loc);
+        let tag = emit_load(&else_blk, elem_ptr, types.i64, loc);
+        emit_store(&else_blk, tag, dst_slot, loc);
+        let src_value_ptr = emit_byte_offset_ptr(
+            context,
+            &else_blk,
+            elem_ptr,
+            ARRAY_ELEM_OFF_VALUE,
+            types,
+            loc,
+        );
+        let dst_value_ptr = emit_byte_offset_ptr(
+            context,
+            &else_blk,
+            dst_slot,
+            ARRAY_ELEM_OFF_VALUE,
+            types,
+            loc,
+        );
+        let payload = emit_load(&else_blk, src_value_ptr, types.i64, loc);
+        emit_store(&else_blk, payload, dst_value_ptr, loc);
+        else_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(oob, &[], then_region, else_region, loc));
 }
 
 /// Phase 2.6+-metatables-index-read (ADR 0134): post-lookup
