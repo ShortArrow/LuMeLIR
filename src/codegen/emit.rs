@@ -6084,7 +6084,15 @@ fn emit_array_index_assign_at<'a, 'c>(
         loc,
     ));
     let elem_ptr = emit_array_elem_ptr(context, block, array_buf, key_i, types, loc);
-    emit_value_slot_store_dispatched(context, block, elem_ptr, value_v, value_kind, types, loc);
+    // ADR 0176 — when value_kind == TaggedValue, value_v is a
+    // slot ptr (Local(TaggedValue) source per ADR 0139 convention).
+    // Raw 16-byte copy preserves the tag; other kinds use the
+    // static-kind dispatched store as before.
+    if matches!(value_kind, ValueKind::TaggedValue) {
+        emit_copy_tagged_slot_16b(context, block, value_v, elem_ptr, types, loc);
+    } else {
+        emit_value_slot_store_dispatched(context, block, elem_ptr, value_v, value_kind, types, loc);
+    }
 }
 
 /// ADR 0170 — depth-bounded recursive routing for Number-key
@@ -10771,22 +10779,38 @@ fn emit_expr<'a, 'c>(
                 )?;
                 let key_kind = infer_kind(&args[1], locals, functions);
                 let value_kind = infer_kind(&args[2], locals, functions);
-                let value_v = emit_expr(
-                    context,
-                    block,
-                    &args[2],
-                    slots,
-                    locals,
-                    functions,
-                    types,
-                    params_len,
-                    in_function_cell_ptr,
-                    loc,
-                )?;
+                // ADR 0176 — for Local(TaggedValue) value, substitute
+                // slots[idx] for value_v per the ADR 0139 convention.
+                // emit_expr on a TaggedValue Local would trap on
+                // non-Number tag.
+                let value_v = if matches!(value_kind, ValueKind::TaggedValue) {
+                    match &args[2].kind {
+                        HirExprKind::Local(LocalId(idx)) => slots[*idx],
+                        _ => {
+                            return Err(CodegenError::UnsupportedExpr(
+                                "rawset TaggedValue value requires `Local` source (ADR 0176 scope)"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                } else {
+                    emit_expr(
+                        context,
+                        block,
+                        &args[2],
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
+                    )?
+                };
                 // ADR 0175 — Local(TaggedValue) key: dispatch at
-                // runtime on the source slot's tag. Value side is
-                // restricted to non-TaggedValue (HIR rejects TaggedValue
-                // value when key is TaggedValue here).
+                // runtime on the source slot's tag. Value can now
+                // also be Local(TaggedValue) per ADR 0176; the
+                // helper handles tag-aware slot copy.
                 if matches!(key_kind, ValueKind::TaggedValue) {
                     let local_idx = match &args[1].kind {
                         HirExprKind::Local(LocalId(i)) => *i,

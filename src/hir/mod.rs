@@ -5085,8 +5085,9 @@ impl LowerCtx {
                     });
                 }
                 // ADR 0175 — when rawset's key is Local(TaggedValue),
-                // value must be non-TaggedValue. TaggedValue value
-                // is deferred to a sibling ADR.
+                // value must be non-TaggedValue OR Local(TaggedValue).
+                // Non-Local TaggedValue source (e.g. fn return) still
+                // deferred to a future ADR. ADR 0176 narrowed this.
                 if matches!(builtin, Builtin::RawSet)
                     && arg_idx == 2
                     && matches!(k, ValueKind::TaggedValue)
@@ -5101,11 +5102,12 @@ impl LowerCtx {
                                 )
                         })
                         .unwrap_or(false);
-                    if key_is_tagged_local {
+                    let value_is_local = matches!(arg.kind, HirExprKind::Local(_));
+                    if key_is_tagged_local && !value_is_local {
                         return Err(HirError::TypeMismatch {
                             op: "rawset".to_owned(),
                             lhs_kind:
-                                "non-tagged value (Number/String/Bool/Function/Table); TaggedValue value deferred"
+                                "non-tagged value or Local(TaggedValue); non-Local TaggedValue source deferred"
                                     .to_owned(),
                             rhs_kind: k.name().to_owned(),
                             offset: arg.span.start,
