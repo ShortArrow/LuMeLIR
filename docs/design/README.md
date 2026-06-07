@@ -233,6 +233,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0175 — rawset-tagged-key](0175-rawset-tagged-key.md) — `rawset(t, k, v)` with `Local(TaggedValue)` key, non-TaggedValue value
 - [0176 — rawset-tagged-key-tagged-value](0176-rawset-tagged-key-tagged-value.md) — Full pairs-body `rawset(t, k, v)` with both key + value `Local(TaggedValue)`
 - [0177 — index-tagged-key](0177-index-tagged-key.md) — `t[k]` with `Local(TaggedValue)` key on the tagged-consumer path (`local x = t[k]`)
+- [0178 — tagged-key-runtime-dispatch-helper](0178-tagged-key-runtime-dispatch-helper.md) — Tidy First: extract the shared TaggedValue-key tag-dispatch scaffold used by 0174 / 0175 / 0176 / 0177
 
 ### Feature Implementation Memos
 
