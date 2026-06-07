@@ -5428,115 +5428,145 @@ fn emit_local_init_tagged<'a, 'c>(
                 .unwrap()
                 .into();
             emit_trap_if(context, block, is_nil, "s_table_index_nil", types, loc);
-            let tag_num_const = block
-                .append_operation(arith::constant(
-                    context,
-                    IntegerAttribute::new(types.i64, TAG_NUMBER).into(),
-                    loc,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            let is_num: Value<'c, 'a> = block
-                .append_operation(arith::cmpi(
-                    context,
-                    arith::CmpiPredicate::Eq,
-                    tag,
-                    tag_num_const,
-                    loc,
-                ))
-                .result(0)
-                .unwrap()
-                .into();
-            let num_then = Region::new();
-            let num_then_blk = Block::new(&[]);
-            {
-                let pay_ptr = emit_byte_offset_ptr(
-                    context,
-                    &num_then_blk,
-                    source_slot,
-                    ARRAY_ELEM_OFF_VALUE,
-                    types,
-                    loc,
-                );
-                let pay_i64 = emit_load(&num_then_blk, pay_ptr, types.i64, loc);
-                let key_f64: Value<'c, '_> = num_then_blk
-                    .append_operation(
-                        OperationBuilder::new("arith.bitcast", loc)
-                            .add_operands(&[pay_i64])
-                            .add_results(&[types.f64])
-                            .build()
-                            .expect("arith.bitcast f64"),
-                    )
-                    .result(0)
-                    .unwrap()
-                    .into();
-                let is_nan: Value<'c, '_> = num_then_blk
-                    .append_operation(arith::cmpf(
+            emit_tagged_key_runtime_dispatch(
+                context,
+                block,
+                source_slot,
+                types,
+                loc,
+                |then_blk, key_i| {
+                    emit_indextagged_number_key_dispatch(
+                        context, then_blk, target_ptr, key_i, dst_slot, functions, types, loc,
+                    );
+                },
+                |else_blk| {
+                    emit_hash_lookup_into_tagged_slot(
                         context,
-                        CmpfPredicate::Une,
-                        key_f64,
-                        key_f64,
+                        else_blk,
+                        target_ptr,
+                        source_slot,
+                        dst_slot,
+                        HashLookupOutcome::NilOnMissing,
+                        types,
                         loc,
-                    ))
-                    .result(0)
-                    .unwrap()
-                    .into();
-                emit_trap_if(
-                    context,
-                    &num_then_blk,
-                    is_nan,
-                    "s_table_index_nan",
-                    types,
-                    loc,
-                );
-                let key_i = emit_f2i(&num_then_blk, key_f64, types, loc);
-                emit_indextagged_number_key_dispatch(
-                    context,
-                    &num_then_blk,
-                    target_ptr,
-                    key_i,
-                    dst_slot,
-                    functions,
-                    types,
-                    loc,
-                );
-                num_then_blk.append_operation(scf::r#yield(&[], loc));
-            }
-            num_then.append_block(num_then_blk);
-            let num_else = Region::new();
-            let num_else_blk = Block::new(&[]);
-            {
-                // Hash-eligible tag (String/Bool/Function/Table).
-                // Source slot already (tag, payload).
-                emit_hash_lookup_into_tagged_slot(
-                    context,
-                    &num_else_blk,
-                    target_ptr,
-                    source_slot,
-                    dst_slot,
-                    HashLookupOutcome::NilOnMissing,
-                    types,
-                    loc,
-                );
-                emit_metatable_index_fallback_if_nil(
-                    context,
-                    &num_else_blk,
-                    target_ptr,
-                    source_slot,
-                    dst_slot,
-                    functions,
-                    types,
-                    loc,
-                );
-                num_else_blk.append_operation(scf::r#yield(&[], loc));
-            }
-            num_else.append_block(num_else_blk);
-            block.append_operation(scf::r#if(is_num, &[], num_then, num_else, loc));
+                    );
+                    emit_metatable_index_fallback_if_nil(
+                        context,
+                        else_blk,
+                        target_ptr,
+                        source_slot,
+                        dst_slot,
+                        functions,
+                        types,
+                        loc,
+                    );
+                },
+            );
         }
         _ => unreachable!("IndexTagged key must be Number, String, or TaggedValue"),
     }
     Ok(())
+}
+
+/// ADR 0178 — shared TaggedValue runtime tag-dispatch scaffold.
+///
+/// Emits the common shape used by every `Local(TaggedValue)` key
+/// consumer (rawget, rawset, IndexTagged read): load the tag,
+/// compare against `TAG_NUMBER`, scf.if then-branch (bitcast
+/// payload to f64, NaN-trap, f2i, hand `key_i` to `on_number_key`),
+/// else-branch (hand `&source_slot`-aware block to `on_hash_key`).
+///
+/// Per-site fences (e.g. Nil-trap for IndexTagged, too_small for
+/// rawset, in-range scf.if for rawget) stay at the call site —
+/// only the scaffold itself is shared.
+fn emit_tagged_key_runtime_dispatch<'a, 'c, FN, FH>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    source_slot: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+    on_number_key: FN,
+    on_hash_key: FH,
+) where
+    FN: FnOnce(&Block<'c>, Value<'c, '_>),
+    FH: FnOnce(&Block<'c>),
+{
+    let tag = emit_load(block, source_slot, types.i64, loc);
+    let tag_num_const = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, TAG_NUMBER).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let is_num: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            tag,
+            tag_num_const,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let num_then = Region::new();
+    let num_then_blk = Block::new(&[]);
+    {
+        let pay_ptr = emit_byte_offset_ptr(
+            context,
+            &num_then_blk,
+            source_slot,
+            ARRAY_ELEM_OFF_VALUE,
+            types,
+            loc,
+        );
+        let pay_i64 = emit_load(&num_then_blk, pay_ptr, types.i64, loc);
+        let key_f64: Value<'c, '_> = num_then_blk
+            .append_operation(
+                OperationBuilder::new("arith.bitcast", loc)
+                    .add_operands(&[pay_i64])
+                    .add_results(&[types.f64])
+                    .build()
+                    .expect("arith.bitcast f64"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let is_nan: Value<'c, '_> = num_then_blk
+            .append_operation(arith::cmpf(
+                context,
+                CmpfPredicate::Une,
+                key_f64,
+                key_f64,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        emit_trap_if(
+            context,
+            &num_then_blk,
+            is_nan,
+            "s_table_index_nan",
+            types,
+            loc,
+        );
+        let key_i = emit_f2i(&num_then_blk, key_f64, types, loc);
+        on_number_key(&num_then_blk, key_i);
+        num_then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    num_then.append_block(num_then_blk);
+    let num_else = Region::new();
+    let num_else_blk = Block::new(&[]);
+    {
+        on_hash_key(&num_else_blk);
+        num_else_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    num_else.append_block(num_else_blk);
+    block.append_operation(scf::r#if(is_num, &[], num_then, num_else, loc));
 }
 
 /// ADR 0177 — extracted helper shared by the Number-key arm and
@@ -10966,130 +10996,56 @@ fn emit_expr<'a, 'c>(
                         _ => unreachable!("ADR 0175 HIR guard ensures Local(TaggedValue) only"),
                     };
                     let source_slot = slots[local_idx];
-                    let tag = emit_load(block, source_slot, types.i64, loc);
-                    let tag_num_const = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(types.i64, TAG_NUMBER).into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let is_num: Value<'c, '_> = block
-                        .append_operation(arith::cmpi(
-                            context,
-                            arith::CmpiPredicate::Eq,
-                            tag,
-                            tag_num_const,
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let num_then = Region::new();
-                    let num_then_blk = Block::new(&[]);
-                    {
-                        let pay_ptr = emit_byte_offset_ptr(
-                            context,
-                            &num_then_blk,
-                            source_slot,
-                            ARRAY_ELEM_OFF_VALUE,
-                            types,
-                            loc,
-                        );
-                        let pay_i64 = emit_load(&num_then_blk, pay_ptr, types.i64, loc);
-                        let key_f64: Value<'c, '_> = num_then_blk
-                            .append_operation(
-                                OperationBuilder::new("arith.bitcast", loc)
-                                    .add_operands(&[pay_i64])
-                                    .add_results(&[types.f64])
-                                    .build()
-                                    .expect("arith.bitcast f64"),
-                            )
-                            .result(0)
-                            .unwrap()
-                            .into();
-                        let is_nan: Value<'c, '_> = num_then_blk
-                            .append_operation(arith::cmpf(
+                    emit_tagged_key_runtime_dispatch(
+                        context,
+                        block,
+                        source_slot,
+                        types,
+                        loc,
+                        |then_blk, key_i| {
+                            let one = then_blk
+                                .append_operation(arith::constant(
+                                    context,
+                                    IntegerAttribute::new(types.i64, 1).into(),
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let too_small: Value<'c, '_> = then_blk
+                                .append_operation(arith::cmpi(
+                                    context,
+                                    arith::CmpiPredicate::Slt,
+                                    key_i,
+                                    one,
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            emit_trap_if(context, then_blk, too_small, "s_table_oob", types, loc);
+                            emit_array_index_assign_at(
+                                context, then_blk, t_ptr, key_i, value_v, value_kind, types, loc,
+                            );
+                        },
+                        |else_blk| {
+                            emit_hash_indexassign_with_newindex(
                                 context,
-                                CmpfPredicate::Une,
-                                key_f64,
-                                key_f64,
+                                else_blk,
+                                t_ptr,
+                                source_slot,
+                                ValueKind::TaggedValue,
+                                source_slot,
+                                value_v,
+                                value_kind,
+                                METATABLE_INDEX_MAX_HOPS,
+                                true,
+                                functions,
+                                types,
                                 loc,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into();
-                        emit_trap_if(
-                            context,
-                            &num_then_blk,
-                            is_nan,
-                            "s_table_index_nan",
-                            types,
-                            loc,
-                        );
-                        let key_i = emit_f2i(&num_then_blk, key_f64, types, loc);
-                        let one = num_then_blk
-                            .append_operation(arith::constant(
-                                context,
-                                IntegerAttribute::new(types.i64, 1).into(),
-                                loc,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into();
-                        let too_small: Value<'c, '_> = num_then_blk
-                            .append_operation(arith::cmpi(
-                                context,
-                                arith::CmpiPredicate::Slt,
-                                key_i,
-                                one,
-                                loc,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into();
-                        emit_trap_if(context, &num_then_blk, too_small, "s_table_oob", types, loc);
-                        emit_array_index_assign_at(
-                            context,
-                            &num_then_blk,
-                            t_ptr,
-                            key_i,
-                            value_v,
-                            value_kind,
-                            types,
-                            loc,
-                        );
-                        num_then_blk.append_operation(scf::r#yield(&[], loc));
-                    }
-                    num_then.append_block(num_then_blk);
-                    let num_else = Region::new();
-                    let num_else_blk = Block::new(&[]);
-                    {
-                        // Hash-eligible tag: pass source slot
-                        // directly as search_key_slot. ADR 0139
-                        // convention — key_kind = TaggedValue tells
-                        // the helper to treat key_value as a slot ptr.
-                        emit_hash_indexassign_with_newindex(
-                            context,
-                            &num_else_blk,
-                            t_ptr,
-                            source_slot,
-                            ValueKind::TaggedValue,
-                            source_slot,
-                            value_v,
-                            value_kind,
-                            METATABLE_INDEX_MAX_HOPS,
-                            true,
-                            functions,
-                            types,
-                            loc,
-                        );
-                        num_else_blk.append_operation(scf::r#yield(&[], loc));
-                    }
-                    num_else.append_block(num_else_blk);
-                    block.append_operation(scf::r#if(is_num, &[], num_then, num_else, loc));
+                            );
+                        },
+                    );
                     return Ok(t_ptr);
                 }
                 let key_value = emit_expr(
@@ -11194,165 +11150,104 @@ fn emit_expr<'a, 'c>(
                         _ => unreachable!("ADR 0174 HIR guard ensures Local(TaggedValue) only"),
                     };
                     let source_slot = slots[local_idx];
-                    let tag = emit_load(block, source_slot, types.i64, loc);
-                    let tag_num_const = block
-                        .append_operation(arith::constant(
-                            context,
-                            IntegerAttribute::new(types.i64, TAG_NUMBER).into(),
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let is_num: Value<'c, '_> = block
-                        .append_operation(arith::cmpi(
-                            context,
-                            arith::CmpiPredicate::Eq,
-                            tag,
-                            tag_num_const,
-                            loc,
-                        ))
-                        .result(0)
-                        .unwrap()
-                        .into();
-                    let num_then = Region::new();
-                    let num_then_blk = Block::new(&[]);
-                    {
-                        let pay_ptr = emit_byte_offset_ptr(
-                            context,
-                            &num_then_blk,
-                            source_slot,
-                            ARRAY_ELEM_OFF_VALUE,
-                            types,
-                            loc,
-                        );
-                        let pay_i64 = emit_load(&num_then_blk, pay_ptr, types.i64, loc);
-                        let key_f64: Value<'c, '_> = num_then_blk
-                            .append_operation(
-                                OperationBuilder::new("arith.bitcast", loc)
-                                    .add_operands(&[pay_i64])
-                                    .add_results(&[types.f64])
-                                    .build()
-                                    .expect("arith.bitcast f64"),
-                            )
-                            .result(0)
-                            .unwrap()
-                            .into();
-                        let is_nan: Value<'c, '_> = num_then_blk
-                            .append_operation(arith::cmpf(
-                                context,
-                                CmpfPredicate::Une,
-                                key_f64,
-                                key_f64,
+                    emit_tagged_key_runtime_dispatch(
+                        context,
+                        block,
+                        source_slot,
+                        types,
+                        loc,
+                        |then_blk, key_i| {
+                            let length_i = emit_load(then_blk, t_ptr, types.i64, loc);
+                            let one = then_blk
+                                .append_operation(arith::constant(
+                                    context,
+                                    IntegerAttribute::new(types.i64, 1).into(),
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let ge_one: Value<'c, '_> = then_blk
+                                .append_operation(arith::cmpi(
+                                    context,
+                                    arith::CmpiPredicate::Sge,
+                                    key_i,
+                                    one,
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let le_len: Value<'c, '_> = then_blk
+                                .append_operation(arith::cmpi(
+                                    context,
+                                    arith::CmpiPredicate::Sle,
+                                    key_i,
+                                    length_i,
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let in_range: Value<'c, '_> = then_blk
+                                .append_operation(arith::andi(ge_one, le_len, loc))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let copy_then = Region::new();
+                            let copy_then_blk = Block::new(&[]);
+                            {
+                                let array_buf = emit_table_array_buf(
+                                    context,
+                                    &copy_then_blk,
+                                    t_ptr,
+                                    types,
+                                    loc,
+                                );
+                                let elem_ptr = emit_array_elem_ptr(
+                                    context,
+                                    &copy_then_blk,
+                                    array_buf,
+                                    key_i,
+                                    types,
+                                    loc,
+                                );
+                                emit_copy_tagged_slot_16b(
+                                    context,
+                                    &copy_then_blk,
+                                    elem_ptr,
+                                    out_slot,
+                                    types,
+                                    loc,
+                                );
+                                copy_then_blk.append_operation(scf::r#yield(&[], loc));
+                            }
+                            copy_then.append_block(copy_then_blk);
+                            let copy_else = Region::new();
+                            let copy_else_blk = Block::new(&[]);
+                            copy_else_blk.append_operation(scf::r#yield(&[], loc));
+                            copy_else.append_block(copy_else_blk);
+                            then_blk.append_operation(scf::r#if(
+                                in_range,
+                                &[],
+                                copy_then,
+                                copy_else,
                                 loc,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into();
-                        emit_trap_if(
-                            context,
-                            &num_then_blk,
-                            is_nan,
-                            "s_table_index_nan",
-                            types,
-                            loc,
-                        );
-                        let key_i = emit_f2i(&num_then_blk, key_f64, types, loc);
-                        let length_i = emit_load(&num_then_blk, t_ptr, types.i64, loc);
-                        let one = num_then_blk
-                            .append_operation(arith::constant(
+                            ));
+                        },
+                        |else_blk| {
+                            emit_hash_lookup_into_tagged_slot(
                                 context,
-                                IntegerAttribute::new(types.i64, 1).into(),
-                                loc,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into();
-                        let ge_one: Value<'c, '_> = num_then_blk
-                            .append_operation(arith::cmpi(
-                                context,
-                                arith::CmpiPredicate::Sge,
-                                key_i,
-                                one,
-                                loc,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into();
-                        let le_len: Value<'c, '_> = num_then_blk
-                            .append_operation(arith::cmpi(
-                                context,
-                                arith::CmpiPredicate::Sle,
-                                key_i,
-                                length_i,
-                                loc,
-                            ))
-                            .result(0)
-                            .unwrap()
-                            .into();
-                        let in_range: Value<'c, '_> = num_then_blk
-                            .append_operation(arith::andi(ge_one, le_len, loc))
-                            .result(0)
-                            .unwrap()
-                            .into();
-                        let copy_then = Region::new();
-                        let copy_then_blk = Block::new(&[]);
-                        {
-                            let array_buf =
-                                emit_table_array_buf(context, &copy_then_blk, t_ptr, types, loc);
-                            let elem_ptr = emit_array_elem_ptr(
-                                context,
-                                &copy_then_blk,
-                                array_buf,
-                                key_i,
-                                types,
-                                loc,
-                            );
-                            emit_copy_tagged_slot_16b(
-                                context,
-                                &copy_then_blk,
-                                elem_ptr,
+                                else_blk,
+                                t_ptr,
+                                source_slot,
                                 out_slot,
+                                HashLookupOutcome::NilOnMissing,
                                 types,
                                 loc,
                             );
-                            copy_then_blk.append_operation(scf::r#yield(&[], loc));
-                        }
-                        copy_then.append_block(copy_then_blk);
-                        let copy_else = Region::new();
-                        let copy_else_blk = Block::new(&[]);
-                        copy_else_blk.append_operation(scf::r#yield(&[], loc));
-                        copy_else.append_block(copy_else_blk);
-                        num_then_blk.append_operation(scf::r#if(
-                            in_range,
-                            &[],
-                            copy_then,
-                            copy_else,
-                            loc,
-                        ));
-                        num_then_blk.append_operation(scf::r#yield(&[], loc));
-                    }
-                    num_then.append_block(num_then_blk);
-                    let num_else = Region::new();
-                    let num_else_blk = Block::new(&[]);
-                    {
-                        // Hash-eligible tag (or Nil → noop since hash
-                        // probe of Nil key yields nothing). The source
-                        // slot already carries (tag, payload).
-                        emit_hash_lookup_into_tagged_slot(
-                            context,
-                            &num_else_blk,
-                            t_ptr,
-                            source_slot,
-                            out_slot,
-                            HashLookupOutcome::NilOnMissing,
-                            types,
-                            loc,
-                        );
-                        num_else_blk.append_operation(scf::r#yield(&[], loc));
-                    }
-                    num_else.append_block(num_else_blk);
-                    block.append_operation(scf::r#if(is_num, &[], num_then, num_else, loc));
+                        },
+                    );
                     return Ok(out_slot);
                 }
                 let key_value = emit_expr(
