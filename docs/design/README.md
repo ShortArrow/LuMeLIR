@@ -235,6 +235,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0177 — index-tagged-key](0177-index-tagged-key.md) — `t[k]` with `Local(TaggedValue)` key on the tagged-consumer path (`local x = t[k]`)
 - [0178 — tagged-key-runtime-dispatch-helper](0178-tagged-key-runtime-dispatch-helper.md) — Tidy First: extract the shared TaggedValue-key tag-dispatch scaffold used by 0174 / 0175 / 0176 / 0177
 - [0179 — non-local-tagged-source-materialisation](0179-non-local-tagged-source-materialisation.md) — HIR materialises non-Local TaggedValue (Call-return) source into a synth local at RawGet/RawSet arg positions, resolving the Local-only restriction in ADRs 0174/0175/0176
+- [0180 — param-table-context-inference](0180-param-table-context-inference.md) — Function parameters inferred as `Table` when used in pairs/ipairs/Index/MethodCall/table-consumer-builtin contexts; symmetric to the existing `Function(arity)` body-walk inference
 
 ### Feature Implementation Memos
 
