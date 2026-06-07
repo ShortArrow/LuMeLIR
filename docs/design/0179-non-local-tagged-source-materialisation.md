@@ -1,4 +1,4 @@
-# 0179. Non-Local TaggedValue Source — Uniform HIR Synth-Local Materialisation
+# 0179. Non-Local TaggedValue Source (Call-Return) — HIR Synth-Local Materialisation
 
 - **Status:** Accepted
 - **Kind:** Architecture Decision
@@ -9,15 +9,15 @@
 
 [ADRs 0084 / 0174 / 0175 / 0176 / 0177](#references) all share an identical scope-ceiling clause: "TaggedValue source must be `Local(LocalId)` only." Codegen sites that consume a TaggedValue key (or, in ADR 0176, value) match on `HirExprKind::Local(LocalId(idx))` and either `unreachable!()` or `return Err(CodegenError::UnsupportedExpr)` otherwise.
 
-This blocks idiomatic patterns the language permits:
+This blocks idiomatic patterns the language permits when the source is a **function call returning TaggedValue**:
 
 ```lua
-local t1, t2 = {}, {}
--- ...
-local x = t1[t2[k]]            -- IndexTagged key: t2[k] is an IndexTagged expr, not a Local
-print(rawget(t1, f()))          -- rawget arg[1]: f() returns TaggedValue, not a Local
-rawset(t1, h(), g())            -- rawset arg[1] AND arg[2]: both non-Local TaggedValue
+local function pick(src) for k, _ in pairs(src) do return k end end
+print(rawget(target, pick(other)))            -- rawget arg[1] non-Local
+rawset(target, pick(other_a), pick(other_b))   -- rawset arg[1] AND arg[2] non-Local
 ```
+
+Investigation while drafting this ADR (see scope ✅/❌ below) found that `HirExprKind::Index` in expression position infers as `Number` (`src/hir/mod.rs:180`), not `TaggedValue`. Plain `t1[t2[k]]` therefore routes through the Number-key path; the inner `t2[k]` never reaches the TaggedValue dispatcher. The only HIR shape that actually produces a non-Local TaggedValue source at the dispatcher sites is `HirExprKind::Call` whose callee returns TaggedValue.
 
 Per the [sweep 0166-0177 retrospective §Horizontal duplication](../notes/sweep-0166-0177-retrospective.md), opening these one site at a time would re-introduce the ad-hoc duplication that ADR 0178 just collapsed. The correct fix is **structural**: HIR pre-materialises any non-Local TaggedValue source into a synth local before lowering reaches the dispatcher sites. Codegen then stays oblivious — every source is already `Local`.
 
@@ -25,15 +25,15 @@ The mechanism is reuse: `materialize_to_synth_local` already exists (introduced 
 
 ## Scope (literal)
 
-- ✅ HIR materialisation at **4 source positions**:
-  1. `IndexTagged { target, key }` — when `key` has `infer_kind == TaggedValue` and `key.kind != Local(_)`.
-  2. `Callee::Builtin(RawGet)` arg[1] — same condition.
-  3. `Callee::Builtin(RawSet)` arg[1] (key) — same condition.
-  4. `Callee::Builtin(RawSet)` arg[2] (value) — when key is `Local(TaggedValue)` AND value has TaggedValue kind AND `value.kind != Local(_)`.
-- ✅ Materialisation reuses `materialize_to_synth_local` (allocates `__synth_NNN` local, inserts `LocalInit` into `pending_pre_stmts`, returns `Local(synth_id)`).
-- ✅ Codegen `_ => return Err(...)` / `_ => unreachable!()` arms guarding the Local check at the 4 sites become unreachable in practice; tightened or kept as defensive `unreachable!()`.
+- ✅ HIR materialisation at **3 builtin-arg source positions**:
+  1. `Callee::Builtin(RawGet)` arg[1] — when `infer_kind == TaggedValue` and `arg.kind != Local(_)`.
+  2. `Callee::Builtin(RawSet)` arg[1] (key) — same condition.
+  3. `Callee::Builtin(RawSet)` arg[2] (value) — when key is `Local(TaggedValue)` AND value has TaggedValue kind AND `value.kind != Local(_)`.
+- ✅ Materialisation reuses `materialize_to_synth_local` (allocates `__tagged_src_N` local, inserts `LocalInit` into `pending_pre_stmts`, returns `Local(synth_id)`).
+- ✅ Codegen `_ => return Err(...)` / `_ => unreachable!()` arms guarding the Local check at the 3 sites become unreachable in practice; kept as defensive `unreachable!()` with updated message.
 - ❌ Non-TaggedValue source kinds (Number, String, Bool, Function, Table) — already handled via `emit_expr` at every site; no change.
-- ❌ `IndexAssign` value side (`t[k] = non_local_tagged_expr`) — separate code path (`emit_index_assign`), separate ADR if needed. The deferral row stays open for that one position.
+- ❌ `IndexTagged` key non-Local — currently impossible to reach via the parser/HIR because `HirExprKind::Index` infers as `Number` in expression position. Enabling `t1[t2[k]]` as TaggedValue-key dispatch requires a prerequisite ADR that widens `Index` to `IndexTagged` in expr position (the chokepoint ADR 0054 deliberately keeps narrow). Deferred.
+- ❌ `IndexAssign` value side (`t[k] = non_local_tagged_expr`) — separate code path (`emit_index_assign`), separate ADR if needed.
 - ❌ Function-form metamethod call ABI (ADRs 0141/0142+) — orthogonal.
 
 ## Decision
@@ -80,7 +80,6 @@ Note: takes `HirExpr` (already-lowered) rather than `&Expr` because the call sit
 
 | Site | Change |
 |---|---|
-| `Index` → `IndexTagged` lowering (at `widen_index_for_local_init` / construction site) | Apply helper to the `key` field BEFORE building IndexTagged. |
 | `lower_builtin_call` arg loop, idx==1, builtin=RawGet/RawSet | After lowering arg, if kind is TaggedValue and not Local, apply helper. |
 | `lower_builtin_call` arg idx==2, builtin=RawSet, key is Local(TaggedValue) | Same; helper handles the kind check. |
 
@@ -92,20 +91,19 @@ In `lower_builtin_call`:
 
 ### Codegen side
 
-At the 4 dispatcher sites, the `_ => return Err(CodegenError::UnsupportedExpr(...))` and `_ => unreachable!(...)` arms become reachable only via a HIR bug — keep as `unreachable!()` with updated message ("HIR ADR 0179 materialisation guarantees Local source") to surface contract violation if regressed.
+At the 2 dispatcher sites covered (RawGet TaggedValue arg, RawSet TaggedValue arg key/value), the `_ => return Err(CodegenError::UnsupportedExpr(...))` and `_ => unreachable!(...)` arms become reachable only via a HIR bug — keep as `unreachable!()` with updated message ("HIR ADR 0179 materialisation guarantees Local source") to surface contract violation if regressed. The IndexTagged TaggedValue-key arm stays unchanged (its non-Local case is unreachable through the parser today and tightened by a future ADR).
 
 No structural codegen change; site code keeps using `slots[idx]` directly.
 
 ### Tests
 
-`tests/phase2_6plus_non_local_tagged_source.rs` (NEW, ~6 e2e):
+`tests/phase2_6plus_non_local_tagged_source.rs` (NEW, ~3 e2e):
 
-1. `t1[t2[k]]` — IndexTagged key is itself IndexTagged.
-2. `rawget(t, fn_returning_tagged())` — Call-return source.
-3. `rawset(t, fn_returning_tagged(), v)` — Call-return key.
-4. `rawset(t, k_local, fn_returning_tagged())` — Call-return value with Local TaggedValue key.
-5. `local m = t1[t2[k]]; rawget(t1, m)` — verify synth local is materialised once, not twice (sanity).
-6. `__index` chain: `t1[t2[k]]` where t1 has `__index` referring to a 2nd table — confirms materialisation doesn't bypass the metatable chain.
+1. `rawget(target, pick(other))` — Call-return TaggedValue source as RawGet key.
+2. `rawset(target, pick(other), "v")` — Call-return TaggedValue source as RawSet key.
+3. `rawset(target, k_local, pick(other))` — Call-return TaggedValue source as RawSet value with Local(TaggedValue) key.
+
+`pick` is a small user function that does `for k, _ in pairs(src) do return k end`, producing a TaggedValue return.
 
 ## Alternatives considered
 
@@ -117,8 +115,8 @@ No structural codegen change; site code keeps using `slots[idx]` directly.
 ## Consequences
 
 **Positive**
-- 5 ADRs' "Local source only" deferral notes are resolved at the source-position level in one move.
-- Future ADRs touching TaggedValue source positions don't re-encounter this restriction.
+- 3 ADRs' (0174 / 0175 / 0176) "Local source only" deferral notes are resolved for the RawGet/RawSet arg positions.
+- Future ADRs touching TaggedValue source at builtin-arg positions don't re-encounter this restriction.
 - Synth-local mechanism is reused (no new HIR machinery).
 - Codegen sites stay unchanged structurally; just the `unreachable!()` messages update.
 
@@ -133,7 +131,8 @@ No structural codegen change; site code keeps using `slots[idx]` directly.
 ## Documentation updates
 
 - [x] §8 — adds 0179.
-- [x] ADRs 0084 / 0174 / 0175 / 0176 / 0177 future-work — "Local source restriction" RESOLVED for the 4 covered positions.
+- [x] ADRs 0174 / 0175 / 0176 future-work — "Local source restriction" RESOLVED for the RawGet/RawSet arg positions.
+- [x] ADR 0177 future-work — Local restriction remains until expr-position Index widening lands (future ADR).
 - [x] Sweep retrospective — "Next moves" 0179 landed.
 
 ## Test count delta
@@ -141,20 +140,19 @@ No structural codegen change; site code keeps using `slots[idx]` directly.
 ```
 Step 0: 1397 (after ADR 0178 refactor)
 C1 (doc): 1397 → 1397
-C2 (6 e2e Red Day 0): 1397 → 1397
-C3 (HIR materialisation): 1397 → 1403
+C2 (3 e2e Red Day 0): 1397 → 1397
+C3 (HIR materialisation): 1397 → 1400
 ```
 
 ## Critical files
 
 - `src/hir/mod.rs`:
   - Add `materialize_tagged_source_if_needed` helper.
-  - Apply at IndexTagged construction site.
   - Apply at `lower_builtin_call` arg loop for rawget/rawset arg[1] and arg[2].
   - Drop the `Local-only` clauses from validation predicates.
 - `src/codegen/emit.rs`:
-  - Update `unreachable!()` / `UnsupportedExpr` messages at the 4 sites.
-- `tests/phase2_6plus_non_local_tagged_source.rs` (NEW) — 6 e2e.
+  - Update `unreachable!()` / `UnsupportedExpr` messages at the 2 covered sites (RawGet/RawSet TaggedValue arg).
+- `tests/phase2_6plus_non_local_tagged_source.rs` (NEW) — 3 e2e.
 
 ## Risks
 
@@ -168,9 +166,10 @@ C3 (HIR materialisation): 1397 → 1403
 
 ## Future work
 
-- IndexAssign value-side materialisation (the one remaining deferral row).
+- **Expr-position `Index` → `IndexTagged` widening** (prerequisite for non-Local IndexTagged-key dispatch). Would allow `t1[t2[k]]` and friends. Separate ADR because it changes a chokepoint kind-inference rule (ADR 0054).
+- IndexAssign value-side materialisation (the one remaining deferral row on the write side).
 - Materialise non-TaggedValue source kinds where useful (e.g. Number key from a Call) — currently works but via a different mechanism.
-- Synth local name collisions across nested non-trivial patterns — already unique by counter, but a debug-readable naming convention (e.g. `__tagged_src_at_line_NN`) could help log inspection.
+- Debug-readable synth-local naming (e.g. `__tagged_src_at_line_NN`) for log inspection.
 
 ## References
 
