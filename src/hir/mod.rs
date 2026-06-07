@@ -4896,6 +4896,38 @@ impl LowerCtx {
             .iter()
             .map(|a| self.lower_expr(a))
             .collect::<Result<Vec<_>, _>>()?;
+        // ADR 0179 — materialise non-Local TaggedValue source at the
+        // RawGet / RawSet builtin-arg positions into synth Locals
+        // before validation sees them. Keeps codegen oblivious of
+        // non-Local TaggedValue sources at these positions.
+        let lowered_args = if matches!(builtin, Builtin::RawGet | Builtin::RawSet) {
+            let mut materialised: Vec<HirExpr> = Vec::with_capacity(lowered_args.len());
+            for (i, arg) in lowered_args.into_iter().enumerate() {
+                let should_materialise_arg2 = i == 2
+                    && matches!(builtin, Builtin::RawSet)
+                    && materialised
+                        .get(1)
+                        .map(|key_arg| {
+                            matches!(key_arg.kind, HirExprKind::Local(_))
+                                && matches!(
+                                    infer_kind(key_arg, &self.locals, &self.functions),
+                                    ValueKind::TaggedValue
+                                )
+                        })
+                        .unwrap_or(false);
+                let should_materialise = i == 1 || should_materialise_arg2;
+                let arg_span = arg.span;
+                let new_arg = if should_materialise {
+                    self.materialize_tagged_source_if_needed(arg, arg_span)?
+                } else {
+                    arg
+                };
+                materialised.push(new_arg);
+            }
+            materialised
+        } else {
+            lowered_args
+        };
         // Phase 2.5b: builtin args may be Number/Bool/Nil but never a
         // Function value (function values cannot be printed or otherwise
         // observed as values yet). Reject explicitly.
@@ -5051,20 +5083,20 @@ impl LowerCtx {
                     // issue ADR 0136 cited.
                     let rawget_number_ok =
                         matches!(builtin, Builtin::RawGet) && matches!(k, ValueKind::Number);
-                    // ADR 0174 — rawget Local(TaggedValue) key.
-                    // Non-Local TaggedValue stays rejected.
-                    let rawget_tagged_local_ok = matches!(builtin, Builtin::RawGet)
-                        && matches!(k, ValueKind::TaggedValue)
-                        && matches!(arg.kind, HirExprKind::Local(_));
-                    // ADR 0175 — rawset Local(TaggedValue) key.
-                    let rawset_tagged_local_ok = matches!(builtin, Builtin::RawSet)
-                        && matches!(k, ValueKind::TaggedValue)
-                        && matches!(arg.kind, HirExprKind::Local(_));
+                    // ADR 0174 — rawget TaggedValue key.
+                    // ADR 0179 — non-Local TaggedValue source is now
+                    // materialised into a synth Local upstream, so
+                    // the Local-check clause is no longer required.
+                    let rawget_tagged_ok =
+                        matches!(builtin, Builtin::RawGet) && matches!(k, ValueKind::TaggedValue);
+                    // ADR 0175 — rawset TaggedValue key (ditto).
+                    let rawset_tagged_ok =
+                        matches!(builtin, Builtin::RawSet) && matches!(k, ValueKind::TaggedValue);
                     if !(hash_ok
                         || rawset_number_ok
                         || rawget_number_ok
-                        || rawget_tagged_local_ok
-                        || rawset_tagged_local_ok)
+                        || rawget_tagged_ok
+                        || rawset_tagged_ok)
                     {
                         return Err(HirError::TypeMismatch {
                             op: builtin.name().to_owned(),
@@ -5084,36 +5116,11 @@ impl LowerCtx {
                         offset: arg.span.start,
                     });
                 }
-                // ADR 0175 — when rawset's key is Local(TaggedValue),
-                // value must be non-TaggedValue OR Local(TaggedValue).
-                // Non-Local TaggedValue source (e.g. fn return) still
-                // deferred to a future ADR. ADR 0176 narrowed this.
-                if matches!(builtin, Builtin::RawSet)
-                    && arg_idx == 2
-                    && matches!(k, ValueKind::TaggedValue)
-                {
-                    let key_is_tagged_local = lowered_args
-                        .get(1)
-                        .map(|key_arg| {
-                            matches!(key_arg.kind, HirExprKind::Local(_))
-                                && matches!(
-                                    infer_kind(key_arg, &self.locals, &self.functions),
-                                    ValueKind::TaggedValue
-                                )
-                        })
-                        .unwrap_or(false);
-                    let value_is_local = matches!(arg.kind, HirExprKind::Local(_));
-                    if key_is_tagged_local && !value_is_local {
-                        return Err(HirError::TypeMismatch {
-                            op: "rawset".to_owned(),
-                            lhs_kind:
-                                "non-tagged value or Local(TaggedValue); non-Local TaggedValue source deferred"
-                                    .to_owned(),
-                            rhs_kind: k.name().to_owned(),
-                            offset: arg.span.start,
-                        });
-                    }
-                }
+                // ADR 0179 — the former "non-Local TaggedValue source
+                // deferred" rejection at rawset arg[2] (introduced by
+                // ADR 0175, narrowed by ADR 0176) is now obsolete:
+                // upstream materialisation guarantees Local source
+                // before this point.
             }
             // ADR 0137 — raw equal / len Lua spec parity.
             //   rawequal(t1, t2): both args must be Table (broader
@@ -5521,6 +5528,41 @@ impl LowerCtx {
             span: synth_span,
         });
         Ok(synth_id)
+    }
+
+    /// ADR 0179 — given an already-lowered HirExpr, if it carries
+    /// TaggedValue kind and is not already `Local(_)`, materialise
+    /// it into a synth Local via `pending_pre_stmts` and return a
+    /// `Local(synth_id)` HirExpr in its place. Idempotent on shapes
+    /// that don't need materialisation.
+    fn materialize_tagged_source_if_needed(
+        &mut self,
+        expr: HirExpr,
+        synth_span: Span,
+    ) -> Result<HirExpr, HirError> {
+        let kind = infer_kind(&expr, &self.locals, &self.functions);
+        if !matches!(kind, ValueKind::TaggedValue) {
+            return Ok(expr);
+        }
+        if matches!(expr.kind, HirExprKind::Local(_)) {
+            return Ok(expr);
+        }
+        let widened = widen_index_for_local_init(expr);
+        let seq = self.callee_seq;
+        self.callee_seq += 1;
+        let synth_name = format!("__tagged_src_{seq}");
+        let synth_id = self.declare_local(synth_name, ValueKind::TaggedValue);
+        self.pending_pre_stmts.push(HirStmt {
+            kind: HirStmtKind::LocalInit {
+                id: synth_id,
+                value: widened,
+            },
+            span: synth_span,
+        });
+        Ok(HirExpr {
+            kind: HirExprKind::Local(synth_id),
+            span: synth_span,
+        })
     }
 }
 
