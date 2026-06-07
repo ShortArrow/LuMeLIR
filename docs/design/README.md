@@ -234,6 +234,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0176 — rawset-tagged-key-tagged-value](0176-rawset-tagged-key-tagged-value.md) — Full pairs-body `rawset(t, k, v)` with both key + value `Local(TaggedValue)`
 - [0177 — index-tagged-key](0177-index-tagged-key.md) — `t[k]` with `Local(TaggedValue)` key on the tagged-consumer path (`local x = t[k]`)
 - [0178 — tagged-key-runtime-dispatch-helper](0178-tagged-key-runtime-dispatch-helper.md) — Tidy First: extract the shared TaggedValue-key tag-dispatch scaffold used by 0174 / 0175 / 0176 / 0177
+- [0179 — non-local-tagged-source-materialisation](0179-non-local-tagged-source-materialisation.md) — HIR uniformly materialises non-Local TaggedValue source into a synth local at 4 positions, resolving the Local-only restriction shared by ADRs 0084/0174/0175/0176/0177
 
 ### Feature Implementation Memos
 
