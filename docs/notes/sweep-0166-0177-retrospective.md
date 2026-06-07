@@ -95,17 +95,53 @@ Body = the literal scaffold above. The 5 call sites collapse to ~10 LOC each. Fu
 3. **Slot-ptr-as-value (ADR 0139) is the right abstraction for TaggedValue source threading.** No ADR in this sweep needed to invent a competing convention.
 4. **Codex 6 #1 has two layers** — per-ADR (caught) and per-sweep (missed until now). Future sweeps should budget one retrospective per ~10 ADRs.
 
-## Next moves
+## Next moves (planned at retro time)
 
 - **ADR 0178 = tagged-key dispatcher helper** (behaviour-preserving Tidy First; 5 call sites → 1 helper). Test delta 0 (pure refactor; existing tests pin).
 - **ADR 0179 = Non-Local TaggedValue source** (tmp-slot materialisation). Sits on top of the helper — adds one new entry path, not five.
 - **Flat-f64 `Index` widening** — orthogonal layer (consumer kind), defer until after 0178/0179.
 
+## Fold-through (ADRs 0178 + 0179)
+
+Both planned moves landed; updates worth noting for the next sweep:
+
+### ADR 0178 — what actually happened
+- Initial scan showed **3 sites**, not 5: IndexTagged TaggedValue arm (~5430), rawset Tagged sub-arm (~10963), rawget Tagged sub-arm (~11191). The retro had over-counted; the 5-count above conflated the dispatcher (this shape) with the Number-key arms (different shape; not part of the unification).
+- Extraction used `for<'a>`-free HRTB closures (`FnOnce(&Block<'c>, Value<'c, '_>)`) which compiled cleanly — the looser bound was sufficient because melior 0.27's `Value` lifetime parameters are permissive across nested-block borrows in practice.
+- Net `src/codegen/emit.rs` **−105 LOC** (+273 / −378).
+- Per-site fences (Nil-trap for IndexTagged, too_small for rawset, in-range scf.if for rawget) stayed outside the helper, exactly as planned. No surprises.
+
+### ADR 0179 — what actually happened
+- Scope **narrowed during drafting** from 4 → 3 source positions. The pre-flight check found `HirExprKind::Index` infers as `Number` (`src/hir/mod.rs:180`), not TaggedValue, so `t1[t2[k]]` IndexTagged-key non-Local case is unreachable through the parser today. The IndexTagged-key non-Local case is now a future ADR blocked on **expr-position `Index` → `IndexTagged` widening** (touches the ADR 0054 chokepoint).
+- Test-writing surfaced a **second structural blocker**: function parameters default to `Number` kind, so `for k, _ in pairs(param) do ... end` inside a helper fails with `for-in-pairs: lhs=table rhs=number`. Worked around by using upvalue-captured tables. The blocker is a separate roadmap item.
+- HIR pre-pass approach worked exactly as planned. ADRs 0174/0175/0176 Local-only clauses dropped uniformly; the obsolete arg[2] rejection block removed.
+- Test delta 1397 → 1400 (3 e2e Red→Green); existing 1397 unchanged.
+
+### Lessons added
+
+5. **Doc-first ADRs need a pre-flight code probe.** ADR 0179 was drafted with 4 positions; only after writing tests did it become clear one of them was unreachable through the parser. A 15-min `infer_kind` / parser-shape probe before C1 saves a C1-amend commit. (Cost this time: one extra commit `2969c96`. Cheap enough that the lesson stands, not a process change.)
+6. **Per-sweep duplication is sometimes mis-counted from the inside.** The "5 sites" figure in this retrospective was wrong; only 3 sites had the dispatcher shape. A retro should cite line numbers AND `grep` evidence; future retros should re-grep at write time, not work from memory.
+
+## Next chokepoint candidates
+
+The structural root behind every "TaggedValue source" deferral row is **ADR 0054**: `Index` infers as `Number` in expression position. This forces TaggedValue inputs to come through narrow channels (Local, LocalInit-widening), which is why dispatchers exist at all and why ADR 0179 had to narrow.
+
+Roadmap-level candidates (need own decision docs):
+
+- **Expr-position `Index` → `IndexTagged` widening.** Touches the ADR 0054 chokepoint. Probably needs to be split: (a) HIR rule change with feature-flag-style coverage, (b) per-consumer kind reconciliation as widening lands. Expected to touch many call sites — should be planned as a multi-ADR sub-sweep, not one ADR.
+- **Function parameter kind inference (or annotation).** Unblocks `pairs(param)` and idiomatic helpers. Two paths: (i) parameters default to TaggedValue, (ii) infer from call sites. Either way it's a HIR-level decision with codegen consequences.
+- **IndexAssign value-side non-Local TaggedValue.** The remaining write-side deferral row. Direct mirror of ADR 0179 on a different code path; small and tractable but doesn't open new ground.
+
+Ordering recommendation: **parameter inference first** (smallest, unblocks test patterns), **then plan the Index-widening sub-sweep** (multi-ADR), **then IndexAssign value side fold-through**.
+
 ## References
 
 - ADRs 0166-0177 (this sweep)
+- ADR 0054 — flat-f64 `Index` chokepoint (next structural root)
 - ADR 0084 — TaggedValue Local restriction precedent
 - ADR 0088 — `emit_hash_lookup_into_tagged_slot` chokepoint
 - ADR 0134 / 0150 — `__index` hash-key fallback chain
 - ADR 0139 — slot-ptr-as-value convention
 - ADR 0165 — Number-key `__index` array OOB fallback
+- [ADR 0178](../design/0178-tagged-key-runtime-dispatch-helper.md) — fold-through helper landed
+- [ADR 0179](../design/0179-non-local-tagged-source-materialisation.md) — fold-through materialisation landed
