@@ -1044,6 +1044,27 @@ fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
         }
     }
 
+    // ADR 0181 — String mirror of mark_ident_as_table.
+    fn mark_ident_as_string(expr: &Expr, name_to_idx: &Map<&str, usize>, kinds: &mut [ValueKind]) {
+        if let ExprKind::Ident(name) = &expr.kind
+            && let Some(&idx) = name_to_idx.get(name.as_str())
+        {
+            kinds[idx] = ValueKind::String;
+        }
+    }
+
+    // ADR 0181 — detect Index-callee Call form `string.<method>(...)`.
+    fn is_string_method_callee(callee: &Expr) -> bool {
+        if let ExprKind::Index { target, key } = &callee.kind
+            && let ExprKind::Ident(target_name) = &target.kind
+            && target_name == "string"
+            && let ExprKind::Str(_) = &key.kind
+        {
+            return true;
+        }
+        false
+    }
+
     fn is_table_consumer_builtin(name: &str) -> bool {
         matches!(
             name,
@@ -1189,13 +1210,23 @@ fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
                         // builtin B makes param Table.
                         mark_ident_as_table(first, name_to_idx, kinds);
                     }
+                } else if is_string_method_callee(callee)
+                    && let Some(first) = args.first()
+                {
+                    // ADR 0181 — `string.<m>(param, ...)` makes param String.
+                    mark_ident_as_string(first, name_to_idx, kinds);
                 }
                 visit_expr(callee, name_to_idx, kinds);
                 for a in args {
                     visit_expr(a, name_to_idx, kinds);
                 }
             }
-            ExprKind::BinOp { lhs, rhs, .. } => {
+            ExprKind::BinOp { op, lhs, rhs } => {
+                // ADR 0181 — Concat operand makes that param String.
+                if matches!(op, BinOp::Concat) {
+                    mark_ident_as_string(lhs, name_to_idx, kinds);
+                    mark_ident_as_string(rhs, name_to_idx, kinds);
+                }
                 visit_expr(lhs, name_to_idx, kinds);
                 visit_expr(rhs, name_to_idx, kinds);
             }
@@ -2090,11 +2121,12 @@ impl LowerCtx {
         ctx.containing_fn = Some(containing_fn);
         let body_kinds = infer_param_kinds(body, params);
         for (i, p) in params.iter().enumerate() {
-            // ADR 0180 — body-walk Table is also decisive (joins the
-            // existing Function precedent). External call-site kinds
-            // win only when body-walk leaves the default Number.
+            // ADR 0180/0181 — body-walk Table and String are also
+            // decisive (join the existing Function precedent). External
+            // call-site kinds win only when body-walk leaves the
+            // default Number.
             let kind = match body_kinds[i] {
-                ValueKind::Function(_) | ValueKind::Table => body_kinds[i],
+                ValueKind::Function(_) | ValueKind::Table | ValueKind::String => body_kinds[i],
                 _ => external_kinds[i],
             };
             ctx.declare_local(p.clone(), kind);
