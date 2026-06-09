@@ -1258,8 +1258,21 @@ fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
             // intentionally NOT applied — receiver is not a param
             // name we're refining).
             // ADR 0180 — `param:method(...)` makes param Table.
-            ExprKind::MethodCall { receiver, args, .. } => {
-                mark_ident_as(receiver, name_to_idx, kinds, ValueKind::Table);
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => {
+                // ADR 0183 — `param:<m>()` refines `param` to String
+                // when `m` is a known `string.<m>` method (ADR 0103's
+                // `Builtin::string_from_method`). Otherwise keep the
+                // ADR 0180 Table default.
+                let recv_kind = if Builtin::string_from_method(method).is_some() {
+                    ValueKind::String
+                } else {
+                    ValueKind::Table
+                };
+                mark_ident_as(receiver, name_to_idx, kinds, recv_kind);
                 visit_expr(receiver, name_to_idx, kinds);
                 for a in args {
                     visit_expr(a, name_to_idx, kinds);
@@ -4462,6 +4475,32 @@ impl LowerCtx {
                         });
                     }
                 };
+                // ADR 0183 — `recv:<m>()` short-circuits to the
+                // `string.<m>` namespace builtin (ADR 0103) when the
+                // receiver is a Local of `ValueKind::String` and `<m>`
+                // is recognised by `Builtin::string_from_method`. Args
+                // become `[recv, ...args]` to match the
+                // `string.<m>(s, ...)` arity. All three conditions must
+                // hold; otherwise fall through to the existing
+                // Index-callee synth path so ADR 0091 + ADR 0092
+                // semantics are preserved.
+                if let Some(recv_id) = self.resolve(&recv_name)
+                    && matches!(self.locals[recv_id.0].kind, ValueKind::String)
+                    && let Some(builtin) = Builtin::string_from_method(method)
+                {
+                    let recv_expr = Expr::new(ExprKind::Ident(recv_name.clone()), receiver.span);
+                    let mut ns_args = Vec::with_capacity(args.len() + 1);
+                    ns_args.push(recv_expr);
+                    for a in args {
+                        ns_args.push(a.clone());
+                    }
+                    let call_kind =
+                        self.lower_namespace_builtin_call(builtin, &ns_args, expr.span)?;
+                    return Ok(HirExpr {
+                        kind: call_kind,
+                        span: expr.span,
+                    });
+                }
                 let recv_ident_expr = Expr::new(ExprKind::Ident(recv_name), receiver.span);
                 let method_key_expr = Expr::new(ExprKind::Str(method.clone()), expr.span);
                 let synth_callee = Expr::new(
