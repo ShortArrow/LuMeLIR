@@ -16,7 +16,12 @@
 //! Non-goals (intentional):
 //! - string.sub / format / rep / find / match / byte / char /
 //!   reverse — future incremental ADRs.
-//! - `s:len()` method syntax (needs metatable).
+//! - ~~`s:len()` method syntax (needs metatable).~~ Resolved by
+//!   ADR 0183 — receiver-kind-based dispatch (no metatable
+//!   required for String primitive). See
+//!   `tests/phase2_6plus_param_methodcall_string.rs` for the
+//!   parameter form; the String-literal Local form is pinned
+//!   below in `string_method_local_literal_*`.
 //! - UTF-8 / multi-byte char handling.
 //! - malloc OOM null-check (carry-over from concat / closure /
 //!   table; future ADR consolidates).
@@ -59,6 +64,28 @@ fn string_upper_basic() {
 fn string_lower_basic() {
     let src = "print(string.lower(\"XYZ\"))";
     assert_eq!(run_ok(src, "lumelir_string_lower").trim(), "xyz");
+}
+
+// --- ADR 0183 regression pins: String-literal Local method syntax ---
+
+#[test]
+fn string_method_local_literal_upper() {
+    // ADR 0183 — `local s = <str-lit>; s:upper()` works because
+    // the literal pins `s` to `ValueKind::String` at declare time;
+    // MethodCall short-circuits to `Builtin::StringUpper`.
+    let src = "local s = \"hello\"; print(s:upper())";
+    assert_eq!(
+        run_ok(src, "lumelir_string_method_local_upper").trim(),
+        "HELLO"
+    );
+}
+
+#[test]
+fn string_method_local_literal_len() {
+    // ADR 0183 — `s:len()` returns Number; same lowering path,
+    // different return kind. Pins the cross-kind dispatch.
+    let src = "local s = \"hello\"; print(s:len())";
+    assert_eq!(run_ok(src, "lumelir_string_method_local_len").trim(), "5");
 }
 
 // --- 1 shadowing positive pin (Codex critical) ---
