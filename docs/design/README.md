@@ -237,6 +237,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0179 — non-local-tagged-source-materialisation](0179-non-local-tagged-source-materialisation.md) — HIR materialises non-Local TaggedValue (Call-return) source into a synth local at RawGet/RawSet arg positions, resolving the Local-only restriction in ADRs 0174/0175/0176
 - [0180 — param-table-context-inference](0180-param-table-context-inference.md) — Function parameters inferred as `Table` when used in pairs/ipairs/Index/MethodCall/table-consumer-builtin contexts; symmetric to the existing `Function(arity)` body-walk inference
 - [0181 — param-string-context-inference](0181-param-string-context-inference.md) — Function parameters inferred as `String` when used as Concat operand or `string.*` method first arg; direct mirror of 0180 for the String kind
+- [0182 — param-inference-kind-parameterised-helpers](0182-param-inference-kind-parameterised-helpers.md) — Tidy First refactor of the 0180/0181 body-walker: collapses `mark_ident_as_table`/`mark_ident_as_string` into one `mark_ident_as` helper and extracts `is_body_decisive_kind` predicate
 
 ### Feature Implementation Memos
 
