@@ -1027,6 +1027,18 @@ fn infer_user_function_param_kinds(
 /// the number of arguments at the call site. Other parameters default
 /// to `ValueKind::Number`. Conflicting arities are caught later by
 /// `lower_call`'s arity check.
+// ADR 0182 — predicate for the body/external merge in
+// `LowerCtx::for_function`. A "body-decisive" kind is one the
+// body-walker can infer with high confidence; when set, it
+// overrides the call-site (external) kind. Adding a new
+// body-walked kind (e.g. ADR 0183) amends this predicate.
+fn is_body_decisive_kind(kind: ValueKind) -> bool {
+    matches!(
+        kind,
+        ValueKind::Function(_) | ValueKind::Table | ValueKind::String
+    )
+}
+
 fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
     use std::collections::HashMap as Map;
     let mut kinds: Vec<ValueKind> = param_names.iter().map(|_| ValueKind::Number).collect();
@@ -1036,20 +1048,20 @@ fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
         .map(|(i, s)| (s.as_str(), i))
         .collect();
 
-    fn mark_ident_as_table(expr: &Expr, name_to_idx: &Map<&str, usize>, kinds: &mut [ValueKind]) {
+    // ADR 0182 — kind-parameterised marker. Sets `kinds[idx] = kind`
+    // when `expr` is an `Ident` whose name resolves to a parameter
+    // index. Generalises ADR 0180's `mark_ident_as_table` and ADR
+    // 0181's `mark_ident_as_string`.
+    fn mark_ident_as(
+        expr: &Expr,
+        name_to_idx: &Map<&str, usize>,
+        kinds: &mut [ValueKind],
+        kind: ValueKind,
+    ) {
         if let ExprKind::Ident(name) = &expr.kind
             && let Some(&idx) = name_to_idx.get(name.as_str())
         {
-            kinds[idx] = ValueKind::Table;
-        }
-    }
-
-    // ADR 0181 — String mirror of mark_ident_as_table.
-    fn mark_ident_as_string(expr: &Expr, name_to_idx: &Map<&str, usize>, kinds: &mut [ValueKind]) {
-        if let ExprKind::Ident(name) = &expr.kind
-            && let Some(&idx) = name_to_idx.get(name.as_str())
-        {
-            kinds[idx] = ValueKind::String;
+            kinds[idx] = kind;
         }
     }
 
@@ -1145,7 +1157,7 @@ fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
             }
             StmtKind::ForIpairs { table, body, .. } => {
                 // ADR 0180 — `for k, v in ipairs(param)` makes param Table.
-                mark_ident_as_table(table, name_to_idx, kinds);
+                mark_ident_as(table, name_to_idx, kinds, ValueKind::Table);
                 visit_expr(table, name_to_idx, kinds);
                 for s in body {
                     visit_stmt(s, name_to_idx, kinds);
@@ -1153,7 +1165,7 @@ fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
             }
             StmtKind::ForPairs { table, body, .. } => {
                 // ADR 0180 — `for k, v in pairs(param)` makes param Table.
-                mark_ident_as_table(table, name_to_idx, kinds);
+                mark_ident_as(table, name_to_idx, kinds, ValueKind::Table);
                 visit_expr(table, name_to_idx, kinds);
                 for s in body {
                     visit_stmt(s, name_to_idx, kinds);
@@ -1208,13 +1220,13 @@ fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
                     {
                         // ADR 0180 — `B(param, ...)` for Table-consumer
                         // builtin B makes param Table.
-                        mark_ident_as_table(first, name_to_idx, kinds);
+                        mark_ident_as(first, name_to_idx, kinds, ValueKind::Table);
                     }
                 } else if is_string_method_callee(callee)
                     && let Some(first) = args.first()
                 {
                     // ADR 0181 — `string.<m>(param, ...)` makes param String.
-                    mark_ident_as_string(first, name_to_idx, kinds);
+                    mark_ident_as(first, name_to_idx, kinds, ValueKind::String);
                 }
                 visit_expr(callee, name_to_idx, kinds);
                 for a in args {
@@ -1224,8 +1236,8 @@ fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
             ExprKind::BinOp { op, lhs, rhs } => {
                 // ADR 0181 — Concat operand makes that param String.
                 if matches!(op, BinOp::Concat) {
-                    mark_ident_as_string(lhs, name_to_idx, kinds);
-                    mark_ident_as_string(rhs, name_to_idx, kinds);
+                    mark_ident_as(lhs, name_to_idx, kinds, ValueKind::String);
+                    mark_ident_as(rhs, name_to_idx, kinds, ValueKind::String);
                 }
                 visit_expr(lhs, name_to_idx, kinds);
                 visit_expr(rhs, name_to_idx, kinds);
@@ -1236,7 +1248,7 @@ fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
             ExprKind::FunctionExpr { .. } => {} // not recursed (own scope)
             // ADR 0180 — `param[k]` / `param.field` makes param Table.
             ExprKind::Index { target, key } => {
-                mark_ident_as_table(target, name_to_idx, kinds);
+                mark_ident_as(target, name_to_idx, kinds, ValueKind::Table);
                 visit_expr(target, name_to_idx, kinds);
                 visit_expr(key, name_to_idx, kinds);
             }
@@ -1247,7 +1259,7 @@ fn infer_param_kinds(body: &[Stmt], param_names: &[String]) -> Vec<ValueKind> {
             // name we're refining).
             // ADR 0180 — `param:method(...)` makes param Table.
             ExprKind::MethodCall { receiver, args, .. } => {
-                mark_ident_as_table(receiver, name_to_idx, kinds);
+                mark_ident_as(receiver, name_to_idx, kinds, ValueKind::Table);
                 visit_expr(receiver, name_to_idx, kinds);
                 for a in args {
                     visit_expr(a, name_to_idx, kinds);
@@ -2121,13 +2133,15 @@ impl LowerCtx {
         ctx.containing_fn = Some(containing_fn);
         let body_kinds = infer_param_kinds(body, params);
         for (i, p) in params.iter().enumerate() {
-            // ADR 0180/0181 — body-walk Table and String are also
-            // decisive (join the existing Function precedent). External
-            // call-site kinds win only when body-walk leaves the
-            // default Number.
-            let kind = match body_kinds[i] {
-                ValueKind::Function(_) | ValueKind::Table | ValueKind::String => body_kinds[i],
-                _ => external_kinds[i],
+            // ADR 0180/0181/0182 — body-walk Table and String are
+            // also decisive (join the existing Function precedent).
+            // External call-site kinds win only when body-walk leaves
+            // the default Number. Membership lives in
+            // `is_body_decisive_kind`.
+            let kind = if is_body_decisive_kind(body_kinds[i]) {
+                body_kinds[i]
+            } else {
+                external_kinds[i]
             };
             ctx.declare_local(p.clone(), kind);
         }
