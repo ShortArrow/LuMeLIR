@@ -374,7 +374,7 @@ pub(crate) fn emit_gc_alloc<'a, 'c>(
 ) -> Value<'c, 'a> {
     use crate::codegen::tagged::{
         GC_HEADER_OFF_MARK, GC_HEADER_OFF_NEXT, GC_HEADER_OFF_SIZE, GC_HEADER_OFF_TYPE_TAG,
-        GC_HEADER_SIZE,
+        GC_HEADER_SIZE, GC_THRESHOLD_CAP,
     };
     // ADR 0184 — guard against payload >= 4 GiB silently wrapping
     // when truncated to u32 for GC_HEADER_OFF_SIZE. LLVM constant-
@@ -427,6 +427,121 @@ pub(crate) fn emit_gc_alloc<'a, 'c>(
         .result(0)
         .unwrap()
         .into();
+    // ADR 0186 — auto-trigger threshold gate. If this allocation
+    // would push `g_gc_total_bytes` past `g_gc_threshold`, call
+    // `@gc_mark` + `@gc_sweep` first, then double the threshold
+    // against the post-sweep total (capped at `GC_THRESHOLD_CAP`).
+    // Doubling lives at the caller, not inside `@gc_sweep`, so
+    // explicit `collectgarbage()` does not inflate the threshold.
+    let bytes_addr_trig = emit_addressof(context, block, "g_gc_total_bytes", types, loc);
+    let cur_total = emit_load(block, bytes_addr_trig, types.i64, loc);
+    let projected_total: Value<'c, 'a> = block
+        .append_operation(arith::addi(cur_total, total_size, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let thr_addr = emit_addressof(context, block, "g_gc_threshold", types, loc);
+    let threshold_pre = emit_load(block, thr_addr, types.i64, loc);
+    let should_gc: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Sge,
+            projected_total,
+            threshold_pre,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let gc_then_region = Region::new();
+    let gc_then_blk = Block::new(&[]);
+    {
+        emit_libc_call_void(context, &gc_then_blk, "gc_mark", &[], loc);
+        emit_libc_call_void(context, &gc_then_blk, "gc_sweep", &[], loc);
+        // Threshold doubling: if post_sweep_total * 2 > current
+        // threshold, raise threshold to min(post_sweep_total * 2,
+        // GC_THRESHOLD_CAP).
+        let bytes_addr_post = emit_addressof(context, &gc_then_blk, "g_gc_total_bytes", types, loc);
+        let post_sweep = emit_load(&gc_then_blk, bytes_addr_post, types.i64, loc);
+        let two_const = gc_then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 2).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let doubled: Value<'c, '_> = gc_then_blk
+            .append_operation(arith::muli(post_sweep, two_const, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let thr_addr_inner = emit_addressof(context, &gc_then_blk, "g_gc_threshold", types, loc);
+        let cur_thr = emit_load(&gc_then_blk, thr_addr_inner, types.i64, loc);
+        let needs_grow: Value<'c, '_> = gc_then_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Sgt,
+                doubled,
+                cur_thr,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let grow_then = Region::new();
+        let grow_then_blk = Block::new(&[]);
+        {
+            let cap_const = grow_then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, GC_THRESHOLD_CAP).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let over_cap: Value<'c, '_> = grow_then_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Sgt,
+                    doubled,
+                    cap_const,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let capped: Value<'c, '_> = grow_then_blk
+                .append_operation(arith::select(over_cap, cap_const, doubled, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            emit_store(&grow_then_blk, capped, thr_addr_inner, loc);
+            grow_then_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        grow_then.append_block(grow_then_blk);
+        let grow_else = Region::new();
+        let grow_else_blk = Block::new(&[]);
+        grow_else_blk.append_operation(scf::r#yield(&[], loc));
+        grow_else.append_block(grow_else_blk);
+        gc_then_blk.append_operation(scf::r#if(needs_grow, &[], grow_then, grow_else, loc));
+        gc_then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    gc_then_region.append_block(gc_then_blk);
+    let gc_else_region = Region::new();
+    let gc_else_blk = Block::new(&[]);
+    gc_else_blk.append_operation(scf::r#yield(&[], loc));
+    gc_else_region.append_block(gc_else_blk);
+    block.append_operation(scf::r#if(
+        should_gc,
+        &[],
+        gc_then_region,
+        gc_else_region,
+        loc,
+    ));
+
     let raw = emit_alloc_with_oom_check(context, block, total_size, "s_gc_oom", types, loc);
     // Header init: mark=0, type_tag, padding=0, size, next=load(g_gc_head).
     let mark_ptr = emit_byte_offset_ptr(context, block, raw, GC_HEADER_OFF_MARK, types, loc);

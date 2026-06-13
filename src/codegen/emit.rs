@@ -46,14 +46,14 @@ use super::primitive::{
 };
 use super::tagged::{
     ARRAY_ELEM_OFF_VALUE, ARRAY_ELEM_SIZE, GC_HEADER_OFF_MARK, GC_HEADER_OFF_NEXT,
-    GC_HEADER_OFF_SIZE, GC_HEADER_SIZE, GC_MARK_BLACK, GC_MARK_WHITE, GC_TYPE_ARRAY_BUF,
-    GC_TYPE_HASH_BUF, GC_TYPE_SCRATCH_BUF, GC_TYPE_TABLE, HashKeyValidityPolicy, TAG_BOOL,
-    TAG_DELETED, TAG_FUNCTION, TAG_NIL, TAG_NUMBER, TAG_STRING, TAG_TABLE, TaggedArithOperandPlan,
-    emit_alloca_slot_for_kind, emit_print_tagged_local, emit_tag_and_payload_ptr,
-    emit_tagged_eq_local_local, emit_tagged_unknown_tag_trap, emit_type_tagged_local,
-    emit_value_slot_check_number, emit_value_slot_store_dispatched, emit_value_slot_store_nil,
-    emit_value_slot_store_number, emit_value_slot_store_table, policy_for_tag,
-    policy_for_tagged_arith_operand,
+    GC_HEADER_OFF_SIZE, GC_HEADER_SIZE, GC_MARK_BLACK, GC_MARK_WHITE, GC_THRESHOLD_INIT,
+    GC_TYPE_ARRAY_BUF, GC_TYPE_HASH_BUF, GC_TYPE_SCRATCH_BUF, GC_TYPE_TABLE, HashKeyValidityPolicy,
+    TAG_BOOL, TAG_DELETED, TAG_FUNCTION, TAG_NIL, TAG_NUMBER, TAG_STRING, TAG_TABLE,
+    TaggedArithOperandPlan, emit_alloca_slot_for_kind, emit_print_tagged_local,
+    emit_tag_and_payload_ptr, emit_tagged_eq_local_local, emit_tagged_unknown_tag_trap,
+    emit_type_tagged_local, emit_value_slot_check_number, emit_value_slot_store_dispatched,
+    emit_value_slot_store_nil, emit_value_slot_store_number, emit_value_slot_store_table,
+    policy_for_tag, policy_for_tagged_arith_operand,
 };
 
 // =============================================================
@@ -884,6 +884,19 @@ fn emit_fmt_global<'c>(
     );
     emit_mutable_i64_global(context, module, types, "g_gc_head", 0, loc);
     emit_mutable_i64_global(context, module, types, "g_gc_total_bytes", 0, loc);
+    // ADR 0186 — auto-trigger threshold global + module-level
+    // mark / sweep `llvm.func` definitions. The auto-trigger
+    // (inside `emit_gc_alloc`) and the explicit `collectgarbage()`
+    // arm both call these via `llvm.call @gc_mark / @gc_sweep`.
+    emit_mutable_i64_global(
+        context,
+        module,
+        types,
+        "g_gc_threshold",
+        GC_THRESHOLD_INIT,
+        loc,
+    );
+    register_gc_runtime_funcs(context, module, types, loc);
 }
 
 /// Emit a **raw C-string global** (NUL-terminated `[N x i8]`).
@@ -11464,8 +11477,10 @@ fn emit_expr<'a, 'c>(
                     let bytes_addr_pre =
                         emit_addressof(context, block, "g_gc_total_bytes", types, loc);
                     let before = emit_load(block, bytes_addr_pre, types.i64, loc);
-                    emit_gc_mark_inline(context, block, types, loc);
-                    emit_gc_sweep_inline(context, block, types, loc);
+                    // ADR 0186 — factored llvm.func calls (shared
+                    // with the emit_gc_alloc auto-trigger path).
+                    emit_libc_call_void(context, block, "gc_mark", &[], loc);
+                    emit_libc_call_void(context, block, "gc_sweep", &[], loc);
                     let bytes_addr_post =
                         emit_addressof(context, block, "g_gc_total_bytes", types, loc);
                     let after = emit_load(block, bytes_addr_post, types.i64, loc);
@@ -19238,6 +19253,54 @@ fn build_for_cond_region<'c, 'a>(
 }
 
 // =============================================================
+// ADR 0186 — register module-level `llvm.func @gc_mark()` and
+// `@gc_sweep()`. Both are void-returning helpers whose bodies are
+// populated by the same inline emitters used for explicit
+// `collectgarbage()`. Factoring (vs. inline) is motivated by the
+// auto-trigger introducing a second caller in `emit_gc_alloc`;
+// per ADR 0182's Tidy First "extract before the second consumer"
+// precedent. Mark / sweep symbol names are the stable contract
+// extended in-place by ADR 0187 (DFS lift).
+// =============================================================
+
+fn register_gc_runtime_funcs<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let void_ty = llvm::r#type::void(context);
+
+    // @gc_mark
+    {
+        let region = Region::new();
+        let blk = Block::new(&[]);
+        emit_gc_mark_inline(context, &blk, types, loc);
+        blk.append_operation(
+            OperationBuilder::new("llvm.return", loc)
+                .build()
+                .expect("llvm.return gc_mark"),
+        );
+        region.append_block(blk);
+        emit_llvm_func(context, module, "gc_mark", region, &[], void_ty, loc);
+    }
+
+    // @gc_sweep
+    {
+        let region = Region::new();
+        let blk = Block::new(&[]);
+        emit_gc_sweep_inline(context, &blk, types, loc);
+        blk.append_operation(
+            OperationBuilder::new("llvm.return", loc)
+                .build()
+                .expect("llvm.return gc_sweep"),
+        );
+        region.append_block(blk);
+        emit_llvm_func(context, module, "gc_sweep", region, &[], void_ty, loc);
+    }
+}
+
+// =============================================================
 // ADR 0185 — v1 safety-mode mark + sweep walks for
 // `collectgarbage()`.
 //
@@ -19648,8 +19711,12 @@ print(double(21))",
         // Phase 2.5c-full Commit 3b body atomic adds the cell-ptr
         // first arg, so the signature is `(!llvm.ptr, f64) -> f64`.
         assert_mlir_has(&mlir, "(!llvm.ptr, f64) -> f64");
+        // The intent is "no TaggedValue widened struct return"; check
+        // the precise ABI shape rather than any `(i64, i64)` substring
+        // (which spuriously matches ADR 0186's scf.while carriers in
+        // the module-level `@gc_sweep` helper).
         assert!(
-            !mlir.contains("(i64, i64)"),
+            !mlir.contains("!llvm.struct<(i64, i64)>"),
             "pure-Number return must not produce TaggedValue ABI, got:\n{mlir}"
         );
     }

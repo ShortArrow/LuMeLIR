@@ -81,6 +81,15 @@ pub(crate) const GC_HEADER_OFF_TYPE_TAG: i64 = 1;
 pub(crate) const GC_HEADER_OFF_SIZE: i64 = 4;
 pub(crate) const GC_HEADER_OFF_NEXT: i64 = 8;
 
+/// ADR 0186 — auto-trigger threshold constants for
+/// `emit_gc_alloc`. When `g_gc_total_bytes + payload_size` reaches
+/// `g_gc_threshold`, the allocator calls `@gc_mark` + `@gc_sweep`
+/// before allocating. Post-sweep the threshold doubles to
+/// `min(post_sweep_total * 2, GC_THRESHOLD_CAP)` to avoid
+/// thrashing on large live working sets.
+pub(crate) const GC_THRESHOLD_INIT: i64 = 1_048_576; // 1 MiB
+pub(crate) const GC_THRESHOLD_CAP: i64 = 1_073_741_824; // 1 GiB
+
 /// ADR 0185 — v1 mark colour values stored in
 /// `*(obj + GC_HEADER_OFF_MARK)`. Mark phase sets BLACK; sweep
 /// resets BLACK → WHITE for the next cycle. GREY is reserved
