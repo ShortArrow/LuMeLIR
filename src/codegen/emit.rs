@@ -19244,7 +19244,7 @@ fn build_for_cond_region<'c, 'a>(
 // `emit_gc_mark_inline` linearly walks `g_gc_head` and sets every
 // node's mark byte to BLACK. v1 safety mode: no DFS, no roots; the
 // walk is conservative — every reachable + unreachable node ends
-// up BLACK so sweep frees nothing. ADR 0186 replaces the body with
+// up BLACK so sweep frees nothing. ADR 0187 replaces the body with
 // the worklist DFS once stack walk delivers real roots.
 //
 // `emit_gc_sweep_inline` walks `g_gc_head` with a prev cursor,

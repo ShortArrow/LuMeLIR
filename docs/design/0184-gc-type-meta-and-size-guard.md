@@ -169,7 +169,7 @@ No new tests — the metadata table is consumed only by future ADR 0185, and the
 ## Future work
 
 - ADR 0185 — Mark phase implementation. Consumes `gc_type_meta`; extends metadata with per-type walk strategy. Resolves R1 (worklist capacity).
-- ADR 0186+ — Sweep phase + auto-trigger per existing 0161 / 0162 designs.
+- ADR 0186 / 0187 — Auto-trigger (0186) + DFS / worklist (0187) consuming the metadata table here; existing 0161 / 0162 designs.
 - ADR 0163 — `__gc` finalizers; consumes `name == "table"` from this metadata.
 
 ## References

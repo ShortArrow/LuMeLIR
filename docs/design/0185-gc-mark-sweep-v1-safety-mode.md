@@ -9,7 +9,7 @@
 
 Phase 3 GC ADRs 0156 / 0157 / 0158 / 0184 landed the allocator wrapper (`emit_gc_alloc`), migrated every malloc site through it, and added the per-type metadata chokepoint plus size guard. ADRs 0159 (mark) / 0161 (sweep) / 0162 (auto-trigger) are decision-only.
 
-ADR 0159's "v1 safety mode" (§v1 safety mode, line 62) is the principled bridge that lets mark + sweep land before ADR 0160's stack walk: every `collectgarbage()` call first marks every `g_gc_head` entry BLACK, the DFS becomes a no-op, sweep finds nothing WHITE, and the heap is unchanged. The full DFS / per-type walks / worklist (R1 from the pre-flight memo) live with ADR 0186 once real roots are available.
+ADR 0159's "v1 safety mode" (§v1 safety mode, line 62) is the principled bridge that lets mark + sweep land before ADR 0160's stack walk: every `collectgarbage()` call first marks every `g_gc_head` entry BLACK, the DFS becomes a no-op, sweep finds nothing WHITE, and the heap is unchanged. The full DFS / per-type walks / worklist (R1 from the pre-flight memo) live with ADR 0187 once real roots are available.
 
 This ADR implements that v1 safety mode. Observable user-visible behaviour is unchanged (`collectgarbage()` still returns 0; `g_gc_total_bytes` is unchanged across collection); what gains is structural completeness — the `emit_gc_mark` / `emit_gc_sweep` chokepoints exist, the `collectgarbage()` Lua builtin wires through them, and the next ADR plugs real roots into the same pipeline.
 
@@ -20,9 +20,9 @@ This ADR implements that v1 safety mode. Observable user-visible behaviour is un
 - ✅ Rewire `Callee::Builtin(CollectGarbage)` emit arm: when `args.len() == 0`, replace the existing `0.0` constant stub with the load-before / mark / sweep / load-after / subtract / sitofp sequence per ADR 0161 §`collectgarbage()` return.
 - ✅ `BLACK` / `WHITE` mark byte constants added to `tagged.rs` next to `GC_HEADER_OFF_MARK`.
 - ✅ 3 Red Day 0 e2e (regression pins, since v1 safety mode is observably no-op): `collectgarbage()` returns 0; `count` is unchanged across collection; sequential `collectgarbage()` calls do not corrupt the heap.
-- ❌ Worklist + per-type DFS (R1). Deferred to ADR 0186 alongside stack walk.
-- ❌ Real root marking. Deferred to ADR 0186.
-- ❌ Auto-trigger threshold (ADR 0162 implementation). Deferred to ADR 0187 — independent, can land before or after 0186.
+- ❌ Worklist + per-type DFS (R1). Deferred to ADR 0187 alongside stack walk.
+- ❌ Real root marking. Deferred to ADR 0187.
+- ❌ Auto-trigger threshold (ADR 0162 implementation). Deferred to ADR 0186 — independent, can land before or after 0187.
 - ❌ `collectgarbage("stop")` / `"restart"` / `"step"` / `"setpause"` / `"setstepmul"`. Still rejected at HIR per ADR 0157.
 - ❌ Finalizer dispatch / `__gc`. Deferred to ADR 0163.
 
@@ -36,9 +36,9 @@ Add mark colour constants alongside `GC_HEADER_OFF_MARK`:
 /// ADR 0185 — v1 mark colour values stored in
 /// `*(obj + GC_HEADER_OFF_MARK)`. Mark phase sets BLACK; sweep
 /// resets BLACK → WHITE for the next cycle. GREY is reserved
-/// for ADR 0186 worklist DFS.
+/// for ADR 0187 worklist DFS.
 pub(crate) const GC_MARK_WHITE: i64 = 0;
-#[allow(dead_code)] // first consumer: ADR 0186 (worklist DFS)
+#[allow(dead_code)] // first consumer: ADR 0187 (worklist DFS)
 pub(crate) const GC_MARK_GREY: i64  = 1;
 pub(crate) const GC_MARK_BLACK: i64 = 2;
 ```
@@ -148,7 +148,7 @@ All three are regression pins. They are Red against the current `args.len() == 0
 
 ## Alternatives considered
 
-- **Skip the safety-mode walk and leave `collectgarbage()` as a stub until 0186.** Rejected — the safety-mode pass exercises every line of the mark + sweep walk, catching bugs in the linked-list cursor / accounting before real roots arrive. Without it, ADR 0186 would land "first DFS + first sweep" together; the surface is too large for one review.
+- **Skip the safety-mode walk and leave `collectgarbage()` as a stub until 0187.** Rejected — the safety-mode pass exercises every line of the mark + sweep walk, catching bugs in the linked-list cursor / accounting before real roots arrive. Without it, ADR 0187 would land "first DFS + first sweep" together; the surface is too large for one review.
 - **Mark `WHITE` rather than `BLACK` in safety mode** so sweep is exercised for the "free a WHITE entry" branch. Rejected — would actually free objects that may be referenced from top-level alloca slots (no stack walk yet) → use-after-free at runtime. The whole point of safety mode is to be conservative.
 - **Inline mark and sweep at every `collectgarbage()` call site.** Rejected — the call site is shared (`collectgarbage()` Lua builtin); inlining bloats code with no payoff. `func.func` boundaries here also help mark / sweep show up legibly in `--emit-llvm` debugging.
 - **Implement worklist + per-type DFS now even though it's unused in safety mode.** Rejected — the worklist capacity strategy (R1) is its own design choice; bundling it here without exercise (safety mode pre-marks BLACK so the DFS visits nothing) buys nothing.
@@ -157,7 +157,7 @@ All three are regression pins. They are Red against the current `args.len() == 0
 
 **Positive**
 - `collectgarbage()` is no longer a stub — the full mark + sweep pipeline runs.
-- `gc_mark` / `gc_sweep` chokepoints exist for ADR 0186 to extend (add real DFS body / consume `gc_type_meta`).
+- `gc_mark` / `gc_sweep` chokepoints exist for ADR 0187 to extend (add real DFS body / consume `gc_type_meta`).
 - Heap accounting (`g_gc_total_bytes`) reaches every code path it will need.
 - v1 safety mode honors the Phase 2 leak contract (ADR 0145) — nothing observable changes for user programs.
 
@@ -166,15 +166,15 @@ All three are regression pins. They are Red against the current `args.len() == 0
 - `gc_mark` / `gc_sweep` are MLIR-level functions; first-time module init has two more function emissions. ~negligible.
 
 **Locked in until superseded**
-- Mark colour constants (`GC_MARK_WHITE = 0`, `GC_MARK_GREY = 1`, `GC_MARK_BLACK = 2`) live in `tagged.rs`. ADR 0186 reuses them.
-- `gc_mark` / `gc_sweep` function names / signatures are the public stable contract for ADR 0186 to extend in-place.
+- Mark colour constants (`GC_MARK_WHITE = 0`, `GC_MARK_GREY = 1`, `GC_MARK_BLACK = 2`) live in `tagged.rs`. ADR 0187 reuses them.
+- `gc_mark` / `gc_sweep` function names / signatures are the public stable contract for ADR 0187 to extend in-place.
 
 ## Documentation updates
 
 - [x] §8 — adds 0185.
-- [x] ADR 0159 pre-impl note — v1 safety mode implementation DONE here; worklist + DFS remain for ADR 0186.
+- [x] ADR 0159 pre-impl note — v1 safety mode implementation DONE here; worklist + DFS remain for ADR 0187.
 - [x] ADR 0161 pre-impl note — sweep algorithm implementation DONE here.
-- [x] ADR 0162 status reminder — auto-trigger threshold still unimplemented; tracked for ADR 0187.
+- [x] ADR 0162 status reminder — auto-trigger threshold still unimplemented; tracked for ADR 0186.
 
 ## Test count delta
 
@@ -198,16 +198,16 @@ C3 (impl): 1415 → 1415
 
 | Risk | Mitigation |
 |---|---|
-| Sweep frees a node still referenced from an alloca slot | v1 safety mode pre-marks every node BLACK before sweep; no WHITE node exists; the "free" branch is exercised but dead-in-practice. ADR 0186 lifts safety mode only after stack walk delivers real roots. |
-| `g_gc_total_bytes` underflow on the free path | Free branch only runs for WHITE nodes; in v1 safety mode no node is WHITE so the path is unreachable in practice. When ADR 0186 lifts the safety mode, a saturated subtract or assert keeps overflow off the table. |
+| Sweep frees a node still referenced from an alloca slot | v1 safety mode pre-marks every node BLACK before sweep; no WHITE node exists; the "free" branch is exercised but dead-in-practice. ADR 0187 lifts safety mode only after stack walk delivers real roots. |
+| `g_gc_total_bytes` underflow on the free path | Free branch only runs for WHITE nodes; in v1 safety mode no node is WHITE so the path is unreachable in practice. When ADR 0187 lifts the safety mode, a saturated subtract or assert keeps overflow off the table. |
 | `func.func @gc_mark` redefinition on multi-compile in same MLIR module | `emit_module_init` is called once; the helpers are emitted once per module. Same lifecycle as existing `emit_string_runtime_decls`. |
 | Test 2 (count unchanged) fails if the safety mode is implemented incorrectly | Test is exactly the v1 contract pin — failure means safety mode bug, not test wrongness. |
 
 ## Future work
 
-- ADR 0186 — Worklist + per-type DFS (consumes `gc_type_meta(tag).has_outgoing_refs` short-circuit; lifts safety mode once stack walk lands). Resolves R1.
-- ADR 0187 — Auto-trigger threshold per ADR 0162 (independent; can land before or after 0186).
-- ADR 0188 — Stack walk per ADR 0160; pairs with 0186 to enable real freeing.
+- ADR 0187 — Worklist + per-type DFS (consumes `gc_type_meta(tag).has_outgoing_refs` short-circuit; lifts safety mode once stack walk lands). Resolves R1.
+- ADR 0186 — Auto-trigger threshold per ADR 0162 (independent; can land before or after 0187).
+- ADR 0188 — Stack walk per ADR 0160; pairs with 0187 to enable real freeing.
 
 ## References
 
