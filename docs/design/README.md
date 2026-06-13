@@ -240,6 +240,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0182 — param-inference-kind-parameterised-helpers](0182-param-inference-kind-parameterised-helpers.md) — Tidy First refactor of the 0180/0181 body-walker: collapses `mark_ident_as_table`/`mark_ident_as_string` into one `mark_ident_as` helper and extracts `is_body_decisive_kind` predicate
 - [0183 — methodcall-string-receiver-dispatch](0183-methodcall-string-receiver-dispatch.md) — `s:upper()` and other `string.<method>` method-syntax forms dispatch via the namespace builtin chokepoint when the receiver is `ValueKind::String`; inference fold-through completes ADR 0181's MethodCall future-work
 - [0184 — gc-type-meta-and-size-guard](0184-gc-type-meta-and-size-guard.md) — Tidy First prep for Phase 3 GC mark phase: `gc_type_meta(type_tag)` decision table in `tagged.rs` + ≥ 4 GiB payload guard in `emit_gc_alloc`; consumes R2/R3 from the 0159-0162 pre-flight review
+- [0185 — gc-mark-sweep-v1-safety-mode](0185-gc-mark-sweep-v1-safety-mode.md) — `emit_gc_mark` + `emit_gc_sweep` MLIR helpers implementing ADR 0159's v1 safety-mode subset and ADR 0161's sweep algorithm verbatim; `collectgarbage()` rewired through them; worklist + DFS deferred to ADR 0186
 
 ### Feature Implementation Memos
 
