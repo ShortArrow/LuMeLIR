@@ -81,6 +81,15 @@ pub(crate) const GC_HEADER_OFF_TYPE_TAG: i64 = 1;
 pub(crate) const GC_HEADER_OFF_SIZE: i64 = 4;
 pub(crate) const GC_HEADER_OFF_NEXT: i64 = 8;
 
+/// ADR 0185 — v1 mark colour values stored in
+/// `*(obj + GC_HEADER_OFF_MARK)`. Mark phase sets BLACK; sweep
+/// resets BLACK → WHITE for the next cycle. GREY is reserved
+/// for ADR 0186 worklist DFS.
+pub(crate) const GC_MARK_WHITE: i64 = 0;
+#[allow(dead_code)] // first consumer: ADR 0186 (worklist DFS)
+pub(crate) const GC_MARK_GREY: i64 = 1;
+pub(crate) const GC_MARK_BLACK: i64 = 2;
+
 pub(crate) const GC_TYPE_TABLE: u8 = 1;
 pub(crate) const GC_TYPE_HASH_BUF: u8 = 2;
 pub(crate) const GC_TYPE_ARRAY_BUF: u8 = 3;
