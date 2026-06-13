@@ -172,6 +172,14 @@ C3 (impl): 1366 → 1369
 | `collectgarbage("count")` returns 0 in trivial programs | Any program that allocates a single string (e.g. `tostring(1)` → boxed string) produces `count > 0`. Test pins. |
 | `collectgarbage()` looks broken because nothing happens | Documented: stub until ADRs 0159 + 0161. Test 3 explicitly pins the 0-return contract. |
 
+## Pre-implementation note (2026-06-13)
+
+Pre-flight review for the unimplemented mark / sweep / trigger ADRs (0159-0162) raised one concern that touches this ADR:
+
+- **`GC_HEADER_OFF_SIZE` u32 truncation.** The `size` field at offset 4 is u32; payloads ≥ 4 GiB silently wrap, breaking `g_gc_total_bytes` accounting and sweep free-size. Recommended fix: add `arith.cmpi(ult, payload_size, 1<<32)` + trap inside `emit_gc_alloc` so allocations beyond 4 GiB fail fast rather than corrupt accounting. To land alongside ADR 0184 (GC mark phase implementation).
+
+Full review and rationale: [`docs/notes/gc-0159-0162-preflight-review.md`](../notes/gc-0159-0162-preflight-review.md) (R3).
+
 ## Future work
 
 - ADR 0158 — migrate remaining allocator types.

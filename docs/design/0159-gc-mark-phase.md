@@ -80,10 +80,21 @@ Once ADR 0160 lands and real roots are available, the safety mark is removed; on
 - v1 safety mode means `collectgarbage()` is observably a no-op until ADR 0160 lands.
 - The 4096-deep worklist is a soft cap that doesn't grow.
 
+## Pre-implementation note (2026-06-13)
+
+Pre-flight review (Codex 6 視点) flagged two points to resolve before implementation:
+
+- **R1 — worklist capacity strategy.** The 4096-cap alloca worklist mentioned for v1 is an ad-hoc placeholder. Recommended fix in the implementation ADR: heap-based `malloc` worklist that grows on demand, allocated outside `emit_gc_alloc` so it is not GC-tracked. Eliminates the silent saturation risk on deep `__index` chains (ADR 0167 multi-hop).
+- **R2 — per-type dispatch chokepoint.** The per-type reference walk (§Per-type reference walks) is the first user of a `GC_TYPE_*` switch. Before mark / sweep / future debug paths each open-code the same `match`, extract a `gc_type_references(type_tag) -> &'static [GcReferenceField]` decision table in `tagged.rs`. Tidy First — precedent in ADR 0182 (`mark_ident_as` consolidation done with only two consumers).
+
+Both items land as **preparatory ADR 0184** (`gc_type_references` decision table) before the mark phase implementation in **ADR 0185**.
+
+Full review and rationale: [`docs/notes/gc-0159-0162-preflight-review.md`](../notes/gc-0159-0162-preflight-review.md).
+
 ## Future work
 
 - Implementation commit per this design.
-- Worklist grow strategy.
+- Worklist grow strategy (folded into ADR 0184/0185 per pre-impl note above).
 - Incremental marking (only if profiling demands).
 
 ## References
