@@ -376,6 +376,43 @@ pub(crate) fn emit_gc_alloc<'a, 'c>(
         GC_HEADER_OFF_MARK, GC_HEADER_OFF_NEXT, GC_HEADER_OFF_SIZE, GC_HEADER_OFF_TYPE_TAG,
         GC_HEADER_SIZE,
     };
+    // ADR 0184 — guard against payload >= 4 GiB silently wrapping
+    // when truncated to u32 for GC_HEADER_OFF_SIZE. LLVM constant-
+    // folds the branch away when `payload_size` is a small literal.
+    let four_gib_const: Value<'c, 'a> = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1_i64 << 32).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let too_large: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Uge,
+            payload_size,
+            four_gib_const,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        let msg = emit_addressof(context, &then_blk, "s_gc_alloc_too_large", types, loc);
+        emit_exit_with_message(context, &then_blk, msg, types, loc);
+        then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(too_large, &[], then_region, else_region, loc));
+
     let header_size_const = block
         .append_operation(arith::constant(
             context,

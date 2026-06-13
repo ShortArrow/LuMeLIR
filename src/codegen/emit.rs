@@ -870,6 +870,16 @@ fn emit_fmt_global<'c>(
         "out of memory: GC alloc failed\0",
         loc,
     );
+    // ADR 0184 — payload-size-too-large diagnostic for the
+    // emit_gc_alloc u32-header bounds guard.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_gc_alloc_too_large",
+        "GC alloc payload >= 4 GiB; u32 size header would wrap\0",
+        loc,
+    );
     emit_mutable_i64_global(context, module, types, "g_gc_head", 0, loc);
     emit_mutable_i64_global(context, module, types, "g_gc_total_bytes", 0, loc);
 }

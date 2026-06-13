@@ -89,6 +89,57 @@ pub(crate) const GC_TYPE_CLOSURE_CELL: u8 = 5;
 pub(crate) const GC_TYPE_UPVALUE_BOX: u8 = 6;
 pub(crate) const GC_TYPE_SCRATCH_BUF: u8 = 7;
 
+/// ADR 0184 — pre-mark-phase metadata per `GC_TYPE_*` tag.
+///
+/// `has_outgoing_refs` is the v1 mark-phase short-circuit: types
+/// flagged `false` (STRING_OBJ, SCRATCH_BUF) are immediately
+/// marked BLACK without a worklist push. Per-type walk strategy
+/// for `true` cases lives in mark-phase code (ADR 0185); this
+/// table is the single chokepoint for any consumer that needs
+/// per-type metadata (mark, future sweep finalizer dispatch,
+/// debug / log paths). New `GC_TYPE_*` variants must add a row;
+/// the `unreachable!` arm fail-fasts on omission.
+#[allow(dead_code)] // first consumer: ADR 0185 (mark phase)
+pub(crate) struct GcTypeMeta {
+    pub name: &'static str,
+    pub has_outgoing_refs: bool,
+}
+
+#[allow(dead_code)] // first consumer: ADR 0185 (mark phase)
+pub(crate) fn gc_type_meta(type_tag: u8) -> &'static GcTypeMeta {
+    match type_tag {
+        GC_TYPE_TABLE => &GcTypeMeta {
+            name: "table",
+            has_outgoing_refs: true,
+        },
+        GC_TYPE_HASH_BUF => &GcTypeMeta {
+            name: "hash_buf",
+            has_outgoing_refs: true,
+        },
+        GC_TYPE_ARRAY_BUF => &GcTypeMeta {
+            name: "array_buf",
+            has_outgoing_refs: true,
+        },
+        GC_TYPE_STRING_OBJ => &GcTypeMeta {
+            name: "string_obj",
+            has_outgoing_refs: false,
+        },
+        GC_TYPE_CLOSURE_CELL => &GcTypeMeta {
+            name: "closure_cell",
+            has_outgoing_refs: true,
+        },
+        GC_TYPE_UPVALUE_BOX => &GcTypeMeta {
+            name: "upvalue_box",
+            has_outgoing_refs: true,
+        },
+        GC_TYPE_SCRATCH_BUF => &GcTypeMeta {
+            name: "scratch_buf",
+            has_outgoing_refs: false,
+        },
+        _ => unreachable!("unknown GC type tag: {type_tag}"),
+    }
+}
+
 // =============================================================
 // Phase 2.6b-hash-key-validity (ADR 0087): runtime validity
 // policy for a hash search-key tag.
