@@ -244,6 +244,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0186 — gc-auto-trigger-and-func-factoring](0186-gc-auto-trigger-and-func-factoring.md) — implements ADR 0162's 1 MiB auto-trigger inside `emit_gc_alloc`, factors the ADR 0185 inline walks into `llvm.func @gc_mark` / `@gc_sweep`, and adds the post-sweep threshold doubling (capped at 1 GiB)
 - [0187 — indexassign-value-side-tagged-source](0187-indexassign-value-side-tagged-source.md) — closes the IndexAssign value-side TaggedValue gap (codegen `unreachable!` at `emit.rs:3980`): HIR materialises non-Local TaggedValue values via the existing ADR 0179 helper; codegen adds a `ValueKind::TaggedValue` arm to the static-key match symmetric to ADR 0138-M's TaggedValue-key arm
 - [0188 — non-local-tagged-source-residuals](0188-non-local-tagged-source-residuals.md) — closes 4 residual non-Local TaggedValue source gaps surfaced by a systematic audit: RawSet value (any key), Index/IndexTagged read key, IndexAssign key. All routed through the existing `materialize_tagged_source_if_needed` chokepoint — codegen `UnsupportedExpr` paths become defensive guards behind a HIR invariant
+- [0189 — phase3-entry-criteria](0189-phase3-entry-criteria.md) — Phase 3 entry / scope freeze meta-ADR (mirror of ADR 0133's Phase 2 pattern): Phase 3 = PRD Domain Specific Features (Rust-Lua Bridge + Embedded register-ops dialect); orders Bridge first per PRD memo; Phase 2 epilogue items (GC stack walk, pcall, _ENV, string patterns) run in parallel
 
 ### Feature Implementation Memos
 
