@@ -247,6 +247,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0189 — phase3-entry-criteria](0189-phase3-entry-criteria.md) — Phase 3 entry / scope freeze meta-ADR (mirror of ADR 0133's Phase 2 pattern): Phase 3 = PRD Domain Specific Features (Rust-Lua Bridge + Embedded register-ops dialect); orders Bridge first per PRD memo; Phase 2 epilogue items (GC stack walk, pcall, _ENV, string patterns) run in parallel
 - [0190 — phase2-epilogue-close-decisions](0190-phase2-epilogue-close-decisions.md) — defers all 4 Phase 2 epilogue items (GC actual freeing, pcall, _ENV, string patterns) to Phase 4; satisfies ADR 0189 §3 close criterion for Phase 3
 - [0191 — rust-lua-bridge-mvp](0191-rust-lua-bridge-mvp.md) — Rust-Lua Bridge MVP: `rust.add(a, b)` namespace dispatch + `build.rs` compiles `src/bridge_runtime.rs` to a bundled object + `cc` link integration; satisfies ADR 0189 §1 close criterion (Bridge end-to-end)
+- [0192 — embedded-register-ops-entry](0192-embedded-register-ops-entry.md) — Embedded register-ops dialect entry decision (decision-only; pins abstract MVP surface volatile load/store + bit-field rmw; target selection deferred until embedded user emerges); satisfies ADR 0189 §2 close criterion
 
 ### Feature Implementation Memos
 
