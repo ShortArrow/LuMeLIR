@@ -242,6 +242,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0184 — gc-type-meta-and-size-guard](0184-gc-type-meta-and-size-guard.md) — Tidy First prep for Phase 3 GC mark phase: `gc_type_meta(type_tag)` decision table in `tagged.rs` + ≥ 4 GiB payload guard in `emit_gc_alloc`; consumes R2/R3 from the 0159-0162 pre-flight review
 - [0185 — gc-mark-sweep-v1-safety-mode](0185-gc-mark-sweep-v1-safety-mode.md) — `emit_gc_mark` + `emit_gc_sweep` MLIR helpers implementing ADR 0159's v1 safety-mode subset and ADR 0161's sweep algorithm verbatim; `collectgarbage()` rewired through them; worklist + DFS deferred to ADR 0187
 - [0186 — gc-auto-trigger-and-func-factoring](0186-gc-auto-trigger-and-func-factoring.md) — implements ADR 0162's 1 MiB auto-trigger inside `emit_gc_alloc`, factors the ADR 0185 inline walks into `llvm.func @gc_mark` / `@gc_sweep`, and adds the post-sweep threshold doubling (capped at 1 GiB)
+- [0187 — indexassign-value-side-tagged-source](0187-indexassign-value-side-tagged-source.md) — closes the IndexAssign value-side TaggedValue gap (codegen `unreachable!` at `emit.rs:3980`): HIR materialises non-Local TaggedValue values via the existing ADR 0179 helper; codegen adds a `ValueKind::TaggedValue` arm to the static-key match symmetric to ADR 0138-M's TaggedValue-key arm
 
 ### Feature Implementation Memos
 
