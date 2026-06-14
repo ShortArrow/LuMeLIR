@@ -60,9 +60,11 @@ The epilogue work and Phase 3 work run **concurrently**. Phase 3 does not block 
 
 Phase 3 closes when:
 
-1. Rust-Lua Bridge entry ADR exists AND a minimum-viable Rust function (e.g. `fn add(a: f64, b: f64) -> f64`) is callable from Lua and verified end-to-end.
-2. Embedded register-ops entry ADR exists (implementation optional unless user emerges).
-3. The 4 Phase 2 epilogue items each have an "implemented" or explicit "deferred to Phase 4" decision recorded.
+1. Rust-Lua Bridge entry ADR exists AND a minimum-viable Rust function (e.g. `fn add(a: f64, b: f64) -> f64`) is callable from Lua and verified end-to-end. — **RESOLVED by [ADR 0191](0191-rust-lua-bridge-mvp.md) (2026-06-15)**: `rust.add(2.5, 3.5)` rounds through `extern "C" fn rust_add` and returns 6.0 end-to-end; 3 e2e tests pass.
+2. Embedded register-ops entry ADR exists (implementation optional unless user emerges). — **RESOLVED by [ADR 0192](0192-embedded-register-ops-entry.md) (2026-06-15)**: abstract MVP surface pinned (volatile load/store + bit-field rmw); target selection deferred to user-triggered follow-up.
+3. The 4 Phase 2 epilogue items each have an "implemented" or explicit "deferred to Phase 4" decision recorded. — **RESOLVED by [ADR 0190](0190-phase2-epilogue-close-decisions.md) (2026-06-15)**: all 4 epilogue items (GC actual freeing, pcall, `_ENV`, string patterns) deferred to Phase 4.
+
+**Status (2026-06-15): Phase 3 closed.** All three close criteria above are satisfied. PRD-defined Phase 3 (Domain Specific Features) is complete in scope. The Bridge MVP proves the PRD kimo claim end-to-end; the Embedded dialect has an entry point ready for user-triggered work. Phase 4 entry-criteria ADR will be written when the first Phase 4 work item is scheduled (see ADR 0190 §Phase 4 entry signal).
 
 PRD success metrics (LuaJIT-equivalent performance, embedded binary size) are **not Phase 3 close requirements** — they are project-wide targets that surface optimisation passes and codegen tightening, which sit in Phase 4+ territory.
 
