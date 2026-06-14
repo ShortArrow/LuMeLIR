@@ -63,15 +63,20 @@ print(t[pick(other)])
 
 #[test]
 fn indextagged_read_non_local_tagged_key() {
+    // Note: rawset on a nested Index target (`rawset(a.inner, ...)`)
+    // is rejected at HIR because Index reads default to Number (see
+    // `src/hir/mod.rs:180`). Populate via an intermediate Local to
+    // keep the focus on the IndexTagged READ key gap.
     let src = r#"
 local function pick(src)
   for k, _ in pairs(src) do return k end
 end
 local other = {}
 rawset(other, "name", "y")
+local inner = {}
+rawset(inner, "name", "deep")
 local a = {}
-a.inner = {}
-rawset(a.inner, "name", "deep")
+a.inner = inner
 print(a.inner[pick(other)])
 "#;
     let out = run_ok(src, "lumelir_residual_idxtag_read_k");

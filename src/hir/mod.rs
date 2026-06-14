@@ -3395,6 +3395,11 @@ impl LowerCtx {
                 // path applies. Idempotent on single-Ident targets.
                 let target_hir = widen_index_for_assign_target(target_hir);
                 let key_hir = self.lower_expr(key)?;
+                // ADR 0188 — codegen TaggedValue-key IndexAssign
+                // dispatcher (`emit.rs:4029`) requires a Local
+                // source; same chokepoint reuse as the value-side
+                // (ADR 0187, below). Idempotent for Local + non-Tagged.
+                let key_hir = self.materialize_tagged_source_if_needed(key_hir, key.span)?;
                 let value_hir = self.lower_expr(value)?;
                 // ADR 0187 — pre-materialise non-Local TaggedValue
                 // values into a synth Local so codegen's static-key
@@ -4426,6 +4431,11 @@ impl LowerCtx {
                 // targets (single-level reads unchanged).
                 let target_hir = widen_index_for_assign_target(target_hir);
                 let key_hir = self.lower_expr(key)?;
+                // ADR 0188 — IndexTagged dispatcher
+                // (`emit.rs:5459`) requires a Local source for a
+                // TaggedValue key; pre-bind non-Local sources via the
+                // chokepoint helper. Idempotent for Local + non-Tagged.
+                let key_hir = self.materialize_tagged_source_if_needed(key_hir, key.span)?;
                 let target_kind = infer_kind(&target_hir, &self.locals, &self.functions);
                 if target_kind != ValueKind::Table && target_kind != ValueKind::TaggedValue {
                     return Err(HirError::TypeMismatch {
@@ -5038,18 +5048,17 @@ impl LowerCtx {
         let lowered_args = if matches!(builtin, Builtin::RawGet | Builtin::RawSet) {
             let mut materialised: Vec<HirExpr> = Vec::with_capacity(lowered_args.len());
             for (i, arg) in lowered_args.into_iter().enumerate() {
+                // ADR 0188 — loosen ADR 0179's arg[2] gate. Codegen
+                // (`emit.rs:11021`) rejects any non-Local TaggedValue
+                // value for RawSet regardless of key kind, not only
+                // when the key is Local(TaggedValue). Materialise
+                // arg[2] whenever it carries a TaggedValue kind.
                 let should_materialise_arg2 = i == 2
                     && matches!(builtin, Builtin::RawSet)
-                    && materialised
-                        .get(1)
-                        .map(|key_arg| {
-                            matches!(key_arg.kind, HirExprKind::Local(_))
-                                && matches!(
-                                    infer_kind(key_arg, &self.locals, &self.functions),
-                                    ValueKind::TaggedValue
-                                )
-                        })
-                        .unwrap_or(false);
+                    && matches!(
+                        infer_kind(&arg, &self.locals, &self.functions),
+                        ValueKind::TaggedValue
+                    );
                 let should_materialise = i == 1 || should_materialise_arg2;
                 let arg_span = arg.span;
                 let new_arg = if should_materialise {
