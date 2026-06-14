@@ -33,7 +33,7 @@ The HIR accepts a TaggedValue value when the key is non-Number (`src/hir/mod.rs:
   2. Non-Local (Call-return) TaggedValue value source on String key.
   3. Boundary: assigning `nil` via a TaggedValue source whose runtime tag happens to be Nil (still hash-soft-delete semantics — value path with concrete kind unchanged).
 - ❌ Number-key (array) + TaggedValue value. Rejected at HIR (`src/hir/mod.rs:3450-3451` requires `key_kind != Number` for TaggedValue value). Out of scope; staying consistent with ADR 0135's Number-key array path policy.
-- ❌ `IndexTagged` target-side TaggedValue value (the deeper nested write `a.b.c = pick(...)`). Scope deferred — the IndexAssign target widening (ADR 0095) already promotes Index → IndexTagged at HIR; codegen treats `IndexTagged` separately and may share or duplicate the unreachable. Verify in C3 and amend if needed; otherwise track as future ADR.
+- ✅ `IndexTagged` target-side TaggedValue value (the deeper nested write `a.b.c = pick(...)`). **Post-impl audit (2026-06-14)** confirmed the IndexAssign codegen normalises both `Index` and `IndexTagged` targets through `emit_resolve_table_target_ptr` (`src/codegen/emit.rs:3629`) before reaching the static-key value-kind match — so this ADR's `ValueKind::TaggedValue` arm covers nested targets at any depth. Tests 4 and 5 in the e2e file pin single- and double-level nesting.
 - ❌ Number-key TaggedValue-value codegen reachability check at `emit.rs:4286`. That `unreachable!` is downstream of the TaggedValue-key arm's `if !matches!(value_kind_early, Nil) { ...; return Ok(()); }` early-return; non-Nil values never reach the match. No change needed; documented here for traceability.
 
 ## Decision
@@ -158,7 +158,7 @@ C3 (HIR + codegen impl): 1418 → 1421 (Green)
 
 ## Future work
 
-- `IndexTagged` (nested write) target-side TaggedValue value — audit codegen for a parallel `unreachable!` and either share or replicate the arm.
+- ~~`IndexTagged` (nested write) target-side TaggedValue value~~ — RESOLVED by post-impl audit (see Scope row above); shared codegen path covers all nesting depths.
 - Source-position TaggedValue normalisation across any remaining dispatcher with a `Local`-only scope-ceiling clause (the ADR 0179 retrospective predicts more lurking).
 - Cross-procedure TaggedValue kind inference (caller refines callee body) — orthogonal but related.
 
