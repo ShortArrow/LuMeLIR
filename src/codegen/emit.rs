@@ -4024,13 +4024,13 @@ fn emit_stmt<'a, 'c>(
                 ValueKind::TaggedValue => {
                     let search_key_slot = match &key.kind {
                         HirExprKind::Local(LocalId(idx)) => slots[*idx],
-                        _ => {
-                            return Err(CodegenError::UnsupportedExpr(
-                                "TaggedValue-key IndexAssign requires `Local` key (ADR 0084 \
-                                 scope)"
-                                    .to_owned(),
-                            ));
-                        }
+                        // ADR 0188 G4 — IndexAssign key now materialised
+                        // at HIR; non-Local TaggedValue keys never reach
+                        // this dispatcher.
+                        _ => unreachable!(
+                            "ADR 0188 — HIR materialises non-Local TaggedValue IndexAssign keys \
+                             into a synth Local; codegen must not observe non-Local source"
+                        ),
                     };
                     let value_kind_early = infer_kind(value, locals, functions);
                     if !matches!(value_kind_early, ValueKind::Nil) {
@@ -4054,13 +4054,15 @@ fn emit_stmt<'a, 'c>(
                             if matches!(value_kind_early, ValueKind::TaggedValue) {
                                 match &value.kind {
                                     HirExprKind::Local(LocalId(idx)) => slots[*idx],
-                                    _ => {
-                                        return Err(CodegenError::UnsupportedExpr(
-                                            "TaggedValue-value IndexAssign requires `Local` value \
-                                         (ADR 0138-M scope)"
-                                                .to_owned(),
-                                        ));
-                                    }
+                                    // ADR 0187 — IndexAssign value side
+                                    // materialised at HIR; non-Local
+                                    // TaggedValue values never reach this
+                                    // dispatcher.
+                                    _ => unreachable!(
+                                        "ADR 0187 — HIR materialises non-Local TaggedValue \
+                                         IndexAssign values into a synth Local; codegen must \
+                                         not observe non-Local source"
+                                    ),
                                 }
                             } else {
                                 value_v
@@ -5454,12 +5456,13 @@ fn emit_local_init_tagged<'a, 'c>(
         ValueKind::TaggedValue => {
             let source_slot = match &key.kind {
                 HirExprKind::Local(LocalId(idx)) => slots[*idx],
-                _ => {
-                    return Err(CodegenError::UnsupportedExpr(
-                        "IndexTagged TaggedValue key requires `Local` source (ADR 0177 scope)"
-                            .to_owned(),
-                    ));
-                }
+                // ADR 0188 G2/G3 — Index / IndexTagged read keys now
+                // materialised at HIR; non-Local TaggedValue keys never
+                // reach this dispatcher.
+                _ => unreachable!(
+                    "ADR 0188 — HIR materialises non-Local TaggedValue Index/IndexTagged keys \
+                     into a synth Local; codegen must not observe non-Local source"
+                ),
             };
             let tag = emit_load(block, source_slot, types.i64, loc);
             // Lua §3.4.10: indexing with nil is a runtime error.
@@ -8771,13 +8774,13 @@ fn emit_expr<'a, 'c>(
                 ValueKind::TaggedValue => {
                     let search_key_slot = match &key.kind {
                         HirExprKind::Local(LocalId(idx)) => slots[*idx],
-                        _ => {
-                            return Err(CodegenError::UnsupportedExpr(
-                                "TaggedValue-key Index read requires `Local` key (ADR 0084 \
-                                 scope)"
-                                    .to_owned(),
-                            ));
-                        }
+                        // ADR 0188 G2 — Index read key materialised at HIR;
+                        // non-Local TaggedValue keys never reach this
+                        // dispatcher.
+                        _ => unreachable!(
+                            "ADR 0188 — HIR materialises non-Local TaggedValue Index read keys \
+                             into a synth Local; codegen must not observe non-Local source"
+                        ),
                     };
                     let tmp_slot = emit_alloca_slot_for_kind(
                         context,
@@ -11021,12 +11024,13 @@ fn emit_expr<'a, 'c>(
                 let value_v = if matches!(value_kind, ValueKind::TaggedValue) {
                     match &args[2].kind {
                         HirExprKind::Local(LocalId(idx)) => slots[*idx],
-                        _ => {
-                            return Err(CodegenError::UnsupportedExpr(
-                                "rawset TaggedValue value requires `Local` source (ADR 0176 scope)"
-                                    .to_owned(),
-                            ));
-                        }
+                        // ADR 0188 G1 — RawSet arg[2] materialised at HIR
+                        // (gate broadened from ADR 0179); non-Local
+                        // TaggedValue values never reach this dispatcher.
+                        _ => unreachable!(
+                            "ADR 0188 — HIR materialises non-Local TaggedValue RawSet arg[2] \
+                             into a synth Local; codegen must not observe non-Local source"
+                        ),
                     }
                 } else {
                     emit_expr(

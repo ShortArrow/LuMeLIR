@@ -139,7 +139,7 @@ C3 (HIR impl): 1423 → 1427 (Green)
 
 ## Future work
 
-- **Codegen Local-only check rewording**: the `UnsupportedExpr` text could be updated to "internal: HIR materialisation invariant violated" since the messages are now structurally unreachable; defer until a future Tidy First sweep groups all 4 sites.
+- ~~**Codegen Local-only check rewording**~~ — RESOLVED in a follow-up Tidy First commit (2026-06-15): the 5 `UnsupportedExpr` paths at `emit.rs:4029` / `4059` / `5459` / `8776` / `11026` are promoted from runtime `Err` to `unreachable!()` panics with ADR-citation messages (`ADR 0187`/`ADR 0188`). HIR materialisation invariant is now load-bearing — a regression in the chokepoint surfaces as a clean panic, not a deferred `Result<>` propagation.
 - ~~**Audit Method`Call` arg positions**~~ — RESOLVED by post-impl audit (2026-06-15, commit-less probes removed after). Surveyed `print` / `tostring` / `type` / `string.format` / `MethodCall` receiver / `assert` / `pairs` / `ipairs` / `next` / `setmetatable` arg positions with non-Local TaggedValue Call-return sources. All either work today (`print` / `tostring` / `type`) or are cleanly rejected at HIR with documented diagnostics keyed to other ADRs (ADR 0152 for `string.format`, ADR 0092 for complex receivers, kind-mismatch for `assert`). No codegen `UnsupportedExpr` / `unreachable!` panics surfaced in the audited surface. The non-Local TaggedValue source sweep is closed for the dispatchers currently exposed to user-level Lua.
 - **Cross-procedure non-Local TaggedValue refinement** — when a callee returns a known-narrow TaggedValue (e.g. always-String), the materialisation could be elided. Speculative.
 
