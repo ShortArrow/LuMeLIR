@@ -1672,6 +1672,22 @@ fn emit_libm_decls<'c>(
             .build();
         module.body().append_operation(op.into());
     }
+
+    // ADR 0191 — Rust-Lua Bridge MVP: extern decl for the bundled
+    // `rust_add` symbol from `src/bridge_runtime.rs`. Same shape as
+    // libm pow. The symbol is resolved at link time via the
+    // `LUMELIR_BRIDGE_OBJ` object passed by `src/codegen/link.rs`.
+    let rust_add_ty = llvm::r#type::function(types.f64, &[types.f64, types.f64], false);
+    let rust_add_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "rust_add"))
+        .function_type(TypeAttribute::new(rust_add_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(rust_add_op.into());
 }
 
 /// MLIR type for a function parameter of static [`ValueKind`]. Number
@@ -9852,6 +9868,46 @@ fn emit_expr<'a, 'c>(
                     block,
                     "pow",
                     &[base, exponent],
+                    types,
+                    loc,
+                ))
+            }
+            Callee::Builtin(Builtin::RustAdd) => {
+                // ADR 0191 — Rust-Lua Bridge: `rust.add(a, b)`
+                // dispatches to the bundled `extern "C" fn rust_add`
+                // in `src/bridge_runtime.rs`. The extern declaration
+                // is emitted at module init alongside libm; here we
+                // just call it like any other Number → Number → Number
+                // libc shape.
+                let a = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let b = emit_expr(
+                    context,
+                    block,
+                    &args[1],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                Ok(emit_libc_call_f64(
+                    context,
+                    block,
+                    "rust_add",
+                    &[a, b],
                     types,
                     loc,
                 ))

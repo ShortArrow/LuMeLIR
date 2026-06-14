@@ -584,6 +584,15 @@ pub enum Builtin {
     /// `io.*` namespace builtin and the 4th consumer of
     /// `Builtin::from_namespace_method`.
     IoWrite,
+    /// ADR 0191 — Rust-Lua Bridge MVP demo function.
+    /// `rust.add(a: Number, b: Number) -> Number` dispatches to
+    /// `extern "C" fn rust_add(f64, f64) -> f64` in
+    /// `src/bridge_runtime.rs`, linked into every produced
+    /// binary via `build.rs` + `src/codegen/link.rs`. Extension
+    /// surface: add a new `Builtin::Rust*` variant + one
+    /// `rust_from_method` arm + one `extern "C" fn` in
+    /// `src/bridge_runtime.rs`.
+    RustAdd,
 }
 
 impl Builtin {
@@ -693,6 +702,20 @@ impl Builtin {
             "table" => Self::table_from_method(method),
             // ADR 0116 — io.* namespace.
             "io" => Self::io_from_method(method),
+            // ADR 0191 — Rust-Lua Bridge namespace.
+            "rust" => Self::rust_from_method(method),
+            _ => None,
+        }
+    }
+
+    /// ADR 0191 — Rust-Lua Bridge: map a `rust.<method>` name to
+    /// a Builtin variant. Returns None for unrecognized methods
+    /// so `lower_call` falls through to the normal Index-callee
+    /// path (which surfaces UndefinedName for unresolved `rust`,
+    /// consistent with ADR 0103's math/string/table behaviour).
+    pub fn rust_from_method(method: &str) -> Option<Self> {
+        match method {
+            "add" => Some(Builtin::RustAdd),
             _ => None,
         }
     }
@@ -762,6 +785,8 @@ impl Builtin {
             // ADR 0119 — io.read([format]). arity 0 = default
             // `"*l"`, arity 1 = explicit format ("*l" / "l").
             Builtin::IoRead => (0, 1),
+            // ADR 0191 — rust.add(a, b) fixed arity 2.
+            Builtin::RustAdd => (2, 2),
         }
     }
 
@@ -802,6 +827,8 @@ impl Builtin {
             Builtin::TableRemove => "table.remove",
             Builtin::IoWrite => "io.write",
             Builtin::IoRead => "io.read",
+            // ADR 0191.
+            Builtin::RustAdd => "rust.add",
         }
     }
 
@@ -866,6 +893,8 @@ impl Builtin {
             // nil on EOF; TaggedValue covers the union (TableRemove
             // precedent).
             Builtin::IoRead => &[ValueKind::TaggedValue],
+            // ADR 0191 — rust.add returns Number.
+            Builtin::RustAdd => &[ValueKind::Number],
         }
     }
 
@@ -982,6 +1011,8 @@ impl Builtin {
             // (any-accepted), followed by a IoWrite-specific
             // Bool/Nil reject in `lower_namespace_builtin_call`.
             Builtin::IoWrite => &[],
+            // ADR 0191 — rust.add(a, b) — both args Number.
+            Builtin::RustAdd => &[ValueKind::Number, ValueKind::Number],
         }
     }
 

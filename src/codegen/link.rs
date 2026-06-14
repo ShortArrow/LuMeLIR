@@ -45,11 +45,17 @@ fn compile_to_object(llvm_ir: &str, obj_path: &Path) -> Result<(), CodegenError>
 }
 
 fn link_object(obj_path: &Path, output: &Path) -> Result<(), CodegenError> {
-    let status = Command::new("cc")
-        .arg(obj_path)
-        .args(["-o"])
-        .arg(output)
-        .args(["-lc", "-lm"])
+    let mut cmd = Command::new("cc");
+    cmd.arg(obj_path).args(["-o"]).arg(output);
+    // ADR 0191 — bridge object provided by `build.rs` at compile
+    // time via `cargo:rustc-env=LUMELIR_BRIDGE_OBJ`. Resolved by
+    // `option_env!` so the lookup happens once at compile time
+    // rather than per-link at runtime.
+    if let Some(bridge_obj) = option_env!("LUMELIR_BRIDGE_OBJ") {
+        cmd.arg(bridge_obj);
+    }
+    cmd.args(["-lc", "-lm"]);
+    let status = cmd
         .status()
         .map_err(|e| CodegenError::LinkFailed(format!("failed to spawn cc: {e}")))?;
 
