@@ -3812,6 +3812,40 @@ fn emit_stmt<'a, 'c>(
                                 loc,
                             );
                         }
+                        // ADR 0187 — TaggedValue value on a String /
+                        // Bool / Function / Table key. HIR has
+                        // materialised non-Local sources into a synth
+                        // Local via `materialize_tagged_source_if_needed`,
+                        // so `value.kind` is `Local(LocalId)` here.
+                        // Hand the local's slot ptr to the shared
+                        // helper, which performs the raw 16-byte
+                        // tagged-slot copy at commit time (mirror of
+                        // ADR 0138-M's TaggedValue-key TaggedValue-
+                        // value handling at lines 4022-4051).
+                        ValueKind::TaggedValue => {
+                            let value_slot_ptr = match &value.kind {
+                                HirExprKind::Local(LocalId(idx)) => slots[*idx],
+                                _ => unreachable!(
+                                    "ADR 0187 — HIR materialises non-Local TaggedValue values \
+                                     into a synth Local; non-Local source must not reach codegen"
+                                ),
+                            };
+                            emit_hash_indexassign_with_newindex(
+                                context,
+                                block,
+                                target_ptr,
+                                key_slot,
+                                key_kind,
+                                key_value,
+                                value_slot_ptr,
+                                ValueKind::TaggedValue,
+                                METATABLE_INDEX_MAX_HOPS,
+                                false,
+                                functions,
+                                types,
+                                loc,
+                            );
+                        }
                         ValueKind::Nil => {
                             // Hard tombstone path is unchanged; Lua
                             // spec — assigning nil to a missing key
@@ -3977,9 +4011,6 @@ fn emit_stmt<'a, 'c>(
                                 loc,
                             ));
                         }
-                        _ => unreachable!(
-                            "HIR rejects non-Number/Bool/String/Nil/Function/Table values for hash insert"
-                        ),
                     }
                 }
                 // Phase 2.8e-iter-tk (ADR 0084): TaggedValue key —

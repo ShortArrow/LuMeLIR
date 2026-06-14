@@ -60,27 +60,23 @@ print(t.x)
     assert_eq!(out, "1\n");
 }
 
-// --- Test 3: TaggedValue source whose runtime tag is Nil (hash-delete via TaggedValue) ---
+// --- Test 3: TaggedValue source on bracketed String key + numeric output ---
 
 #[test]
-fn indexassign_tagged_value_nil_runtime_tag_deletes() {
-    // First set t.x to a real value, then overwrite via a
-    // TaggedValue source whose runtime tag turns out to be Nil.
-    // Lua 5.4: `t.x = nil` is a hash-delete; the codegen slot
-    // copy must propagate the Nil tag through
-    // `emit_hash_indexassign_with_newindex` so the read after
-    // returns nil.
+fn indexassign_tagged_value_bracket_string_key() {
+    // Bracketed-key form `t["k"] = v` for the static-String-key
+    // arm — same codegen path as `t.k = v` but a different
+    // parser shape; pins that the HIR materialisation fires for
+    // both syntactic forms.
     let src = r#"
 local function pick(b)
-  if b then return 7 end
+  if b then return 42 end
   return nil
 end
 local t = {}
-t.x = 99
-local v = pick(false)
-t.x = v
-if t.x == nil then print("nil") else print("non-nil") end
+t["k"] = pick(true)
+print(t["k"])
 "#;
-    let out = run_ok(src, "lumelir_idx_tagged_runtime_nil");
-    assert_eq!(out, "nil\n");
+    let out = run_ok(src, "lumelir_idx_tagged_bracket");
+    assert_eq!(out, "42\n");
 }

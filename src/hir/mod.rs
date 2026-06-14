@@ -3396,6 +3396,12 @@ impl LowerCtx {
                 let target_hir = widen_index_for_assign_target(target_hir);
                 let key_hir = self.lower_expr(key)?;
                 let value_hir = self.lower_expr(value)?;
+                // ADR 0187 — pre-materialise non-Local TaggedValue
+                // values into a synth Local so codegen's static-key
+                // TaggedValue-value arm sees a uniform slot-ptr
+                // source. Idempotent for already-Local TaggedValue
+                // and non-Tagged kinds.
+                let value_hir = self.materialize_tagged_source_if_needed(value_hir, value.span)?;
                 let target_kind = infer_kind(&target_hir, &self.locals, &self.functions);
                 if target_kind != ValueKind::Table && target_kind != ValueKind::TaggedValue {
                     return Err(HirError::TypeMismatch {
