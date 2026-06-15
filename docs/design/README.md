@@ -252,6 +252,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0194 — benchmark-harness-mvp](0194-benchmark-harness-mvp.md) — Phase 4 benchmark harness MVP: recursive `fib(30)` micro-benchmark with LuMeLIR-vs-LuaJIT wall-clock comparison (median of 5 iterations, ratio reported, no perf assertion); satisfies ADR 0193 §Ordering §1
 - [0195 — phase5-entry-criteria](0195-phase5-entry-criteria.md) — Phase 5 entry / scope freeze (Coroutines + Runtime Eval `load`/`require` + Production Hardening); depends on Phase 4 closing; aggregate 13-21 ADRs / 16-27 sessions estimated
 - [0196 — integer-float-subtype-design](0196-integer-float-subtype-design.md) — Phase 4a top-priority design entry: introduce `ValueKind::Integer` (i64) alongside existing `Number` (f64) per Lua 5.4 §2.1; 10 sub-ADRs (0197-0206) cover parser / HIR / codegen / tagged ABI / cross-subtype semantics in three migration phases (additive → opt-in → strict)
+- [0197 — integer-literal-token-additive](0197-integer-literal-token-additive.md) — Integer/Float Phase A additive: lexer adds `TokenKind::Integer(i64)` distinguishing `42`/`0xFF` from `42.0`/`1e5`; parser silently demotes to existing f64 path so 1431 tests stay green; first implementation step of ADR 0196 arc
 
 ### Feature Implementation Memos
 
