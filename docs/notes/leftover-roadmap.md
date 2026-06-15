@@ -144,17 +144,17 @@
 
 これらは 0.5-2 session で probe + 1-3 ADR にまとめられる。
 
-## F. ADR 番号 misallocation
+## F. ADR 番号 misallocation — RESOLVED (2026-06-16)
 
-ADR 0191 §Future work で予約した番号が別件に使われた:
+ADR 0191 §Scope (literal) と §Future work の Bridge sub-piece 予約番号を current 状態に更新済 (commit TBD):
 
-| 元予約 | 実際の使用 | Bridge sub-piece 本来の番号 |
+| 元予約 | 実際の使用 | 現在の状態 |
 |---|---|---|
-| 0192 Bridge marshaling | Embedded register-ops entry | → 0207+ で renumber 必要 |
-| 0193 Bridge error propagation | Phase 4 entry criteria | → 0208+ |
-| 0194 Bridge GC interaction | Benchmark harness MVP | → 0209+ |
+| 0192 Bridge marshaling | Embedded register-ops entry | ADR 0191 doc が `ADR (TBD, post-Phase-4a)` に書き換え済 |
+| 0193 Bridge error propagation | Phase 4 entry criteria | 同上 (paired with pcall when triggered) |
+| 0194 Bridge GC interaction | Benchmark harness MVP | 同上 (paired with GC stack walk) |
 
-これは命名上の混乱で、Bridge sub-pieces ADR を書く時に renumber + cross-reference fix で 0.5 session で消化可能。
+Bridge sub-piece ADR を着手する時に、その時点で next-available な番号を振る。番号予約方式を撤回し、相対参照 (`(TBD, post-Phase-4a)` 等) に統一。
 
 ## 統合ロードマップ (やり残し全体)
 

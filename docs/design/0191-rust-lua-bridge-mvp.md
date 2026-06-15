@@ -19,10 +19,10 @@ The PRD memo identifies the Bridge as the kimo: "普段書いている Rust プ�
 - ✅ **Linker integration** at `src/codegen/link.rs::link_object` — pass the bridge object to `cc` so the compiled-Lua binary resolves `rust_add` at link time.
 - ✅ **Extern declaration** in module init — `llvm.func @rust_add(f64, f64) -> f64` registered alongside `printf` / `strlen` / `sin` / etc.
 - ✅ **3 e2e tests** in a new `tests/phase3_rust_lua_bridge_mvp.rs`: basic call (`print(rust.add(2.5, 3.5))` → `6.0`); shadowing positive (`local rust = {}; function rust.add(x, y) ... end` overrides the bridge); arity pin (`rust.add()` → `ArityMismatch`).
-- ❌ **Non-Number signatures** — `String` / `Table` / `TaggedValue` args/returns. Deferred to ADR 0192 (type marshaling).
+- ❌ **Non-Number signatures** — `String` / `Table` / `TaggedValue` args/returns. Deferred to a future Bridge-marshaling ADR (TBD). (Original plan reserved ADR 0192 for this; that slot was reassigned to Embedded register-ops entry. See [`docs/notes/leftover-roadmap.md` §F](../notes/leftover-roadmap.md).)
 - ❌ **Variadic Rust signatures**. Deferred (rare in practice; not needed for kimo demo).
-- ❌ **Error propagation** — Rust panic → Lua error. Deferred to ADR 0193 (paired with pcall epilogue when triggered).
-- ❌ **GC-managed Lua values passed to Rust** — Bridge MVP uses primitive `f64` so no rooting / pin pressure. Deferred to ADR 0194 (paired with GC stack walk when actual freeing arrives).
+- ❌ **Error propagation** — Rust panic → Lua error. Deferred to a future Bridge-error-propagation ADR (TBD; pairs with pcall epilogue when triggered). (Original plan reserved ADR 0193; reassigned to Phase 4 entry criteria.)
+- ❌ **GC-managed Lua values passed to Rust** — Bridge MVP uses primitive `f64` so no rooting / pin pressure. Deferred to a future Bridge-GC-interaction ADR (TBD; pairs with GC stack walk when actual freeing arrives). (Original plan reserved ADR 0194; reassigned to benchmark harness MVP.)
 - ❌ **Multiple bridge functions** — one demo function only. Future bridge functions extend `src/bridge_runtime.rs` + the `rust_from_method` table; no architectural change required.
 - ❌ **Dynamic linking** — bundled static object via `build.rs`. Sufficient for the MVP and the embedded-target story.
 - ❌ **User-defined bridge crates** — out of scope; the bundled `bridge_runtime.rs` is the MVP surface. Future ADR opens up "drop-in bridge crate" extensibility.
@@ -258,9 +258,9 @@ C3 (impl): 1427 → 1430 (Green)
 
 ## Future work
 
-- ADR 0192 — Type marshaling (String / Table / Bool / TaggedValue across the boundary).
-- ADR 0193 — Error propagation (Rust panic → Lua error; pairs with `pcall` epilogue when triggered).
-- ADR 0194 — GC interaction (Rust holding Lua references; pairs with GC stack walk when actual freeing arrives).
+- ADR (TBD, post-Phase-4a) — Type marshaling (String / Table / Bool / TaggedValue across the boundary). The original 0192 reservation was reassigned to Embedded register-ops entry; this work now takes whichever number is next-available when scheduled.
+- ADR (TBD, paired with pcall) — Error propagation (Rust panic → Lua error). Original 0193 reassigned to Phase 4 entry.
+- ADR (TBD, paired with GC stack walk) — GC interaction (Rust holding Lua references). Original 0194 reassigned to benchmark harness MVP.
 - ADR (TBD) — User-defined bridge crates (drop-in extensibility).
 - ADR (TBD) — Embedded register-ops dialect entry (Phase 3 close criterion §2).
 
