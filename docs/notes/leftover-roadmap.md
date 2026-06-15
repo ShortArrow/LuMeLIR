@@ -242,6 +242,8 @@ ADR (TBD) ADR 番号 misallocation 整理               (0 ADR, 0.5 session)
 
 ## 全体総計
 
+### 元見積 (probe 前、roadmap 初稿時点)
+
 | Bucket | ADR | session |
 |---|---|---|
 | A 設計済未実装 | 13 (decision-only meta) | 0 (実装は B/C 経由) |
@@ -252,7 +254,21 @@ ADR (TBD) ADR 番号 misallocation 整理               (0 ADR, 0.5 session)
 | F 番号 fix | — | 0.5 |
 | 統合 (重複除外) | **約 75-85 unique ADR** | **約 80-115 session** |
 
-**3-6 ヶ月 focused work**。Lua 5.4 conformance roadmap (54-87 session) とほぼ同じスケールで、項目分類だけが異なる (片方は spec 視点、もう片方は ADR 残務視点)。
+### 実測 (probe + 進捗反映後、2026-06-16)
+
+| Bucket | DONE | 真の gap | session 残 |
+|---|---|---|---|
+| **A** 設計済未実装 | 1/13 (ADR 0197) | 12 (Integer/Float 残 9 sub-ADR + pcall/_ENV/GC freeing/__gc/weak tables) | 50-70 |
+| **B** 部分実装 | 3/10 (0186/0157/0184 実は DONE) + 2 redirect (0185→A、0048→A) | 5 (0152/0109/0119/0116/0104 spec 拡張) | 5-10 |
+| **C** §Future work bullets | 0/20 | 20 (Bridge sub-pieces + benchmark expansion + Phase 5 workstreams) | 12-20 |
+| **D** §Non-goals deferred | 5/12 ([probe results](bucket-d-probe-results.md): setmetatable nil, table.insert arity-3, table.remove arity-2, setpause, __metatable hide DONE) | 4 confirmed + ~3 deep (__tostring/__concat/__call/__add partial, OOM aggregation, hop-depth review) | 4-8 |
+| **E** probes | 7/8 ([probe results](bucket-e-probe-results.md): hex/sci/long-strings/long-comments/mid-block-return/next/bracket-key DONE) | 1 (E7 vararg) | 1-2 |
+| **F** 番号 fix | DONE | 0 | 0 |
+| **統合** (重複除外) | **約 18 DONE** | **約 50-60 真の gap** | **約 70-110 session** |
+
+probe 駆動で **約 15-25 session 分** が "既に DONE" と判明 (元 roadmap が overcounted)。残作業見積もほぼ同じ規模で **3-6 ヶ月 focused work**。
+
+probe しない B (部分実装は intent-by-design) や C (planned future work) は probe 駆動圧縮の余地が薄い。残作業の主体はそれら + bucket A (multi-session 大物群) + bucket D 残 + E7。
 
 ## 推奨着手順序
 
