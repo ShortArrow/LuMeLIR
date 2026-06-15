@@ -261,6 +261,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0203 — string-format-octal-general-float](0203-string-format-octal-general-float.md) — `string.format` accepts `%o` octal and `%g` general-float specs; same dispatch shape as ADRs 0152/0202
 - [0204 — string-format-scientific-char](0204-string-format-scientific-char.md) — `string.format` accepts `%e` scientific and `%c` char specs
 - [0205 — string-format-i-alias](0205-string-format-i-alias.md) — `%i` C99 alias for `%d` in `string.format`; pure alias, no new variant
+- [0206 — benchmark-string-concat](0206-benchmark-string-concat.md) — second micro-benchmark in the ADR 0194 harness: `..` in a 200-iter loop; LuMeLIR observed 0.44x faster than LuaJIT (startup-amortized); consumes one bucket C item from ADR 0194 §Future work
 
 ### Feature Implementation Memos
 
