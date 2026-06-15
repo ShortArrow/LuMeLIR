@@ -10072,6 +10072,22 @@ fn emit_expr<'a, 'c>(
                 let if_op = scf::r#if(in_range, &[types.f64], then_region, else_region, loc);
                 Ok(block.append_operation(if_op).result(0).unwrap().into())
             }
+            Callee::Builtin(Builtin::StringReverse) => {
+                // ADR 0201 — byte-wise string reversal.
+                let arg = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                Ok(emit_string_reverse(context, block, arg, types, loc))
+            }
             Callee::Builtin(b @ (Builtin::StringUpper | Builtin::StringLower)) => {
                 // Phase 2.7q-stdlib-string (ADR 0103): `string.upper` /
                 // `string.lower` share the malloc + memcpy + scf::while
@@ -12144,6 +12160,147 @@ fn emit_string_case_map<'a, 'c>(
     let while_op = scf::r#while(&[zero], &[types.i64], before_region, after_region, loc);
     block.append_operation(while_op);
     // ADR 0112: finalize the compat NUL terminator.
+    emit_string_obj_finalize_nul(context, block, new_obj, length, types, loc);
+    new_obj
+}
+
+/// ADR 0201 — `string.reverse(s)`: allocate a new string-object of
+/// the same length, then iterate `i ∈ 0..length` copying
+/// `src[length - 1 - i]` to `dst[i]`. Byte-wise per Lua 5.4 §6.4.
+fn emit_string_reverse<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    src: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let length = emit_string_obj_len(block, src, types, loc);
+    let src_data = emit_string_obj_data(context, block, src, types, loc);
+    let new_obj = emit_string_obj_alloc(context, block, length, types, loc);
+    let dst = emit_string_obj_data(context, block, new_obj, types, loc);
+    let zero = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let one = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let i8_ty: Type<'c> = IntegerType::new(context, 8).into();
+    let before_region = Region::new();
+    let before_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let i_arg: Value<'c, '_> = before_blk.argument(0).unwrap().into();
+        let cond: Value<'c, '_> = before_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Slt,
+                i_arg,
+                length,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        before_blk.append_operation(scf::condition(cond, &[i_arg], loc));
+    }
+    before_region.append_block(before_blk);
+    let after_region = Region::new();
+    let after_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let i_arg: Value<'c, '_> = after_blk.argument(0).unwrap().into();
+        // src_idx = length - 1 - i.
+        let len_minus_1: Value<'c, '_> = after_blk
+            .append_operation(arith::subi(length, one, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let src_idx: Value<'c, '_> = after_blk
+            .append_operation(arith::subi(len_minus_1, i_arg, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        // p_src = src_data + src_idx (i8 GEP).
+        let p_src: Value<'c, '_> = after_blk
+            .append_operation(
+                OperationBuilder::new("llvm.getelementptr", loc)
+                    .add_operands(&[src_data, src_idx])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "elem_type"),
+                            TypeAttribute::new(i8_ty).into(),
+                        ),
+                        (
+                            Identifier::new(context, "rawConstantIndices"),
+                            DenseI32ArrayAttribute::new(context, &[i32::MIN]).into(),
+                        ),
+                    ])
+                    .add_results(&[types.ptr])
+                    .build()
+                    .expect("llvm.getelementptr p_src"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let byte: Value<'c, '_> = after_blk
+            .append_operation(
+                OperationBuilder::new("llvm.load", loc)
+                    .add_operands(&[p_src])
+                    .add_results(&[i8_ty])
+                    .build()
+                    .expect("llvm.load i8 reverse"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        // p_dst = dst + i.
+        let p_dst: Value<'c, '_> = after_blk
+            .append_operation(
+                OperationBuilder::new("llvm.getelementptr", loc)
+                    .add_operands(&[dst, i_arg])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "elem_type"),
+                            TypeAttribute::new(i8_ty).into(),
+                        ),
+                        (
+                            Identifier::new(context, "rawConstantIndices"),
+                            DenseI32ArrayAttribute::new(context, &[i32::MIN]).into(),
+                        ),
+                    ])
+                    .add_results(&[types.ptr])
+                    .build()
+                    .expect("llvm.getelementptr p_dst"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        after_blk.append_operation(
+            OperationBuilder::new("llvm.store", loc)
+                .add_operands(&[byte, p_dst])
+                .build()
+                .expect("llvm.store i8 reverse"),
+        );
+        let next: Value<'c, '_> = after_blk
+            .append_operation(arith::addi(i_arg, one, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        after_blk.append_operation(scf::r#yield(&[next], loc));
+    }
+    after_region.append_block(after_blk);
+    let while_op = scf::r#while(&[zero], &[types.i64], before_region, after_region, loc);
+    block.append_operation(while_op);
     emit_string_obj_finalize_nul(context, block, new_obj, length, types, loc);
     new_obj
 }

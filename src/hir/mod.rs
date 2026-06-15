@@ -258,6 +258,8 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             | Callee::Builtin(Builtin::StringRep)
             | Callee::Builtin(Builtin::StringChar)
             | Callee::Builtin(Builtin::StringFormat)
+            // ADR 0201 — string.reverse returns String.
+            | Callee::Builtin(Builtin::StringReverse)
             | Callee::Builtin(Builtin::TableConcat) => ValueKind::String,
             // ADR 0111 — table.insert is void; expression-position
             // use synthesises a Number placeholder (same shape as

@@ -584,6 +584,8 @@ pub enum Builtin {
     /// `io.*` namespace builtin and the 4th consumer of
     /// `Builtin::from_namespace_method`.
     IoWrite,
+    /// ADR 0201 — `string.reverse(s)` byte-wise reversal.
+    StringReverse,
     /// ADR 0191 — Rust-Lua Bridge MVP demo function.
     /// `rust.add(a: Number, b: Number) -> Number` dispatches to
     /// `extern "C" fn rust_add(f64, f64) -> f64` in
@@ -657,6 +659,8 @@ impl Builtin {
             // ADR 0113 — string.char (variadic byte-producer).
             "char" => Some(Builtin::StringChar),
             "format" => Some(Builtin::StringFormat),
+            // ADR 0201 — string.reverse byte-wise.
+            "reverse" => Some(Builtin::StringReverse),
             _ => None,
         }
     }
@@ -789,6 +793,8 @@ impl Builtin {
             Builtin::IoRead => (0, 1),
             // ADR 0191 — rust.add(a, b) fixed arity 2.
             Builtin::RustAdd => (2, 2),
+            // ADR 0201 — string.reverse(s).
+            Builtin::StringReverse => (1, 1),
         }
     }
 
@@ -831,6 +837,8 @@ impl Builtin {
             Builtin::IoRead => "io.read",
             // ADR 0191.
             Builtin::RustAdd => "rust.add",
+            // ADR 0201.
+            Builtin::StringReverse => "string.reverse",
         }
     }
 
@@ -897,6 +905,8 @@ impl Builtin {
             Builtin::IoRead => &[ValueKind::TaggedValue],
             // ADR 0191 — rust.add returns Number.
             Builtin::RustAdd => &[ValueKind::Number],
+            // ADR 0201 — string.reverse returns String.
+            Builtin::StringReverse => &[ValueKind::String],
         }
     }
 
@@ -1015,6 +1025,8 @@ impl Builtin {
             Builtin::IoWrite => &[],
             // ADR 0191 — rust.add(a, b) — both args Number.
             Builtin::RustAdd => &[ValueKind::Number, ValueKind::Number],
+            // ADR 0201 — string.reverse(s) — String arg.
+            Builtin::StringReverse => &[ValueKind::String],
         }
     }
 
