@@ -29,11 +29,18 @@ Each probable item from leftover-roadmap.md §D was probed via one-shot e2e. Res
 - D-§0143-concat-metamethod — `..` operator must fall back to `__concat` when operand kinds don't match (Lua §3.4.6). HIR kind-check needs to defer to a runtime metamethod-probe path.
 - D-§0186-setpause — `collectgarbage("setpause", n)` and `("stop" | "restart" | "step" | "setstepmul")` extension. Small arity + arm change.
 
+## Round-2 probes (2026-06-16, post ADR 0200)
+
+| Item | ADR | Status | Evidence |
+|---|---|---|---|
+| `__metatable` field hiding | 0135 | ✅ **既実装** | `mt.__metatable = "hidden"; getmetatable(t)` → `"hidden"`. |
+| `__call` metamethod | 0146 | ❌ **未実装 (partial?)** | `setmetatable({}, mt with __call); t(5)` → HIR `IndirectCallNoCandidates`. The call-site direct dispatch fails before any metamethod probe. |
+| `__add` arith metamethod | 0147 | ❌ **未実装 (partial?)** | `t + 1` → HIR `TypeMismatch op="+" lhs="table" rhs="number"`. HIR kind-check rejects before metamethod probe. |
+
+ADRs 0146 / 0147 nominally "DONE" but the probes show they fire only for narrow shapes. Investigation needed before next implementation work.
+
 Other bucket D items not directly probed (require deeper investigation):
-- 0135 `__metatable` field hiding
 - 0103/0104/0105/0113/0152 malloc OOM null-check aggregation (ADR 0157/0184 で partial)
-- 0146 `__call` chain
-- 0147 算術 metamethod chain
 - 0167 multi-hop chain max depth review
 
 ## Recommended ordering
