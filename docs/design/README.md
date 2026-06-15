@@ -251,6 +251,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0193 — phase4-entry-criteria](0193-phase4-entry-criteria.md) — Phase 4 entry / scope freeze (post-PRD completeness + optimisation): enumerates workstreams (PRD §7 perf + binary-size metrics, epilogue items, Bridge sub-pieces, Embedded impl) and ordering; benchmark harness identified as first Phase 4 implementation ADR
 - [0194 — benchmark-harness-mvp](0194-benchmark-harness-mvp.md) — Phase 4 benchmark harness MVP: recursive `fib(30)` micro-benchmark with LuMeLIR-vs-LuaJIT wall-clock comparison (median of 5 iterations, ratio reported, no perf assertion); satisfies ADR 0193 §Ordering §1
 - [0195 — phase5-entry-criteria](0195-phase5-entry-criteria.md) — Phase 5 entry / scope freeze (Coroutines + Runtime Eval `load`/`require` + Production Hardening); depends on Phase 4 closing; aggregate 13-21 ADRs / 16-27 sessions estimated
+- [0196 — integer-float-subtype-design](0196-integer-float-subtype-design.md) — Phase 4a top-priority design entry: introduce `ValueKind::Integer` (i64) alongside existing `Number` (f64) per Lua 5.4 §2.1; 10 sub-ADRs (0197-0206) cover parser / HIR / codegen / tagged ABI / cross-subtype semantics in three migration phases (additive → opt-in → strict)
 
 ### Feature Implementation Memos
 
