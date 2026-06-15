@@ -866,6 +866,13 @@ impl<'t> Parser<'t> {
                 self.bump();
                 Ok(Expr::new(ExprKind::Number(value), tok.span))
             }
+            // ADR 0197 Phase A — integer-syntax literal demotes to
+            // f64 via `as` cast. ADR 0198 lifts this by introducing
+            // a dedicated `ExprKind::Integer`.
+            TokenKind::Integer(value) => {
+                self.bump();
+                Ok(Expr::new(ExprKind::Number(value as f64), tok.span))
+            }
             TokenKind::Str(ref s) => {
                 self.bump();
                 Ok(Expr::new(ExprKind::Str(s.clone()), tok.span))

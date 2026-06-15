@@ -62,8 +62,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
         }
 
         if ch.is_ascii_digit() {
-            let (span, value) = scan_number(src, &mut chars);
-            tokens.push(Token::new(TokenKind::Number(value), span));
+            let (span, lit) = scan_number(src, &mut chars);
+            let kind = match lit {
+                NumericLit::Integer(i) => TokenKind::Integer(i),
+                NumericLit::Float(f) => TokenKind::Number(f),
+            };
+            tokens.push(Token::new(kind, span));
             continue;
         }
 
@@ -300,16 +304,29 @@ fn is_ident_continue(ch: char) -> bool {
     ch == '_' || ch.is_ascii_alphanumeric()
 }
 
+/// ADR 0197 — output of [`scan_number`]. Carries the lexer's
+/// integer-vs-float syntactic decision before the parser demotes
+/// (Phase A) or routes to a dedicated AST variant (ADR 0198+).
+pub(crate) enum NumericLit {
+    Integer(i64),
+    Float(f64),
+}
+
 /// Scan a numeric literal. Phase 2.2d (ADR 0023) widens this from
 /// "ASCII digit run" to cover the three Lua 5.4 numeric forms our
 /// subset uses: decimal integers, hex integers (`0x`/`0X` prefix),
 /// decimal floats (`3.14`), and scientific notation (`1e3`,
 /// `2.5e-1`). Hex floats and binary literals are deferred.
 ///
+/// ADR 0197 — returns `NumericLit::Integer(i64)` for integer-syntax
+/// lexemes (decimal digits without `.`/`eE`, or hex `0x...`) and
+/// `NumericLit::Float(f64)` for fractional / scientific notation.
+/// Decimal integer overflow falls back to `Float` per Lua §3.4.3.
+///
 /// Lookahead uses byte indexing on `src` directly (the input is
 /// ASCII for all numeric lexemes), advancing `chars` once per
 /// committed byte so the caller's iterator stays in sync.
-fn scan_number<I>(src: &str, chars: &mut std::iter::Peekable<I>) -> (Span, f64)
+fn scan_number<I>(src: &str, chars: &mut std::iter::Peekable<I>) -> (Span, NumericLit)
 where
     I: Iterator<Item = (usize, char)>,
 {
@@ -330,9 +347,12 @@ where
             end += 1;
             chars.next();
         }
+        // ADR 0197 — Lua 5.4 §3.1: hex integer literals are signed
+        // 64-bit. `u64 → i64 as` preserves bits so 0xFFFFFFFFFFFFFFFF
+        // becomes -1, matching the spec.
         let int_value = u64::from_str_radix(&src[start + 2..end], 16)
             .expect("hex digit run is always a valid u64");
-        return (Span::new(start, end), int_value as f64);
+        return (Span::new(start, end), NumericLit::Integer(int_value as i64));
     }
 
     // Decimal integer part — ≥1 digit (entry condition guaranteed it).
@@ -341,9 +361,12 @@ where
         end += 1;
         chars.next();
     }
+    let int_part_end = end;
+    let mut is_float = false;
     // Optional fractional part `.\d+`. Require at least one trailing
     // digit so future `t.x` field syntax doesn't grab the dot.
     if bytes.get(end) == Some(&b'.') && bytes.get(end + 1).is_some_and(|b| b.is_ascii_digit()) {
+        is_float = true;
         end += 1;
         chars.next(); // '.'
         while bytes.get(end).is_some_and(|b| b.is_ascii_digit()) {
@@ -359,6 +382,7 @@ where
             probe += 1;
         }
         if bytes.get(probe).is_some_and(|b| b.is_ascii_digit()) {
+            is_float = true;
             end += 1;
             chars.next(); // 'e' / 'E'
             if matches!(bytes.get(end), Some(&b'+' | &b'-')) {
@@ -371,10 +395,18 @@ where
             }
         }
     }
+    // ADR 0197 — pure decimal integer (no `.` no `eE`): try i64; if
+    // it overflows, fall back to f64 per Lua §3.4.3 (source-literal
+    // integer overflow → float).
+    if !is_float {
+        if let Ok(i) = src[start..int_part_end].parse::<i64>() {
+            return (Span::new(start, end), NumericLit::Integer(i));
+        }
+    }
     let value = src[start..end]
         .parse::<f64>()
         .expect("scan_number recognised a valid f64 lexeme");
-    (Span::new(start, end), value)
+    (Span::new(start, end), NumericLit::Float(value))
 }
 
 /// Scan a string literal `"..."` or `'...'` (Phase 2.7a, ADR 0024).
@@ -637,7 +669,7 @@ mod tests {
 
     #[test]
     fn lex_single_integer_literal_yields_number_token() {
-        assert_eq!(kinds("42"), vec![TokenKind::Number(42.0), TokenKind::Eof]);
+        assert_eq!(kinds("42"), vec![TokenKind::Integer(42), TokenKind::Eof]);
     }
 
     #[test]
@@ -645,9 +677,9 @@ mod tests {
         assert_eq!(
             kinds("1+2"),
             vec![
-                TokenKind::Number(1.0),
+                TokenKind::Integer(1),
                 TokenKind::Plus,
-                TokenKind::Number(2.0),
+                TokenKind::Integer(2),
                 TokenKind::Eof,
             ],
         );
@@ -658,9 +690,9 @@ mod tests {
         assert_eq!(
             kinds(" 1 +\t2\n"),
             vec![
-                TokenKind::Number(1.0),
+                TokenKind::Integer(1),
                 TokenKind::Plus,
-                TokenKind::Number(2.0),
+                TokenKind::Integer(2),
                 TokenKind::Eof,
             ],
         );
@@ -681,9 +713,9 @@ mod tests {
             vec![
                 TokenKind::Ident("print".to_owned()),
                 TokenKind::LParen,
-                TokenKind::Number(1.0),
+                TokenKind::Integer(1),
                 TokenKind::Plus,
-                TokenKind::Number(2.0),
+                TokenKind::Integer(2),
                 TokenKind::RParen,
                 TokenKind::Eof,
             ],
@@ -706,7 +738,7 @@ mod tests {
                 TokenKind::Keyword(Keyword::Local),
                 TokenKind::Ident("x".to_owned()),
                 TokenKind::Equals,
-                TokenKind::Number(1.0),
+                TokenKind::Integer(1),
                 TokenKind::Semicolon,
                 TokenKind::Eof,
             ],
@@ -758,9 +790,9 @@ mod tests {
         assert_eq!(
             kinds("1,2"),
             vec![
-                TokenKind::Number(1.0),
+                TokenKind::Integer(1),
                 TokenKind::Comma,
-                TokenKind::Number(2.0),
+                TokenKind::Integer(2),
                 TokenKind::Eof,
             ],
         );
@@ -909,15 +941,12 @@ mod tests {
 
     #[test]
     fn lex_hex_integer_literal_yields_f64() {
-        assert_eq!(
-            kinds("0xff"),
-            vec![TokenKind::Number(255.0), TokenKind::Eof]
-        );
+        assert_eq!(kinds("0xff"), vec![TokenKind::Integer(255), TokenKind::Eof]);
     }
 
     #[test]
     fn lex_uppercase_hex_prefix_is_accepted() {
-        assert_eq!(kinds("0X1A"), vec![TokenKind::Number(26.0), TokenKind::Eof]);
+        assert_eq!(kinds("0X1A"), vec![TokenKind::Integer(26), TokenKind::Eof]);
     }
 
     #[test]
@@ -935,6 +964,9 @@ mod tests {
 
     #[test]
     fn lex_scientific_notation_without_fractional_part() {
+        // ADR 0197 — scientific notation (`1e3`) is float syntax
+        // even when the value is integer-valued. Stays as
+        // `TokenKind::Number(f64)`.
         assert_eq!(
             kinds("1e3"),
             vec![TokenKind::Number(1000.0), TokenKind::Eof]
@@ -949,11 +981,57 @@ mod tests {
         assert_eq!(
             kinds("0xff,1"),
             vec![
-                TokenKind::Number(255.0),
+                TokenKind::Integer(255),
                 TokenKind::Comma,
-                TokenKind::Number(1.0),
+                TokenKind::Integer(1),
                 TokenKind::Eof,
             ]
+        );
+    }
+
+    // ADR 0197 — integer-syntax token distinction.
+
+    #[test]
+    fn lex_integer_decimal_emits_integer_token() {
+        assert_eq!(kinds("42"), vec![TokenKind::Integer(42), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn lex_integer_hex_emits_integer_token() {
+        assert_eq!(kinds("0xFF"), vec![TokenKind::Integer(255), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn lex_float_decimal_emits_number_token() {
+        assert_eq!(kinds("42.5"), vec![TokenKind::Number(42.5), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn lex_float_scientific_emits_number_token() {
+        assert_eq!(
+            kinds("2.5e2"),
+            vec![TokenKind::Number(250.0), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn lex_integer_overflow_falls_back_to_float() {
+        // ADR 0197 — i64 overflow on decimal integer literal falls
+        // back to float per Lua §3.4.3.
+        let toks = kinds("99999999999999999999");
+        assert!(
+            matches!(toks[0], TokenKind::Number(_)),
+            "expected Number fallback, got {:?}",
+            toks[0]
+        );
+    }
+
+    #[test]
+    fn lex_hex_max_u64_wraps_to_negative_i64() {
+        // ADR 0197 — `u64 → i64 as` preserves bits per Lua spec.
+        assert_eq!(
+            kinds("0xFFFFFFFFFFFFFFFF"),
+            vec![TokenKind::Integer(-1), TokenKind::Eof]
         );
     }
 
@@ -1025,7 +1103,7 @@ mod tests {
     fn lex_single_line_comment_terminates_at_newline() {
         assert_eq!(
             kinds("-- skip\n42"),
-            vec![TokenKind::Number(42.0), TokenKind::Eof]
+            vec![TokenKind::Integer(42), TokenKind::Eof]
         );
     }
 
@@ -1034,10 +1112,10 @@ mod tests {
         assert_eq!(
             kinds("1 + 2 -- sum\n3"),
             vec![
-                TokenKind::Number(1.0),
+                TokenKind::Integer(1),
                 TokenKind::Plus,
-                TokenKind::Number(2.0),
-                TokenKind::Number(3.0),
+                TokenKind::Integer(2),
+                TokenKind::Integer(3),
                 TokenKind::Eof,
             ]
         );
@@ -1048,7 +1126,7 @@ mod tests {
         // A bare `-` keeps its arithmetic-minus meaning.
         assert_eq!(
             kinds("- 1"),
-            vec![TokenKind::Minus, TokenKind::Number(1.0), TokenKind::Eof]
+            vec![TokenKind::Minus, TokenKind::Integer(1), TokenKind::Eof]
         );
     }
 
@@ -1060,11 +1138,7 @@ mod tests {
     fn lex_block_comment_inline_is_skipped() {
         assert_eq!(
             kinds("1 --[[ in line ]] 2"),
-            vec![
-                TokenKind::Number(1.0),
-                TokenKind::Number(2.0),
-                TokenKind::Eof
-            ]
+            vec![TokenKind::Integer(1), TokenKind::Integer(2), TokenKind::Eof]
         );
     }
 
@@ -1073,11 +1147,7 @@ mod tests {
         let src = "1\n--[[\nline two\nline three\n]]\n2";
         assert_eq!(
             kinds(src),
-            vec![
-                TokenKind::Number(1.0),
-                TokenKind::Number(2.0),
-                TokenKind::Eof
-            ]
+            vec![TokenKind::Integer(1), TokenKind::Integer(2), TokenKind::Eof]
         );
     }
 
@@ -1098,11 +1168,7 @@ mod tests {
         // happens to start with `[`. It is NOT a block comment.
         assert_eq!(
             kinds("1 --[ rest of line\n2"),
-            vec![
-                TokenKind::Number(1.0),
-                TokenKind::Number(2.0),
-                TokenKind::Eof
-            ]
+            vec![TokenKind::Integer(1), TokenKind::Integer(2), TokenKind::Eof]
         );
     }
 
@@ -1184,7 +1250,7 @@ mod tests {
         // Level-1 block comment lets `]]` survive in the body.
         assert_eq!(
             kinds("--[=[ has ]] inside ]=] 1"),
-            vec![TokenKind::Number(1.0), TokenKind::Eof]
+            vec![TokenKind::Integer(1), TokenKind::Eof]
         );
     }
 
@@ -1376,7 +1442,7 @@ mod tests {
             vec![
                 TokenKind::Ident("print".into()),
                 TokenKind::LParen,
-                TokenKind::Number(1.0),
+                TokenKind::Integer(1),
                 TokenKind::RParen,
                 TokenKind::Eof,
             ]

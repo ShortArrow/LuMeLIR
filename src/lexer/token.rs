@@ -33,6 +33,12 @@ impl Token {
 /// (Phase 1 baseline) and 0007 (Phase 2.0 additions).
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
+    /// ADR 0197 — integer-syntax literal (`42`, `0xFF`). Phase A
+    /// additive: the parser converts to `ExprKind::Number(f64)`
+    /// via `as f64` cast so AST / HIR / codegen are unchanged.
+    /// ADR 0198 introduces matching `ExprKind::Integer` +
+    /// `ValueKind::Integer` and lifts the conversion.
+    Integer(i64),
     Number(f64),
     /// String literal payload (Phase 2.7a, ADR 0024). Already
     /// escape-processed — `"a\\nb"` lexes to `Str("a\nb".into())`.
