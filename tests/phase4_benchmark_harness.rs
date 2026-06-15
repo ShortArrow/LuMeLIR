@@ -38,6 +38,26 @@ end
 print(#s)
 "#;
 
+/// ADR 0207 — table-ops benchmark. Inserts N pairs via
+/// `table.insert` then sums all values. Exercises the array
+/// grow + hash insert + Number-key read paths.
+const TABLE_N: u32 = 500;
+const TABLE_SOURCE: &str = r#"
+local t = {}
+local i = 1
+while i <= __N__ do
+  table.insert(t, i)
+  i = i + 1
+end
+local sum = 0
+local j = 1
+while j <= __N__ do
+  sum = sum + t[j]
+  j = j + 1
+end
+print(sum)
+"#;
+
 fn run_lumelir(bin: &Path) -> (Duration, String) {
     let t = Instant::now();
     let out = Command::new(bin)
@@ -172,5 +192,52 @@ fn benchmark_string_concat_lumelir_vs_luajit() {
     let tag = if ratio < 1.0 { "faster" } else { "slower" };
     eprintln!(
         "concat({CONCAT_N}): LuMeLIR {lumelir_median:.2} ms  LuaJIT {luajit_median:.2} ms  ratio {ratio:.2}x ({tag}) (median of {ITERATIONS})"
+    );
+}
+
+/// ADR 0207 — third micro-benchmark: table-ops (insert + sum).
+#[test]
+fn benchmark_table_ops_lumelir_vs_luajit() {
+    let expected = (1..=u64::from(TABLE_N)).sum::<u64>().to_string();
+    let src = TABLE_SOURCE.replace("__N__", &TABLE_N.to_string());
+
+    let chunk = lumelir::parser::parse(&src).expect("parse table source");
+    let hir = lumelir::hir::lower(&chunk).expect("hir lower table source");
+    let lumelir_bin = std::env::temp_dir().join("lumelir_bench_table");
+    lumelir::codegen::compile(&hir, &lumelir_bin).expect("codegen compile table");
+
+    let (lumelir_times, lumelir_stdout) =
+        repeat_and_collect(ITERATIONS, || run_lumelir(&lumelir_bin));
+    let _ = std::fs::remove_file(&lumelir_bin);
+    assert_eq!(
+        lumelir_stdout, expected,
+        "LuMeLIR table({TABLE_N}) stdout mismatch"
+    );
+
+    let luajit_avail = Command::new("luajit").arg("-v").output().is_ok();
+    if !luajit_avail {
+        eprintln!(
+            "table({TABLE_N}): LuMeLIR {:.2} ms (median of {ITERATIONS}); luajit not on PATH — comparison skipped",
+            median_ms(&lumelir_times)
+        );
+        return;
+    }
+
+    let lua_src_path = std::env::temp_dir().join("lumelir_bench_table.lua");
+    std::fs::write(&lua_src_path, &src).expect("write table.lua");
+    let (luajit_times, luajit_stdout) =
+        repeat_and_collect(ITERATIONS, || run_luajit(&lua_src_path));
+    let _ = std::fs::remove_file(&lua_src_path);
+    assert_eq!(
+        luajit_stdout, expected,
+        "LuaJIT table({TABLE_N}) stdout mismatch"
+    );
+
+    let lumelir_median = median_ms(&lumelir_times);
+    let luajit_median = median_ms(&luajit_times);
+    let ratio = lumelir_median / luajit_median;
+    let tag = if ratio < 1.0 { "faster" } else { "slower" };
+    eprintln!(
+        "table({TABLE_N}): LuMeLIR {lumelir_median:.2} ms  LuaJIT {luajit_median:.2} ms  ratio {ratio:.2}x ({tag}) (median of {ITERATIONS})"
     );
 }
