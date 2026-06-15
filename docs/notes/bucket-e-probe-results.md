@@ -17,7 +17,7 @@ Each item from `leftover-roadmap.md` §E was probed via a one-shot e2e (compile 
 | 3 | Long strings `[[...]]` | ✅ **既実装** | `print([[hi]])` → `"hi"`. ADR 0038 long-bracket scanner. |
 | 4 | Long comments `--[[...]]` | ✅ **既実装** | `--[[ comment ]]\nprint(1)` → `"1"`. ADR 0034 block-comment scanner. |
 | 5 | Mid-block return | ✅ **既実装** | `function f() if true then return 1 end; return 2 end; print(f())` → `"1"`. Parser accepts return anywhere in block, HIR + codegen route correctly. |
-| 6 | Bracket-key table `{[k]=v}` | ❌ **未実装** | `local t = {[1]=99}` → parser: `UnexpectedToken { actual: LBracket, offset: 11 }`. Parser table-constructor arm does not accept bracket-keyed entries. |
+| 6 | Bracket-key table `{[k]=v}` | ✅ **RESOLVED by ADR 0199** | Parser bracket-key + named-key (`{name=v}`) forms supported; AST/HIR `TableField` enum; keyed fields desugar via IndexAssign pre-statements. |
 | 7 | Vararg `...` | ❌ **未実装** | `function f(...) return ... end` → parser: `UnexpectedToken { actual: DotDot, offset: 17 }`. Lexer treats `...` as `..` `.` (DotDot then Dot); no `Ellipsis` token. |
 | 8 | `next(t)` arity 1 | ✅ **RESOLVED by ADR 0198** | Was `ArityMismatch`; ADR 0198 relaxed arity (2,2)→(1,2) and HIR synthesizes nil for arg 2. |
 

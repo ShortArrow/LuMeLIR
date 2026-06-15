@@ -4372,12 +4372,28 @@ impl LowerCtx {
             // land in a 16-byte tagged slot. Closure with
             // upvalues is rejected via the existing
             // `ClosureEscapes` analysis.
-            ExprKind::Table(elems) => {
-                let lowered: Vec<HirExpr> = elems
-                    .iter()
-                    .map(|e| self.lower_expr(e))
-                    .collect::<Result<_, _>>()?;
-                for elem in &lowered {
+            ExprKind::Table(fields) => {
+                // ADR 0199 — split fields into positional (initial
+                // table array) and keyed (post-init IndexAssign
+                // pre-statements). Keyed-only or mixed tables are
+                // materialised into a synth local so the
+                // expression's value is `Local(synth_id)` and the
+                // post-init writes run via pending_pre_stmts.
+                let mut positional_lowered: Vec<HirExpr> = Vec::new();
+                let mut keyed_lowered: Vec<(HirExpr, HirExpr)> = Vec::new();
+                for field in fields {
+                    match field {
+                        crate::parser::TableField::Positional(e) => {
+                            positional_lowered.push(self.lower_expr(e)?);
+                        }
+                        crate::parser::TableField::Keyed { key, value } => {
+                            let lk = self.lower_expr(key)?;
+                            let lv = self.lower_expr(value)?;
+                            keyed_lowered.push((lk, lv));
+                        }
+                    }
+                }
+                for elem in &positional_lowered {
                     let k = infer_kind(elem, &self.locals, &self.functions);
                     let elem_ok = matches!(
                         k,
@@ -4396,12 +4412,6 @@ impl LowerCtx {
                             offset: elem.span.start,
                         });
                     }
-                    // Phase 2.5c-full Commit 3c (ADR 0083 supersede 0044):
-                    // closure-with-upvalues no longer escape-rejects
-                    // on table-element insertion. ADR 0074's tagged-
-                    // return rejection stays — its rationale (signature
-                    // erasure on TaggedValue Function payload) is
-                    // independent of the escape concern.
                     if let Some(fid) = function_ref_id(elem, &self.locals) {
                         if self.functions[fid.0]
                             .ret_kinds
@@ -4417,7 +4427,42 @@ impl LowerCtx {
                         }
                     }
                 }
-                HirExprKind::Table(lowered)
+                if keyed_lowered.is_empty() {
+                    HirExprKind::Table(positional_lowered)
+                } else {
+                    // Synth local holds the positional-init table;
+                    // each keyed pair becomes a pre-stmt IndexAssign.
+                    let synth_span = expr.span;
+                    let seq = self.callee_seq;
+                    self.callee_seq += 1;
+                    let synth_name = format!("__tbl_init_{seq}");
+                    let synth_id = self.declare_local(synth_name, ValueKind::Table);
+                    self.pending_pre_stmts.push(HirStmt {
+                        kind: HirStmtKind::LocalInit {
+                            id: synth_id,
+                            value: HirExpr {
+                                kind: HirExprKind::Table(positional_lowered),
+                                span: synth_span,
+                            },
+                        },
+                        span: synth_span,
+                    });
+                    for (k, v) in keyed_lowered {
+                        let kspan = k.span;
+                        self.pending_pre_stmts.push(HirStmt {
+                            kind: HirStmtKind::IndexAssign {
+                                target: HirExpr {
+                                    kind: HirExprKind::Local(synth_id),
+                                    span: synth_span,
+                                },
+                                key: k,
+                                value: v,
+                            },
+                            span: kspan,
+                        });
+                    }
+                    HirExprKind::Local(synth_id)
+                }
             }
             // Phase 2.6a-arr (ADR 0054) / 2.6b-hash (ADR 0058):
             // `target[key]` index read. Number key → array path,

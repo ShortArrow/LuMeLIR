@@ -70,9 +70,11 @@ fn resolve_input(input: Option<&str>) -> Result<(String, PathBuf)> {
 /// synthesis shape.
 fn inject_arg_table_prelude(chunk: &mut Chunk, script_args: &[String]) {
     let zero_span = Span { start: 0, end: 0 };
-    let entries: Vec<Expr> = script_args
+    let entries: Vec<crate::parser::TableField> = script_args
         .iter()
-        .map(|s| Expr::new(ExprKind::Str(s.clone()), zero_span))
+        .map(|s| {
+            crate::parser::TableField::Positional(Expr::new(ExprKind::Str(s.clone()), zero_span))
+        })
         .collect();
     let table = Expr::new(ExprKind::Table(entries), zero_span);
     let arg_stmt = Stmt::new(

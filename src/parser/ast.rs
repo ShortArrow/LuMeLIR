@@ -43,10 +43,14 @@ pub enum ExprKind {
         params: Vec<String>,
         body: Chunk,
     },
-    /// `{ e1, e2, … }` table constructor (Phase 2.6a-min, ADR 0053
-    /// for the empty form; ADR 0054 for the populated array form).
-    /// Trailing comma allowed.
-    Table(Vec<Expr>),
+    /// `{ field1, field2, … }` table constructor (Phase 2.6a-min,
+    /// ADR 0053 for the empty form; ADR 0054 for the populated
+    /// array form; ADR 0199 for keyed forms). Each field is one of
+    /// the three Lua 5.4 §3.4.9 shapes — `Positional(expr)` for
+    /// `e`, `Keyed { key: Str(name), value }` for `name = e`, and
+    /// `Keyed { key, value }` for `[k] = e`. Trailing comma or
+    /// semicolon allowed.
+    Table(Vec<TableField>),
     /// `target[key]` array indexing (Phase 2.6a-arr, ADR 0054).
     /// `target` must be Table-kind, `key` Number-kind. Out-of-
     /// bounds reads trap at runtime.
@@ -67,6 +71,16 @@ pub enum ExprKind {
         method: String,
         args: Vec<Expr>,
     },
+}
+
+/// ADR 0199 — one entry inside a `Table` constructor. Lua 5.4
+/// §3.4.9 has three shapes; the named form `Name = exp` is
+/// represented as `Keyed { key: Str(name), value }` so HIR
+/// downstream sees the same shape for both keyed variants.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableField {
+    Positional(Expr),
+    Keyed { key: Expr, value: Expr },
 }
 
 /// Binary operators. Phase 2.2a covers all arithmetic operators

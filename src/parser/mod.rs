@@ -9,7 +9,7 @@
 mod ast;
 mod error;
 
-pub use ast::{BinOp, Chunk, Expr, ExprKind, Stmt, StmtKind, UnaryOp};
+pub use ast::{BinOp, Chunk, Expr, ExprKind, Stmt, StmtKind, TableField, UnaryOp};
 pub use error::ParseError;
 
 use crate::lexer::{self, Keyword, Span, Token, TokenKind};
@@ -917,34 +917,86 @@ impl<'t> Parser<'t> {
                     }),
                 }
             }
-            // Phase 2.6a-min (ADR 0053) / 2.6a-arr (ADR 0054):
-            // table constructor `{e1, e2, …}` — comma-separated,
-            // trailing comma allowed (Lua 5.4 spec).
+            // Phase 2.6a-min (ADR 0053) / 2.6a-arr (ADR 0054) /
+            // ADR 0199: table constructor with three field shapes.
+            // Comma OR semicolon separator; trailing separator OK.
             TokenKind::LBrace => {
                 self.bump();
-                let mut elems: Vec<Expr> = Vec::new();
+                let mut fields: Vec<TableField> = Vec::new();
                 loop {
                     if matches!(self.peek().kind, TokenKind::RBrace) {
                         let closing = self.bump().clone();
                         let span = Span::new(tok.span.start, closing.span.end);
-                        return Ok(Expr::new(ExprKind::Table(elems), span));
+                        return Ok(Expr::new(ExprKind::Table(fields), span));
                     }
                     if matches!(self.peek().kind, TokenKind::Eof) {
                         return Err(ParseError::UnexpectedEof {
                             offset: self.peek().span.start,
                         });
                     }
-                    elems.push(self.parse_expr(0)?);
+                    // ADR 0199 — field-shape detection:
+                    //   `[` ... `]` `=` ... → Keyed{ key, value }
+                    //   Ident `=` ...        → Keyed{ key: Str, value }
+                    //   otherwise            → Positional
+                    let field = if matches!(self.peek().kind, TokenKind::LBracket) {
+                        self.bump(); // `[`
+                        let key = self.parse_expr(0)?;
+                        match self.peek().kind {
+                            TokenKind::RBracket => {
+                                self.bump();
+                            }
+                            _ => {
+                                let t = self.peek().clone();
+                                return Err(ParseError::UnexpectedToken {
+                                    actual: t.kind,
+                                    offset: t.span.start,
+                                });
+                            }
+                        }
+                        match self.peek().kind {
+                            TokenKind::Equals => {
+                                self.bump();
+                            }
+                            _ => {
+                                let t = self.peek().clone();
+                                return Err(ParseError::UnexpectedToken {
+                                    actual: t.kind,
+                                    offset: t.span.start,
+                                });
+                            }
+                        }
+                        let value = self.parse_expr(0)?;
+                        TableField::Keyed { key, value }
+                    } else if matches!(self.peek().kind, TokenKind::Ident(_))
+                        && matches!(
+                            self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                            Some(TokenKind::Equals)
+                        )
+                    {
+                        // ADR 0199 — named-key sugar `Name = exp` →
+                        // Keyed { Str(Name), exp }.
+                        let ident_tok = self.bump().clone();
+                        let name = if let TokenKind::Ident(n) = &ident_tok.kind {
+                            n.clone()
+                        } else {
+                            unreachable!("matched Ident above");
+                        };
+                        self.bump(); // `=`
+                        let value = self.parse_expr(0)?;
+                        let key = Expr::new(ExprKind::Str(name), ident_tok.span);
+                        TableField::Keyed { key, value }
+                    } else {
+                        TableField::Positional(self.parse_expr(0)?)
+                    };
+                    fields.push(field);
                     match self.peek().kind {
-                        TokenKind::Comma => {
+                        TokenKind::Comma | TokenKind::Semicolon => {
                             self.bump();
-                            // Trailing comma is fine — next iteration
-                            // will see `RBrace` and exit cleanly.
                         }
                         TokenKind::RBrace => {
                             let closing = self.bump().clone();
                             let span = Span::new(tok.span.start, closing.span.end);
-                            return Ok(Expr::new(ExprKind::Table(elems), span));
+                            return Ok(Expr::new(ExprKind::Table(fields), span));
                         }
                         TokenKind::Eof => {
                             return Err(ParseError::UnexpectedEof {
@@ -1326,9 +1378,18 @@ mod tests {
                 params,
                 body: body.into_iter().map(strip_span_stmt).collect(),
             },
-            ExprKind::Table(elems) => {
-                ExprKind::Table(elems.into_iter().map(strip_span_expr).collect())
-            }
+            ExprKind::Table(fields) => ExprKind::Table(
+                fields
+                    .into_iter()
+                    .map(|f| match f {
+                        TableField::Positional(e) => TableField::Positional(strip_span_expr(e)),
+                        TableField::Keyed { key, value } => TableField::Keyed {
+                            key: strip_span_expr(key),
+                            value: strip_span_expr(value),
+                        },
+                    })
+                    .collect(),
+            ),
             ExprKind::Index { target, key } => ExprKind::Index {
                 target: Box::new(strip_span_expr(*target)),
                 key: Box::new(strip_span_expr(*key)),
