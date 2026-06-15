@@ -526,6 +526,11 @@ pub enum FormatSpec {
     HexLower,
     /// ADR 0202 — `%X` uppercase hex, Number argument.
     HexUpper,
+    /// ADR 0203 — `%o` octal, Number argument (f2i + printf `%llo`).
+    Octal,
+    /// ADR 0203 — `%g` general float, Number argument (no f2i;
+    /// passes f64 directly to printf `%g`).
+    GeneralFloat,
 }
 
 /// ADR 0152 — minimum-scope `string.format` specifier parser.
@@ -551,12 +556,15 @@ pub fn parse_format_specifiers(fmt: &str) -> Result<Vec<FormatSpec>, String> {
             // ADR 0202 — hex integer formats.
             b'x' => out.push(FormatSpec::HexLower),
             b'X' => out.push(FormatSpec::HexUpper),
+            // ADR 0203 — octal + general float.
+            b'o' => out.push(FormatSpec::Octal),
+            b'g' => out.push(FormatSpec::GeneralFloat),
             b'%' => {
                 // Literal `%`; consumes no arg.
             }
             other => {
                 return Err(format!(
-                    "unsupported format spec '%{}' (ADR 0152/0202 scope: %d / %f / %s / %x / %X / %%)",
+                    "unsupported format spec '%{}' (ADR 0152/0202/0203 scope: %d / %f / %g / %s / %x / %X / %o / %%)",
                     char::from(other)
                 ));
             }
@@ -5584,7 +5592,10 @@ impl LowerCtx {
                     | FormatSpec::Float
                     // ADR 0202 — hex specs require Number args.
                     | FormatSpec::HexLower
-                    | FormatSpec::HexUpper => ValueKind::Number,
+                    | FormatSpec::HexUpper
+                    // ADR 0203 — octal + general-float specs require Number.
+                    | FormatSpec::Octal
+                    | FormatSpec::GeneralFloat => ValueKind::Number,
                     FormatSpec::Str => ValueKind::String,
                 };
                 if actual != expected_kind {

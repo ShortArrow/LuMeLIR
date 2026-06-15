@@ -10311,6 +10311,13 @@ fn emit_expr<'a, 'c>(
                             b'X' => {
                                 c_fmt.extend_from_slice(b"%llX");
                             }
+                            // ADR 0203 — octal (i64 path) + general float (f64).
+                            b'o' => {
+                                c_fmt.extend_from_slice(b"%llo");
+                            }
+                            b'g' => {
+                                c_fmt.extend_from_slice(b"%g");
+                            }
                             other => {
                                 c_fmt.push(b'%');
                                 c_fmt.push(other);
@@ -10402,9 +10409,9 @@ fn emit_expr<'a, 'c>(
                 while j < bytes.len() {
                     if bytes[j] == b'%' && j + 1 < bytes.len() {
                         match bytes[j + 1] {
-                            // ADR 0202 — `%x` / `%X` join `%d` in
-                            // the f2i + i64 push path.
-                            b'd' | b'x' | b'X' => {
+                            // ADR 0202 / 0203 — `%x` / `%X` / `%o`
+                            // join `%d` in the f2i + i64 push path.
+                            b'd' | b'x' | b'X' | b'o' => {
                                 let f = emit_expr(
                                     context,
                                     block,
@@ -10421,7 +10428,9 @@ fn emit_expr<'a, 'c>(
                                 call_args.push(as_i64);
                                 spec_idx += 1;
                             }
-                            b'f' => {
+                            // ADR 0203 — `%g` joins `%f` in the f64
+                            // direct-push path (no conversion).
+                            b'f' | b'g' => {
                                 let f = emit_expr(
                                     context,
                                     block,

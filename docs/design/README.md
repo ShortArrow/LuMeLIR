@@ -258,6 +258,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0200 — collectgarbage-setpause](0200-collectgarbage-setpause.md) — Lua 5.4 §6.1 `collectgarbage("setpause", n)`: relax arity to (0,2); new `g_gc_pause` mutable global (init 200); ADR 0186 doubling logic uses `g_gc_pause / 100` instead of hardcoded `*2`; resolves bucket D §0186-setpause
 - [0201 — string-reverse](0201-string-reverse.md) — Lua 5.4 §6.4 `string.reverse(s)` byte-wise reversal; new `Builtin::StringReverse` variant routed through ADR 0103's namespace dispatch; resolves one bucket B real gap
 - [0202 — string-format-hex](0202-string-format-hex.md) — `string.format` accepts `%x` / `%X` hex specs; extends ADR 0152's MVP set; another bucket B real gap resolved
+- [0203 — string-format-octal-general-float](0203-string-format-octal-general-float.md) — `string.format` accepts `%o` octal and `%g` general-float specs; same dispatch shape as ADRs 0152/0202
 
 ### Feature Implementation Memos
 
