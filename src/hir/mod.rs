@@ -144,6 +144,20 @@ fn widen_index_for_local_init(value: HirExpr) -> HirExpr {
 /// TAG_TABLE narrow + descriptor extraction for the TaggedValue case.
 /// Idempotent on non-Index targets (single-Ident path, ADR 0055,
 /// is preserved without change).
+/// ADR 0208 — recognise `math.<name>` constant identifiers and
+/// return the f64 value. Used by HIR's `ExprKind::Index` lowering
+/// arm to short-circuit before the namespace-Table resolver
+/// rejects `math` as an undefined ident. Lua 5.4 §6.7 names the
+/// constants here; `maxinteger` / `mininteger` are deferred to
+/// the ADR 0196 Integer/Float arc.
+fn math_constant_value(name: &str) -> Option<f64> {
+    match name {
+        "pi" => Some(std::f64::consts::PI),
+        "huge" => Some(f64::INFINITY),
+        _ => None,
+    }
+}
+
 fn widen_index_for_assign_target(target: HirExpr) -> HirExpr {
     match target.kind {
         HirExprKind::Index { target: t, key } => HirExpr {
@@ -4496,6 +4510,24 @@ impl LowerCtx {
             // String key → hash path. Codegen dispatches on the
             // key's static kind.
             ExprKind::Index { target, key } => {
+                // ADR 0208 — recognise `math.pi` / `math.huge` constant
+                // access shapes before invoking the namespace-Table
+                // resolver. The `math` name is otherwise an unresolved
+                // ident in HIR (only `math.<method>(args)` Call form
+                // dispatches through `Builtin::from_namespace_method`).
+                if let ExprKind::Ident(ns) = &target.kind
+                    && self.resolve(ns).is_none()
+                    && !self.function_names.contains_key(ns.as_str())
+                    && ns == "math"
+                    && let ExprKind::Str(name) = &key.kind
+                {
+                    if let Some(value) = math_constant_value(name) {
+                        return Ok(HirExpr {
+                            kind: HirExprKind::Number(value),
+                            span: expr.span,
+                        });
+                    }
+                }
                 let target_hir = self.lower_expr(target)?;
                 // Phase 2.6+-nested-index-assign-widen (ADR 0095):
                 // when the target is itself an Index (nested read
