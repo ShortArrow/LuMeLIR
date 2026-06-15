@@ -249,6 +249,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0191 — rust-lua-bridge-mvp](0191-rust-lua-bridge-mvp.md) — Rust-Lua Bridge MVP: `rust.add(a, b)` namespace dispatch + `build.rs` compiles `src/bridge_runtime.rs` to a bundled object + `cc` link integration; satisfies ADR 0189 §1 close criterion (Bridge end-to-end)
 - [0192 — embedded-register-ops-entry](0192-embedded-register-ops-entry.md) — Embedded register-ops dialect entry decision (decision-only; pins abstract MVP surface volatile load/store + bit-field rmw; target selection deferred until embedded user emerges); satisfies ADR 0189 §2 close criterion
 - [0193 — phase4-entry-criteria](0193-phase4-entry-criteria.md) — Phase 4 entry / scope freeze (post-PRD completeness + optimisation): enumerates workstreams (PRD §7 perf + binary-size metrics, epilogue items, Bridge sub-pieces, Embedded impl) and ordering; benchmark harness identified as first Phase 4 implementation ADR
+- [0194 — benchmark-harness-mvp](0194-benchmark-harness-mvp.md) — Phase 4 benchmark harness MVP: recursive `fib(30)` micro-benchmark with LuMeLIR-vs-LuaJIT wall-clock comparison (median of 5 iterations, ratio reported, no perf assertion); satisfies ADR 0193 §Ordering §1
 
 ### Feature Implementation Memos
 
