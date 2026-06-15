@@ -259,6 +259,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0201 — string-reverse](0201-string-reverse.md) — Lua 5.4 §6.4 `string.reverse(s)` byte-wise reversal; new `Builtin::StringReverse` variant routed through ADR 0103's namespace dispatch; resolves one bucket B real gap
 - [0202 — string-format-hex](0202-string-format-hex.md) — `string.format` accepts `%x` / `%X` hex specs; extends ADR 0152's MVP set; another bucket B real gap resolved
 - [0203 — string-format-octal-general-float](0203-string-format-octal-general-float.md) — `string.format` accepts `%o` octal and `%g` general-float specs; same dispatch shape as ADRs 0152/0202
+- [0204 — string-format-scientific-char](0204-string-format-scientific-char.md) — `string.format` accepts `%e` scientific and `%c` char specs
 
 ### Feature Implementation Memos
 
