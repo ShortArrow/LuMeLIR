@@ -10302,6 +10302,15 @@ fn emit_expr<'a, 'c>(
                             b'd' => {
                                 c_fmt.extend_from_slice(b"%lld");
                             }
+                            // ADR 0202 — hex formats: pass through
+                            // as `%llx` / `%llX` since args arrive
+                            // as i64 (post-f2i in the per-arg loop).
+                            b'x' => {
+                                c_fmt.extend_from_slice(b"%llx");
+                            }
+                            b'X' => {
+                                c_fmt.extend_from_slice(b"%llX");
+                            }
                             other => {
                                 c_fmt.push(b'%');
                                 c_fmt.push(other);
@@ -10393,7 +10402,9 @@ fn emit_expr<'a, 'c>(
                 while j < bytes.len() {
                     if bytes[j] == b'%' && j + 1 < bytes.len() {
                         match bytes[j + 1] {
-                            b'd' => {
+                            // ADR 0202 — `%x` / `%X` join `%d` in
+                            // the f2i + i64 push path.
+                            b'd' | b'x' | b'X' => {
                                 let f = emit_expr(
                                     context,
                                     block,

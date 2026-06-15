@@ -521,6 +521,11 @@ pub enum FormatSpec {
     /// `%s` — String argument; codegen passes the boxed-object data
     /// ptr to printf `%s`.
     Str,
+    /// ADR 0202 — `%x` lowercase hex, Number argument. Codegen
+    /// converts to i64 (`f2i`) and passes to printf `%llx`.
+    HexLower,
+    /// ADR 0202 — `%X` uppercase hex, Number argument.
+    HexUpper,
 }
 
 /// ADR 0152 — minimum-scope `string.format` specifier parser.
@@ -543,12 +548,15 @@ pub fn parse_format_specifiers(fmt: &str) -> Result<Vec<FormatSpec>, String> {
             b'd' => out.push(FormatSpec::Decimal),
             b'f' => out.push(FormatSpec::Float),
             b's' => out.push(FormatSpec::Str),
+            // ADR 0202 — hex integer formats.
+            b'x' => out.push(FormatSpec::HexLower),
+            b'X' => out.push(FormatSpec::HexUpper),
             b'%' => {
                 // Literal `%`; consumes no arg.
             }
             other => {
                 return Err(format!(
-                    "unsupported format spec '%{}' (ADR 0152 scope: %d / %f / %s / %%)",
+                    "unsupported format spec '%{}' (ADR 0152/0202 scope: %d / %f / %s / %x / %X / %%)",
                     char::from(other)
                 ));
             }
@@ -5572,7 +5580,11 @@ impl LowerCtx {
                     });
                 }
                 let expected_kind = match spec {
-                    FormatSpec::Decimal | FormatSpec::Float => ValueKind::Number,
+                    FormatSpec::Decimal
+                    | FormatSpec::Float
+                    // ADR 0202 — hex specs require Number args.
+                    | FormatSpec::HexLower
+                    | FormatSpec::HexUpper => ValueKind::Number,
                     FormatSpec::Str => ValueKind::String,
                 };
                 if actual != expected_kind {
