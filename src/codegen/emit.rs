@@ -10299,7 +10299,8 @@ fn emit_expr<'a, 'c>(
                 while i < bytes.len() {
                     if bytes[i] == b'%' && i + 1 < bytes.len() {
                         match bytes[i + 1] {
-                            b'd' => {
+                            // ADR 0205 — `%i` aliases `%d` → `%lld`.
+                            b'd' | b'i' => {
                                 c_fmt.extend_from_slice(b"%lld");
                             }
                             // ADR 0202 — hex formats: pass through
@@ -10416,11 +10417,10 @@ fn emit_expr<'a, 'c>(
                 while j < bytes.len() {
                     if bytes[j] == b'%' && j + 1 < bytes.len() {
                         match bytes[j + 1] {
-                            // ADR 0202 / 0203 / 0204 — `%x` / `%X` /
-                            // `%o` / `%c` join `%d` in the f2i + i64
-                            // push path. `%c` reads the i64 as a
-                            // char code (printf does the truncation).
-                            b'd' | b'x' | b'X' | b'o' | b'c' => {
+                            // ADR 0202 / 0203 / 0204 / 0205 —
+                            // `%x` / `%X` / `%o` / `%c` / `%i` join
+                            // `%d` in the f2i + i64 push path.
+                            b'd' | b'i' | b'x' | b'X' | b'o' | b'c' => {
                                 let f = emit_expr(
                                     context,
                                     block,

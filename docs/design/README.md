@@ -260,6 +260,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0202 — string-format-hex](0202-string-format-hex.md) — `string.format` accepts `%x` / `%X` hex specs; extends ADR 0152's MVP set; another bucket B real gap resolved
 - [0203 — string-format-octal-general-float](0203-string-format-octal-general-float.md) — `string.format` accepts `%o` octal and `%g` general-float specs; same dispatch shape as ADRs 0152/0202
 - [0204 — string-format-scientific-char](0204-string-format-scientific-char.md) — `string.format` accepts `%e` scientific and `%c` char specs
+- [0205 — string-format-i-alias](0205-string-format-i-alias.md) — `%i` C99 alias for `%d` in `string.format`; pure alias, no new variant
 
 ### Feature Implementation Memos
 

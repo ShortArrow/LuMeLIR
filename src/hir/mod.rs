@@ -554,7 +554,9 @@ pub fn parse_format_specifiers(fmt: &str) -> Result<Vec<FormatSpec>, String> {
             return Err("dangling '%' at end of format string".to_owned());
         }
         match bytes[i + 1] {
-            b'd' => out.push(FormatSpec::Decimal),
+            // ADR 0205 — `%i` C99-style alias for `%d`. Both lower
+            // to FormatSpec::Decimal; codegen path identical.
+            b'd' | b'i' => out.push(FormatSpec::Decimal),
             b'f' => out.push(FormatSpec::Float),
             b's' => out.push(FormatSpec::Str),
             // ADR 0202 — hex integer formats.
@@ -571,7 +573,7 @@ pub fn parse_format_specifiers(fmt: &str) -> Result<Vec<FormatSpec>, String> {
             }
             other => {
                 return Err(format!(
-                    "unsupported format spec '%{}' (ADR 0152/0202/0203/0204 scope: %d / %f / %g / %e / %s / %c / %x / %X / %o / %%)",
+                    "unsupported format spec '%{}' (ADR 0152/0202/0203/0204/0205 scope: %d / %i / %f / %g / %e / %s / %c / %x / %X / %o / %%)",
                     char::from(other)
                 ));
             }
