@@ -458,22 +458,29 @@ pub(crate) fn emit_gc_alloc<'a, 'c>(
     {
         emit_libc_call_void(context, &gc_then_blk, "gc_mark", &[], loc);
         emit_libc_call_void(context, &gc_then_blk, "gc_sweep", &[], loc);
-        // Threshold doubling: if post_sweep_total * 2 > current
-        // threshold, raise threshold to min(post_sweep_total * 2,
-        // GC_THRESHOLD_CAP).
+        // ADR 0200 — threshold doubling uses `g_gc_pause / 100` as
+        // the multiplier (was hardcoded `*2` in ADR 0186). Default
+        // pause = 200 (Lua 5.4) → identical 2.0× behaviour.
         let bytes_addr_post = emit_addressof(context, &gc_then_blk, "g_gc_total_bytes", types, loc);
         let post_sweep = emit_load(&gc_then_blk, bytes_addr_post, types.i64, loc);
-        let two_const = gc_then_blk
+        let pause_addr = emit_addressof(context, &gc_then_blk, "g_gc_pause", types, loc);
+        let pause = emit_load(&gc_then_blk, pause_addr, types.i64, loc);
+        let mul: Value<'c, '_> = gc_then_blk
+            .append_operation(arith::muli(post_sweep, pause, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let hundred_const = gc_then_blk
             .append_operation(arith::constant(
                 context,
-                IntegerAttribute::new(types.i64, 2).into(),
+                IntegerAttribute::new(types.i64, 100).into(),
                 loc,
             ))
             .result(0)
             .unwrap()
             .into();
         let doubled: Value<'c, '_> = gc_then_blk
-            .append_operation(arith::muli(post_sweep, two_const, loc))
+            .append_operation(arith::divsi(mul, hundred_const, loc))
             .result(0)
             .unwrap()
             .into();

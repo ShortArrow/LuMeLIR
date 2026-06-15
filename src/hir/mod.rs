@@ -5338,9 +5338,8 @@ impl LowerCtx {
             }
         }
         // ADR 0157 — collectgarbage option validation. 0-arg form is
-        // OK. 1-arg form must be the static String literal `"count"`;
-        // other options (`"stop"` / `"restart"` / `"step"` /
-        // `"setpause"` / `"setstepmul"` / etc.) reject.
+        // OK. 1-arg form must be the static String literal `"count"`.
+        // ADR 0200 — 2-arg form: ("setpause", Number).
         if matches!(builtin, Builtin::CollectGarbage) && lowered_args.len() == 1 {
             match &lowered_args[0].kind {
                 HirExprKind::Str(s) if s == "count" => {}
@@ -5360,6 +5359,30 @@ impl LowerCtx {
                         offset: lowered_args[0].span.start,
                     });
                 }
+            }
+        }
+        if matches!(builtin, Builtin::CollectGarbage) && lowered_args.len() == 2 {
+            // ADR 0200 — only "setpause" (Lua spec subset).
+            let opt_ok = matches!(
+                &lowered_args[0].kind,
+                HirExprKind::Str(s) if s == "setpause"
+            );
+            if !opt_ok {
+                return Err(HirError::TypeMismatch {
+                    op: "collectgarbage".to_owned(),
+                    lhs_kind: "\"setpause\" (ADR 0200 scope)".to_owned(),
+                    rhs_kind: format!("{:?}", lowered_args[0].kind),
+                    offset: lowered_args[0].span.start,
+                });
+            }
+            let val_kind = infer_kind(&lowered_args[1], &self.locals, &self.functions);
+            if !matches!(val_kind, ValueKind::Number) {
+                return Err(HirError::TypeMismatch {
+                    op: "collectgarbage(\"setpause\", _)".to_owned(),
+                    lhs_kind: "number".to_owned(),
+                    rhs_kind: val_kind.name().to_owned(),
+                    offset: lowered_args[1].span.start,
+                });
             }
         }
         Ok(HirExprKind::Call {

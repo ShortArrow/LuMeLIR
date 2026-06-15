@@ -17,7 +17,7 @@ Each probable item from leftover-roadmap.md §D was probed via one-shot e2e. Res
 | `table.remove(t, pos)` arity-2 | 0118 | ✅ **既実装** | `table.remove(t, 2)` returns the removed element + shifts. |
 | `__tostring` chain (consulted by `tostring()` builtin) | 0142 | ❌ **未実装** | `local mt={}; mt.__tostring=function() return "wrap" end; setmetatable(t, mt); print(tostring(t))` → `"table"` (not `"wrap"`). `tostring()` builtin doesn't consult metamethod. |
 | `__concat` metamethod fallback | 0143 | ❌ **未実装** | `t .. "x"` with `mt.__concat` set → `TypeMismatch op=".." lhs="matching kinds" rhs="table vs string"`. HIR kind-checks `..` BEFORE metamethod dispatch. |
-| `collectgarbage("setpause", n)` | 0186 | ❌ **未実装** | `ArityMismatch { builtin: "collectgarbage", expected: 0, actual: 2 }`. Builtin arity is `(0, 1)`. |
+| `collectgarbage("setpause", n)` | 0186 | ✅ **RESOLVED by ADR 0200** | Arity (0,1)→(0,2); g_gc_pause mutable global init 200; doubling uses g_gc_pause/100. |
 
 ## Verdict
 

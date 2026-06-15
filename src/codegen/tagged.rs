@@ -90,6 +90,10 @@ pub(crate) const GC_HEADER_OFF_NEXT: i64 = 8;
 pub(crate) const GC_THRESHOLD_INIT: i64 = 1_048_576; // 1 MiB
 pub(crate) const GC_THRESHOLD_CAP: i64 = 1_073_741_824; // 1 GiB
 
+/// ADR 0200 — `g_gc_pause` initial value (Lua 5.4 default: 200).
+/// Acts as a percentage; doubling logic uses `g_gc_pause / 100`.
+pub(crate) const GC_PAUSE_INIT: i64 = 200;
+
 /// ADR 0185 — v1 mark colour values stored in
 /// `*(obj + GC_HEADER_OFF_MARK)`. Mark phase sets BLACK; sweep
 /// resets BLACK → WHITE for the next cycle. GREY is reserved

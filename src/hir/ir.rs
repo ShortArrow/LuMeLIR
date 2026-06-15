@@ -750,7 +750,8 @@ impl Builtin {
             Builtin::RawEqual => (2, 2),
             Builtin::RawLen => (1, 1),
             // ADR 0157 — collectgarbage() / collectgarbage("count").
-            Builtin::CollectGarbage => (0, 1),
+            // ADR 0200 — collectgarbage("setpause", n) → arity widens to (0, 2).
+            Builtin::CollectGarbage => (0, 2),
             Builtin::MathSqrt | Builtin::MathFloor | Builtin::MathAbs => (1, 1),
             Builtin::MathPow => (2, 2),
             Builtin::MathSin | Builtin::MathCos | Builtin::MathLog | Builtin::MathExp => (1, 1),

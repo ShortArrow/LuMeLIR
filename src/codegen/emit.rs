@@ -46,10 +46,10 @@ use super::primitive::{
 };
 use super::tagged::{
     ARRAY_ELEM_OFF_VALUE, ARRAY_ELEM_SIZE, GC_HEADER_OFF_MARK, GC_HEADER_OFF_NEXT,
-    GC_HEADER_OFF_SIZE, GC_HEADER_SIZE, GC_MARK_BLACK, GC_MARK_WHITE, GC_THRESHOLD_INIT,
-    GC_TYPE_ARRAY_BUF, GC_TYPE_HASH_BUF, GC_TYPE_SCRATCH_BUF, GC_TYPE_TABLE, HashKeyValidityPolicy,
-    TAG_BOOL, TAG_DELETED, TAG_FUNCTION, TAG_NIL, TAG_NUMBER, TAG_STRING, TAG_TABLE,
-    TaggedArithOperandPlan, emit_alloca_slot_for_kind, emit_print_tagged_local,
+    GC_HEADER_OFF_SIZE, GC_HEADER_SIZE, GC_MARK_BLACK, GC_MARK_WHITE, GC_PAUSE_INIT,
+    GC_THRESHOLD_INIT, GC_TYPE_ARRAY_BUF, GC_TYPE_HASH_BUF, GC_TYPE_SCRATCH_BUF, GC_TYPE_TABLE,
+    HashKeyValidityPolicy, TAG_BOOL, TAG_DELETED, TAG_FUNCTION, TAG_NIL, TAG_NUMBER, TAG_STRING,
+    TAG_TABLE, TaggedArithOperandPlan, emit_alloca_slot_for_kind, emit_print_tagged_local,
     emit_tag_and_payload_ptr, emit_tagged_eq_local_local, emit_tagged_unknown_tag_trap,
     emit_type_tagged_local, emit_value_slot_check_number, emit_value_slot_store_dispatched,
     emit_value_slot_store_nil, emit_value_slot_store_number, emit_value_slot_store_table,
@@ -896,6 +896,10 @@ fn emit_fmt_global<'c>(
         GC_THRESHOLD_INIT,
         loc,
     );
+    // ADR 0200 — collectgarbage("setpause", n) configurable
+    // doubling multiplier. Default 200 → behaviour unchanged from
+    // ADR 0186 (200/100 = 2.0×).
+    emit_mutable_i64_global(context, module, types, "g_gc_pause", GC_PAUSE_INIT, loc);
     register_gc_runtime_funcs(context, module, types, loc);
 }
 
@@ -11586,6 +11590,37 @@ fn emit_expr<'a, 'c>(
                         .unwrap()
                         .into();
                     return Ok(delta_f64);
+                }
+                // ADR 0200 — 2-arg form: ("setpause", n). Load the
+                // previous g_gc_pause, store the new value, return
+                // the previous as f64 per Lua 5.4 §6.1.
+                if args.len() == 2 {
+                    let pause_addr = emit_addressof(context, block, "g_gc_pause", types, loc);
+                    let prev_i64 = emit_load(block, pause_addr, types.i64, loc);
+                    let new_f64 = emit_expr(
+                        context,
+                        block,
+                        &args[1],
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
+                    )?;
+                    let new_i64: Value<'c, '_> = block
+                        .append_operation(arith::fptosi(new_f64, types.i64, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    emit_store(block, new_i64, pause_addr, loc);
+                    let prev_f64: Value<'c, '_> = block
+                        .append_operation(arith::sitofp(prev_i64, types.f64, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    return Ok(prev_f64);
                 }
                 let bytes_addr = emit_addressof(context, block, "g_gc_total_bytes", types, loc);
                 let bytes_i64 = emit_load(block, bytes_addr, types.i64, loc);
