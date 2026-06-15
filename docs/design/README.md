@@ -255,6 +255,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0197 — integer-literal-token-additive](0197-integer-literal-token-additive.md) — Integer/Float Phase A additive: lexer adds `TokenKind::Integer(i64)` distinguishing `42`/`0xFF` from `42.0`/`1e5`; parser silently demotes to existing f64 path so 1431 tests stay green; first implementation step of ADR 0196 arc
 - [0198 — next-arity-1](0198-next-arity-1.md) — `next(t)` arity 1 per Lua 5.4 §6.1: `Builtin::Next` arity (2,2) → (1,2); HIR synthesizes nil for arg 2 when omitted; resolves bucket E §E8 from the leftover roadmap
 - [0199 — table-constructor-keyed-fields](0199-table-constructor-keyed-fields.md) — Lua 5.4 §3.4.9 bracket-key `{[k]=v}` and named-key `{name=v}` table constructor field forms; AST/HIR `TableField` enum; keyed fields desugar via IndexAssign pre-statements; resolves bucket E §E6 from the leftover roadmap
+- [0200 — collectgarbage-setpause](0200-collectgarbage-setpause.md) — Lua 5.4 §6.1 `collectgarbage("setpause", n)`: relax arity to (0,2); new `g_gc_pause` mutable global (init 200); ADR 0186 doubling logic uses `g_gc_pause / 100` instead of hardcoded `*2`; resolves bucket D §0186-setpause
 
 ### Feature Implementation Memos
 
