@@ -740,7 +740,8 @@ impl Builtin {
             // ADR 0030 / 0051: assert(v) or assert(v, msg).
             Builtin::Assert => (1, 2),
             Builtin::Error => (1, 1),
-            Builtin::Next => (2, 2),
+            // ADR 0198 — Lua 5.4 §6.1: next(table [, index]); arg 2 defaults to nil.
+            Builtin::Next => (1, 2),
             // ADR 0134 — metatables global builtins.
             Builtin::SetMetatable => (2, 2),
             Builtin::GetMetatable => (1, 1),

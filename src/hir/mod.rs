@@ -5039,10 +5039,20 @@ impl LowerCtx {
                 offset: whole.span.start,
             });
         }
-        let lowered_args = args
+        let mut lowered_args = args
             .iter()
             .map(|a| self.lower_expr(a))
             .collect::<Result<Vec<_>, _>>()?;
+        // ADR 0198 — `next(t)` defaults arg 2 to nil per Lua 5.4
+        // §6.1. Synth Nil so downstream validation / codegen see the
+        // same shape as explicit `next(t, nil)`.
+        if matches!(builtin, Builtin::Next) && lowered_args.len() == 1 {
+            let span = whole.span;
+            lowered_args.push(HirExpr {
+                kind: HirExprKind::Nil,
+                span,
+            });
+        }
         // ADR 0179 — materialise non-Local TaggedValue source at the
         // RawGet / RawSet builtin-arg positions into synth Locals
         // before validation sees them. Keeps codegen oblivious of
