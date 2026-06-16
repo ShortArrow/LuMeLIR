@@ -185,6 +185,10 @@ fn function_ref_id(expr: &HirExpr, locals: &[LocalInfo]) -> Option<FuncId> {
 pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction]) -> ValueKind {
     match &expr.kind {
         HirExprKind::Number(_) => ValueKind::Number,
+        // ADR 0209 Phase B silent demotion — Integer infers as
+        // Number so the 125 ValueKind::Number consumers stay
+        // untouched. ADR 0210+ lifts this.
+        HirExprKind::Integer(_) => ValueKind::Number,
         HirExprKind::Bool(_) => ValueKind::Bool,
         HirExprKind::Nil => ValueKind::Nil,
         HirExprKind::Str(_) => ValueKind::String,
@@ -4056,6 +4060,8 @@ impl LowerCtx {
     fn lower_expr(&mut self, expr: &Expr) -> Result<HirExpr, HirError> {
         let kind = match &expr.kind {
             ExprKind::Number(n) => HirExprKind::Number(*n),
+            // ADR 0209 Phase B opt-in — preserve integer info at HIR.
+            ExprKind::Integer(i) => HirExprKind::Integer(*i),
             ExprKind::Str(s) => HirExprKind::Str(s.clone()),
             ExprKind::Ident(name) => match self.resolve(name) {
                 Some(id) => HirExprKind::Local(id),
@@ -5900,6 +5906,8 @@ fn check_method_receiver_shape(expr: &Expr) -> Result<(), HirError> {
             check_method_receiver_shape(key)
         }
         ExprKind::Number(_)
+        // ADR 0209 — Integer literal joins Number in the allowed set.
+        | ExprKind::Integer(_)
         | ExprKind::Str(_)
         | ExprKind::Bool(_)
         | ExprKind::Nil
@@ -5943,7 +5951,8 @@ mod tests {
             HirExprKind::Call { callee, args } => {
                 assert!(matches!(callee, Callee::Builtin(Builtin::Print)));
                 assert_eq!(args.len(), 1);
-                assert!(matches!(args[0].kind, HirExprKind::Number(42.0)));
+                // ADR 0209 — Phase B: integer literal preserved at HIR.
+                assert!(matches!(args[0].kind, HirExprKind::Integer(42)));
             }
             other => panic!("expected Call, got {other:?}"),
         }
@@ -6005,7 +6014,7 @@ mod tests {
             panic!("expected Assign, got {:?}", hir.stmts[1].kind);
         };
         assert_eq!(*id, LocalId(0));
-        assert!(matches!(value.kind, HirExprKind::Number(2.0)));
+        assert!(matches!(value.kind, HirExprKind::Integer(2)));
     }
 
     #[test]
@@ -6556,9 +6565,11 @@ local f = function() return b end";
         else {
             panic!("expected ForNumeric, got {:?}", hir.stmts[0].kind);
         };
-        assert!(matches!(start.kind, HirExprKind::Number(1.0)));
-        assert!(matches!(stop.kind, HirExprKind::Number(3.0)));
-        // Implicit step → synthesised Number(1.0).
+        // ADR 0209 — Phase B: source-integer 1 / 3 preserve i64 at HIR.
+        assert!(matches!(start.kind, HirExprKind::Integer(1)));
+        assert!(matches!(stop.kind, HirExprKind::Integer(3)));
+        // Implicit step → synthesised Number(1.0) (HIR-generated,
+        // not source). Stays as Number.
         assert!(matches!(step.kind, HirExprKind::Number(1.0)));
         assert_eq!(body.len(), 1);
     }

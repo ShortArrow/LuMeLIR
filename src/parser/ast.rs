@@ -17,6 +17,13 @@ impl Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
     Number(f64),
+    /// ADR 0209 — integer-syntax literal preserved at AST level
+    /// (Phase B of the ADR 0196 Integer/Float arc). HIR will lower
+    /// to a matching `HirExprKind::Integer(i64)`; `infer_kind`
+    /// returns `ValueKind::Number` for Phase B silent demotion so
+    /// existing codegen + 125 `ValueKind::Number` consumers stay
+    /// untouched. ADR 0210+ lifts the demotion at the kind layer.
+    Integer(i64),
     /// String literal, escapes already processed by the lexer
     /// (Phase 2.7a, ADR 0024).
     Str(String),

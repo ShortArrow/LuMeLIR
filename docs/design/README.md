@@ -264,6 +264,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0206 — benchmark-string-concat](0206-benchmark-string-concat.md) — second micro-benchmark in the ADR 0194 harness: `..` in a 200-iter loop; LuMeLIR observed 0.44x faster than LuaJIT (startup-amortized); consumes one bucket C item from ADR 0194 §Future work
 - [0207 — benchmark-table-ops](0207-benchmark-table-ops.md) — third micro-benchmark: `table.insert` + sum loop over N=500; LuMeLIR 0.48x faster than LuaJIT; closes ADR 0194 §Future work table-ops item
 - [0208 — math-constants](0208-math-constants.md) — `math.pi` / `math.huge` numeric constants recognised by HIR Index lowering's namespace short-circuit; composes with arithmetic + print paths without runtime change
+- [0209 — integer-ast-hir-variant](0209-integer-ast-hir-variant.md) — Phase B opt-in of ADR 0196 Integer/Float arc: AST `ExprKind::Integer(i64)` + HIR `HirExprKind::Integer(i64)`; `infer_kind` returns `ValueKind::Number` (silent demotion at kind layer); codegen emits `i64 const + sitofp` to demote at leaf. First implementation step of milestone M1.
 
 ### Feature Implementation Memos
 

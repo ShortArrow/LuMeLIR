@@ -209,6 +209,13 @@ pub struct HirExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HirExprKind {
     Number(f64),
+    /// ADR 0209 — integer-syntax literal preserved at HIR. Phase B
+    /// silent demotion: `infer_kind` returns `ValueKind::Number`
+    /// so the 125-site `ValueKind::Number` consumer surface is
+    /// untouched; codegen emits `arith::sitofp(i64, f64)` to keep
+    /// downstream f64 paths working. ADR 0210+ lifts the demotion
+    /// at the kind layer by introducing `ValueKind::Integer`.
+    Integer(i64),
     /// String literal. Codegen materialises each unique payload as
     /// an `llvm.mlir.global` and emits an `addressof` at every use
     /// site. Phase 2.7a (ADR 0024).

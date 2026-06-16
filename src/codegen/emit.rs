@@ -8539,6 +8539,28 @@ fn emit_expr<'a, 'c>(
             );
             Ok(block.append_operation(op).result(0).unwrap().into())
         }
+        // ADR 0209 Phase B silent demotion — Integer literal emits
+        // as i64 constant then sitofp to f64 so downstream f64
+        // consumers stay untouched. ADR 0210+ lifts the demotion
+        // by emitting i64 directly where Integer flows through
+        // Integer-aware ops.
+        HirExprKind::Integer(i) => {
+            let i64_const = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, *i).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let as_f64 = block
+                .append_operation(arith::sitofp(i64_const, types.f64, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            Ok(as_f64)
+        }
         HirExprKind::Bool(b) => {
             let attr = IntegerAttribute::new(types.i1, i64::from(*b));
             let op = arith::constant(context, attr.into(), loc);
@@ -20089,9 +20111,13 @@ print(v)",
         let ctx = new_context();
         let module = emit_module(&ctx, &lower_src("print(42)")).unwrap();
         let mlir = module.as_operation().to_string();
+        // ADR 0209 — Phase B: `print(42)` lowers to
+        // `HirExprKind::Integer(42)`; codegen emits an i64 constant
+        // followed by sitofp to f64. The f64 constant disappears
+        // from the IR (was 4.200000e+01 in Phase A).
         assert!(
-            mlir.contains("arith.constant 4.200000e+01"),
-            "expected arith.constant 42.0, got:\n{mlir}"
+            mlir.contains("arith.constant 42 : i64") && mlir.contains("arith.sitofp"),
+            "expected i64 42 constant + sitofp demotion, got:\n{mlir}"
         );
     }
 

@@ -866,12 +866,13 @@ impl<'t> Parser<'t> {
                 self.bump();
                 Ok(Expr::new(ExprKind::Number(value), tok.span))
             }
-            // ADR 0197 Phase A — integer-syntax literal demotes to
-            // f64 via `as` cast. ADR 0198 lifts this by introducing
-            // a dedicated `ExprKind::Integer`.
+            // ADR 0209 Phase B opt-in — integer-syntax literals
+            // route to ExprKind::Integer(i64), preserving full i64
+            // precision through the AST. HIR lowers to
+            // HirExprKind::Integer; codegen demotes via sitofp.
             TokenKind::Integer(value) => {
                 self.bump();
-                Ok(Expr::new(ExprKind::Number(value as f64), tok.span))
+                Ok(Expr::new(ExprKind::Integer(value), tok.span))
             }
             TokenKind::Str(ref s) => {
                 self.bump();
@@ -1346,8 +1347,22 @@ mod tests {
         Ok(chunk.into_iter().next().unwrap())
     }
 
+    /// ADR 0209 — currently unused. Was the default literal helper
+    /// for parser tests; after Phase B all whole-number test inputs
+    /// migrated to `integer()`. Retained for fractional-literal tests
+    /// when those are added.
+    #[allow(dead_code)]
     fn number(v: f64) -> Expr {
         Expr::new(ExprKind::Number(v), Span::new(0, 0))
+    }
+
+    /// ADR 0209 — test helper for integer-syntax literals. Most
+    /// existing parser tests pass whole-number sources (`42`,
+    /// `1`, `2`); under Phase B these now parse as
+    /// `ExprKind::Integer(N)` not `ExprKind::Number(N.0)`. Tests
+    /// migrated to `integer(N)` for source-fidelity.
+    fn integer(v: i64) -> Expr {
+        Expr::new(ExprKind::Integer(v), Span::new(0, 0))
     }
 
     fn ident(name: &str) -> Expr {
@@ -1357,6 +1372,8 @@ mod tests {
     fn strip_span_expr(expr: Expr) -> Expr {
         let kind = match expr.kind {
             ExprKind::Number(v) => ExprKind::Number(v),
+            // ADR 0209 — Integer preserved through span strip.
+            ExprKind::Integer(v) => ExprKind::Integer(v),
             ExprKind::Str(s) => ExprKind::Str(s),
             ExprKind::Bool(b) => ExprKind::Bool(b),
             ExprKind::Nil => ExprKind::Nil,
@@ -1539,8 +1556,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_integer_literal_yields_number_expr() {
-        assert_eq!(parse_single_expr("42").unwrap(), ExprKind::Number(42.0));
+    fn parse_integer_literal_yields_integer_expr() {
+        // ADR 0209 — Phase B: integer-syntax literals route to
+        // ExprKind::Integer(i64). HIR demotes to Number for the
+        // 125 ValueKind::Number consumer surface (Phase B silent
+        // demotion); codegen emits sitofp.
+        assert_eq!(parse_single_expr("42").unwrap(), ExprKind::Integer(42));
     }
 
     #[test]
@@ -1558,8 +1579,8 @@ mod tests {
             kind,
             ExprKind::BinOp {
                 op: BinOp::Add,
-                lhs: Box::new(number(1.0)),
-                rhs: Box::new(number(2.0)),
+                lhs: Box::new(integer(1)),
+                rhs: Box::new(integer(2)),
             },
         );
     }
@@ -1574,12 +1595,12 @@ mod tests {
                 lhs: Box::new(Expr::new(
                     ExprKind::BinOp {
                         op: BinOp::Add,
-                        lhs: Box::new(number(1.0)),
-                        rhs: Box::new(number(2.0)),
+                        lhs: Box::new(integer(1)),
+                        rhs: Box::new(integer(2)),
                     },
                     Span::new(0, 0),
                 )),
-                rhs: Box::new(number(3.0)),
+                rhs: Box::new(integer(3)),
             },
         );
     }
@@ -1603,7 +1624,7 @@ mod tests {
             kind,
             ExprKind::Call {
                 callee: Box::new(ident("print")),
-                args: vec![number(42.0)],
+                args: vec![integer(42)],
             },
         );
     }
@@ -1618,8 +1639,8 @@ mod tests {
                 args: vec![Expr::new(
                     ExprKind::BinOp {
                         op: BinOp::Add,
-                        lhs: Box::new(number(1.0)),
-                        rhs: Box::new(number(2.0)),
+                        lhs: Box::new(integer(1)),
+                        rhs: Box::new(integer(2)),
                     },
                     Span::new(0, 0),
                 )],
@@ -1667,7 +1688,7 @@ mod tests {
             stripped.kind,
             StmtKind::Local {
                 name: "x".to_owned(),
-                value: number(1.0),
+                value: integer(1),
             },
         );
     }
@@ -1681,7 +1702,7 @@ mod tests {
             stripped[0].kind,
             StmtKind::Local {
                 name: "x".to_owned(),
-                value: number(1.0),
+                value: integer(1),
             },
         );
         match &stripped[1].kind {
@@ -1724,7 +1745,7 @@ mod tests {
             stripped.kind,
             StmtKind::Assign {
                 name: "x".to_owned(),
-                value: number(2.0),
+                value: integer(2),
             },
         );
     }
@@ -1794,8 +1815,8 @@ mod tests {
             kind,
             ExprKind::BinOp {
                 op: BinOp::Sub,
-                lhs: Box::new(number(3.0)),
-                rhs: Box::new(number(1.0)),
+                lhs: Box::new(integer(3)),
+                rhs: Box::new(integer(1)),
             },
         );
     }
@@ -1808,8 +1829,8 @@ mod tests {
             kind,
             ExprKind::BinOp {
                 op: BinOp::Add,
-                lhs: Box::new(number(1.0)),
-                rhs: Box::new(binop(BinOp::Mul, number(2.0), number(3.0))),
+                lhs: Box::new(integer(1)),
+                rhs: Box::new(binop(BinOp::Mul, integer(2), integer(3))),
             },
         );
     }
@@ -1822,8 +1843,8 @@ mod tests {
             kind,
             ExprKind::BinOp {
                 op: BinOp::Mod,
-                lhs: Box::new(binop(BinOp::Div, number(6.0), number(2.0))),
-                rhs: Box::new(number(3.0)),
+                lhs: Box::new(binop(BinOp::Div, integer(6), integer(2))),
+                rhs: Box::new(integer(3)),
             },
         );
     }
@@ -1836,8 +1857,8 @@ mod tests {
             kind,
             ExprKind::BinOp {
                 op: BinOp::Pow,
-                lhs: Box::new(number(2.0)),
-                rhs: Box::new(binop(BinOp::Pow, number(3.0), number(2.0))),
+                lhs: Box::new(integer(2)),
+                rhs: Box::new(binop(BinOp::Pow, integer(3), integer(2))),
             },
         );
     }
@@ -1849,7 +1870,7 @@ mod tests {
             kind,
             ExprKind::UnaryOp {
                 op: UnaryOp::Neg,
-                operand: Box::new(number(5.0)),
+                operand: Box::new(integer(5)),
             },
         );
     }
@@ -1862,7 +1883,7 @@ mod tests {
             kind,
             ExprKind::UnaryOp {
                 op: UnaryOp::Neg,
-                operand: Box::new(binop(BinOp::Pow, number(2.0), number(3.0))),
+                operand: Box::new(binop(BinOp::Pow, integer(2), integer(3))),
             },
         );
     }
@@ -1875,8 +1896,8 @@ mod tests {
             kind,
             ExprKind::BinOp {
                 op: BinOp::Mul,
-                lhs: Box::new(unary(UnaryOp::Neg, number(2.0))),
-                rhs: Box::new(number(3.0)),
+                lhs: Box::new(unary(UnaryOp::Neg, integer(2))),
+                rhs: Box::new(integer(3)),
             },
         );
     }
@@ -1902,8 +1923,8 @@ mod tests {
             kind,
             ExprKind::BinOp {
                 op: BinOp::Lt,
-                lhs: Box::new(number(1.0)),
-                rhs: Box::new(number(2.0)),
+                lhs: Box::new(integer(1)),
+                rhs: Box::new(integer(2)),
             },
         );
     }
@@ -1915,8 +1936,8 @@ mod tests {
             kind,
             ExprKind::BinOp {
                 op: BinOp::Eq,
-                lhs: Box::new(number(1.0)),
-                rhs: Box::new(number(1.0)),
+                lhs: Box::new(integer(1)),
+                rhs: Box::new(integer(1)),
             },
         );
     }
@@ -1929,8 +1950,8 @@ mod tests {
             kind,
             ExprKind::BinOp {
                 op: BinOp::Lt,
-                lhs: Box::new(binop(BinOp::Add, number(1.0), number(2.0))),
-                rhs: Box::new(binop(BinOp::Mul, number(3.0), number(4.0))),
+                lhs: Box::new(binop(BinOp::Add, integer(1), integer(2))),
+                rhs: Box::new(binop(BinOp::Mul, integer(3), integer(4))),
             },
         );
     }
@@ -2087,8 +2108,8 @@ mod tests {
             kind,
             ExprKind::BinOp {
                 op: BinOp::And,
-                lhs: Box::new(binop(BinOp::Lt, number(1.0), number(2.0))),
-                rhs: Box::new(binop(BinOp::Lt, number(3.0), number(4.0))),
+                lhs: Box::new(binop(BinOp::Lt, integer(1), integer(2))),
+                rhs: Box::new(binop(BinOp::Lt, integer(3), integer(4))),
             },
         );
     }
@@ -2103,8 +2124,8 @@ mod tests {
             kind,
             ExprKind::BinOp {
                 op: BinOp::Lt,
-                lhs: Box::new(unary(UnaryOp::Not, number(1.0))),
-                rhs: Box::new(number(2.0)),
+                lhs: Box::new(unary(UnaryOp::Not, integer(1))),
+                rhs: Box::new(integer(2)),
             },
         );
     }
