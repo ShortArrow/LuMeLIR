@@ -144,16 +144,24 @@ fn widen_index_for_local_init(value: HirExpr) -> HirExpr {
 /// TAG_TABLE narrow + descriptor extraction for the TaggedValue case.
 /// Idempotent on non-Index targets (single-Ident path, ADR 0055,
 /// is preserved without change).
-/// ADR 0208 — recognise `math.<name>` constant identifiers and
-/// return the f64 value. Used by HIR's `ExprKind::Index` lowering
-/// arm to short-circuit before the namespace-Table resolver
-/// rejects `math` as an undefined ident. Lua 5.4 §6.7 names the
-/// constants here; `maxinteger` / `mininteger` are deferred to
-/// the ADR 0196 Integer/Float arc.
+/// ADR 0208 — recognise `math.<name>` Number-kind constants.
+/// ADR 0212 adds Integer constants via `math_integer_constant`.
 fn math_constant_value(name: &str) -> Option<f64> {
     match name {
         "pi" => Some(std::f64::consts::PI),
         "huge" => Some(f64::INFINITY),
+        _ => None,
+    }
+}
+
+/// ADR 0212 — recognise `math.<name>` Integer-kind constants
+/// (`maxinteger` / `mininteger`). Lowers to `HirExprKind::Integer`
+/// so `math.type(math.maxinteger)` returns `"integer"` per
+/// Lua 5.4 §6.7.
+fn math_integer_constant(name: &str) -> Option<i64> {
+    match name {
+        "maxinteger" => Some(i64::MAX),
+        "mininteger" => Some(i64::MIN),
         _ => None,
     }
 }
@@ -4534,6 +4542,13 @@ impl LowerCtx {
                     if let Some(value) = math_constant_value(name) {
                         return Ok(HirExpr {
                             kind: HirExprKind::Number(value),
+                            span: expr.span,
+                        });
+                    }
+                    // ADR 0212 — Integer-kind math constants.
+                    if let Some(value) = math_integer_constant(name) {
+                        return Ok(HirExpr {
+                            kind: HirExprKind::Integer(value),
                             span: expr.span,
                         });
                     }
