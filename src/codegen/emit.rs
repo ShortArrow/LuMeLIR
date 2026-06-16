@@ -52,8 +52,8 @@ use super::tagged::{
     TAG_TABLE, TaggedArithOperandPlan, emit_alloca_slot_for_kind, emit_print_tagged_local,
     emit_tag_and_payload_ptr, emit_tagged_eq_local_local, emit_tagged_unknown_tag_trap,
     emit_type_tagged_local, emit_value_slot_check_number, emit_value_slot_store_dispatched,
-    emit_value_slot_store_nil, emit_value_slot_store_number, emit_value_slot_store_table,
-    policy_for_tag, policy_for_tagged_arith_operand,
+    emit_value_slot_store_nil, emit_value_slot_store_number, emit_value_slot_store_string,
+    emit_value_slot_store_table, policy_for_tag, policy_for_tagged_arith_operand,
 };
 
 // =============================================================
@@ -300,6 +300,26 @@ fn emit_fmt_global<'c>(
     );
     // Phase 2.6a-min (ADR 0053): typename for `type(t)` on tables.
     emit_string_global(context, module, i8_type, "s_typename_table", "table\0", loc);
+    // ADR 0210 — math.type subtype names ("integer" / "float").
+    // Distinct from s_typename_number to match Lua 5.4 §6.7
+    // subtype semantics (type(42) returns "number" but
+    // math.type(42) returns "integer").
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_subtypename_integer",
+        "integer\0",
+        loc,
+    );
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_subtypename_float",
+        "float\0",
+        loc,
+    );
     // Phase 2.7g (ADR 0030): diagnostic for the `assert` failure
     // path. The `printf("%s\n", _)` caller already adds the line
     // terminator, so the payload itself ends with NUL only.
@@ -10796,6 +10816,33 @@ fn emit_expr<'a, 'c>(
                     loc,
                 );
                 Ok(block.append_operation(zero).result(0).unwrap().into())
+            }
+            Callee::Builtin(Builtin::MathType) => {
+                // ADR 0210 — math.type(x): static-shape subtype
+                // distinction. If the arg is `HirExprKind::Integer`
+                // → write `TAG_STRING + ptr("integer")` to a tmp
+                // 16-byte tagged slot. If `HirExprKind::Number` →
+                // `TAG_STRING + ptr("float")`. Other shapes (Local,
+                // Call result, BinOp, etc.) → `TAG_NIL` (subtype
+                // not statically derivable until ADR 0211+ adds
+                // tagged-slot subtype tracking).
+                let out_slot =
+                    emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
+                let arg_expr = &args[0];
+                match &arg_expr.kind {
+                    HirExprKind::Integer(_) => {
+                        let s = emit_addressof(context, block, "s_subtypename_integer", types, loc);
+                        emit_value_slot_store_string(context, block, out_slot, s, types, loc);
+                    }
+                    HirExprKind::Number(_) => {
+                        let s = emit_addressof(context, block, "s_subtypename_float", types, loc);
+                        emit_value_slot_store_string(context, block, out_slot, s, types, loc);
+                    }
+                    _ => {
+                        emit_value_slot_store_nil(context, block, out_slot, types, loc);
+                    }
+                }
+                Ok(out_slot)
             }
             Callee::Builtin(Builtin::IoRead) => {
                 // Phase 2.7x-stdlib-io-read (ADR 0119):

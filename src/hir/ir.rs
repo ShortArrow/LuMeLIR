@@ -593,6 +593,11 @@ pub enum Builtin {
     IoWrite,
     /// ADR 0201 — `string.reverse(s)` byte-wise reversal.
     StringReverse,
+    /// ADR 0210 — `math.type(x)` returns `"integer"` / `"float"`
+    /// for source-syntax Integer / Number literals (and locals
+    /// initialised from them). Source-other shapes (call-return,
+    /// non-Number) return Nil per Lua 5.4 §6.7.
+    MathType,
     /// ADR 0191 — Rust-Lua Bridge MVP demo function.
     /// `rust.add(a: Number, b: Number) -> Number` dispatches to
     /// `extern "C" fn rust_add(f64, f64) -> f64` in
@@ -644,6 +649,10 @@ impl Builtin {
             "cos" => Some(Builtin::MathCos),
             "log" => Some(Builtin::MathLog),
             "exp" => Some(Builtin::MathExp),
+            // ADR 0210 — math.type(x) returns "integer"/"float"
+            // for static-kind Integer/Number literals; runtime
+            // tag dispatch is future work.
+            "type" => Some(Builtin::MathType),
             _ => None,
         }
     }
@@ -802,6 +811,8 @@ impl Builtin {
             Builtin::RustAdd => (2, 2),
             // ADR 0201 — string.reverse(s).
             Builtin::StringReverse => (1, 1),
+            // ADR 0210 — math.type(x).
+            Builtin::MathType => (1, 1),
         }
     }
 
@@ -846,6 +857,8 @@ impl Builtin {
             Builtin::RustAdd => "rust.add",
             // ADR 0201.
             Builtin::StringReverse => "string.reverse",
+            // ADR 0210.
+            Builtin::MathType => "math.type",
         }
     }
 
@@ -914,6 +927,10 @@ impl Builtin {
             Builtin::RustAdd => &[ValueKind::Number],
             // ADR 0201 — string.reverse returns String.
             Builtin::StringReverse => &[ValueKind::String],
+            // ADR 0210 — math.type returns "integer"/"float"/nil
+            // → TaggedValue (String-or-Nil), matching IoRead /
+            // GetMetatable precedent.
+            Builtin::MathType => &[ValueKind::TaggedValue],
         }
     }
 
@@ -1034,6 +1051,9 @@ impl Builtin {
             Builtin::RustAdd => &[ValueKind::Number, ValueKind::Number],
             // ADR 0201 — string.reverse(s) — String arg.
             Builtin::StringReverse => &[ValueKind::String],
+            // ADR 0210 — math.type accepts any Number-kind arg
+            // (subtype distinction is shape-based at HIR).
+            Builtin::MathType => &[ValueKind::Number],
         }
     }
 
