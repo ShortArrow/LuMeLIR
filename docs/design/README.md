@@ -268,6 +268,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0210 — math-type-static-shape](0210-math-type-static-shape.md) — `math.type(x)` returns `"integer"` / `"float"` for `HirExprKind::Integer` / `HirExprKind::Number` arg literals, `nil` for other shapes (Phase B subtype loss documented). First user-visible Integer/Float distinction; M1 second sub-ADR.
 - [0211 — math-tointeger-static-shape](0211-math-tointeger-static-shape.md) — `math.tointeger(x)` returns the integer form of exactly-representable Integer / Number literals, `nil` for fractional or Locals/Calls (Phase B). Parallel to ADR 0210; M1 third sub-ADR.
 - [0212 — math-integer-constants](0212-math-integer-constants.md) — `math.maxinteger` / `math.mininteger` constants lower to `HirExprKind::Integer(i64::MAX/MIN)`; composes with `math.type` to return `"integer"`. M1 fourth sub-ADR.
+- [0213 — integer-binop-constant-folding](0213-integer-binop-constant-folding.md) — HIR folds Integer+Integer arithmetic / bitwise / floor-div / mod / shifts to `HirExprKind::Integer`, preserving subtype through static arithmetic so `math.type(1 + 2)` returns `"integer"`. Overflow / div-by-zero fall through to f64 path. M1 fifth sub-ADR.
 
 ### Feature Implementation Memos
 

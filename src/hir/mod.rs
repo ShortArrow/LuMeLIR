@@ -4102,6 +4102,35 @@ impl LowerCtx {
             ExprKind::BinOp { op, lhs, rhs } => {
                 let lhs_hir = self.lower_expr(lhs)?;
                 let rhs_hir = self.lower_expr(rhs)?;
+                // ADR 0213 — Integer + Integer constant folding for
+                // arithmetic / bitwise / floor-div / mod. Preserves
+                // the Integer subtype through static arithmetic so
+                // `math.type(1 + 2)` returns "integer" per Lua spec.
+                // Pow stays Number; Div (`/`) always Number per
+                // Lua §3.4.1.
+                if let (HirExprKind::Integer(a), HirExprKind::Integer(b)) =
+                    (&lhs_hir.kind, &rhs_hir.kind)
+                {
+                    let folded: Option<i64> = match op {
+                        BinOp::Add => a.checked_add(*b),
+                        BinOp::Sub => a.checked_sub(*b),
+                        BinOp::Mul => a.checked_mul(*b),
+                        BinOp::FloorDiv if *b != 0 => Some(a.div_euclid(*b)),
+                        BinOp::Mod if *b != 0 => Some(a.rem_euclid(*b)),
+                        BinOp::BitAnd => Some(a & b),
+                        BinOp::BitOr => Some(a | b),
+                        BinOp::BitXor => Some(a ^ b),
+                        BinOp::Shl if (0..64).contains(b) => Some(a << b),
+                        BinOp::Shr if (0..64).contains(b) => Some(((*a as u64) >> b) as i64),
+                        _ => None,
+                    };
+                    if let Some(v) = folded {
+                        return Ok(HirExpr {
+                            kind: HirExprKind::Integer(v),
+                            span: expr.span,
+                        });
+                    }
+                }
                 let lk = infer_kind(&lhs_hir, &self.locals, &self.functions);
                 let rk = infer_kind(&rhs_hir, &self.locals, &self.functions);
                 match op {

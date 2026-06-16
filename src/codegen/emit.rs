@@ -20212,8 +20212,10 @@ print(v)",
 
     #[test]
     fn emit_addition_produces_arith_addf() {
+        // ADR 0213 — fractional operands bypass Integer+Integer
+        // constant folding so the addf path runs.
         let ctx = new_context();
-        let module = emit_module(&ctx, &lower_src("print(1 + 2)")).unwrap();
+        let module = emit_module(&ctx, &lower_src("print(1.5 + 2.5)")).unwrap();
         let mlir = module.as_operation().to_string();
         assert!(
             mlir.contains("arith.addf"),
@@ -20739,16 +20741,18 @@ print(v)",
 
     #[test]
     fn emit_subtraction_uses_arith_subf() {
+        // ADR 0213 — fractional operands bypass Integer fold.
         let ctx = new_context();
-        let module = emit_module(&ctx, &lower_src("print(3 - 1)")).unwrap();
+        let module = emit_module(&ctx, &lower_src("print(3.5 - 1.5)")).unwrap();
         assert!(module.as_operation().verify());
         assert!(module.as_operation().to_string().contains("arith.subf"));
     }
 
     #[test]
     fn emit_multiplication_uses_arith_mulf() {
+        // ADR 0213 — fractional operands bypass Integer fold.
         let ctx = new_context();
-        let module = emit_module(&ctx, &lower_src("print(2 * 3)")).unwrap();
+        let module = emit_module(&ctx, &lower_src("print(2.5 * 3.0)")).unwrap();
         assert!(module.as_operation().verify());
         assert!(module.as_operation().to_string().contains("arith.mulf"));
     }
@@ -20771,8 +20775,10 @@ print(v)",
 
     #[test]
     fn emit_modulo_uses_floor_for_lua_semantics() {
+        // ADR 0213 — fractional operands bypass Integer fold so
+        // the f64 floor-based path runs.
         let ctx = new_context();
-        let module = emit_module(&ctx, &lower_src("print(5 % 3)")).unwrap();
+        let module = emit_module(&ctx, &lower_src("print(5.5 % 3.0)")).unwrap();
         assert!(module.as_operation().verify());
         let mlir = module.as_operation().to_string();
         assert!(mlir.contains("llvm.call @floor"), "got:\n{mlir}");
