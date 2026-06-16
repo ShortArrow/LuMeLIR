@@ -253,6 +253,10 @@ fn emit_fmt_global<'c>(
     // plus literal `\t`/`\n` payloads, for multi-arg `print(a, b, ...)`.
     emit_cstr_global(context, module, i8_type, "fmt_raw", "%g\0", loc);
     emit_cstr_global(context, module, i8_type, "fmt_str_raw", "%s\0", loc);
+    // ADR 0214 — `%lld` no-newline format for static Integer
+    // arg precision-preserving print. Without it, `print(math.
+    // maxinteger)` loses precision via sitofp + %g.
+    emit_cstr_global(context, module, i8_type, "fmt_lld_raw", "%lld\0", loc);
     emit_string_global(context, module, i8_type, "s_tab", "\t\0", loc);
     emit_string_global(context, module, i8_type, "s_newline", "\n\0", loc);
     // Phase 2.7c (ADR 0026): `%.14g` is the Lua-spec format for
@@ -9284,6 +9288,25 @@ fn emit_expr<'a, 'c>(
                     for (i, a) in args.iter().enumerate() {
                         if i > 0 {
                             emit_print_literal(context, block, "s_tab", types, loc);
+                        }
+                        // ADR 0214 — static Integer fast path: emit
+                        // i64 constant + `%lld` printf so
+                        // `print(math.maxinteger)` /
+                        // `print(1 + 2)` preserve precision and
+                        // print without f64 fraction artifacts.
+                        if let HirExprKind::Integer(i) = &a.kind {
+                            let i64_const = block
+                                .append_operation(arith::constant(
+                                    context,
+                                    IntegerAttribute::new(types.i64, *i).into(),
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let fmt_ptr = emit_addressof(context, block, "fmt_lld_raw", types, loc);
+                            emit_printf(context, block, fmt_ptr, i64_const, types, loc);
+                            continue;
                         }
                         let kind = infer_kind(a, locals, functions);
                         // Phase 2.6c-tag-hetero (ADR 0064):

@@ -269,6 +269,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0211 — math-tointeger-static-shape](0211-math-tointeger-static-shape.md) — `math.tointeger(x)` returns the integer form of exactly-representable Integer / Number literals, `nil` for fractional or Locals/Calls (Phase B). Parallel to ADR 0210; M1 third sub-ADR.
 - [0212 — math-integer-constants](0212-math-integer-constants.md) — `math.maxinteger` / `math.mininteger` constants lower to `HirExprKind::Integer(i64::MAX/MIN)`; composes with `math.type` to return `"integer"`. M1 fourth sub-ADR.
 - [0213 — integer-binop-constant-folding](0213-integer-binop-constant-folding.md) — HIR folds Integer+Integer arithmetic / bitwise / floor-div / mod / shifts to `HirExprKind::Integer`, preserving subtype through static arithmetic so `math.type(1 + 2)` returns `"integer"`. Overflow / div-by-zero fall through to f64 path. M1 fifth sub-ADR.
+- [0214 — print-integer-subtype](0214-print-integer-subtype.md) — `print(HirExprKind::Integer)` emits `i64 const` + `printf("%lld")`, preserving precision (`print(math.maxinteger)` → `9223372036854775807`) and dropping the `.0` artifact. New `fmt_lld_raw` cstr global. M1 sixth sub-ADR.
 
 ### Feature Implementation Memos
 
