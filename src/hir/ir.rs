@@ -598,6 +598,12 @@ pub enum Builtin {
     /// initialised from them). Source-other shapes (call-return,
     /// non-Number) return Nil per Lua 5.4 §6.7.
     MathType,
+    /// ADR 0211 — `math.tointeger(x)` converts an exactly-
+    /// representable integer-valued literal to its integer form
+    /// (i64-as-f64 at Phase B); returns Nil for fractional
+    /// literals and Locals / Calls / BinOp results. Phase C lifts
+    /// the runtime case.
+    MathToInteger,
     /// ADR 0191 — Rust-Lua Bridge MVP demo function.
     /// `rust.add(a: Number, b: Number) -> Number` dispatches to
     /// `extern "C" fn rust_add(f64, f64) -> f64` in
@@ -653,6 +659,10 @@ impl Builtin {
             // for static-kind Integer/Number literals; runtime
             // tag dispatch is future work.
             "type" => Some(Builtin::MathType),
+            // ADR 0211 — math.tointeger(x) returns the integer
+            // form of an exactly-representable Integer / Number
+            // literal; nil otherwise.
+            "tointeger" => Some(Builtin::MathToInteger),
             _ => None,
         }
     }
@@ -813,6 +823,8 @@ impl Builtin {
             Builtin::StringReverse => (1, 1),
             // ADR 0210 — math.type(x).
             Builtin::MathType => (1, 1),
+            // ADR 0211 — math.tointeger(x).
+            Builtin::MathToInteger => (1, 1),
         }
     }
 
@@ -859,6 +871,8 @@ impl Builtin {
             Builtin::StringReverse => "string.reverse",
             // ADR 0210.
             Builtin::MathType => "math.type",
+            // ADR 0211.
+            Builtin::MathToInteger => "math.tointeger",
         }
     }
 
@@ -931,6 +945,10 @@ impl Builtin {
             // → TaggedValue (String-or-Nil), matching IoRead /
             // GetMetatable precedent.
             Builtin::MathType => &[ValueKind::TaggedValue],
+            // ADR 0211 — math.tointeger returns Number-or-Nil
+            // (i64-as-f64 at Phase B; Phase C will use Integer
+            // tagged value).
+            Builtin::MathToInteger => &[ValueKind::TaggedValue],
         }
     }
 
@@ -1054,6 +1072,8 @@ impl Builtin {
             // ADR 0210 — math.type accepts any Number-kind arg
             // (subtype distinction is shape-based at HIR).
             Builtin::MathType => &[ValueKind::Number],
+            // ADR 0211 — math.tointeger accepts Number.
+            Builtin::MathToInteger => &[ValueKind::Number],
         }
     }
 

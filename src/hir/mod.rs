@@ -297,6 +297,8 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             Callee::Builtin(Builtin::IoRead) => ValueKind::TaggedValue,
             // ADR 0210 — math.type returns String-or-nil → TaggedValue.
             Callee::Builtin(Builtin::MathType) => ValueKind::TaggedValue,
+            // ADR 0211 — math.tointeger returns Number-or-nil → TaggedValue.
+            Callee::Builtin(Builtin::MathToInteger) => ValueKind::TaggedValue,
             // ADR 0134 — setmetatable returns t (always a Table per
             // the HIR kind check). getmetatable returns Table-or-nil
             // → TaggedValue (TableRemove / IoRead precedent).

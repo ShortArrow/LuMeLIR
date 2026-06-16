@@ -10817,6 +10817,48 @@ fn emit_expr<'a, 'c>(
                 );
                 Ok(block.append_operation(zero).result(0).unwrap().into())
             }
+            Callee::Builtin(Builtin::MathToInteger) => {
+                // ADR 0211 — math.tointeger(x): static-shape
+                // integer-valued check.
+                //   - HirExprKind::Integer(i) → Number(i as f64)
+                //   - HirExprKind::Number(n) with n.fract()==0.0 → Number(n)
+                //   - else → Nil
+                // Phase B emits f64-as-Number; Phase C will switch
+                // the success path to a real Integer tagged value.
+                let out_slot =
+                    emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
+                let arg_expr = &args[0];
+                match &arg_expr.kind {
+                    HirExprKind::Integer(i) => {
+                        let f_val = block
+                            .append_operation(arith::constant(
+                                context,
+                                FloatAttribute::new(context, types.f64, *i as f64).into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        emit_value_slot_store_number(context, block, out_slot, f_val, types, loc);
+                    }
+                    HirExprKind::Number(n) if n.is_finite() && n.fract() == 0.0 => {
+                        let f_val = block
+                            .append_operation(arith::constant(
+                                context,
+                                FloatAttribute::new(context, types.f64, *n).into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        emit_value_slot_store_number(context, block, out_slot, f_val, types, loc);
+                    }
+                    _ => {
+                        emit_value_slot_store_nil(context, block, out_slot, types, loc);
+                    }
+                }
+                Ok(out_slot)
+            }
             Callee::Builtin(Builtin::MathType) => {
                 // ADR 0210 — math.type(x): static-shape subtype
                 // distinction. If the arg is `HirExprKind::Integer`
