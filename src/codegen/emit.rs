@@ -10193,6 +10193,25 @@ fn emit_expr<'a, 'c>(
                             emit_printf(context, block, fmt_ptr, i64_const, types, loc);
                             continue;
                         }
+                        // ADR 0233 — M8-B: a Number-kind Local with
+                        // Integer subtype carries an integer-valued
+                        // f64 in its slot. Read it, fptosi to i64,
+                        // and print via the %lld format. Restores
+                        // precision for values within ±2^53.
+                        if let HirExprKind::Local(LocalId(idx)) = &a.kind
+                            && matches!(locals[*idx].kind, ValueKind::Number)
+                            && locals[*idx].subtype == crate::hir::NumberSubtype::Integer
+                        {
+                            let f64_val = emit_load(block, slots[*idx], types.f64, loc);
+                            let i64_val: Value<'c, '_> = block
+                                .append_operation(arith::fptosi(f64_val, types.i64, loc))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let fmt_ptr = emit_addressof(context, block, "fmt_lld_raw", types, loc);
+                            emit_printf(context, block, fmt_ptr, i64_val, types, loc);
+                            continue;
+                        }
                         let kind = infer_kind(a, locals, functions);
                         // Phase 2.6c-tag-hetero (ADR 0064):
                         // `print(Local(TaggedValue))` dispatches at
@@ -10416,6 +10435,19 @@ fn emit_expr<'a, 'c>(
             // are rejected at HIR-time and never reach codegen.
             Callee::Builtin(Builtin::ToString) => {
                 let kind = infer_kind(&args[0], locals, functions);
+                // ADR 0233 — M8-B: a Local with Integer subtype
+                // formats via `%lld` for precision. Fast path
+                // before the TaggedValue / Index / Call dispatches
+                // so the integer-shaped slot value reaches
+                // `emit_tostring_integer` without losing precision
+                // through %.14g formatting.
+                if let HirExprKind::Local(LocalId(idx)) = &args[0].kind
+                    && matches!(locals[*idx].kind, ValueKind::Number)
+                    && locals[*idx].subtype == crate::hir::NumberSubtype::Integer
+                {
+                    let f64_val = emit_load(block, slots[*idx], types.f64, loc);
+                    return Ok(emit_tostring_integer(context, block, f64_val, types, loc));
+                }
                 // Phase 2.6c-tag-consumers (ADR 0067): when the
                 // operand is a `Local(TaggedValue)`, dispatch on
                 // the runtime tag. Without this, `emit_expr` on
@@ -17415,6 +17447,65 @@ fn emit_tostring<'a, 'c>(
             emit_tostring(context, block, value, ValueKind::Number, types, loc)
         }
     }
+}
+
+/// ADR 0233 — M8-B: integer-precision `tostring` for a Local
+/// with Integer subtype. The slot holds an integer-valued f64
+/// (Phase B silent demotion); we `fptosi` back to i64 and
+/// format with `%lld`. Mirrors the Number path's snprintf +
+/// boxed-string wrap but with the lossless integer format.
+fn emit_tostring_integer<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    value_f64: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    let value_i64: Value<'c, 'a> = block
+        .append_operation(arith::fptosi(value_f64, types.i64, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    // Scratch buf — 32 bytes covers any i64 + sign + NUL.
+    let buf_size = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 32).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let buf = emit_gc_alloc(context, block, buf_size, GC_TYPE_SCRATCH_BUF, types, loc);
+    let fmt_ptr = emit_addressof(context, block, "fmt_lld_raw", types, loc);
+    let snprintf_callee_ty =
+        llvm::r#type::function(types.i32, &[types.ptr, types.i64, types.ptr], true);
+    let call_op = OperationBuilder::new("llvm.call", loc)
+        .add_operands(&[buf, buf_size, fmt_ptr, value_i64])
+        .add_attributes(&[
+            (
+                Identifier::new(context, "callee"),
+                FlatSymbolRefAttribute::new(context, "snprintf").into(),
+            ),
+            (
+                Identifier::new(context, "var_callee_type"),
+                TypeAttribute::new(snprintf_callee_ty).into(),
+            ),
+            (
+                Identifier::new(context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(context, &[4, 0]).into(),
+            ),
+            (
+                Identifier::new(context, "op_bundle_sizes"),
+                DenseI32ArrayAttribute::new(context, &[]).into(),
+            ),
+        ])
+        .add_results(&[types.i32])
+        .build()
+        .expect("llvm.call @snprintf tostring_integer");
+    block.append_operation(call_op);
+    let actual_len = emit_libc_call_i64(context, block, "strlen", &[buf], types, loc);
+    emit_string_obj_from_bytes(context, block, buf, actual_len, types, loc)
 }
 
 /// ADR 0142 — `tostring(t)` for static Table operand. Probes the
