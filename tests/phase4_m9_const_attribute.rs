@@ -47,10 +47,10 @@ fn const_local_assign_is_rejected_at_hir() {
 }
 
 #[test]
-fn close_attribute_parses_but_does_not_constrain_writes() {
-    // <close> compiles; the metamethod dispatch is M9-C. Until
-    // then a Local marked <close> behaves like any other Local
-    // for read/write purposes (no readonly_locals entry).
+fn close_attribute_parses_and_reads() {
+    // ADR 0237 — M9-B widens readonly enforcement to <close>
+    // per Lua spec. The Local can still be read; only writes
+    // reject.
     assert_eq!(
         run_ok(
             "local r <close> = 7

@@ -2811,7 +2811,11 @@ impl LowerCtx {
                     _ => None,
                 };
                 let id = self.declare_local_with_func_id(name.clone(), kind, func_id);
-                if matches!(attr.as_deref(), Some("const")) {
+                // ADR 0237 — M9-B: `<close>` is implicitly
+                // `<const>` per Lua 5.4 §3.3.8 (variable cannot
+                // be assigned after declaration). Enforce
+                // readonly for both attrs.
+                if matches!(attr.as_deref(), Some("const") | Some("close")) {
                     self.locals[id.0].is_const = true;
                     self.readonly_locals.insert(id);
                 }
@@ -3741,10 +3745,7 @@ impl LowerCtx {
                 names,
                 values,
                 attrs,
-            } => {
-                let _ = attrs; // ADR 0236 — consumed via post-pass
-                self.lower_local_multi(names, values, stmt.span)
-            }
+            } => self.lower_local_multi(names, values, attrs, stmt.span),
             StmtKind::AssignMulti { names, values } => {
                 self.lower_assign_multi(names, values, stmt.span)
             }
@@ -4291,8 +4292,24 @@ impl LowerCtx {
         &mut self,
         names: &[String],
         values: &[Expr],
+        attrs: &[Option<String>],
         span: Span,
     ) -> Result<HirStmt, HirError> {
+        // ADR 0237 — M9-B: validate every attribute name before
+        // declaring any Local (atomicity — partial declaration on
+        // attribute error would be surprising).
+        for (n, attr) in names.iter().zip(attrs.iter()) {
+            let _ = n;
+            if let Some(a) = attr
+                && a != "const"
+                && a != "close"
+            {
+                return Err(HirError::UnknownAttribute {
+                    name: a.clone(),
+                    offset: span.start,
+                });
+            }
+        }
         if values.len() == names.len() {
             // Parallel: lower each value, declare locals 1-1.
             // Lower all RHS first under the original scope so name
@@ -4302,7 +4319,7 @@ impl LowerCtx {
                 .map(|e| self.lower_expr(e))
                 .collect::<Result<_, _>>()?;
             let mut stmts: Vec<HirStmt> = Vec::with_capacity(names.len());
-            for (n, v) in names.iter().zip(lowered) {
+            for ((n, v), attr) in names.iter().zip(lowered).zip(attrs.iter()) {
                 let kind = infer_kind(&v, &self.locals, &self.functions);
                 let func_id = match &v.kind {
                     HirExprKind::FunctionRef(fid) => Some(*fid),
@@ -4310,6 +4327,10 @@ impl LowerCtx {
                     _ => None,
                 };
                 let id = self.declare_local_with_func_id(n.clone(), kind, func_id);
+                if matches!(attr.as_deref(), Some("const") | Some("close")) {
+                    self.locals[id.0].is_const = true;
+                    self.readonly_locals.insert(id);
+                }
                 stmts.push(HirStmt {
                     kind: HirStmtKind::LocalInit { id, value: v },
                     span,
@@ -4358,8 +4379,13 @@ impl LowerCtx {
                 });
             }
             let mut dst_ids: Vec<LocalId> = Vec::with_capacity(names.len());
-            for (n, k) in names.iter().zip(ret_kinds.iter()) {
-                dst_ids.push(self.declare_local(n.clone(), *k));
+            for ((n, k), attr) in names.iter().zip(ret_kinds.iter()).zip(attrs.iter()) {
+                let id = self.declare_local(n.clone(), *k);
+                if matches!(attr.as_deref(), Some("const") | Some("close")) {
+                    self.locals[id.0].is_const = true;
+                    self.readonly_locals.insert(id);
+                }
+                dst_ids.push(id);
             }
             return Ok(HirStmt {
                 kind: HirStmtKind::MultiAssignFromCall {
