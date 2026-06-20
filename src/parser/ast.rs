@@ -163,6 +163,12 @@ pub enum StmtKind {
     Local {
         name: String,
         value: Expr,
+        /// ADR 0236 — M9-A: Lua 5.4 §3.3.7 attribute on the
+        /// declaration (`local x <const> = ...` /
+        /// `local x <close> = ...`). `None` for an unadorned
+        /// `local x`. HIR consumes this to set
+        /// `LocalInfo::is_const` / `is_close`.
+        attr: Option<String>,
     },
     /// `local NAME (, NAME)+ = EXPR (, EXPR)*` (Phase 2.5d, ADR 0021).
     /// `values.len() == 1` means a single Call expanded across all
@@ -171,6 +177,9 @@ pub enum StmtKind {
     LocalMulti {
         names: Vec<String>,
         values: Vec<Expr>,
+        /// ADR 0236 — per-name attribute aligned with `names`.
+        /// `attrs.len() == names.len()`; entries default to `None`.
+        attrs: Vec<Option<String>>,
     },
     Assign {
         name: String,

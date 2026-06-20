@@ -81,6 +81,7 @@ fn inject_arg_table_prelude(chunk: &mut Chunk, script_args: &[String]) {
         StmtKind::Local {
             name: "arg".to_owned(),
             value: table,
+            attr: None,
         },
         zero_span,
     );

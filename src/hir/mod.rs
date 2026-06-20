@@ -791,10 +791,10 @@ fn process_alias_stmt(
     insert_only: bool,
 ) -> bool {
     match &stmt.kind {
-        StmtKind::Local { name, value } | StmtKind::Assign { name, value } => {
+        StmtKind::Local { name, value, .. } | StmtKind::Assign { name, value } => {
             record_alias_binding(name, value, alias_map, method_funcs, insert_only)
         }
-        StmtKind::LocalMulti { names, values } | StmtKind::AssignMulti { names, values }
+        StmtKind::LocalMulti { names, values, .. } | StmtKind::AssignMulti { names, values }
             if names.len() == values.len() =>
         {
             let mut any = false;
@@ -1419,6 +1419,7 @@ fn register_function_signature(
                 func_id: None,
                 is_captured: false,
                 subtype: NumberSubtype::Unknown,
+                is_const: false,
             })
             .collect(),
         upvalues: Vec::new(),
@@ -1458,6 +1459,7 @@ fn alloc_method_signature(
                 func_id: None,
                 is_captured: false,
                 subtype: NumberSubtype::Unknown,
+                is_const: false,
             })
             .collect(),
         upvalues: Vec::new(),
@@ -1642,6 +1644,7 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
                 StmtKind::Local {
                     name: "_G".to_owned(),
                     value: Expr::new(ExprKind::Table(Vec::new()), zero_span),
+                    attr: None,
                 },
                 zero_span,
             ));
@@ -1651,6 +1654,7 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
                 StmtKind::Local {
                     name: "_ENV".to_owned(),
                     value: Expr::new(ExprKind::Ident("_G".to_owned()), zero_span),
+                    attr: None,
                 },
                 zero_span,
             ));
@@ -2735,6 +2739,7 @@ impl LowerCtx {
             func_id,
             is_captured: false,
             subtype: NumberSubtype::Unknown,
+            is_const: false,
         });
         self.scopes
             .last_mut()
@@ -2772,7 +2777,22 @@ impl LowerCtx {
 
     fn lower_stmt_match_arms(&mut self, stmt: &Stmt) -> Result<HirStmt, HirError> {
         match &stmt.kind {
-            StmtKind::Local { name, value } => {
+            StmtKind::Local { name, value, attr } => {
+                // ADR 0236 — M9-A: `<const>` / `<close>`
+                // attributes. Validate the attribute name; the
+                // const flag drives both `LocalInfo::is_const`
+                // and entry into `readonly_locals`. `<close>`
+                // parses + records but does not yet wire the
+                // `__close` metamethod dispatch (M9-C scope).
+                if let Some(a) = attr
+                    && a != "const"
+                    && a != "close"
+                {
+                    return Err(HirError::UnknownAttribute {
+                        name: a.clone(),
+                        offset: stmt.span.start,
+                    });
+                }
                 let value = self.lower_expr(value)?;
                 // Phase 2.6c-tag-locals (ADR 0063): a plain table
                 // read in LocalInit position widens the local to
@@ -2791,6 +2811,10 @@ impl LowerCtx {
                     _ => None,
                 };
                 let id = self.declare_local_with_func_id(name.clone(), kind, func_id);
+                if matches!(attr.as_deref(), Some("const")) {
+                    self.locals[id.0].is_const = true;
+                    self.readonly_locals.insert(id);
+                }
                 Ok(HirStmt {
                     kind: HirStmtKind::LocalInit { id, value },
                     span: stmt.span,
@@ -3713,7 +3737,12 @@ impl LowerCtx {
                     span: stmt.span,
                 })
             }
-            StmtKind::LocalMulti { names, values } => {
+            StmtKind::LocalMulti {
+                names,
+                values,
+                attrs,
+            } => {
+                let _ = attrs; // ADR 0236 — consumed via post-pass
                 self.lower_local_multi(names, values, stmt.span)
             }
             StmtKind::AssignMulti { names, values } => {
@@ -3923,6 +3952,7 @@ impl LowerCtx {
                     func_id,
                     is_captured: false,
                     subtype: NumberSubtype::Unknown,
+                    is_const: false,
                 });
                 self.scopes[0].insert(name.to_owned(), id);
                 Ok((id, true))
@@ -4694,6 +4724,7 @@ impl LowerCtx {
                                 func_id: None,
                                 is_captured: false,
                                 subtype: NumberSubtype::Unknown,
+                                is_const: false,
                             })
                             .collect(),
                         upvalues: Vec::new(),

@@ -44,6 +44,9 @@ pub struct LocalInfo {
     pub is_captured: bool,
     /// ADR 0232 — M8-A. See [`NumberSubtype`].
     pub subtype: NumberSubtype,
+    /// ADR 0236 — M9-A: `<const>` attribute. When `true` the HIR
+    /// rejects any Assign to this Local.
+    pub is_const: bool,
 }
 
 /// A name-resolved program — the input to codegen.

@@ -506,8 +506,11 @@ impl<'t> Parser<'t> {
         if matches!(self.peek().kind, TokenKind::Keyword(Keyword::Function)) {
             return self.parse_function_def(local_tok);
         }
-        // Parse one or more names separated by commas.
+        // Parse one or more names separated by commas. Each name
+        // may carry an attribute `<const>` or `<close>` per Lua
+        // 5.4 §3.3.7 (ADR 0236).
         let mut names: Vec<String> = Vec::new();
+        let mut attrs: Vec<Option<String>> = Vec::new();
         loop {
             let name_tok = self.peek().clone();
             match name_tok.kind {
@@ -527,6 +530,40 @@ impl<'t> Parser<'t> {
                     });
                 }
             }
+            // Optional attribute: `<IDENT>` immediately after the
+            // name.
+            let attr = if matches!(self.peek().kind, TokenKind::Lt) {
+                self.bump();
+                let inner_tok = self.peek().clone();
+                let attr_name = match inner_tok.kind {
+                    TokenKind::Ident(n) => {
+                        self.bump();
+                        n
+                    }
+                    other => {
+                        return Err(ParseError::UnexpectedToken {
+                            actual: other,
+                            offset: inner_tok.span.start,
+                        });
+                    }
+                };
+                let gt_tok = self.peek().clone();
+                match gt_tok.kind {
+                    TokenKind::Gt => {
+                        self.bump();
+                    }
+                    other => {
+                        return Err(ParseError::UnexpectedToken {
+                            actual: other,
+                            offset: gt_tok.span.start,
+                        });
+                    }
+                }
+                Some(attr_name)
+            } else {
+                None
+            };
+            attrs.push(attr);
             if matches!(self.peek().kind, TokenKind::Comma) {
                 self.bump();
             } else {
@@ -564,9 +601,14 @@ impl<'t> Parser<'t> {
         let kind = if names.len() == 1 && values.len() == 1 {
             let value = values.pop().unwrap();
             let name = names.pop().unwrap();
-            StmtKind::Local { name, value }
+            let attr = attrs.pop().unwrap();
+            StmtKind::Local { name, value, attr }
         } else {
-            StmtKind::LocalMulti { names, values }
+            StmtKind::LocalMulti {
+                names,
+                values,
+                attrs,
+            }
         };
         Ok(Stmt::new(kind, span))
     }
@@ -1426,9 +1468,10 @@ mod tests {
 
     fn strip_span_stmt(stmt: Stmt) -> Stmt {
         let kind = match stmt.kind {
-            StmtKind::Local { name, value } => StmtKind::Local {
+            StmtKind::Local { name, value, attr } => StmtKind::Local {
                 name,
                 value: strip_span_expr(value),
+                attr,
             },
             StmtKind::Assign { name, value } => StmtKind::Assign {
                 name,
@@ -1534,9 +1577,14 @@ mod tests {
             StmtKind::Return { value } => StmtKind::Return {
                 value: value.map(strip_span_expr),
             },
-            StmtKind::LocalMulti { names, values } => StmtKind::LocalMulti {
+            StmtKind::LocalMulti {
+                names,
+                values,
+                attrs,
+            } => StmtKind::LocalMulti {
                 names,
                 values: values.into_iter().map(strip_span_expr).collect(),
+                attrs,
             },
             StmtKind::AssignMulti { names, values } => StmtKind::AssignMulti {
                 names,
@@ -1689,6 +1737,7 @@ mod tests {
             StmtKind::Local {
                 name: "x".to_owned(),
                 value: integer(1),
+                attr: None,
             },
         );
     }
@@ -1703,6 +1752,7 @@ mod tests {
             StmtKind::Local {
                 name: "x".to_owned(),
                 value: integer(1),
+                attr: None,
             },
         );
         match &stripped[1].kind {
@@ -2270,7 +2320,7 @@ mod tests {
     fn parse_function_expr_in_local_init() {
         let stmt = parse_single_stmt("local f = function(x) return x end").expect("must parse");
         match stmt.kind {
-            StmtKind::Local { name, value } => {
+            StmtKind::Local { name, value, .. } => {
                 assert_eq!(name, "f");
                 assert!(matches!(value.kind, ExprKind::FunctionExpr { .. }));
             }
@@ -2304,7 +2354,7 @@ mod tests {
     fn parse_local_multi_value_yields_local_multi() {
         let stmt = parse_single_stmt("local a, b = 1, 2").expect("must parse");
         match stmt.kind {
-            StmtKind::LocalMulti { names, values } => {
+            StmtKind::LocalMulti { names, values, .. } => {
                 assert_eq!(names, vec!["a".to_owned(), "b".to_owned()]);
                 assert_eq!(values.len(), 2);
             }
@@ -2316,7 +2366,7 @@ mod tests {
     fn parse_local_multi_name_single_call_yields_local_multi() {
         let stmt = parse_single_stmt("local a, b = f()").expect("must parse");
         match stmt.kind {
-            StmtKind::LocalMulti { names, values } => {
+            StmtKind::LocalMulti { names, values, .. } => {
                 assert_eq!(names.len(), 2);
                 assert_eq!(values.len(), 1);
                 assert!(matches!(values[0].kind, ExprKind::Call { .. }));

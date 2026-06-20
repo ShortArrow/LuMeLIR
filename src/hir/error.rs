@@ -48,6 +48,12 @@ pub enum HirError {
     #[error("loop variable '{name}' is read-only inside its `for` body")]
     ReadOnlyAssign { name: String, offset: usize },
 
+    /// ADR 0236 — M9-A: Lua 5.4 §3.3.7 only defines `<const>` and
+    /// `<close>` attributes on local declarations. Any other name
+    /// is rejected at HIR-lower time.
+    #[error("unknown local attribute '<{name}>' (expected `const` or `close`)")]
+    UnknownAttribute { name: String, offset: usize },
+
     #[error("`break` is not inside any loop")]
     BreakOutsideLoop { offset: usize },
 
@@ -182,7 +188,8 @@ impl HirError {
             | HirError::IndirectCallNoCandidates { offset, .. }
             | HirError::IndirectCallNonNumberReturn { offset, .. }
             | HirError::MutualCapturingRecursion { offset, .. }
-            | HirError::ComplexMethodReceiver { offset } => *offset,
+            | HirError::ComplexMethodReceiver { offset }
+            | HirError::UnknownAttribute { offset, .. } => *offset,
         }
     }
 }
