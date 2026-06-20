@@ -507,6 +507,14 @@ pub enum Builtin {
     /// helper (single-position trick: passes `j_raw = i_raw`).
     /// Phase 2.7q-stdlib-string (ADR 0109).
     StringByte,
+    /// ADR 0228 — M7-A first sub-ADR: `string.find(s, sub)`
+    /// literal substring search. Returns Number-or-Nil
+    /// (TaggedValue) carrying the 1-indexed start position or
+    /// Nil on no-match. Magic-char pattern semantics deferred;
+    /// this entry handles only the "plain" case (no `%`, `*`,
+    /// `+`, `?`, `[`, `]`, `(`, `)`, `^`, `$`, `.` etc).
+    /// Multi-return (start, end) deferred to M7-B.
+    StringFind,
     /// `string.char(...)` — Lua 5.4 §6.4 variadic byte-producer.
     /// Each arg must be an integer-valued Number in [0, 255];
     /// returns a boxed string object (ADR 0112). Embedded NUL
@@ -714,6 +722,8 @@ impl Builtin {
             "rep" => Some(Builtin::StringRep),
             // ADR 0109 — string.byte (single-position form).
             "byte" => Some(Builtin::StringByte),
+            // ADR 0228 — M7-A literal-only string.find.
+            "find" => Some(Builtin::StringFind),
             // ADR 0113 — string.char (variadic byte-producer).
             "char" => Some(Builtin::StringChar),
             "format" => Some(Builtin::StringFormat),
@@ -835,6 +845,9 @@ impl Builtin {
             // ADR 0109 — string.byte(s [, i]) single-position
             // form. Multi-byte (s, i, j) is future work.
             Builtin::StringByte => (1, 2),
+            // ADR 0228 — string.find(s, sub) — `init` and `plain`
+            // args deferred to a future sub-ADR.
+            Builtin::StringFind => (2, 2),
             // ADR 0113 — string.char(...) variadic byte-producer.
             // Print precedent for variadic (0, usize::MAX).
             Builtin::StringChar => (0, usize::MAX),
@@ -905,6 +918,7 @@ impl Builtin {
             Builtin::StringSub => "string.sub",
             Builtin::StringRep => "string.rep",
             Builtin::StringByte => "string.byte",
+            Builtin::StringFind => "string.find",
             Builtin::StringChar => "string.char",
             Builtin::StringFormat => "string.format",
             Builtin::TableConcat => "table.concat",
@@ -974,6 +988,9 @@ impl Builtin {
             | Builtin::MathExp => &[ValueKind::Number],
             // Phase 2.7q-stdlib-string (ADR 0103/0109).
             Builtin::StringLen | Builtin::StringByte => &[ValueKind::Number],
+            // ADR 0228 — string.find returns Number-or-Nil
+            // (TaggedValue). M7-B widens to multi-return.
+            Builtin::StringFind => &[ValueKind::TaggedValue],
             Builtin::StringUpper
             | Builtin::StringLower
             | Builtin::StringSub
@@ -1079,6 +1096,8 @@ impl Builtin {
             Builtin::StringSub => &[ValueKind::String, ValueKind::Number, ValueKind::Number],
             Builtin::StringRep => &[ValueKind::String, ValueKind::Number],
             Builtin::StringByte => &[ValueKind::String, ValueKind::Number],
+            // ADR 0228 — string.find(s, sub).
+            Builtin::StringFind => &[ValueKind::String, ValueKind::String],
             // table.* — first arg Table; sep String; bounds Number.
             Builtin::TableConcat => &[
                 ValueKind::Table,

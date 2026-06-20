@@ -1881,6 +1881,21 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(rust_starts_with_op.into());
+
+    // ADR 0228 — M7-A: `string.find(s, sub)` literal substring
+    // runtime helper. Shares the bridge object file but is
+    // surfaced via `string.find`, not via `rust.*`.
+    let str_find_ty = llvm::r#type::function(types.i64, &[types.ptr, types.ptr], false);
+    let str_find_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "lumelir_string_find_plain"))
+        .function_type(TypeAttribute::new(str_find_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(str_find_op.into());
 }
 
 /// MLIR type for a function parameter of static [`ValueKind`]. Number
@@ -11621,6 +11636,107 @@ fn emit_expr<'a, 'c>(
                     context, block, scratch, actual_len, types, loc,
                 ))
             }
+            Callee::Builtin(Builtin::StringFind) => {
+                // ADR 0228 — M7-A: literal-only `string.find(s,
+                // sub)`. Calls `lumelir_string_find_plain`; on a
+                // positive i64 result builds a TaggedValue Number;
+                // on 0 builds a TaggedValue Nil. Single-return
+                // truncation per ADR 0081 Next precedent — multi-
+                // return (start, end) is M7-B.
+                let s = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let sub = emit_expr(
+                    context,
+                    block,
+                    &args[1],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let call_op = OperationBuilder::new("llvm.call", loc)
+                    .add_operands(&[s, sub])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "callee"),
+                            FlatSymbolRefAttribute::new(context, "lumelir_string_find_plain")
+                                .into(),
+                        ),
+                        (
+                            Identifier::new(context, "operandSegmentSizes"),
+                            DenseI32ArrayAttribute::new(context, &[2, 0]).into(),
+                        ),
+                        (
+                            Identifier::new(context, "op_bundle_sizes"),
+                            DenseI32ArrayAttribute::new(context, &[]).into(),
+                        ),
+                    ])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.call @lumelir_string_find_plain");
+                let pos_i64: Value<'c, '_> =
+                    block.append_operation(call_op).result(0).unwrap().into();
+                let zero_i64 = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let is_found: Value<'c, '_> = block
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Ne,
+                        pos_i64,
+                        zero_i64,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let out_slot =
+                    emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
+                let then_region = Region::new();
+                let then_blk = Block::new(&[]);
+                {
+                    let pos_f64: Value<'c, '_> = then_blk
+                        .append_operation(arith::sitofp(pos_i64, types.f64, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    super::tagged::emit_value_slot_store_number(
+                        context, &then_blk, out_slot, pos_f64, types, loc,
+                    );
+                    then_blk.append_operation(scf::r#yield(&[], loc));
+                }
+                then_region.append_block(then_blk);
+                let else_region = Region::new();
+                let else_blk = Block::new(&[]);
+                {
+                    super::tagged::emit_value_slot_store_nil(
+                        context, &else_blk, out_slot, types, loc,
+                    );
+                    else_blk.append_operation(scf::r#yield(&[], loc));
+                }
+                else_region.append_block(else_blk);
+                block.append_operation(scf::r#if(is_found, &[], then_region, else_region, loc));
+                Ok(out_slot)
+            }
             Callee::Builtin(Builtin::StringChar) => {
                 // Phase 2.7v-stdlib-string-char (ADR 0113):
                 // variadic byte-producer. Lowers each arg as f64,
@@ -20209,20 +20325,51 @@ fn emit_if<'a, 'c>(
     in_function_cell_ptr: Option<Value<'c, 'a>>,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
-    let cond_kind = infer_kind(cond, locals, functions);
-    let cond_val = emit_expr(
-        context,
-        parent,
-        cond,
-        slots,
-        locals,
-        functions,
-        types,
-        params_len,
-        in_function_cell_ptr,
-        loc,
-    )?;
-    let cond_i1 = emit_truthiness(context, parent, cond_val, cond_kind, types, loc);
+    // ADR 0228 — TaggedValue Local reads trap on Nil tag via
+    // `emit_value_slot_check_number`, breaking the canonical
+    // `local p = string.find(...); if p then ... end` idiom. For
+    // a Local-of-TaggedValue cond, read the tag at slot offset 0
+    // directly and use `tag != TAG_NIL` as the truthiness flag.
+    let cond_i1 = if let HirExprKind::Local(LocalId(idx)) = &cond.kind
+        && matches!(locals[*idx].kind, ValueKind::TaggedValue)
+    {
+        let tag_val = emit_load(parent, slots[*idx], types.i64, loc);
+        let nil_tag = parent
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, crate::codegen::tagged::TAG_NIL).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        parent
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Ne,
+                tag_val,
+                nil_tag,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into()
+    } else {
+        let cond_kind = infer_kind(cond, locals, functions);
+        let cond_val = emit_expr(
+            context,
+            parent,
+            cond,
+            slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
+        )?;
+        emit_truthiness(context, parent, cond_val, cond_kind, types, loc)
+    };
 
     let then_region = build_body_region(
         context,
