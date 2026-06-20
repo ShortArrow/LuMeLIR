@@ -27,3 +27,18 @@ fn panic(_info: &PanicInfo) -> ! {
 pub extern "C" fn rust_add(a: f64, b: f64) -> f64 {
     a + b
 }
+
+// ADR 0224 — String → Number marshaling. `s_ptr` is the user-
+// visible pointer of a Lua boxed-string object whose first 8
+// bytes (offset 0) hold the i64 byte length (ADR 0112 layout).
+// The function reads the length and returns it as f64 (Lua
+// Number ABI).
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_strlen(s_ptr: *const u8) -> f64 {
+    // SAFETY: the caller passes a Lua boxed-string-object ptr
+    // whose layout begins with an aligned i64 length. The HIR
+    // arg-kind validation guarantees only String values reach
+    // this site.
+    let len_i64 = unsafe { core::ptr::read_unaligned(s_ptr.cast::<i64>()) };
+    len_i64 as f64
+}

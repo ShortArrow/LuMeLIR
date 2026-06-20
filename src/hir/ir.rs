@@ -623,6 +623,13 @@ pub enum Builtin {
     /// `rust_from_method` arm + one `extern "C" fn` in
     /// `src/bridge_runtime.rs`.
     RustAdd,
+    /// ADR 0224 — Rust-Lua Bridge String → Number demo.
+    /// `rust.strlen(s: String) -> Number` dispatches to
+    /// `extern "C" fn rust_strlen(*const u8) -> f64` in
+    /// `src/bridge_runtime.rs`. Reads the boxed-string-object
+    /// length field (i64 at offset 0 per ADR 0112) and returns
+    /// it as f64. First sub-ADR of the M5 marshaling milestone.
+    RustStrlen,
 }
 
 impl Builtin {
@@ -758,6 +765,8 @@ impl Builtin {
     pub fn rust_from_method(method: &str) -> Option<Self> {
         match method {
             "add" => Some(Builtin::RustAdd),
+            // ADR 0224 — String → Number marshaling.
+            "strlen" => Some(Builtin::RustStrlen),
             _ => None,
         }
     }
@@ -834,6 +843,8 @@ impl Builtin {
             Builtin::IoRead => (0, 1),
             // ADR 0191 — rust.add(a, b) fixed arity 2.
             Builtin::RustAdd => (2, 2),
+            // ADR 0224 — single-String-arg signature.
+            Builtin::RustStrlen => (1, 1),
             // ADR 0201 — string.reverse(s).
             Builtin::StringReverse => (1, 1),
             // ADR 0210 — math.type(x).
@@ -883,6 +894,7 @@ impl Builtin {
             Builtin::IoRead => "io.read",
             // ADR 0191.
             Builtin::RustAdd => "rust.add",
+            Builtin::RustStrlen => "rust.strlen",
             // ADR 0201.
             Builtin::StringReverse => "string.reverse",
             // ADR 0210.
@@ -963,6 +975,8 @@ impl Builtin {
             Builtin::IoRead => &[ValueKind::TaggedValue],
             // ADR 0191 — rust.add returns Number.
             Builtin::RustAdd => &[ValueKind::Number],
+            // ADR 0224 — returns Number (the i64 string length).
+            Builtin::RustStrlen => &[ValueKind::Number],
             // ADR 0201 — string.reverse returns String.
             Builtin::StringReverse => &[ValueKind::String],
             // ADR 0210 — math.type returns "integer"/"float"/nil
@@ -1093,6 +1107,7 @@ impl Builtin {
             Builtin::IoWrite => &[],
             // ADR 0191 — rust.add(a, b) — both args Number.
             Builtin::RustAdd => &[ValueKind::Number, ValueKind::Number],
+            Builtin::RustStrlen => &[ValueKind::String],
             // ADR 0201 — string.reverse(s) — String arg.
             Builtin::StringReverse => &[ValueKind::String],
             // ADR 0210 — math.type accepts any Number-kind arg

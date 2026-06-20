@@ -277,7 +277,9 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             | Callee::Builtin(Builtin::StringLen)
             | Callee::Builtin(Builtin::StringByte)
             // ADR 0191 — rust.add(a, b) returns Number.
-            | Callee::Builtin(Builtin::RustAdd) => ValueKind::Number,
+            | Callee::Builtin(Builtin::RustAdd)
+            // ADR 0224 — rust.strlen(s) returns Number.
+            | Callee::Builtin(Builtin::RustStrlen) => ValueKind::Number,
             // Phase 2.7q-stdlib-string (ADR 0103): string.upper /
             // string.lower allocate and return a new String.
             Callee::Builtin(Builtin::StringUpper)

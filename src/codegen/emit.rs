@@ -1834,6 +1834,21 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(rust_add_op.into());
+
+    // ADR 0224 — Rust-Lua Bridge String → Number marshaling
+    // demo: `rust_strlen(s_ptr) -> f64` reads the i64 length
+    // header (offset 0) of a boxed-string-object pointer.
+    let rust_strlen_ty = llvm::r#type::function(types.f64, &[types.ptr], false);
+    let rust_strlen_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "rust_strlen"))
+        .function_type(TypeAttribute::new(rust_strlen_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(rust_strlen_op.into());
 }
 
 /// MLIR type for a function parameter of static [`ValueKind`]. Number
@@ -10818,6 +10833,32 @@ fn emit_expr<'a, 'c>(
                     block,
                     "rust_add",
                     &[a, b],
+                    types,
+                    loc,
+                ))
+            }
+            Callee::Builtin(Builtin::RustStrlen) => {
+                // ADR 0224 — Rust-Lua Bridge String → Number
+                // marshaling: pass the boxed-string-object user-
+                // visible ptr to `rust_strlen`; the Rust function
+                // reads the i64 length header at offset 0.
+                let s = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                Ok(emit_libc_call_f64(
+                    context,
+                    block,
+                    "rust_strlen",
+                    &[s],
                     types,
                     loc,
                 ))
