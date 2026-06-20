@@ -988,9 +988,11 @@ impl Builtin {
             | Builtin::MathExp => &[ValueKind::Number],
             // Phase 2.7q-stdlib-string (ADR 0103/0109).
             Builtin::StringLen | Builtin::StringByte => &[ValueKind::Number],
-            // ADR 0228 — string.find returns Number-or-Nil
-            // (TaggedValue). M7-B widens to multi-return.
-            Builtin::StringFind => &[ValueKind::TaggedValue],
+            // ADR 0228 / 0229 — string.find multi-return
+            // (start, end). Both TaggedValue Number-or-Nil.
+            // Single-assign truncates to position 0 (start)
+            // per ADR 0081 Next precedent.
+            Builtin::StringFind => &[ValueKind::TaggedValue, ValueKind::TaggedValue],
             Builtin::StringUpper
             | Builtin::StringLower
             | Builtin::StringSub

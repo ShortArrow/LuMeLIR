@@ -5515,8 +5515,22 @@ fn emit_multi_assign_from_builtin<'a, 'c>(
             in_function_cell_ptr,
             loc,
         ),
+        // ADR 0229 — string.find multi-return (start, end).
+        Builtin::StringFind => emit_call_string_find_into_locals(
+            context,
+            block,
+            dst_ids,
+            args,
+            slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
+        ),
         _ => unreachable!(
-            "multi-assign from builtin {:?} not supported (Next / Pcall declare multi-return)",
+            "multi-assign from builtin {:?} not supported (Next / Pcall / StringFind declare multi-return)",
             b
         ),
     }
@@ -5789,6 +5803,148 @@ fn emit_call_pcall_into_locals<'a, 'c>(
     }
     else_region.append_block(else_blk);
     block.append_operation(scf::r#if(is_initial, &[], then_region, else_region, loc));
+    Ok(())
+}
+
+/// ADR 0229 — multi-return `string.find(s, sub)` emit. Computes
+/// the 1-indexed start via `lumelir_string_find_plain` then
+/// derives `end = start + sub_len - 1`. Both positions are
+/// written as TaggedValue Number; the no-match path writes Nil
+/// to both. Single-assign (`local s = string.find(...)`) goes
+/// through the existing Callee::Builtin single-return arm.
+#[allow(clippy::too_many_arguments)]
+fn emit_call_string_find_into_locals<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    dst_ids: &[LocalId],
+    args: &[HirExpr],
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    in_function_cell_ptr: Option<Value<'c, 'a>>,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    debug_assert_eq!(dst_ids.len(), 2);
+    debug_assert_eq!(args.len(), 2);
+    let s = emit_expr(
+        context,
+        block,
+        &args[0],
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
+    )?;
+    let sub = emit_expr(
+        context,
+        block,
+        &args[1],
+        slots,
+        locals,
+        functions,
+        types,
+        params_len,
+        in_function_cell_ptr,
+        loc,
+    )?;
+    let call_op = OperationBuilder::new("llvm.call", loc)
+        .add_operands(&[s, sub])
+        .add_attributes(&[
+            (
+                Identifier::new(context, "callee"),
+                FlatSymbolRefAttribute::new(context, "lumelir_string_find_plain").into(),
+            ),
+            (
+                Identifier::new(context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(context, &[2, 0]).into(),
+            ),
+            (
+                Identifier::new(context, "op_bundle_sizes"),
+                DenseI32ArrayAttribute::new(context, &[]).into(),
+            ),
+        ])
+        .add_results(&[types.i64])
+        .build()
+        .expect("llvm.call @lumelir_string_find_plain (multi-return)");
+    let pos_i64: Value<'c, '_> = block.append_operation(call_op).result(0).unwrap().into();
+    let zero_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let is_found: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Ne,
+            pos_i64,
+            zero_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let sub_len_i64 = emit_load(block, sub, types.i64, loc);
+    let one_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let sub_len_minus_one: Value<'c, '_> = block
+        .append_operation(arith::subi(sub_len_i64, one_i64, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let end_i64: Value<'c, '_> = block
+        .append_operation(arith::addi(pos_i64, sub_len_minus_one, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let start_slot = slots[dst_ids[0].0];
+    let end_slot = slots[dst_ids[1].0];
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        let start_f64: Value<'c, '_> = then_blk
+            .append_operation(arith::sitofp(pos_i64, types.f64, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        super::tagged::emit_value_slot_store_number(
+            context, &then_blk, start_slot, start_f64, types, loc,
+        );
+        let end_f64: Value<'c, '_> = then_blk
+            .append_operation(arith::sitofp(end_i64, types.f64, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        super::tagged::emit_value_slot_store_number(
+            context, &then_blk, end_slot, end_f64, types, loc,
+        );
+        then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    {
+        super::tagged::emit_value_slot_store_nil(context, &else_blk, start_slot, types, loc);
+        super::tagged::emit_value_slot_store_nil(context, &else_blk, end_slot, types, loc);
+        else_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(is_found, &[], then_region, else_region, loc));
     Ok(())
 }
 
