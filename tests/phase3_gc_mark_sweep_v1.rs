@@ -1,11 +1,12 @@
-//! Phase 3.gc-v1-step3 (ADR 0185): v1 safety-mode mark + sweep
-//! regression pins. `collectgarbage()` now runs the
-//! `emit_gc_mark` + `emit_gc_sweep` pair instead of a 0.0 stub;
-//! v1 safety mode pre-marks every g_gc_head entry BLACK so
-//! sweep frees nothing and observable behaviour is unchanged.
+//! Phase 3 GC `collectgarbage()` end-to-end pins. ADR 0185 v1
+//! safety-mode (mark-all-BLACK, sweep frees nothing) was the
+//! transient contract; ADR 0218 supersedes it for chunk-safe
+//! programs (no Tables / user functions / TaggedValue locals)
+//! by walking a chunk-level String-slot root table — transient
+//! intermediate allocations are freed.
 //!
-//! These tests pin that contract: delta=0, count-unchanged
-//! across collection, sequential calls don't corrupt the heap.
+//! These tests pin the new real-freeing contract for chunk-safe
+//! programs. Sequential calls still must not corrupt the heap.
 
 use std::process::Command;
 
@@ -27,44 +28,47 @@ fn run_ok(src: &str, output_name: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-// --- Test 1: `collectgarbage()` returns 0 in v1 safety mode ---
+// --- Test 1: `collectgarbage()` returns positive delta after
+// transient allocations exist (ADR 0218 real freeing path). ---
 
 #[test]
-fn collectgarbage_returns_zero_in_safety_mode() {
-    // v1 safety mode pre-marks every node BLACK; sweep frees
-    // nothing; delta is exactly 0.
+fn collectgarbage_returns_positive_delta_when_transients_exist() {
+    // `tostring(1)` allocates an intermediate scratch buffer
+    // alongside the final string object; the buffer is not
+    // rooted by any chunk slot, so the mark phase leaves it
+    // WHITE and sweep frees it. `freed > 0` proves the path is
+    // live (it was pinned at 0 under ADR 0185 v1 safety mode).
     let src = r#"
 local s = tostring(1)
 local freed = collectgarbage()
-if freed == 0 then
-  print("zero")
+if freed > 0 then
+  print("freed")
 else
-  print("nonzero")
+  print("zero")
 end
 "#;
-    let out = run_ok(src, "lumelir_gc_v1_returns_zero");
-    assert_eq!(out, "zero\n");
+    let out = run_ok(src, "lumelir_gc_freed");
+    assert_eq!(out, "freed\n");
 }
 
-// --- Test 2: `collectgarbage("count")` unchanged across collection ---
+// --- Test 2: `collectgarbage("count")` decreases across a
+// collection that has transients (ADR 0218). ---
 
 #[test]
-fn collectgarbage_count_unchanged_across_safety_mode_collection() {
-    // Pre-collection count == post-collection count because
-    // safety mode frees nothing. This is the v1 contract pin.
+fn collectgarbage_count_decreases_after_collection_with_transients() {
     let src = r#"
 local s = tostring(1)
 local before = collectgarbage("count")
 collectgarbage()
 local after = collectgarbage("count")
-if before == after then
-  print("unchanged")
+if after < before then
+  print("decreased")
 else
-  print("changed")
+  print("unchanged")
 end
 "#;
-    let out = run_ok(src, "lumelir_gc_v1_count_unchanged");
-    assert_eq!(out, "unchanged\n");
+    let out = run_ok(src, "lumelir_gc_count_decreased");
+    assert_eq!(out, "decreased\n");
 }
 
 // --- Test 3: sequential `collectgarbage()` calls do not corrupt heap ---

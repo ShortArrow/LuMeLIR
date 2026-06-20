@@ -74,14 +74,16 @@ end
     assert_eq!(out, "grew\n");
 }
 
-// --- Test 3: explicit collectgarbage() unchanged after auto-trigger ---
+// --- Test 3: explicit collectgarbage() post-loop frees transients ---
 
 #[test]
-fn explicit_collectgarbage_returns_zero_post_auto_trigger() {
-    // The auto-trigger fires during the loop; the explicit call
-    // after the loop must still observe v1 safety-mode semantics
-    // (delta = 0 because mark pre-paints BLACK, sweep frees
-    // nothing).
+fn explicit_collectgarbage_frees_transients_post_auto_trigger() {
+    // Per ADR 0218 (chunk-safe real freeing): the auto-trigger
+    // fires during the loop, and the explicit post-loop call
+    // observes a positive delta because the per-iteration
+    // `string.rep` allocations not anchored to a surviving slot
+    // are WHITE → freed. Previous expectation (delta == 0) was
+    // the ADR 0185 v1 safety-mode contract, now superseded.
     let src = r#"
 local i = 1
 while i <= 800 do
@@ -89,12 +91,12 @@ while i <= 800 do
   i = i + 1
 end
 local freed = collectgarbage()
-if freed == 0 then
-  print("zero")
+if freed > 0 then
+  print("freed")
 else
-  print("nonzero")
+  print("zero")
 end
 "#;
-    let out = run_ok(src, "lumelir_gc_auto_trigger_explicit_unchanged");
-    assert_eq!(out, "zero\n");
+    let out = run_ok(src, "lumelir_gc_auto_trigger_explicit_freed");
+    assert_eq!(out, "freed\n");
 }

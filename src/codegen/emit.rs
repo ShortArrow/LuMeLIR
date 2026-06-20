@@ -193,6 +193,16 @@ pub(crate) fn emit_module_unverified<'c>(
     emit_pcall_decls(context, &module, &types, loc);
     emit_mutable_byte_array_global(context, &module, i8_type, "g_jmpbuf", 512, loc);
     emit_mutable_i64_global(context, &module, &types, "g_error_value", 0, loc);
+    // ADR 0218 — chunk-level GC root table. main() populates this
+    // at startup with the address of each String-kind chunk local;
+    // the GC mark phase walks the table and marks the pointed-to
+    // string objects BLACK. Sweep then frees transient string
+    // allocations not anchored to a chunk slot. See
+    // `chunk_safe_for_real_gc` for the gate.
+    emit_mutable_i64_global(context, &module, &types, "g_chunk_root_table", 0, loc);
+    emit_mutable_i64_global(context, &module, &types, "g_chunk_root_count", 0, loc);
+    // ADR 0218 — emit mark / sweep with the chunk-safe gate.
+    register_gc_runtime_funcs(context, &module, &types, chunk_safe_for_real_gc(chunk), loc);
     for hir_fn in &chunk.functions {
         emit_function(context, &module, hir_fn, &chunk.functions, &types, loc)?;
     }
@@ -928,7 +938,22 @@ fn emit_fmt_global<'c>(
     // doubling multiplier. Default 200 → behaviour unchanged from
     // ADR 0186 (200/100 = 2.0×).
     emit_mutable_i64_global(context, module, types, "g_gc_pause", GC_PAUSE_INIT, loc);
-    register_gc_runtime_funcs(context, module, types, loc);
+}
+
+/// ADR 0218 — true iff this chunk is safe to GC with real
+/// freeing: all chunk locals are non-pointer (Number / Bool /
+/// Nil) or String, and there are no user functions / Tables /
+/// TaggedValue slots whose contents would require DFS through
+/// child objects. For unsafe chunks the GC stays in ADR 0185 v1
+/// safety mode (mark-all-BLACK, sweep frees nothing).
+pub(crate) fn chunk_safe_for_real_gc(chunk: &HirChunk) -> bool {
+    chunk.functions.is_empty()
+        && chunk.locals.iter().all(|l| {
+            matches!(
+                l.kind,
+                ValueKind::Number | ValueKind::Bool | ValueKind::Nil | ValueKind::String
+            )
+        })
 }
 
 /// Emit a **raw C-string global** (NUL-terminated `[N x i8]`).
@@ -2355,6 +2380,108 @@ fn emit_main<'c>(
         .iter()
         .map(|info| emit_alloca_slot_for_kind(context, &main_block, info.kind, types, loc))
         .collect();
+
+    // ADR 0218 — build the chunk root table for the GC mark phase.
+    // Only String-kind slots register here at minimum scope; the
+    // chunk-safe gate (chunk_safe_for_real_gc) ensures we are not
+    // emitting this for chunks with Tables / Functions / TaggedValue
+    // locals that would require DFS through child objects (deferred
+    // to future ADRs). First, zero-initialise every String slot so
+    // the root walk reads null (skipped) until the user code stores
+    // a real string-object ptr.
+    if chunk_safe_for_real_gc(chunk) {
+        let null_ptr_iv = main_block
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let null_ptr: Value<'c, '_> = main_block
+            .append_operation(
+                OperationBuilder::new("llvm.inttoptr", loc)
+                    .add_operands(&[null_ptr_iv])
+                    .add_results(&[types.ptr])
+                    .build()
+                    .expect("llvm.inttoptr null for String slot init"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let string_slot_addrs: Vec<Value<'c, '_>> = chunk
+            .locals
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| matches!(l.kind, ValueKind::String))
+            .map(|(i, _)| {
+                emit_store(&main_block, null_ptr, slots[i], loc);
+                slots[i]
+            })
+            .collect();
+        let count = string_slot_addrs.len();
+        if count > 0 {
+            let count_i32 = main_block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i32, count as i64).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let root_arr_op = OperationBuilder::new("llvm.alloca", loc)
+                .add_operands(&[count_i32])
+                .add_attributes(&[(
+                    Identifier::new(context, "elem_type"),
+                    TypeAttribute::new(types.ptr).into(),
+                )])
+                .add_results(&[types.ptr])
+                .build()
+                .expect("llvm.alloca for chunk root table");
+            let root_arr: Value<'c, '_> = main_block
+                .append_operation(root_arr_op)
+                .result(0)
+                .unwrap()
+                .into();
+            for (idx, slot_addr) in string_slot_addrs.iter().enumerate() {
+                let entry_ptr = emit_byte_offset_ptr(
+                    context,
+                    &main_block,
+                    root_arr,
+                    (idx * 8) as i64,
+                    types,
+                    loc,
+                );
+                emit_store(&main_block, *slot_addr, entry_ptr, loc);
+            }
+            let arr_iv: Value<'c, '_> = main_block
+                .append_operation(
+                    OperationBuilder::new("llvm.ptrtoint", loc)
+                        .add_operands(&[root_arr])
+                        .add_results(&[types.i64])
+                        .build()
+                        .expect("llvm.ptrtoint chunk_root_table"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let table_addr = emit_addressof(context, &main_block, "g_chunk_root_table", types, loc);
+            emit_store(&main_block, arr_iv, table_addr, loc);
+            let count_i64 = main_block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, count as i64).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let count_addr = emit_addressof(context, &main_block, "g_chunk_root_count", types, loc);
+            emit_store(&main_block, count_i64, count_addr, loc);
+        }
+    }
 
     // ADR 0215 — top-level setjmp landing pad. Captures the CPU
     // state into `g_jmpbuf`. On a `longjmp` from `error(msg)` the
@@ -20263,6 +20390,7 @@ fn register_gc_runtime_funcs<'c>(
     context: &'c Context,
     module: &Module<'c>,
     types: &Types<'c>,
+    chunk_safe: bool,
     loc: Location<'c>,
 ) {
     let void_ty = llvm::r#type::void(context);
@@ -20271,7 +20399,13 @@ fn register_gc_runtime_funcs<'c>(
     {
         let region = Region::new();
         let blk = Block::new(&[]);
-        emit_gc_mark_inline(context, &blk, types, loc);
+        if chunk_safe {
+            // ADR 0218 — walk g_chunk_root_table, mark BLACK.
+            emit_gc_mark_from_chunk_roots(context, &blk, types, loc);
+        } else {
+            // ADR 0185 v1 safety mode — mark everything BLACK.
+            emit_gc_mark_inline(context, &blk, types, loc);
+        }
         blk.append_operation(
             OperationBuilder::new("llvm.return", loc)
                 .build()
@@ -20395,6 +20529,302 @@ fn emit_gc_mark_inline<'a, 'c>(
     after_region.append_block(after_blk);
 
     let while_op = scf::r#while(&[head_iv], &[types.i64], before_region, after_region, loc);
+    block.append_operation(while_op);
+}
+
+/// ADR 0218 — chunk-safe mark phase. Walks `g_gc_head` once; for
+/// each tracked object computes its user-visible payload address
+/// (`raw + GC_HEADER_SIZE`), then linearly scans the chunk root
+/// table for a slot that holds that payload pointer. On match the
+/// header mark byte is set BLACK. Roots that point at static
+/// string literals (which are not in `g_gc_head`) never match and
+/// are safely ignored — preserving them from any mark write that
+/// would hit .rodata.
+fn emit_gc_mark_from_chunk_roots<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let count_addr = emit_addressof(context, block, "g_chunk_root_count", types, loc);
+    let count = emit_load(block, count_addr, types.i64, loc);
+    let table_addr = emit_addressof(context, block, "g_chunk_root_table", types, loc);
+    let table_ptr_iv = emit_load(block, table_addr, types.i64, loc);
+    let table_ptr: Value<'c, 'a> = block
+        .append_operation(
+            OperationBuilder::new("llvm.inttoptr", loc)
+                .add_operands(&[table_ptr_iv])
+                .add_results(&[types.ptr])
+                .build()
+                .expect("llvm.inttoptr chunk_root_table"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let head_addr = emit_addressof(context, block, "g_gc_head", types, loc);
+    let head_iv = emit_load(block, head_addr, types.i64, loc);
+
+    // Outer scf.while over g_gc_head chain.
+    let outer_before = Region::new();
+    let outer_before_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let cur_iv: Value<'c, '_> = outer_before_blk.argument(0).unwrap().into();
+        let zero = outer_before_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let cond: Value<'c, '_> = outer_before_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Ne,
+                cur_iv,
+                zero,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        outer_before_blk.append_operation(scf::condition(cond, &[cur_iv], loc));
+    }
+    outer_before.append_block(outer_before_blk);
+
+    let outer_after = Region::new();
+    let outer_after_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let cur_iv: Value<'c, '_> = outer_after_blk.argument(0).unwrap().into();
+        let cur_ptr: Value<'c, '_> = outer_after_blk
+            .append_operation(
+                OperationBuilder::new("llvm.inttoptr", loc)
+                    .add_operands(&[cur_iv])
+                    .add_results(&[types.ptr])
+                    .build()
+                    .expect("llvm.inttoptr gc obj"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        // user-visible payload ptr = raw + GC_HEADER_SIZE.
+        let user_ptr = emit_byte_offset_ptr(
+            context,
+            &outer_after_blk,
+            cur_ptr,
+            crate::codegen::tagged::GC_HEADER_SIZE,
+            types,
+            loc,
+        );
+        let user_iv: Value<'c, '_> = outer_after_blk
+            .append_operation(
+                OperationBuilder::new("llvm.ptrtoint", loc)
+                    .add_operands(&[user_ptr])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.ptrtoint user_ptr"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        // Inner scf.while: scan root table for a slot whose
+        // contents equal `user_iv`. Carry an i1 `found` flag.
+        let inner_before = Region::new();
+        let inner_before_blk = Block::new(&[(types.i64, loc), (types.i1, loc)]);
+        {
+            let i: Value<'c, '_> = inner_before_blk.argument(0).unwrap().into();
+            let found: Value<'c, '_> = inner_before_blk.argument(1).unwrap().into();
+            let i_lt: Value<'c, '_> = inner_before_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Slt,
+                    i,
+                    count,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            // continue while i < count AND not found.
+            let one = inner_before_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i1, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let not_found: Value<'c, '_> = inner_before_blk
+                .append_operation(arith::xori(found, one, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let cont: Value<'c, '_> = inner_before_blk
+                .append_operation(arith::andi(i_lt, not_found, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            inner_before_blk.append_operation(scf::condition(cont, &[i, found], loc));
+        }
+        inner_before.append_block(inner_before_blk);
+        let inner_after = Region::new();
+        let inner_after_blk = Block::new(&[(types.i64, loc), (types.i1, loc)]);
+        {
+            let i: Value<'c, '_> = inner_after_blk.argument(0).unwrap().into();
+            let found: Value<'c, '_> = inner_after_blk.argument(1).unwrap().into();
+            let off_const = inner_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 8).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let byte_off: Value<'c, '_> = inner_after_blk
+                .append_operation(arith::muli(i, off_const, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let entry_ptr = emit_byte_offset_ptr_dynamic(
+                context,
+                &inner_after_blk,
+                table_ptr,
+                byte_off,
+                types,
+                loc,
+            );
+            let slot_addr = emit_load(&inner_after_blk, entry_ptr, types.ptr, loc);
+            let slot_val = emit_load(&inner_after_blk, slot_addr, types.ptr, loc);
+            let slot_iv: Value<'c, '_> = inner_after_blk
+                .append_operation(
+                    OperationBuilder::new("llvm.ptrtoint", loc)
+                        .add_operands(&[slot_val])
+                        .add_results(&[types.i64])
+                        .build()
+                        .expect("llvm.ptrtoint slot_val"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let eq: Value<'c, '_> = inner_after_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    slot_iv,
+                    user_iv,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let new_found: Value<'c, '_> = inner_after_blk
+                .append_operation(arith::ori(found, eq, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let one_i64 = inner_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let next_i: Value<'c, '_> = inner_after_blk
+                .append_operation(arith::addi(i, one_i64, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            inner_after_blk.append_operation(scf::r#yield(&[next_i, new_found], loc));
+        }
+        inner_after.append_block(inner_after_blk);
+        let zero_i64_in = outer_after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let false_i1 = outer_after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i1, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let scan_op = scf::r#while(
+            &[zero_i64_in, false_i1],
+            &[types.i64, types.i1],
+            inner_before,
+            inner_after,
+            loc,
+        );
+        let scan_results = outer_after_blk.append_operation(scan_op);
+        let found_flag: Value<'c, '_> = scan_results.result(1).unwrap().into();
+        // If found, mark BLACK at cur_ptr + GC_HEADER_OFF_MARK.
+        let mark_then = Region::new();
+        let mark_then_blk = Block::new(&[]);
+        {
+            let mark_field_ptr = emit_byte_offset_ptr(
+                context,
+                &mark_then_blk,
+                cur_ptr,
+                GC_HEADER_OFF_MARK,
+                types,
+                loc,
+            );
+            let black_i8 = mark_then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i8, GC_MARK_BLACK).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            emit_store(&mark_then_blk, black_i8, mark_field_ptr, loc);
+            mark_then_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        mark_then.append_block(mark_then_blk);
+        let mark_else = Region::new();
+        let mark_else_blk = Block::new(&[]);
+        mark_else_blk.append_operation(scf::r#yield(&[], loc));
+        mark_else.append_block(mark_else_blk);
+        outer_after_blk.append_operation(scf::r#if(found_flag, &[], mark_then, mark_else, loc));
+        // Next.
+        let next_field_ptr = emit_byte_offset_ptr(
+            context,
+            &outer_after_blk,
+            cur_ptr,
+            GC_HEADER_OFF_NEXT,
+            types,
+            loc,
+        );
+        let next_val = emit_load(&outer_after_blk, next_field_ptr, types.ptr, loc);
+        let next_iv: Value<'c, '_> = outer_after_blk
+            .append_operation(
+                OperationBuilder::new("llvm.ptrtoint", loc)
+                    .add_operands(&[next_val])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.ptrtoint next"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        outer_after_blk.append_operation(scf::r#yield(&[next_iv], loc));
+    }
+    outer_after.append_block(outer_after_blk);
+
+    let while_op = scf::r#while(&[head_iv], &[types.i64], outer_before, outer_after, loc);
     block.append_operation(while_op);
 }
 
