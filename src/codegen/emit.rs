@@ -201,6 +201,13 @@ pub(crate) fn emit_module_unverified<'c>(
     // `chunk_safe_for_real_gc` for the gate.
     emit_mutable_i64_global(context, &module, &types, "g_chunk_root_table", 0, loc);
     emit_mutable_i64_global(context, &module, &types, "g_chunk_root_count", 0, loc);
+    // ADR 0219 — re-entrancy counter incremented at every user fn
+    // entry, decremented before each return. The GC mark phase
+    // falls back to v1 safety mode (mark all BLACK) while non-
+    // zero so allocations live in user fn frames are never freed
+    // mid-execution. Allows the chunk-safe predicate to relax to
+    // non-capturing user functions.
+    emit_mutable_i64_global(context, &module, &types, "g_gc_fn_depth", 0, loc);
     // ADR 0218 — emit mark / sweep with the chunk-safe gate.
     register_gc_runtime_funcs(context, &module, &types, chunk_safe_for_real_gc(chunk), loc);
     for hir_fn in &chunk.functions {
@@ -940,20 +947,28 @@ fn emit_fmt_global<'c>(
     emit_mutable_i64_global(context, module, types, "g_gc_pause", GC_PAUSE_INIT, loc);
 }
 
-/// ADR 0218 — true iff this chunk is safe to GC with real
-/// freeing: all chunk locals are non-pointer (Number / Bool /
-/// Nil) or String, and there are no user functions / Tables /
-/// TaggedValue slots whose contents would require DFS through
-/// child objects. For unsafe chunks the GC stays in ADR 0185 v1
-/// safety mode (mark-all-BLACK, sweep frees nothing).
+/// ADR 0218 + ADR 0219 — true iff this chunk is safe to GC with
+/// real freeing. Permitted slot kinds: Number / Bool / Nil /
+/// String (ADR 0218) plus Function (ADR 0219, when bound to a
+/// non-capturing user fn — the closure cell is a static global
+/// not tracked by the allocator). User fns themselves are
+/// allowed when none capture upvalues (capturing closures
+/// allocate cells that would need DFS marking). Tables and
+/// TaggedValue locals remain disqualifying — DFS through child
+/// objects is deferred to a future ADR.
 pub(crate) fn chunk_safe_for_real_gc(chunk: &HirChunk) -> bool {
-    chunk.functions.is_empty()
-        && chunk.locals.iter().all(|l| {
-            matches!(
-                l.kind,
-                ValueKind::Number | ValueKind::Bool | ValueKind::Nil | ValueKind::String
-            )
-        })
+    let all_fns_non_capturing = chunk.functions.iter().all(|f| f.upvalues.is_empty());
+    let locals_ok = chunk.locals.iter().all(|l| {
+        matches!(
+            l.kind,
+            ValueKind::Number
+                | ValueKind::Bool
+                | ValueKind::Nil
+                | ValueKind::String
+                | ValueKind::Function(_)
+        )
+    });
+    all_fns_non_capturing && locals_ok
 }
 
 /// Emit a **raw C-string global** (NUL-terminated `[N x i8]`).
@@ -2189,6 +2204,29 @@ fn emit_function<'c>(
         all_param_types.iter().map(|t| (*t, loc)).collect();
     let block = Block::new(&block_args);
 
+    // ADR 0219 — user fn entry: g_gc_fn_depth += 1. While the
+    // counter is non-zero the GC mark phase reverts to v1
+    // safety mode so allocations live in this frame survive.
+    {
+        let depth_addr = emit_addressof(context, &block, "g_gc_fn_depth", types, loc);
+        let depth = emit_load(&block, depth_addr, types.i64, loc);
+        let one = block
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let depth_plus_one: Value<'c, '_> = block
+            .append_operation(arith::addi(depth, one, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        emit_store(&block, depth_plus_one, depth_addr, loc);
+    }
+
     // Cell ptr is the entry block's first argument. Threaded down
     // through `emit_stmts` so direct user calls and capturing
     // closure creation sites can recover it.
@@ -2343,6 +2381,26 @@ fn emit_function<'c>(
                 ret_values.push(payload);
             }
         };
+    }
+    // ADR 0219 — user fn exit: g_gc_fn_depth -= 1.
+    {
+        let depth_addr = emit_addressof(context, &block, "g_gc_fn_depth", types, loc);
+        let depth = emit_load(&block, depth_addr, types.i64, loc);
+        let one = block
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let depth_minus_one: Value<'c, '_> = block
+            .append_operation(arith::subi(depth, one, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        emit_store(&block, depth_minus_one, depth_addr, loc);
     }
     emit_llvm_return(context, &block, &ret_types, &ret_values, loc);
     region.append_block(block);
@@ -20541,6 +20599,51 @@ fn emit_gc_mark_inline<'a, 'c>(
 /// are safely ignored — preserving them from any mark write that
 /// would hit .rodata.
 fn emit_gc_mark_from_chunk_roots<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    // ADR 0219 — when running inside any user fn frame, fall back
+    // to v1 safety mode (mark all g_gc_head BLACK). Allocations
+    // live in the user fn frame are not in the chunk root table
+    // and would be erroneously freed otherwise.
+    let depth_addr = emit_addressof(context, block, "g_gc_fn_depth", types, loc);
+    let depth = emit_load(block, depth_addr, types.i64, loc);
+    let zero_depth = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let in_user_fn: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Ne,
+            depth,
+            zero_depth,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let depth_then = Region::new();
+    let depth_then_blk = Block::new(&[]);
+    emit_gc_mark_inline(context, &depth_then_blk, types, loc);
+    depth_then_blk.append_operation(scf::r#yield(&[], loc));
+    depth_then.append_block(depth_then_blk);
+    let depth_else = Region::new();
+    let depth_else_blk = Block::new(&[]);
+    emit_gc_mark_from_chunk_roots_real(context, &depth_else_blk, types, loc);
+    depth_else_blk.append_operation(scf::r#yield(&[], loc));
+    depth_else.append_block(depth_else_blk);
+    block.append_operation(scf::r#if(in_user_fn, &[], depth_then, depth_else, loc));
+}
+
+fn emit_gc_mark_from_chunk_roots_real<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     types: &Types<'c>,
