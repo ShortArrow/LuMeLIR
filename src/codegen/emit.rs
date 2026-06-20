@@ -189,6 +189,10 @@ pub(crate) fn emit_module_unverified<'c>(
     emit_libm_decls(context, &module, &types, loc);
     emit_strlen_decl(context, &module, &types, loc);
     emit_string_runtime_decls(context, &module, &types, loc);
+    // ADR 0215 — pcall / error setjmp/longjmp infrastructure.
+    emit_pcall_decls(context, &module, &types, loc);
+    emit_mutable_byte_array_global(context, &module, i8_type, "g_jmpbuf", 512, loc);
+    emit_mutable_i64_global(context, &module, &types, "g_error_value", 0, loc);
     for hir_fn in &chunk.functions {
         emit_function(context, &module, hir_fn, &chunk.functions, &types, loc)?;
     }
@@ -1453,6 +1457,71 @@ fn emit_user_string_globals<'c>(
     }
 }
 
+/// ADR 0215 — `_setjmp(jmpbuf) -> i32` / `longjmp(jmpbuf, i32)` libc
+/// externs for protected-call (`pcall`) + `error()` value
+/// propagation. `_setjmp` (vs `setjmp` macro) is the BSD-derived
+/// real symbol on glibc / musl that skips signal-mask save —
+/// matches Lua's pcall semantics (no signal-mask requirement) and
+/// keeps the jmpbuf small. `longjmp` is noreturn.
+fn emit_pcall_decls<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let setjmp_ty = llvm::r#type::function(types.i32, &[types.ptr], false);
+    let setjmp_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "_setjmp"))
+        .function_type(TypeAttribute::new(setjmp_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(setjmp_op.into());
+
+    let longjmp_ty =
+        llvm::r#type::function(llvm::r#type::void(context), &[types.ptr, types.i32], false);
+    let longjmp_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "longjmp"))
+        .function_type(TypeAttribute::new(longjmp_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(longjmp_op.into());
+}
+
+/// ADR 0215 — emit a mutable byte-array global initialised to all
+/// zeros. Used for `g_jmpbuf` (cross-libc-conservative 512-byte
+/// `jmp_buf`-backing storage; glibc `jmp_buf` is ~200B, musl 304B,
+/// macOS 192B, so 512B is safely larger than all).
+fn emit_mutable_byte_array_global<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    i8_type: Type<'c>,
+    name: &str,
+    size: u32,
+    loc: Location<'c>,
+) {
+    let array_type = llvm::r#type::array(i8_type, size);
+    let zeros: String = "\0".repeat(size as usize);
+    let global_op = GlobalOperationBuilder::new(context, loc)
+        .initializer(Region::new())
+        .global_type(TypeAttribute::new(array_type))
+        .sym_name(StringAttribute::new(context, name))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::Internal,
+        ))
+        .value(StringAttribute::new(context, &zeros).into())
+        .build();
+    module.body().append_operation(global_op.into());
+}
+
 /// Phase 2.7a (ADR 0024): declare libc `strlen(ptr) -> i64` so the
 /// `#s` length operator can compile to a single call without
 /// statically tracking each string's byte length.
@@ -2286,6 +2355,72 @@ fn emit_main<'c>(
         .iter()
         .map(|info| emit_alloca_slot_for_kind(context, &main_block, info.kind, types, loc))
         .collect();
+
+    // ADR 0215 — top-level setjmp landing pad. Captures the CPU
+    // state into `g_jmpbuf`. On a `longjmp` from `error(msg)` the
+    // setjmp call returns nonzero; we print the stashed string-
+    // object payload and exit 1 (preserving ADR 0033 behaviour).
+    // On the initial call (return 0) execution continues into the
+    // user chunk body.
+    let jmpbuf_ptr = emit_addressof(context, &main_block, "g_jmpbuf", types, loc);
+    let setjmp_op = OperationBuilder::new("llvm.call", loc)
+        .add_operands(&[jmpbuf_ptr])
+        .add_attributes(&[
+            (
+                Identifier::new(context, "callee"),
+                FlatSymbolRefAttribute::new(context, "_setjmp").into(),
+            ),
+            (
+                Identifier::new(context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(context, &[1, 0]).into(),
+            ),
+            (
+                Identifier::new(context, "op_bundle_sizes"),
+                DenseI32ArrayAttribute::new(context, &[]).into(),
+            ),
+        ])
+        .add_results(&[types.i32])
+        .build()
+        .expect("llvm.call @_setjmp");
+    let setjmp_ret: Value<'c, '_> = main_block
+        .append_operation(setjmp_op)
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_i32: Value<'c, '_> = main_block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i32, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let is_nonzero: Value<'c, '_> = main_block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Ne,
+            setjmp_ret,
+            zero_i32,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let landing_then = Region::new();
+    let landing_then_blk = Block::new(&[]);
+    {
+        let err_addr = emit_addressof(context, &landing_then_blk, "g_error_value", types, loc);
+        let err_ptr = emit_load(&landing_then_blk, err_addr, types.ptr, loc);
+        emit_exit_with_message(context, &landing_then_blk, err_ptr, types, loc);
+        landing_then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    landing_then.append_block(landing_then_blk);
+    let landing_else = Region::new();
+    let landing_else_blk = Block::new(&[]);
+    landing_else_blk.append_operation(scf::r#yield(&[], loc));
+    landing_else.append_block(landing_else_blk);
+    main_block.append_operation(scf::r#if(is_nonzero, &[], landing_then, landing_else, loc));
 
     // Chunk-level (main fn) has no enclosing closure cell.
     emit_stmts(
@@ -9684,11 +9819,13 @@ fn emit_expr<'a, 'c>(
                 emit_assert(context, block, cond_val, custom_msg, types, loc);
                 Ok(cond_val)
             }
-            // Phase 2.7h (ADR 0033): `error(msg)` — unconditional
-            // exit. Print the message and `exit(1)` via the shared
-            // helper extracted in the preceding Tidy First commit.
-            // The placeholder f64 0.0 result satisfies the
-            // expression-position contract; control never reaches it.
+            // ADR 0215 — `error(msg)` stashes the string-object
+            // pointer into `g_error_value` then `longjmp`s back to
+            // the nearest `_setjmp` landing pad. The chunk-level
+            // pad in `emit_main` (uncaught case) prints the message
+            // and exits 1, preserving the ADR 0033 user-visible
+            // contract. ADR 0216 will add `pcall` which installs
+            // its own pad to catch the longjmp non-fatally.
             Callee::Builtin(Builtin::Error) => {
                 let msg_val = emit_expr(
                     context,
@@ -9702,7 +9839,40 @@ fn emit_expr<'a, 'c>(
                     in_function_cell_ptr,
                     loc,
                 )?;
-                emit_exit_with_message(context, block, msg_val, types, loc);
+                let err_addr = emit_addressof(context, block, "g_error_value", types, loc);
+                emit_store(block, msg_val, err_addr, loc);
+                let jmpbuf_ptr = emit_addressof(context, block, "g_jmpbuf", types, loc);
+                let one_i32 = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i32, 1).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let longjmp_op = OperationBuilder::new("llvm.call", loc)
+                    .add_operands(&[jmpbuf_ptr, one_i32])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "callee"),
+                            FlatSymbolRefAttribute::new(context, "longjmp").into(),
+                        ),
+                        (
+                            Identifier::new(context, "operandSegmentSizes"),
+                            DenseI32ArrayAttribute::new(context, &[2, 0]).into(),
+                        ),
+                        (
+                            Identifier::new(context, "op_bundle_sizes"),
+                            DenseI32ArrayAttribute::new(context, &[]).into(),
+                        ),
+                    ])
+                    .build()
+                    .expect("llvm.call @longjmp");
+                block.append_operation(longjmp_op);
+                // Placeholder for expression-position contract.
+                // Control never reaches it because longjmp is
+                // noreturn; LLVM will eliminate as dead.
                 let zero = arith::constant(
                     context,
                     FloatAttribute::new(context, types.f64, 0.0).into(),
