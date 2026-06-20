@@ -8,7 +8,8 @@
 |---|---|---|
 | [**roadmap-status-2026-06-20.md**](roadmap-status-2026-06-20.md) (本 doc) | 最新進捗 + 次 goal 推奨。`/goal` 設定時に最初に読む | ✅ 鮮 |
 | [roadmap-revision-2026-06-16.md](roadmap-revision-2026-06-16.md) | 方針 — milestone ベース goal + leverage 原則 | ✅ 鮮 |
-| [lua54-conformance-roadmap.md](lua54-conformance-roadmap.md) | Lua 5.4 spec gap 視点 | ✅ 鮮 |
+| [**lua54-full-conformance-path-2026-06-20.md**](lua54-full-conformance-path-2026-06-20.md) | Lua 5.4 網羅まで M2-M17 milestone 列 | ✅ 鮮 |
+| [lua54-conformance-roadmap.md](lua54-conformance-roadmap.md) | Lua 5.4 §-by-§ gap table (上 doc の基礎データ) | ⚠ 2026-06-15 snapshot 部分 stale |
 | [cosmetic-backlog.md](cosmetic-backlog.md) | opportunistic 行先 (format spec, math fn 等) | ✅ 鮮 |
 | [leftover-roadmap.md](leftover-roadmap.md) | bucket A-F comprehensive snapshot | ⚠ stale (2026-06-15 時点) — 俯瞰用のみ |
 | [bucket-d-probe-results.md](bucket-d-probe-results.md) / [bucket-e-probe-results.md](bucket-e-probe-results.md) | probe driven 圧縮の根拠 | 履歴 |
