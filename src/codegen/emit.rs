@@ -1866,6 +1866,21 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(rust_not_op.into());
+
+    // ADR 0226 — mixed-kind multi-arg marshaling.
+    // `rust_starts_with(*const u8, *const u8) -> bool` reads
+    // both boxed-string headers and compares the prefix bytes.
+    let rust_starts_with_ty = llvm::r#type::function(types.i8, &[types.ptr, types.ptr], false);
+    let rust_starts_with_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "rust_starts_with"))
+        .function_type(TypeAttribute::new(rust_starts_with_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(rust_starts_with_op.into());
 }
 
 /// MLIR type for a function parameter of static [`ValueKind`]. Number
@@ -10936,6 +10951,69 @@ fn emit_expr<'a, 'c>(
                             .add_results(&[types.i1])
                             .build()
                             .expect("llvm.trunc i8→i1"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                Ok(ret_i1)
+            }
+            Callee::Builtin(Builtin::RustStartsWith) => {
+                // ADR 0226 — mixed-kind multi-arg marshaling.
+                // Pass both boxed-string-object ptrs through to
+                // `rust_starts_with(*const u8, *const u8) -> i8`,
+                // then truncate the i8 return to i1.
+                let s = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let prefix = emit_expr(
+                    context,
+                    block,
+                    &args[1],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let call_op = OperationBuilder::new("llvm.call", loc)
+                    .add_operands(&[s, prefix])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "callee"),
+                            FlatSymbolRefAttribute::new(context, "rust_starts_with").into(),
+                        ),
+                        (
+                            Identifier::new(context, "operandSegmentSizes"),
+                            DenseI32ArrayAttribute::new(context, &[2, 0]).into(),
+                        ),
+                        (
+                            Identifier::new(context, "op_bundle_sizes"),
+                            DenseI32ArrayAttribute::new(context, &[]).into(),
+                        ),
+                    ])
+                    .add_results(&[types.i8])
+                    .build()
+                    .expect("llvm.call @rust_starts_with");
+                let ret_i8: Value<'c, '_> =
+                    block.append_operation(call_op).result(0).unwrap().into();
+                let ret_i1: Value<'c, '_> = block
+                    .append_operation(
+                        OperationBuilder::new("llvm.trunc", loc)
+                            .add_operands(&[ret_i8])
+                            .add_results(&[types.i1])
+                            .build()
+                            .expect("llvm.trunc i8→i1 starts_with"),
                     )
                     .result(0)
                     .unwrap()

@@ -52,3 +52,30 @@ pub extern "C" fn rust_strlen(s_ptr: *const u8) -> f64 {
     let len_i64 = unsafe { core::ptr::read_unaligned(s_ptr.cast::<i64>()) };
     len_i64 as f64
 }
+
+// ADR 0226 — mixed-kind multi-arg marshaling: String + String →
+// Bool. Returns `true` when `s` begins with `prefix`. Reads both
+// length headers (ADR 0112 layout) and compares the first
+// `prefix_len` data bytes; short-circuits when prefix is longer
+// than s.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_starts_with(s_ptr: *const u8, prefix_ptr: *const u8) -> bool {
+    unsafe {
+        let s_len = core::ptr::read_unaligned(s_ptr.cast::<i64>()) as usize;
+        let p_len = core::ptr::read_unaligned(prefix_ptr.cast::<i64>()) as usize;
+        if p_len > s_len {
+            return false;
+        }
+        // Data lives at offset 8 in both buffers.
+        let s_data = s_ptr.add(8);
+        let p_data = prefix_ptr.add(8);
+        let mut i = 0usize;
+        while i < p_len {
+            if *s_data.add(i) != *p_data.add(i) {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+}

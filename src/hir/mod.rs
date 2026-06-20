@@ -281,7 +281,10 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // ADR 0224 — rust.strlen(s) returns Number.
             | Callee::Builtin(Builtin::RustStrlen) => ValueKind::Number,
             // ADR 0225 — rust.not(b) returns Bool.
-            Callee::Builtin(Builtin::RustNot) => ValueKind::Bool,
+            // ADR 0226 — rust.starts_with(s, p) returns Bool.
+            Callee::Builtin(Builtin::RustNot) | Callee::Builtin(Builtin::RustStartsWith) => {
+                ValueKind::Bool
+            }
             // Phase 2.7q-stdlib-string (ADR 0103): string.upper /
             // string.lower allocate and return a new String.
             Callee::Builtin(Builtin::StringUpper)

@@ -636,6 +636,13 @@ pub enum Builtin {
     /// `src/bridge_runtime.rs`. Second sub-ADR of the M5
     /// marshaling milestone.
     RustNot,
+    /// ADR 0226 — mixed-kind multi-arg marshaling demo.
+    /// `rust.starts_with(s: String, prefix: String) -> Bool`
+    /// dispatches to
+    /// `extern "C" fn rust_starts_with(*const u8, *const u8) -> bool`
+    /// in `src/bridge_runtime.rs`. Third sub-ADR of the M5
+    /// marshaling milestone.
+    RustStartsWith,
 }
 
 impl Builtin {
@@ -776,6 +783,8 @@ impl Builtin {
             // ADR 0225 — Bool ↔ Bool marshaling demo. Method
             // name is `invert` because Lua's `not` is reserved.
             "invert" => Some(Builtin::RustNot),
+            // ADR 0226 — mixed-kind multi-arg marshaling.
+            "starts_with" => Some(Builtin::RustStartsWith),
             _ => None,
         }
     }
@@ -855,6 +864,7 @@ impl Builtin {
             // ADR 0224 — single-String-arg signature.
             Builtin::RustStrlen => (1, 1),
             Builtin::RustNot => (1, 1),
+            Builtin::RustStartsWith => (2, 2),
             // ADR 0201 — string.reverse(s).
             Builtin::StringReverse => (1, 1),
             // ADR 0210 — math.type(x).
@@ -906,6 +916,7 @@ impl Builtin {
             Builtin::RustAdd => "rust.add",
             Builtin::RustStrlen => "rust.strlen",
             Builtin::RustNot => "rust.invert",
+            Builtin::RustStartsWith => "rust.starts_with",
             // ADR 0201.
             Builtin::StringReverse => "string.reverse",
             // ADR 0210.
@@ -990,6 +1001,8 @@ impl Builtin {
             Builtin::RustStrlen => &[ValueKind::Number],
             // ADR 0225 — rust.not returns Bool.
             Builtin::RustNot => &[ValueKind::Bool],
+            // ADR 0226 — rust.starts_with returns Bool.
+            Builtin::RustStartsWith => &[ValueKind::Bool],
             // ADR 0201 — string.reverse returns String.
             Builtin::StringReverse => &[ValueKind::String],
             // ADR 0210 — math.type returns "integer"/"float"/nil
@@ -1122,6 +1135,7 @@ impl Builtin {
             Builtin::RustAdd => &[ValueKind::Number, ValueKind::Number],
             Builtin::RustStrlen => &[ValueKind::String],
             Builtin::RustNot => &[ValueKind::Bool],
+            Builtin::RustStartsWith => &[ValueKind::String, ValueKind::String],
             // ADR 0201 — string.reverse(s) — String arg.
             Builtin::StringReverse => &[ValueKind::String],
             // ADR 0210 — math.type accepts any Number-kind arg
