@@ -907,10 +907,14 @@ impl Builtin {
             Builtin::Type => &[ValueKind::String],
             Builtin::Assert => &[ValueKind::Bool],
             Builtin::Error => &[ValueKind::Number],
-            // ADR 0216 — pcall returns Bool at minimum scope; ADR
-            // 0217 widens to (Bool, TaggedValue) for the err
-            // message position.
-            Builtin::Pcall => &[ValueKind::Bool],
+            // ADR 0216 — pcall single-return Bool.
+            // ADR 0217 — pcall multi-return (Bool, TaggedValue).
+            // Position 0 = ok flag (true = normal return / false =
+            // caught error). Position 1 = err value (String message
+            // captured from `error(msg)` / Nil on success). Single-
+            // assign `local ok = pcall(f)` truncates to position 0
+            // (Next precedent).
+            Builtin::Pcall => &[ValueKind::Bool, ValueKind::TaggedValue],
             Builtin::Next => &[ValueKind::TaggedValue, ValueKind::TaggedValue],
             // ADR 0134 — setmetatable returns t (Table); getmetatable
             // returns the metatable (Table) or nil → TaggedValue.

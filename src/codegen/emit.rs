@@ -5162,8 +5162,22 @@ fn emit_multi_assign_from_builtin<'a, 'c>(
             in_function_cell_ptr,
             loc,
         ),
+        // ADR 0217 — pcall multi-return (Bool, TaggedValue).
+        Builtin::Pcall => emit_call_pcall_into_locals(
+            context,
+            block,
+            dst_ids,
+            args,
+            slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
+        ),
         _ => unreachable!(
-            "multi-assign from builtin {:?} not supported (only Next declares multi-return)",
+            "multi-assign from builtin {:?} not supported (Next / Pcall declare multi-return)",
             b
         ),
     }
@@ -5246,6 +5260,191 @@ fn emit_call_next_into_locals<'a, 'c>(
     emit_store(block, v_tag, v_slot, loc);
     let v_pay_ptr = emit_byte_offset_ptr(context, block, v_slot, ARRAY_ELEM_OFF_VALUE, types, loc);
     emit_store(block, v_pay, v_pay_ptr, loc);
+    Ok(())
+}
+
+/// ADR 0217 — multi-return `pcall(f)` emit. Sibling of the single-
+/// return emit arm at the Callee::Builtin(Pcall) site. Stores
+/// true+nil into (ok, err) on the success path, false+String(msg)
+/// on the longjmp landing path. Both branches restore g_jmpbuf
+/// from the per-call save buffer.
+#[allow(clippy::too_many_arguments)]
+fn emit_call_pcall_into_locals<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    dst_ids: &[LocalId],
+    args: &[HirExpr],
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    params_len: usize,
+    _in_function_cell_ptr: Option<Value<'c, 'a>>,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    debug_assert_eq!(dst_ids.len(), 2);
+    debug_assert_eq!(args.len(), 1);
+    let HirExprKind::Local(LocalId(idx)) = &args[0].kind else {
+        unreachable!(
+            "pcall multi-return arg must be Local — HIR \
+             rejects upstream (ADR 0216 contract)"
+        );
+    };
+    let local_info = &locals[*idx];
+    let cell_ptr = if let Some(FuncId(fid)) = local_info.func_id
+        && functions[fid].upvalues.is_empty()
+        && *idx >= params_len
+    {
+        let closure_sym = format!("{}_closure", functions[fid].mangled_name);
+        emit_addressof(context, block, &closure_sym, types, loc)
+    } else if *idx < params_len {
+        slots[*idx]
+    } else {
+        emit_load(block, slots[*idx], types.ptr, loc)
+    };
+    let fn_ptr = super::closure::emit_load_closure_fn_ptr(context, block, cell_ptr, types, loc);
+    let bufcount_i32 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i32, 512).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let bufsize: Value<'c, 'a> = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 512).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let alloca_op = OperationBuilder::new("llvm.alloca", loc)
+        .add_operands(&[bufcount_i32])
+        .add_attributes(&[(
+            Identifier::new(context, "elem_type"),
+            TypeAttribute::new(types.i8).into(),
+        )])
+        .add_results(&[types.ptr])
+        .build()
+        .expect("llvm.alloca for jmpbuf save (multi-return pcall)");
+    let save_buf: Value<'c, 'a> = block.append_operation(alloca_op).result(0).unwrap().into();
+    let jmpbuf_ptr = emit_addressof(context, block, "g_jmpbuf", types, loc);
+    let _ = emit_libc_call_ptr(
+        context,
+        block,
+        "memcpy",
+        &[save_buf, jmpbuf_ptr, bufsize],
+        types,
+        loc,
+    );
+    let setjmp_op = OperationBuilder::new("llvm.call", loc)
+        .add_operands(&[jmpbuf_ptr])
+        .add_attributes(&[
+            (
+                Identifier::new(context, "callee"),
+                FlatSymbolRefAttribute::new(context, "_setjmp").into(),
+            ),
+            (
+                Identifier::new(context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(context, &[1, 0]).into(),
+            ),
+            (
+                Identifier::new(context, "op_bundle_sizes"),
+                DenseI32ArrayAttribute::new(context, &[]).into(),
+            ),
+        ])
+        .add_results(&[types.i32])
+        .build()
+        .expect("llvm.call @_setjmp pcall multi-return");
+    let setjmp_ret: Value<'c, 'a> = block.append_operation(setjmp_op).result(0).unwrap().into();
+    let zero_i32: Value<'c, 'a> = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i32, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let is_initial: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            setjmp_ret,
+            zero_i32,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let ok_slot = slots[dst_ids[0].0];
+    let err_slot = slots[dst_ids[1].0];
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        let _ = emit_llvm_call_indirect(
+            context,
+            &then_blk,
+            fn_ptr,
+            &[cell_ptr],
+            Some(types.f64),
+            loc,
+        );
+        let _ = emit_libc_call_ptr(
+            context,
+            &then_blk,
+            "memcpy",
+            &[jmpbuf_ptr, save_buf, bufsize],
+            types,
+            loc,
+        );
+        let true_i1 = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i1, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        emit_store(&then_blk, true_i1, ok_slot, loc);
+        super::tagged::emit_value_slot_store_nil(context, &then_blk, err_slot, types, loc);
+        then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    {
+        let _ = emit_libc_call_ptr(
+            context,
+            &else_blk,
+            "memcpy",
+            &[jmpbuf_ptr, save_buf, bufsize],
+            types,
+            loc,
+        );
+        let false_i1 = else_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i1, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        emit_store(&else_blk, false_i1, ok_slot, loc);
+        let err_val_addr = emit_addressof(context, &else_blk, "g_error_value", types, loc);
+        let err_ptr = emit_load(&else_blk, err_val_addr, types.ptr, loc);
+        super::tagged::emit_value_slot_store_string(
+            context, &else_blk, err_slot, err_ptr, types, loc,
+        );
+        else_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(is_initial, &[], then_region, else_region, loc));
     Ok(())
 }
 

@@ -272,6 +272,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0214 — print-integer-subtype](0214-print-integer-subtype.md) — `print(HirExprKind::Integer)` emits `i64 const` + `printf("%lld")`, preserving precision (`print(math.maxinteger)` → `9223372036854775807`) and dropping the `.0` artifact. New `fmt_lld_raw` cstr global. M1 sixth sub-ADR.
 - [0215 — pcall-setjmp-infrastructure](0215-pcall-setjmp-infrastructure.md) — libc `_setjmp`/`longjmp` externs + `g_jmpbuf` (512B mutable) + `g_error_value` (i64 boxed-string ptr) + chunk-level setjmp landing pad in `emit_main`. `error(msg)` rewired to longjmp; uncaught still prints msg + exits 1 (ADR 0033 contract preserved). M2 first sub-ADR; `pcall` consumer in ADR 0216.
 - [0216 — pcall-builtin-single-return](0216-pcall-builtin-single-return.md) — `Builtin::Pcall` consumer of the ADR 0215 foundation. `pcall(f)` returns `Bool` — `true` on normal return, `false` on caught `error()`. Scope: arity (1,1), Local of `Function(0)` arg only. Multi-return `(ok, err)` deferred to ADR 0217. M2 second sub-ADR.
+- [0217 — pcall-multireturn-abi](0217-pcall-multireturn-abi.md) — Widens `Builtin::Pcall::ret_kinds` to `[Bool, TaggedValue]` and adds `emit_call_pcall_into_locals` for the multi-assign path. `local ok, err = pcall(f)` — err is String(msg) on caught error, Nil on success. Composes with ADR 0021 multi-assign (Next precedent). M2 third sub-ADR — M2 milestone close.
 
 ### Feature Implementation Memos
 
