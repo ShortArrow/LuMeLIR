@@ -1497,7 +1497,160 @@ fn lower_into_function(
     Ok(())
 }
 
+/// ADR 0221 — recursive AST scan for a bare-Ident reference to
+/// `name`. Used to decide whether the chunk needs the synthetic
+/// `local _G = {}` (and `local _ENV = _G`) prepended at HIR-lower
+/// time.
+fn chunk_references_name(chunk: &Chunk, name: &str) -> bool {
+    chunk.iter().any(|s| stmt_references_name(s, name))
+}
+
+fn stmt_references_name(stmt: &Stmt, name: &str) -> bool {
+    match &stmt.kind {
+        StmtKind::Local { value, .. } => expr_references_name(value, name),
+        StmtKind::LocalMulti { values, .. } => values.iter().any(|v| expr_references_name(v, name)),
+        StmtKind::Assign { value, .. } => expr_references_name(value, name),
+        StmtKind::IndexAssign { target, key, value } => {
+            expr_references_name(target, name)
+                || expr_references_name(key, name)
+                || expr_references_name(value, name)
+        }
+        StmtKind::AssignMulti { values, .. } => {
+            values.iter().any(|v| expr_references_name(v, name))
+        }
+        StmtKind::Block(c) => chunk_references_name(c, name),
+        StmtKind::If {
+            cond,
+            then_body,
+            elifs,
+            else_body,
+        } => {
+            expr_references_name(cond, name)
+                || chunk_references_name(then_body, name)
+                || elifs
+                    .iter()
+                    .any(|(c, b)| expr_references_name(c, name) || chunk_references_name(b, name))
+                || else_body
+                    .as_ref()
+                    .is_some_and(|b| chunk_references_name(b, name))
+        }
+        StmtKind::While { cond, body } => {
+            expr_references_name(cond, name) || chunk_references_name(body, name)
+        }
+        StmtKind::Repeat { body, cond } => {
+            chunk_references_name(body, name) || expr_references_name(cond, name)
+        }
+        StmtKind::ForNumeric {
+            start,
+            stop,
+            step,
+            body,
+            ..
+        } => {
+            expr_references_name(start, name)
+                || expr_references_name(stop, name)
+                || step.as_ref().is_some_and(|s| expr_references_name(s, name))
+                || chunk_references_name(body, name)
+        }
+        StmtKind::ForGeneric {
+            iter,
+            state,
+            ctl,
+            body,
+            ..
+        } => {
+            expr_references_name(iter, name)
+                || expr_references_name(state, name)
+                || expr_references_name(ctl, name)
+                || chunk_references_name(body, name)
+        }
+        StmtKind::ForIpairs { table, body, .. } | StmtKind::ForPairs { table, body, .. } => {
+            expr_references_name(table, name) || chunk_references_name(body, name)
+        }
+        StmtKind::Return { value } => value
+            .as_ref()
+            .is_some_and(|v| expr_references_name(v, name)),
+        StmtKind::ReturnMulti { values } => values.iter().any(|v| expr_references_name(v, name)),
+        StmtKind::FunctionDef { body, .. } | StmtKind::MethodDef { body, .. } => {
+            chunk_references_name(body, name)
+        }
+        StmtKind::Break => false,
+        StmtKind::ExprStmt(e) => expr_references_name(e, name),
+    }
+}
+
+fn expr_references_name(expr: &Expr, name: &str) -> bool {
+    match &expr.kind {
+        ExprKind::Ident(n) => n == name,
+        ExprKind::Call { callee, args } => {
+            expr_references_name(callee, name) || args.iter().any(|a| expr_references_name(a, name))
+        }
+        ExprKind::BinOp { lhs, rhs, .. } => {
+            expr_references_name(lhs, name) || expr_references_name(rhs, name)
+        }
+        ExprKind::UnaryOp { operand, .. } => expr_references_name(operand, name),
+        ExprKind::FunctionExpr { body, .. } => chunk_references_name(body, name),
+        ExprKind::Table(fields) => fields.iter().any(|f| match f {
+            crate::parser::TableField::Positional(e) => expr_references_name(e, name),
+            crate::parser::TableField::Keyed { key, value } => {
+                expr_references_name(key, name) || expr_references_name(value, name)
+            }
+        }),
+        ExprKind::Index { target, key } => {
+            expr_references_name(target, name) || expr_references_name(key, name)
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            expr_references_name(receiver, name)
+                || args.iter().any(|a| expr_references_name(a, name))
+        }
+        ExprKind::Number(_)
+        | ExprKind::Integer(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Nil => false,
+    }
+}
+
 pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
+    // ADR 0221 — `_G` / `_ENV` chunk-level Table. If the source
+    // references `_G` or `_ENV` as a bare Ident anywhere, prepend
+    // a synthetic `local _G = {}` (and `local _ENV = _G`) so the
+    // existing Local + Table machinery picks them up. Programs
+    // that never use either pass through unchanged — preserving
+    // the ADR 0218 chunk-safe predicate for the common case.
+    let needs_g = chunk_references_name(chunk, "_G");
+    let needs_env = chunk_references_name(chunk, "_ENV");
+    let synthesised_chunk: Vec<Stmt> = if needs_g || needs_env {
+        let mut new_chunk: Vec<Stmt> = Vec::with_capacity(chunk.len() + 2);
+        let zero_span = Span::new(0, 0);
+        if needs_g || needs_env {
+            new_chunk.push(Stmt::new(
+                StmtKind::Local {
+                    name: "_G".to_owned(),
+                    value: Expr::new(ExprKind::Table(Vec::new()), zero_span),
+                },
+                zero_span,
+            ));
+        }
+        if needs_env {
+            new_chunk.push(Stmt::new(
+                StmtKind::Local {
+                    name: "_ENV".to_owned(),
+                    value: Expr::new(ExprKind::Ident("_G".to_owned()), zero_span),
+                },
+                zero_span,
+            ));
+        }
+        new_chunk.extend(chunk.iter().cloned());
+        new_chunk
+    } else {
+        Vec::new()
+    };
+    let chunk: &Chunk = if synthesised_chunk.is_empty() {
+        chunk
+    } else {
+        &synthesised_chunk
+    };
     // Pass 1: register every top-level `local function` in the
     // function table so recursion and forward-reference work.
     let mut functions: Vec<HirFunction> = Vec::new();
