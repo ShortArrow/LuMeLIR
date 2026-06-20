@@ -1,5 +1,11 @@
 # やり残しロードマップ — 既存 ADR 残務整理
 
+> **⚠ Superseded for daily navigation — 2026-06-20**
+>
+> Session-scoped goal の置き場としては [roadmap-revision-2026-06-16.md](roadmap-revision-2026-06-16.md) + [roadmap-status-2026-06-20.md](roadmap-status-2026-06-20.md) を canonical とする。本 doc は **bucket-by-bucket comprehensive snapshot** として残し、「全体に何が残ってるか」を俯瞰したい時のみ参照。
+>
+> **Stale 注意:** 推奨着手順序 §1 / §2 / §3 + 「優先順位 1 — Phase 4a closeout」§表中の `ADR 0197-0206 (10 ADR)` 行は **DONE** — ADRs 0197-0214 が 2026-06-15 → 2026-06-20 で着地、test 1431 → 1478。M1 milestone (Integer/Float subtype 中核) は 6/6-10 sub-ADR で minimal close。詳細は status doc 参照。
+
 - **Date:** 2026-06-15
 - **Scope:** 過去 ADR が残した未片付け項目を一覧化。Lua 5.4 conformance とは別系統で、「過去にした決定が未消化のまま残ってる」項目だけを対象。
 - **State snapshot:** commit `854df26` (ADR 0196, tests 1431)

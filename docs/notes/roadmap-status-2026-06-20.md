@@ -2,6 +2,18 @@
 
 差分整理。元 doc: [roadmap-revision-2026-06-16.md](roadmap-revision-2026-06-16.md)。M1 minimal close + M2-M6 残量再確認。
 
+## Roadmap doc 階層 (canonical 順)
+
+| Doc | 役割 | 鮮度 |
+|---|---|---|
+| [**roadmap-status-2026-06-20.md**](roadmap-status-2026-06-20.md) (本 doc) | 最新進捗 + 次 goal 推奨。`/goal` 設定時に最初に読む | ✅ 鮮 |
+| [roadmap-revision-2026-06-16.md](roadmap-revision-2026-06-16.md) | 方針 — milestone ベース goal + leverage 原則 | ✅ 鮮 |
+| [lua54-conformance-roadmap.md](lua54-conformance-roadmap.md) | Lua 5.4 spec gap 視点 | ✅ 鮮 |
+| [cosmetic-backlog.md](cosmetic-backlog.md) | opportunistic 行先 (format spec, math fn 等) | ✅ 鮮 |
+| [leftover-roadmap.md](leftover-roadmap.md) | bucket A-F comprehensive snapshot | ⚠ stale (2026-06-15 時点) — 俯瞰用のみ |
+| [bucket-d-probe-results.md](bucket-d-probe-results.md) / [bucket-e-probe-results.md](bucket-e-probe-results.md) | probe driven 圧縮の根拠 | 履歴 |
+| [sweep-0166-0177-retrospective.md](sweep-0166-0177-retrospective.md) / [sweep-0182-0188-retrospective.md](sweep-0182-0188-retrospective.md) | meta-pattern 学び | 履歴 |
+
 ## M1 (Integer/Float subtype 中核) — **6/6-10 minimal close**
 
 `/goal M1` で 6 sub-ADR が連続着地。range 下限到達で goal hook 仕様上は完了扱い可。
