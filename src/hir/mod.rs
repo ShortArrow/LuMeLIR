@@ -257,6 +257,8 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // time. The kind is a Number placeholder for static
             // typing only — code after `error(...)` is unreachable.
             Callee::Builtin(Builtin::Error) => ValueKind::Number,
+            // ADR 0216 — pcall returns Bool (success / caught flag).
+            Callee::Builtin(Builtin::Pcall) => ValueKind::Bool,
             // Phase 2.8e-iter-next (ADR 0081): `next(...)` in
             // single-value position truncates to the first result —
             // the next key, which is a TaggedValue.
@@ -5255,7 +5257,10 @@ impl LowerCtx {
             // site keeps treating Function-as-value as a hard
             // error.
             if let ValueKind::Function(_) = k
-                && !matches!(builtin, Builtin::Type | Builtin::ToString | Builtin::Next)
+                && !matches!(
+                    builtin,
+                    Builtin::Type | Builtin::ToString | Builtin::Next | Builtin::Pcall
+                )
             {
                 let arg_name = match &arg.kind {
                     HirExprKind::Local(LocalId(idx)) => self.locals[*idx].name.clone(),
@@ -5309,6 +5314,18 @@ impl LowerCtx {
                 return Err(HirError::TypeMismatch {
                     op: "error".to_owned(),
                     lhs_kind: "string".to_owned(),
+                    rhs_kind: k.name().to_owned(),
+                    offset: arg.span.start,
+                });
+            }
+            // ADR 0216 — pcall(f): arg must be a Local of Function(0)
+            // kind. Inline lambdas + Function(N>0) deferred to ADR
+            // 0217. Only Function(0) (no-arg) matches; anything else
+            // is a kind error.
+            if matches!(builtin, Builtin::Pcall) && !matches!(k, ValueKind::Function(0)) {
+                return Err(HirError::TypeMismatch {
+                    op: "pcall".to_owned(),
+                    lhs_kind: "function(0)".to_owned(),
                     rhs_kind: k.name().to_owned(),
                     offset: arg.span.start,
                 });

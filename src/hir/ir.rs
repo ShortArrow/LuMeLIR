@@ -604,6 +604,16 @@ pub enum Builtin {
     /// literals and Locals / Calls / BinOp results. Phase C lifts
     /// the runtime case.
     MathToInteger,
+    /// ADR 0216 — `pcall(f)` runs `f()` under a setjmp landing pad
+    /// (ADR 0215). Returns `true` if `f` returned normally; `false`
+    /// if any `error(msg)` longjmp'd back. The error message is
+    /// discarded at this minimum-viable scope; ADR 0217 will add
+    /// the second return value (`local ok, err = pcall(f)`) per the
+    /// Lua 5.4 §6.1 multi-return contract. Phase B restriction:
+    /// arg must be a Local of `ValueKind::Function(0)` (no-arg
+    /// callable). Inline lambdas (`pcall(function() ... end)`) are
+    /// rejected at HIR; users wrap in `local f = function...`.
+    Pcall,
     /// ADR 0191 — Rust-Lua Bridge MVP demo function.
     /// `rust.add(a: Number, b: Number) -> Number` dispatches to
     /// `extern "C" fn rust_add(f64, f64) -> f64` in
@@ -624,6 +634,8 @@ impl Builtin {
             "type" => Some(Builtin::Type),
             "assert" => Some(Builtin::Assert),
             "error" => Some(Builtin::Error),
+            // ADR 0216 — protected call.
+            "pcall" => Some(Builtin::Pcall),
             "next" => Some(Builtin::Next),
             // ADR 0134 — metatables global builtins.
             "setmetatable" => Some(Builtin::SetMetatable),
@@ -770,6 +782,9 @@ impl Builtin {
             // ADR 0030 / 0051: assert(v) or assert(v, msg).
             Builtin::Assert => (1, 2),
             Builtin::Error => (1, 1),
+            // ADR 0216 — pcall(f) only at minimum scope; ADR 0217
+            // widens to pcall(f, args...).
+            Builtin::Pcall => (1, 1),
             // ADR 0198 — Lua 5.4 §6.1: next(table [, index]); arg 2 defaults to nil.
             Builtin::Next => (1, 2),
             // ADR 0134 — metatables global builtins.
@@ -836,6 +851,7 @@ impl Builtin {
             Builtin::Type => "type",
             Builtin::Assert => "assert",
             Builtin::Error => "error",
+            Builtin::Pcall => "pcall",
             Builtin::Next => "next",
             Builtin::SetMetatable => "setmetatable",
             Builtin::GetMetatable => "getmetatable",
@@ -891,6 +907,10 @@ impl Builtin {
             Builtin::Type => &[ValueKind::String],
             Builtin::Assert => &[ValueKind::Bool],
             Builtin::Error => &[ValueKind::Number],
+            // ADR 0216 — pcall returns Bool at minimum scope; ADR
+            // 0217 widens to (Bool, TaggedValue) for the err
+            // message position.
+            Builtin::Pcall => &[ValueKind::Bool],
             Builtin::Next => &[ValueKind::TaggedValue, ValueKind::TaggedValue],
             // ADR 0134 — setmetatable returns t (Table); getmetatable
             // returns the metatable (Table) or nil → TaggedValue.
@@ -982,6 +1002,8 @@ impl Builtin {
             | Builtin::Type
             | Builtin::Assert
             | Builtin::Error
+            // ADR 0216 — per-arg validation in `lower_builtin_call`.
+            | Builtin::Pcall
             | Builtin::Next
             // ADR 0134 — global builtins; per-arg kind checks live
             // in `lower_builtin_call` alongside Assert / Next.

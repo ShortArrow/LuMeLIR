@@ -271,6 +271,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0213 — integer-binop-constant-folding](0213-integer-binop-constant-folding.md) — HIR folds Integer+Integer arithmetic / bitwise / floor-div / mod / shifts to `HirExprKind::Integer`, preserving subtype through static arithmetic so `math.type(1 + 2)` returns `"integer"`. Overflow / div-by-zero fall through to f64 path. M1 fifth sub-ADR.
 - [0214 — print-integer-subtype](0214-print-integer-subtype.md) — `print(HirExprKind::Integer)` emits `i64 const` + `printf("%lld")`, preserving precision (`print(math.maxinteger)` → `9223372036854775807`) and dropping the `.0` artifact. New `fmt_lld_raw` cstr global. M1 sixth sub-ADR.
 - [0215 — pcall-setjmp-infrastructure](0215-pcall-setjmp-infrastructure.md) — libc `_setjmp`/`longjmp` externs + `g_jmpbuf` (512B mutable) + `g_error_value` (i64 boxed-string ptr) + chunk-level setjmp landing pad in `emit_main`. `error(msg)` rewired to longjmp; uncaught still prints msg + exits 1 (ADR 0033 contract preserved). M2 first sub-ADR; `pcall` consumer in ADR 0216.
+- [0216 — pcall-builtin-single-return](0216-pcall-builtin-single-return.md) — `Builtin::Pcall` consumer of the ADR 0215 foundation. `pcall(f)` returns `Bool` — `true` on normal return, `false` on caught `error()`. Scope: arity (1,1), Local of `Function(0)` arg only. Multi-return `(ok, err)` deferred to ADR 0217. M2 second sub-ADR.
 
 ### Feature Implementation Memos
 

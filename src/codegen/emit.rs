@@ -9880,6 +9880,187 @@ fn emit_expr<'a, 'c>(
                 );
                 Ok(block.append_operation(zero).result(0).unwrap().into())
             }
+            // ADR 0216 — `pcall(f)` runs `f()` under a nested
+            // setjmp landing pad on top of the ADR 0215 chunk-level
+            // pad. Save the chunk-level `g_jmpbuf` to a 512-byte
+            // alloca, overwrite it with our own setjmp, call `f`,
+            // restore the saved jmpbuf, and return `true`. On a
+            // longjmp from inside `f` (or any frame `f` calls into),
+            // setjmp returns nonzero; we restore the jmpbuf and
+            // return `false`. ADR 0217 widens to multi-return
+            // `(ok, err)`.
+            Callee::Builtin(Builtin::Pcall) => {
+                let HirExprKind::Local(LocalId(idx)) = &args[0].kind else {
+                    unreachable!(
+                        "pcall arg must be a Local — HIR \
+                         lower_builtin_call rejects non-Function(0) \
+                         kinds upstream (ADR 0216)"
+                    )
+                };
+                // For statically-known non-capturing user fns the
+                // slot is never stored (LocalInit alias-skip rule
+                // at emit.rs:3418); the cell ptr is the static
+                // `<mangled>_closure` global. For capturing
+                // closures + params + indirect-bound locals, the
+                // slot holds the cell ptr.
+                let local_info = &locals[*idx];
+                let cell_ptr = if let Some(FuncId(fid)) = local_info.func_id
+                    && functions[fid].upvalues.is_empty()
+                    && *idx >= params_len
+                {
+                    let closure_sym = format!("{}_closure", functions[fid].mangled_name);
+                    emit_addressof(context, block, &closure_sym, types, loc)
+                } else if *idx < params_len {
+                    slots[*idx]
+                } else {
+                    emit_load(block, slots[*idx], types.ptr, loc)
+                };
+                let fn_ptr =
+                    super::closure::emit_load_closure_fn_ptr(context, block, cell_ptr, types, loc);
+                // Stack-allocate a 512-byte save buffer. `llvm.alloca`
+                // takes an i32 count of elements (per ADR 0083 emit
+                // patterns); memcpy below uses a separate i64.
+                let bufcount_i32 = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i32, 512).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let bufsize: Value<'c, 'a> = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 512).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let alloca_op = OperationBuilder::new("llvm.alloca", loc)
+                    .add_operands(&[bufcount_i32])
+                    .add_attributes(&[(
+                        Identifier::new(context, "elem_type"),
+                        TypeAttribute::new(types.i8).into(),
+                    )])
+                    .add_results(&[types.ptr])
+                    .build()
+                    .expect("llvm.alloca for jmpbuf save");
+                let save_buf: Value<'c, 'a> =
+                    block.append_operation(alloca_op).result(0).unwrap().into();
+                let jmpbuf_ptr = emit_addressof(context, block, "g_jmpbuf", types, loc);
+                // Save g_jmpbuf -> save_buf.
+                let _ = emit_libc_call_ptr(
+                    context,
+                    block,
+                    "memcpy",
+                    &[save_buf, jmpbuf_ptr, bufsize],
+                    types,
+                    loc,
+                );
+                // Call _setjmp(g_jmpbuf) -> i32.
+                let setjmp_op = OperationBuilder::new("llvm.call", loc)
+                    .add_operands(&[jmpbuf_ptr])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "callee"),
+                            FlatSymbolRefAttribute::new(context, "_setjmp").into(),
+                        ),
+                        (
+                            Identifier::new(context, "operandSegmentSizes"),
+                            DenseI32ArrayAttribute::new(context, &[1, 0]).into(),
+                        ),
+                        (
+                            Identifier::new(context, "op_bundle_sizes"),
+                            DenseI32ArrayAttribute::new(context, &[]).into(),
+                        ),
+                    ])
+                    .add_results(&[types.i32])
+                    .build()
+                    .expect("llvm.call @_setjmp pcall");
+                let setjmp_ret: Value<'c, 'a> =
+                    block.append_operation(setjmp_op).result(0).unwrap().into();
+                let zero_i32: Value<'c, 'a> = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i32, 0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let is_initial: Value<'c, 'a> = block
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Eq,
+                        setjmp_ret,
+                        zero_i32,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let then_region = Region::new();
+                let then_blk = Block::new(&[]);
+                {
+                    // Successful initial path: invoke f, restore
+                    // jmpbuf, yield true.
+                    let _ = emit_llvm_call_indirect(
+                        context,
+                        &then_blk,
+                        fn_ptr,
+                        &[cell_ptr],
+                        Some(types.f64),
+                        loc,
+                    );
+                    let _ = emit_libc_call_ptr(
+                        context,
+                        &then_blk,
+                        "memcpy",
+                        &[jmpbuf_ptr, save_buf, bufsize],
+                        types,
+                        loc,
+                    );
+                    let true_i1 = then_blk
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i1, 1).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    then_blk.append_operation(scf::r#yield(&[true_i1], loc));
+                }
+                then_region.append_block(then_blk);
+                let else_region = Region::new();
+                let else_blk = Block::new(&[]);
+                {
+                    // Longjmp landing: restore jmpbuf, yield false.
+                    let _ = emit_libc_call_ptr(
+                        context,
+                        &else_blk,
+                        "memcpy",
+                        &[jmpbuf_ptr, save_buf, bufsize],
+                        types,
+                        loc,
+                    );
+                    let false_i1 = else_blk
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i1, 0).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    else_blk.append_operation(scf::r#yield(&[false_i1], loc));
+                }
+                else_region.append_block(else_blk);
+                let if_op = scf::r#if(is_initial, &[types.i1], then_region, else_region, loc);
+                Ok(block.append_operation(if_op).result(0).unwrap().into())
+            }
             // Phase 2.7f (ADR 0029): `type(x)` is pure static
             // dispatch — the arg's value is irrelevant, only its
             // kind matters. We still emit_expr the arg because Lua
