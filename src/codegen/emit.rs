@@ -12365,12 +12365,32 @@ fn emit_expr<'a, 'c>(
                 let out_slot =
                     emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
                 let arg_expr = &args[0];
-                match &arg_expr.kind {
-                    HirExprKind::Integer(_) => {
+                // ADR 0232 — M8-A. Local-args propagate via
+                // `LocalInfo::subtype` so `local i = 1;
+                // math.type(i)` returns "integer".
+                let local_subtype = if let HirExprKind::Local(LocalId(idx)) = &arg_expr.kind {
+                    if matches!(locals[*idx].kind, ValueKind::Number) {
+                        Some(locals[*idx].subtype)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                match (&arg_expr.kind, local_subtype) {
+                    (HirExprKind::Integer(_), _) => {
                         let s = emit_addressof(context, block, "s_subtypename_integer", types, loc);
                         emit_value_slot_store_string(context, block, out_slot, s, types, loc);
                     }
-                    HirExprKind::Number(_) => {
+                    (HirExprKind::Number(_), _) => {
+                        let s = emit_addressof(context, block, "s_subtypename_float", types, loc);
+                        emit_value_slot_store_string(context, block, out_slot, s, types, loc);
+                    }
+                    (_, Some(crate::hir::NumberSubtype::Integer)) => {
+                        let s = emit_addressof(context, block, "s_subtypename_integer", types, loc);
+                        emit_value_slot_store_string(context, block, out_slot, s, types, loc);
+                    }
+                    (_, Some(crate::hir::NumberSubtype::Float)) => {
                         let s = emit_addressof(context, block, "s_subtypename_float", types, loc);
                         emit_value_slot_store_string(context, block, out_slot, s, types, loc);
                     }

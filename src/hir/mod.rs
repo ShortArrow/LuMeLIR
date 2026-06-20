@@ -11,7 +11,7 @@ mod ir;
 pub use error::HirError;
 pub use ir::{
     Builtin, Callee, FuncId, HirChunk, HirExpr, HirExprKind, HirFunction, HirStmt, HirStmtKind,
-    IndirectSig, LocalId, LocalInfo, ParentScope, UpvalueInfo,
+    IndirectSig, LocalId, LocalInfo, NumberSubtype, ParentScope, UpvalueInfo,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -1418,6 +1418,7 @@ fn register_function_signature(
                 kind: ValueKind::Number,
                 func_id: None,
                 is_captured: false,
+                subtype: NumberSubtype::Unknown,
             })
             .collect(),
         upvalues: Vec::new(),
@@ -1456,6 +1457,7 @@ fn alloc_method_signature(
                 kind: ValueKind::Number,
                 func_id: None,
                 is_captured: false,
+                subtype: NumberSubtype::Unknown,
             })
             .collect(),
         upvalues: Vec::new(),
@@ -2039,11 +2041,83 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
         all_functions[caller_fid].body = body;
     }
     check_mutual_capturing_recursion_in_stmts(&stmts, None, &all_functions)?;
+    // ADR 0232 — M8-A: propagate Integer/Float subtype to Number-
+    // kind Locals based on their LocalInit / Assign RHS.
+    propagate_number_subtype(&stmts, &mut chunk_locals);
+    for hir_fn in all_functions.iter_mut() {
+        let body = std::mem::take(&mut hir_fn.body);
+        propagate_number_subtype(&body, &mut hir_fn.locals);
+        hir_fn.body = body;
+    }
     Ok(HirChunk {
         locals: chunk_locals,
         stmts,
         functions: all_functions,
     })
+}
+
+/// ADR 0232 — recursive walk over stmts updating each
+/// Number-kind Local's `subtype`. Each LocalInit / Assign RHS
+/// is classified:
+/// - `HirExprKind::Integer(_)` → Integer
+/// - `HirExprKind::Number(_)`  → Float
+/// - anything else             → Unknown (covers Locals, Calls,
+///   BinOp results — all of which could be either subtype at
+///   runtime without further analysis)
+///
+/// Reassignment widens the subtype: when a Local's RHS varies
+/// between Integer and Number across stmts, the final subtype
+/// is `Unknown`. The walker tracks "first seen" + "reset if
+/// observed differently" semantics.
+fn propagate_number_subtype(stmts: &[HirStmt], locals: &mut [LocalInfo]) {
+    fn classify(value: &HirExpr) -> NumberSubtype {
+        match &value.kind {
+            HirExprKind::Integer(_) => NumberSubtype::Integer,
+            HirExprKind::Number(_) => NumberSubtype::Float,
+            _ => NumberSubtype::Unknown,
+        }
+    }
+    fn merge(current: NumberSubtype, new: NumberSubtype) -> NumberSubtype {
+        match (current, new) {
+            (NumberSubtype::Unknown, _) => new,
+            (a, b) if a == b => a,
+            _ => NumberSubtype::Unknown,
+        }
+    }
+    fn walk(stmts: &[HirStmt], locals: &mut [LocalInfo]) {
+        for s in stmts {
+            match &s.kind {
+                HirStmtKind::LocalInit { id, value } | HirStmtKind::Assign { id, value } => {
+                    if matches!(locals[id.0].kind, ValueKind::Number) {
+                        let new = classify(value);
+                        locals[id.0].subtype = merge(locals[id.0].subtype, new);
+                    }
+                }
+                HirStmtKind::If {
+                    then_body,
+                    elifs,
+                    else_body,
+                    ..
+                } => {
+                    walk(then_body, locals);
+                    for (_, b) in elifs {
+                        walk(b, locals);
+                    }
+                    if let Some(b) = else_body {
+                        walk(b, locals);
+                    }
+                }
+                HirStmtKind::While { body, .. } | HirStmtKind::Repeat { body, .. } => {
+                    walk(body, locals);
+                }
+                HirStmtKind::ForNumeric { body, .. } => {
+                    walk(body, locals);
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(stmts, locals);
 }
 
 /// Phase 2.5c-full Commit 3b prep fix (ADR 0083): walk a stmt slice
@@ -2624,6 +2698,7 @@ impl LowerCtx {
             kind,
             func_id,
             is_captured: false,
+            subtype: NumberSubtype::Unknown,
         });
         self.scopes
             .last_mut()
@@ -3811,6 +3886,7 @@ impl LowerCtx {
                     kind: expected_kind,
                     func_id,
                     is_captured: false,
+                    subtype: NumberSubtype::Unknown,
                 });
                 self.scopes[0].insert(name.to_owned(), id);
                 Ok((id, true))
@@ -4581,6 +4657,7 @@ impl LowerCtx {
                                 kind: ValueKind::Number,
                                 func_id: None,
                                 is_captured: false,
+                                subtype: NumberSubtype::Unknown,
                             })
                             .collect(),
                         upvalues: Vec::new(),

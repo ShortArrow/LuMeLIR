@@ -21,12 +21,29 @@ pub struct LocalId(pub usize);
 /// visible to every closure sharing the same outer local). The
 /// flag is filled by a post-pass after every function body has
 /// been lowered.
+/// ADR 0232 — M8-A: static subtype tag for Number-kind Locals.
+/// `Integer` means the slot statically holds an integer (the
+/// LocalInit / Assign RHS lowered to `HirExprKind::Integer` and
+/// the slot has not been observably overwritten by a non-integer
+/// expression). `Float` is the dual. `Unknown` means the slot
+/// could carry either at runtime (e.g. assigned from a Local /
+/// Call / param). Only applies when `kind == Number`; other
+/// `ValueKind`s set this to `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumberSubtype {
+    Unknown,
+    Integer,
+    Float,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalInfo {
     pub name: String,
     pub kind: ValueKind,
     pub func_id: Option<FuncId>,
     pub is_captured: bool,
+    /// ADR 0232 — M8-A. See [`NumberSubtype`].
+    pub subtype: NumberSubtype,
 }
 
 /// A name-resolved program — the input to codegen.

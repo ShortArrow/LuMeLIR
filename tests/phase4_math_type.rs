@@ -36,12 +36,12 @@ fn math_type_float_literal_returns_float() {
 }
 
 #[test]
-fn math_type_local_returns_nil_phase_b() {
-    // Phase B: subtype lost at Local declaration (silent demotion
-    // to ValueKind::Number). ADR 0211+ tracks subtype through
-    // tagged slots so this returns "integer".
+fn math_type_local_returns_integer_after_m8a() {
+    // ADR 0232 — M8-A: subtype propagates from LocalInit Integer
+    // literal to the Local's LocalInfo::subtype. math.type(Local)
+    // now reads it and returns "integer".
     assert_eq!(
         run_ok("local x = 42; print(math.type(x))", "lumelir_mt_local").trim(),
-        "nil"
+        "integer"
     );
 }
