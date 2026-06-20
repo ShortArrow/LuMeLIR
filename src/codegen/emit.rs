@@ -201,6 +201,12 @@ pub(crate) fn emit_module_unverified<'c>(
     // `chunk_safe_for_real_gc` for the gate.
     emit_mutable_i64_global(context, &module, &types, "g_chunk_root_table", 0, loc);
     emit_mutable_i64_global(context, &module, &types, "g_chunk_root_count", 0, loc);
+    // ADR 0220 — parallel root table for TaggedValue chunk slots.
+    // Each entry is the address of a 16-byte tagged slot; the GC
+    // mark phase reads its tag (offset 0) and, when TAG_STRING,
+    // checks the payload ptr (offset 8) against g_gc_head.
+    emit_mutable_i64_global(context, &module, &types, "g_chunk_tv_table", 0, loc);
+    emit_mutable_i64_global(context, &module, &types, "g_chunk_tv_count", 0, loc);
     // ADR 0219 — re-entrancy counter incremented at every user fn
     // entry, decremented before each return. The GC mark phase
     // falls back to v1 safety mode (mark all BLACK) while non-
@@ -966,6 +972,9 @@ pub(crate) fn chunk_safe_for_real_gc(chunk: &HirChunk) -> bool {
                 | ValueKind::Nil
                 | ValueKind::String
                 | ValueKind::Function(_)
+                // ADR 0220 — TaggedValue slot scanning via tag
+                // dispatch (TAG_STRING follows the payload ptr).
+                | ValueKind::TaggedValue
         )
     });
     all_fns_non_capturing && locals_ok
@@ -2538,6 +2547,89 @@ fn emit_main<'c>(
                 .into();
             let count_addr = emit_addressof(context, &main_block, "g_chunk_root_count", types, loc);
             emit_store(&main_block, count_i64, count_addr, loc);
+        }
+        // ADR 0220 — TaggedValue root table. Each entry stores
+        // the slot address; the GC mark phase reads the tag at
+        // offset 0 and, when TAG_STRING, follows the payload ptr
+        // at offset 8.
+        let tv_slot_addrs: Vec<Value<'c, '_>> = chunk
+            .locals
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| matches!(l.kind, ValueKind::TaggedValue))
+            .map(|(i, _)| {
+                super::tagged::emit_value_slot_store_nil(
+                    context,
+                    &main_block,
+                    slots[i],
+                    types,
+                    loc,
+                );
+                slots[i]
+            })
+            .collect();
+        let tv_count = tv_slot_addrs.len();
+        if tv_count > 0 {
+            let tv_count_i32 = main_block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i32, tv_count as i64).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let tv_arr_op = OperationBuilder::new("llvm.alloca", loc)
+                .add_operands(&[tv_count_i32])
+                .add_attributes(&[(
+                    Identifier::new(context, "elem_type"),
+                    TypeAttribute::new(types.ptr).into(),
+                )])
+                .add_results(&[types.ptr])
+                .build()
+                .expect("llvm.alloca for chunk tv table");
+            let tv_arr: Value<'c, '_> = main_block
+                .append_operation(tv_arr_op)
+                .result(0)
+                .unwrap()
+                .into();
+            for (idx, slot_addr) in tv_slot_addrs.iter().enumerate() {
+                let entry_ptr = emit_byte_offset_ptr(
+                    context,
+                    &main_block,
+                    tv_arr,
+                    (idx * 8) as i64,
+                    types,
+                    loc,
+                );
+                emit_store(&main_block, *slot_addr, entry_ptr, loc);
+            }
+            let tv_arr_iv: Value<'c, '_> = main_block
+                .append_operation(
+                    OperationBuilder::new("llvm.ptrtoint", loc)
+                        .add_operands(&[tv_arr])
+                        .add_results(&[types.i64])
+                        .build()
+                        .expect("llvm.ptrtoint chunk_tv_table"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let tv_table_addr =
+                emit_addressof(context, &main_block, "g_chunk_tv_table", types, loc);
+            emit_store(&main_block, tv_arr_iv, tv_table_addr, loc);
+            let tv_count_i64 = main_block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, tv_count as i64).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let tv_count_addr =
+                emit_addressof(context, &main_block, "g_chunk_tv_count", types, loc);
+            emit_store(&main_block, tv_count_i64, tv_count_addr, loc);
         }
     }
 
@@ -5525,6 +5617,9 @@ fn emit_call_pcall_into_locals<'a, 'c>(
         types,
         loc,
     );
+    // ADR 0220 — save g_gc_fn_depth so a caught longjmp restores it.
+    let depth_addr = emit_addressof(context, block, "g_gc_fn_depth", types, loc);
+    let saved_depth = emit_load(block, depth_addr, types.i64, loc);
     let setjmp_op = OperationBuilder::new("llvm.call", loc)
         .add_operands(&[jmpbuf_ptr])
         .add_attributes(&[
@@ -5586,6 +5681,7 @@ fn emit_call_pcall_into_locals<'a, 'c>(
             types,
             loc,
         );
+        emit_store(&then_blk, saved_depth, depth_addr, loc);
         let true_i1 = then_blk
             .append_operation(arith::constant(
                 context,
@@ -5611,6 +5707,7 @@ fn emit_call_pcall_into_locals<'a, 'c>(
             types,
             loc,
         );
+        emit_store(&else_blk, saved_depth, depth_addr, loc);
         let false_i1 = else_blk
             .append_operation(arith::constant(
                 context,
@@ -10343,6 +10440,12 @@ fn emit_expr<'a, 'c>(
                     types,
                     loc,
                 );
+                // ADR 0220 — also save g_gc_fn_depth so a caught
+                // longjmp out of f restores it (otherwise f's
+                // unmatched entry increment leaks; the GC mark
+                // path then never re-enters real-freeing mode).
+                let depth_addr = emit_addressof(context, block, "g_gc_fn_depth", types, loc);
+                let saved_depth = emit_load(block, depth_addr, types.i64, loc);
                 // Call _setjmp(g_jmpbuf) -> i32.
                 let setjmp_op = OperationBuilder::new("llvm.call", loc)
                     .add_operands(&[jmpbuf_ptr])
@@ -10389,7 +10492,7 @@ fn emit_expr<'a, 'c>(
                 let then_blk = Block::new(&[]);
                 {
                     // Successful initial path: invoke f, restore
-                    // jmpbuf, yield true.
+                    // jmpbuf + fn depth, yield true.
                     let _ = emit_llvm_call_indirect(
                         context,
                         &then_blk,
@@ -10406,6 +10509,7 @@ fn emit_expr<'a, 'c>(
                         types,
                         loc,
                     );
+                    emit_store(&then_blk, saved_depth, depth_addr, loc);
                     let true_i1 = then_blk
                         .append_operation(arith::constant(
                             context,
@@ -10421,7 +10525,8 @@ fn emit_expr<'a, 'c>(
                 let else_region = Region::new();
                 let else_blk = Block::new(&[]);
                 {
-                    // Longjmp landing: restore jmpbuf, yield false.
+                    // Longjmp landing: restore jmpbuf + fn depth,
+                    // yield false.
                     let _ = emit_libc_call_ptr(
                         context,
                         &else_blk,
@@ -10430,6 +10535,7 @@ fn emit_expr<'a, 'c>(
                         types,
                         loc,
                     );
+                    emit_store(&else_blk, saved_depth, depth_addr, loc);
                     let false_i1 = else_blk
                         .append_operation(arith::constant(
                             context,
@@ -20664,6 +20770,22 @@ fn emit_gc_mark_from_chunk_roots_real<'a, 'c>(
         .result(0)
         .unwrap()
         .into();
+    // ADR 0220 — TaggedValue parallel root table.
+    let tv_count_addr = emit_addressof(context, block, "g_chunk_tv_count", types, loc);
+    let tv_count = emit_load(block, tv_count_addr, types.i64, loc);
+    let tv_table_addr = emit_addressof(context, block, "g_chunk_tv_table", types, loc);
+    let tv_table_iv = emit_load(block, tv_table_addr, types.i64, loc);
+    let tv_table_ptr: Value<'c, 'a> = block
+        .append_operation(
+            OperationBuilder::new("llvm.inttoptr", loc)
+                .add_operands(&[tv_table_iv])
+                .add_results(&[types.ptr])
+                .build()
+                .expect("llvm.inttoptr chunk_tv_table"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
     let head_addr = emit_addressof(context, block, "g_gc_head", types, loc);
     let head_iv = emit_load(block, head_addr, types.i64, loc);
 
@@ -20871,7 +20993,173 @@ fn emit_gc_mark_from_chunk_roots_real<'a, 'c>(
             loc,
         );
         let scan_results = outer_after_blk.append_operation(scan_op);
-        let found_flag: Value<'c, '_> = scan_results.result(1).unwrap().into();
+        let str_found: Value<'c, '_> = scan_results.result(1).unwrap().into();
+
+        // ADR 0220 — TaggedValue table scan. For each TV slot, read
+        // tag at offset 0; when TAG_STRING, follow the payload ptr
+        // at offset 8 and compare against user_iv.
+        let tv_inner_before = Region::new();
+        let tv_inner_before_blk = Block::new(&[(types.i64, loc), (types.i1, loc)]);
+        {
+            let i: Value<'c, '_> = tv_inner_before_blk.argument(0).unwrap().into();
+            let found: Value<'c, '_> = tv_inner_before_blk.argument(1).unwrap().into();
+            let i_lt: Value<'c, '_> = tv_inner_before_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Slt,
+                    i,
+                    tv_count,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let one = tv_inner_before_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i1, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let not_found: Value<'c, '_> = tv_inner_before_blk
+                .append_operation(arith::xori(found, one, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let cont: Value<'c, '_> = tv_inner_before_blk
+                .append_operation(arith::andi(i_lt, not_found, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            tv_inner_before_blk.append_operation(scf::condition(cont, &[i, found], loc));
+        }
+        tv_inner_before.append_block(tv_inner_before_blk);
+        let tv_inner_after = Region::new();
+        let tv_inner_after_blk = Block::new(&[(types.i64, loc), (types.i1, loc)]);
+        {
+            let i: Value<'c, '_> = tv_inner_after_blk.argument(0).unwrap().into();
+            let found: Value<'c, '_> = tv_inner_after_blk.argument(1).unwrap().into();
+            let eight = tv_inner_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 8).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let byte_off: Value<'c, '_> = tv_inner_after_blk
+                .append_operation(arith::muli(i, eight, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let entry_ptr = emit_byte_offset_ptr_dynamic(
+                context,
+                &tv_inner_after_blk,
+                tv_table_ptr,
+                byte_off,
+                types,
+                loc,
+            );
+            // entry_ptr points at an i64 ptr slot. Load the 16-byte
+            // tagged slot address.
+            let tv_slot_addr = emit_load(&tv_inner_after_blk, entry_ptr, types.ptr, loc);
+            // Tag at offset 0.
+            let tag = emit_load(&tv_inner_after_blk, tv_slot_addr, types.i64, loc);
+            let tag_string = tv_inner_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, crate::codegen::tagged::TAG_STRING).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let is_string: Value<'c, '_> = tv_inner_after_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    tag,
+                    tag_string,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            // Payload at offset 8.
+            let payload_ptr_slot =
+                emit_byte_offset_ptr(context, &tv_inner_after_blk, tv_slot_addr, 8, types, loc);
+            let payload = emit_load(&tv_inner_after_blk, payload_ptr_slot, types.ptr, loc);
+            let payload_iv: Value<'c, '_> = tv_inner_after_blk
+                .append_operation(
+                    OperationBuilder::new("llvm.ptrtoint", loc)
+                        .add_operands(&[payload])
+                        .add_results(&[types.i64])
+                        .build()
+                        .expect("llvm.ptrtoint tv payload"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let payload_eq: Value<'c, '_> = tv_inner_after_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    payload_iv,
+                    user_iv,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let match_now: Value<'c, '_> = tv_inner_after_blk
+                .append_operation(arith::andi(is_string, payload_eq, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let new_found: Value<'c, '_> = tv_inner_after_blk
+                .append_operation(arith::ori(found, match_now, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let one_i64 = tv_inner_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let next_i: Value<'c, '_> = tv_inner_after_blk
+                .append_operation(arith::addi(i, one_i64, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            tv_inner_after_blk.append_operation(scf::r#yield(&[next_i, new_found], loc));
+        }
+        tv_inner_after.append_block(tv_inner_after_blk);
+        let tv_zero_i64 = outer_after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let tv_scan_op = scf::r#while(
+            &[tv_zero_i64, str_found],
+            &[types.i64, types.i1],
+            tv_inner_before,
+            tv_inner_after,
+            loc,
+        );
+        let tv_scan_results = outer_after_blk.append_operation(tv_scan_op);
+        let found_flag: Value<'c, '_> = tv_scan_results.result(1).unwrap().into();
+
         // If found, mark BLACK at cur_ptr + GC_HEADER_OFF_MARK.
         let mark_then = Region::new();
         let mark_then_blk = Block::new(&[]);
