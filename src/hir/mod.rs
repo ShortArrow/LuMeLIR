@@ -2070,10 +2070,46 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
 /// is `Unknown`. The walker tracks "first seen" + "reset if
 /// observed differently" semantics.
 fn propagate_number_subtype(stmts: &[HirStmt], locals: &mut [LocalInfo]) {
-    fn classify(value: &HirExpr) -> NumberSubtype {
+    fn classify(value: &HirExpr, locals: &[LocalInfo]) -> NumberSubtype {
         match &value.kind {
             HirExprKind::Integer(_) => NumberSubtype::Integer,
             HirExprKind::Number(_) => NumberSubtype::Float,
+            // ADR 0234 — Local read: forward the slot's current
+            // tracked subtype.
+            HirExprKind::Local(LocalId(idx)) => locals[*idx].subtype,
+            // ADR 0234 — BinOp: integer-preserving ops yield
+            // Integer when both operands classify as Integer
+            // (per Lua §3.4.1). Div (/) and Pow (^) are always
+            // Float per spec — they break the propagation.
+            HirExprKind::BinOp { op, lhs, rhs } => {
+                let l = classify(lhs, locals);
+                let r = classify(rhs, locals);
+                let integer_preserving = matches!(
+                    op,
+                    BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::FloorDiv
+                        | BinOp::Mod
+                        | BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                        | BinOp::Shl
+                        | BinOp::Shr
+                );
+                if integer_preserving && l == NumberSubtype::Integer && r == NumberSubtype::Integer
+                {
+                    NumberSubtype::Integer
+                } else if matches!(op, BinOp::Div | BinOp::Pow) {
+                    // Always Float.
+                    NumberSubtype::Float
+                } else if l == NumberSubtype::Float || r == NumberSubtype::Float {
+                    // Any Float operand → Float result.
+                    NumberSubtype::Float
+                } else {
+                    NumberSubtype::Unknown
+                }
+            }
             _ => NumberSubtype::Unknown,
         }
     }
@@ -2089,7 +2125,7 @@ fn propagate_number_subtype(stmts: &[HirStmt], locals: &mut [LocalInfo]) {
             match &s.kind {
                 HirStmtKind::LocalInit { id, value } | HirStmtKind::Assign { id, value } => {
                     if matches!(locals[id.0].kind, ValueKind::Number) {
-                        let new = classify(value);
+                        let new = classify(value, locals);
                         locals[id.0].subtype = merge(locals[id.0].subtype, new);
                     }
                 }
