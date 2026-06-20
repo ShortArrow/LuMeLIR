@@ -1896,6 +1896,24 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(str_find_op.into());
+
+    // ADR 0231 — M7-D: pattern matcher with char classes + `.`
+    // wildcard. Returns a packed i64: low 32 bits = 1-indexed
+    // start, high 32 bits = matched byte length.
+    let str_match_extents_ty = llvm::r#type::function(types.i64, &[types.ptr, types.ptr], false);
+    let str_match_extents_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(
+            context,
+            "lumelir_string_match_extents",
+        ))
+        .function_type(TypeAttribute::new(str_match_extents_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(str_match_extents_op.into());
 }
 
 /// MLIR type for a function parameter of static [`ValueKind`]. Number
@@ -5857,7 +5875,7 @@ fn emit_call_string_find_into_locals<'a, 'c>(
         .add_attributes(&[
             (
                 Identifier::new(context, "callee"),
-                FlatSymbolRefAttribute::new(context, "lumelir_string_find_plain").into(),
+                FlatSymbolRefAttribute::new(context, "lumelir_string_match_extents").into(),
             ),
             (
                 Identifier::new(context, "operandSegmentSizes"),
@@ -5870,8 +5888,8 @@ fn emit_call_string_find_into_locals<'a, 'c>(
         ])
         .add_results(&[types.i64])
         .build()
-        .expect("llvm.call @lumelir_string_find_plain (multi-return)");
-    let pos_i64: Value<'c, '_> = block.append_operation(call_op).result(0).unwrap().into();
+        .expect("llvm.call @lumelir_string_match_extents (multi-return)");
+    let packed: Value<'c, '_> = block.append_operation(call_op).result(0).unwrap().into();
     let zero_i64 = block
         .append_operation(arith::constant(
             context,
@@ -5885,14 +5903,47 @@ fn emit_call_string_find_into_locals<'a, 'c>(
         .append_operation(arith::cmpi(
             context,
             arith::CmpiPredicate::Ne,
-            pos_i64,
+            packed,
             zero_i64,
             loc,
         ))
         .result(0)
         .unwrap()
         .into();
-    let sub_len_i64 = emit_load(block, sub, types.i64, loc);
+    // start = packed & 0xFFFFFFFF; len = (packed >> 32) & 0xFFFFFFFF.
+    let mask_low = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0xFFFFFFFF).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let pos_i64: Value<'c, '_> = block
+        .append_operation(arith::andi(packed, mask_low, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let thirty_two = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 32).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let len_shifted: Value<'c, '_> = block
+        .append_operation(arith::shrui(packed, thirty_two, loc))
+        .result(0)
+        .unwrap()
+        .into();
+    let len_i64: Value<'c, '_> = block
+        .append_operation(arith::andi(len_shifted, mask_low, loc))
+        .result(0)
+        .unwrap()
+        .into();
     let one_i64 = block
         .append_operation(arith::constant(
             context,
@@ -5902,13 +5953,13 @@ fn emit_call_string_find_into_locals<'a, 'c>(
         .result(0)
         .unwrap()
         .into();
-    let sub_len_minus_one: Value<'c, '_> = block
-        .append_operation(arith::subi(sub_len_i64, one_i64, loc))
+    let len_minus_one: Value<'c, '_> = block
+        .append_operation(arith::subi(len_i64, one_i64, loc))
         .result(0)
         .unwrap()
         .into();
     let end_i64: Value<'c, '_> = block
-        .append_operation(arith::addi(pos_i64, sub_len_minus_one, loc))
+        .append_operation(arith::addi(pos_i64, len_minus_one, loc))
         .result(0)
         .unwrap()
         .into();
@@ -11828,7 +11879,7 @@ fn emit_expr<'a, 'c>(
                     .add_attributes(&[
                         (
                             Identifier::new(context, "callee"),
-                            FlatSymbolRefAttribute::new(context, "lumelir_string_find_plain")
+                            FlatSymbolRefAttribute::new(context, "lumelir_string_match_extents")
                                 .into(),
                         ),
                         (
@@ -11842,8 +11893,8 @@ fn emit_expr<'a, 'c>(
                     ])
                     .add_results(&[types.i64])
                     .build()
-                    .expect("llvm.call @lumelir_string_find_plain");
-                let pos_i64: Value<'c, '_> =
+                    .expect("llvm.call @lumelir_string_match_extents");
+                let packed: Value<'c, '_> =
                     block.append_operation(call_op).result(0).unwrap().into();
                 let zero_i64 = block
                     .append_operation(arith::constant(
@@ -11858,10 +11909,25 @@ fn emit_expr<'a, 'c>(
                     .append_operation(arith::cmpi(
                         context,
                         arith::CmpiPredicate::Ne,
-                        pos_i64,
+                        packed,
                         zero_i64,
                         loc,
                     ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                // start = packed & 0xFFFFFFFF (low 32 bits)
+                let mask_low = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 0xFFFFFFFF).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let pos_i64: Value<'c, '_> = block
+                    .append_operation(arith::andi(packed, mask_low, loc))
                     .result(0)
                     .unwrap()
                     .into();

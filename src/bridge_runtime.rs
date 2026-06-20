@@ -53,6 +53,95 @@ pub extern "C" fn rust_strlen(s_ptr: *const u8) -> f64 {
     len_i64 as f64
 }
 
+// ADR 0231 — M7-D: pattern matcher with character classes
+// (`%a` / `%d` / `%s` / `%w` / `%p` / `%l` / `%u` / `%x` / `%c`
+// and their complements) + `.` wildcard + `%X` magic-char
+// escape. No quantifiers / sets / anchors / captures yet.
+// Returns a packed i64: low 32 bits = 1-indexed start, high 32
+// bits = matched byte length. 0 = no match.
+fn matches_class(c: u8, class: u8) -> bool {
+    match class {
+        b'a' => c.is_ascii_alphabetic(),
+        b'A' => !c.is_ascii_alphabetic(),
+        b'd' => c.is_ascii_digit(),
+        b'D' => !c.is_ascii_digit(),
+        b's' => c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' || c == 0x0b || c == 0x0c,
+        b'S' => !(c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' || c == 0x0b || c == 0x0c),
+        b'w' => c.is_ascii_alphanumeric(),
+        b'W' => !c.is_ascii_alphanumeric(),
+        b'p' => c.is_ascii_punctuation(),
+        b'P' => !c.is_ascii_punctuation(),
+        b'l' => c.is_ascii_lowercase(),
+        b'L' => !c.is_ascii_lowercase(),
+        b'u' => c.is_ascii_uppercase(),
+        b'U' => !c.is_ascii_uppercase(),
+        b'x' => c.is_ascii_hexdigit(),
+        b'X' => !c.is_ascii_hexdigit(),
+        b'c' => c.is_ascii_control(),
+        b'C' => !c.is_ascii_control(),
+        // `%.` → literal `.`, `%%` → literal `%`, etc.
+        _ => c == class,
+    }
+}
+
+// Try to match `pat` starting at `s[s_start]`. Returns
+// `Some(consumed_s_bytes)` on success.
+fn try_match_at(s: &[u8], s_start: usize, pat: &[u8]) -> Option<usize> {
+    let mut s_i = s_start;
+    let mut p_i = 0;
+    while p_i < pat.len() {
+        if s_i >= s.len() {
+            return None;
+        }
+        let p = pat[p_i];
+        if p == b'%' {
+            // %X — class or literal escape.
+            if p_i + 1 >= pat.len() {
+                return None;
+            }
+            if !matches_class(s[s_i], pat[p_i + 1]) {
+                return None;
+            }
+            p_i += 2;
+            s_i += 1;
+        } else if p == b'.' {
+            // Wildcard.
+            p_i += 1;
+            s_i += 1;
+        } else if s[s_i] == p {
+            p_i += 1;
+            s_i += 1;
+        } else {
+            return None;
+        }
+    }
+    Some(s_i - s_start)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lumelir_string_match_extents(s_ptr: *const u8, pat_ptr: *const u8) -> i64 {
+    unsafe {
+        let s_len = core::ptr::read_unaligned(s_ptr.cast::<i64>()) as usize;
+        let pat_len = core::ptr::read_unaligned(pat_ptr.cast::<i64>()) as usize;
+        let s = core::slice::from_raw_parts(s_ptr.add(8), s_len);
+        let pat = core::slice::from_raw_parts(pat_ptr.add(8), pat_len);
+        if pat_len == 0 {
+            // Empty pattern matches at start with zero length.
+            return 1;
+        }
+        let mut start = 0;
+        while start <= s_len {
+            if let Some(consumed) = try_match_at(s, start, pat) {
+                let pos = (start as i64) + 1;
+                let len = consumed as i64;
+                return (len << 32) | pos;
+            }
+            start += 1;
+        }
+        0
+    }
+}
+
 // ADR 0228 — M7-A: `string.find(s, sub)` literal substring
 // search runtime helper. Returns 1-indexed start position in
 // `s`, or 0 if not found. Magic-char pattern semantics are
