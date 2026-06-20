@@ -12379,6 +12379,19 @@ fn emit_expr<'a, 'c>(
                             .into();
                         emit_value_slot_store_number(context, block, out_slot, f_val, types, loc);
                     }
+                    // ADR 0235 — M8-D: a Number-kind Local with
+                    // Integer subtype holds an integer-valued
+                    // f64 (Phase B silent demotion). Read the
+                    // slot and return its f64 value — same
+                    // success path as the static Integer literal
+                    // arm.
+                    HirExprKind::Local(LocalId(idx))
+                        if matches!(locals[*idx].kind, ValueKind::Number)
+                            && locals[*idx].subtype == crate::hir::NumberSubtype::Integer =>
+                    {
+                        let f_val = emit_load(block, slots[*idx], types.f64, loc);
+                        emit_value_slot_store_number(context, block, out_slot, f_val, types, loc);
+                    }
                     _ => {
                         emit_value_slot_store_nil(context, block, out_slot, types, loc);
                     }

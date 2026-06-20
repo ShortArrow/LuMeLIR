@@ -26,7 +26,7 @@
 | **M5** | Bridge marshaling | 2-3 | C 中 | M2 (error 連動) |
 | **M6** | Phase 4a 完了宣言 | 0.5 | — | M2-M5 |
 | **M7** | string patterns (find/match/gmatch/gsub) | ✅ 4/4-6 minimum-viable close (ADRs 0228-0231; 1519 → 1540) | B 高 | — |
-| **M8** | M1-extended (runtime slot 拡張) | 7-12.5 | A 中 | M2 (error 連動でテスト安定) |
+| **M8** | M1-extended (runtime slot 拡張) | ✅ 4/4-6 minimum-viable close (ADRs 0232-0235; 1540 → 1561) | A 中 | M2 (error 連動でテスト安定) |
 | **M9** | `<close>` / `<const>` + `__close` + goto/label | 2-3 | A 低 | — |
 | **M10** | `__gc` + `__mode` weak tables | 3-4 | A 中 | M3 (GC freeing) |
 | **M11** | stdlib 拡張 (math/table/os/utf8/debug/basic select) | 8-12 | B 中 | — |

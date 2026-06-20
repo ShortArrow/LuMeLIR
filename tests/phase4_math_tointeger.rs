@@ -41,15 +41,15 @@ fn math_tointeger_fractional_returns_nil() {
 }
 
 #[test]
-fn math_tointeger_local_returns_nil_phase_b() {
-    // Phase B: subtype info lost at Local declaration.
-    // ADR 0212+ tracks subtype through tagged slots.
+fn math_tointeger_local_returns_integer_after_m8d() {
+    // ADR 0235 — M8-D: subtype propagation lights up math.
+    // tointeger for Locals carrying Integer subtype.
     assert_eq!(
         run_ok(
             "local x = 42; print(math.tointeger(x))",
             "lumelir_mti_local"
         )
         .trim(),
-        "nil"
+        "42"
     );
 }
