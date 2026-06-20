@@ -515,6 +515,12 @@ pub enum Builtin {
     /// `+`, `?`, `[`, `]`, `(`, `)`, `^`, `$`, `.` etc).
     /// Multi-return (start, end) deferred to M7-B.
     StringFind,
+    /// ADR 0230 — M7-C: `string.match(s, sub)` literal
+    /// substring match. Returns the matched substring (String)
+    /// on a hit or Nil on miss. In plain mode the matched
+    /// substring equals `sub` itself; magic-char patterns +
+    /// captures are deferred to the pattern matcher port.
+    StringMatch,
     /// `string.char(...)` — Lua 5.4 §6.4 variadic byte-producer.
     /// Each arg must be an integer-valued Number in [0, 255];
     /// returns a boxed string object (ADR 0112). Embedded NUL
@@ -724,6 +730,8 @@ impl Builtin {
             "byte" => Some(Builtin::StringByte),
             // ADR 0228 — M7-A literal-only string.find.
             "find" => Some(Builtin::StringFind),
+            // ADR 0230 — M7-C literal-only string.match.
+            "match" => Some(Builtin::StringMatch),
             // ADR 0113 — string.char (variadic byte-producer).
             "char" => Some(Builtin::StringChar),
             "format" => Some(Builtin::StringFormat),
@@ -848,6 +856,7 @@ impl Builtin {
             // ADR 0228 — string.find(s, sub) — `init` and `plain`
             // args deferred to a future sub-ADR.
             Builtin::StringFind => (2, 2),
+            Builtin::StringMatch => (2, 2),
             // ADR 0113 — string.char(...) variadic byte-producer.
             // Print precedent for variadic (0, usize::MAX).
             Builtin::StringChar => (0, usize::MAX),
@@ -919,6 +928,7 @@ impl Builtin {
             Builtin::StringRep => "string.rep",
             Builtin::StringByte => "string.byte",
             Builtin::StringFind => "string.find",
+            Builtin::StringMatch => "string.match",
             Builtin::StringChar => "string.char",
             Builtin::StringFormat => "string.format",
             Builtin::TableConcat => "table.concat",
@@ -993,6 +1003,9 @@ impl Builtin {
             // Single-assign truncates to position 0 (start)
             // per ADR 0081 Next precedent.
             Builtin::StringFind => &[ValueKind::TaggedValue, ValueKind::TaggedValue],
+            // ADR 0230 — string.match returns String-or-Nil
+            // → TaggedValue.
+            Builtin::StringMatch => &[ValueKind::TaggedValue],
             Builtin::StringUpper
             | Builtin::StringLower
             | Builtin::StringSub
@@ -1100,6 +1113,7 @@ impl Builtin {
             Builtin::StringByte => &[ValueKind::String, ValueKind::Number],
             // ADR 0228 — string.find(s, sub).
             Builtin::StringFind => &[ValueKind::String, ValueKind::String],
+            Builtin::StringMatch => &[ValueKind::String, ValueKind::String],
             // table.* — first arg Table; sep String; bounds Number.
             Builtin::TableConcat => &[
                 ValueKind::Table,

@@ -11893,6 +11893,100 @@ fn emit_expr<'a, 'c>(
                 block.append_operation(scf::r#if(is_found, &[], then_region, else_region, loc));
                 Ok(out_slot)
             }
+            Callee::Builtin(Builtin::StringMatch) => {
+                // ADR 0230 — M7-C: literal-only `string.match(s,
+                // sub)`. Plain mode: matched substring == sub
+                // itself when found, Nil otherwise. Reuses the
+                // ADR 0228 find helper for the substring search.
+                let s = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let sub = emit_expr(
+                    context,
+                    block,
+                    &args[1],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let call_op = OperationBuilder::new("llvm.call", loc)
+                    .add_operands(&[s, sub])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "callee"),
+                            FlatSymbolRefAttribute::new(context, "lumelir_string_find_plain")
+                                .into(),
+                        ),
+                        (
+                            Identifier::new(context, "operandSegmentSizes"),
+                            DenseI32ArrayAttribute::new(context, &[2, 0]).into(),
+                        ),
+                        (
+                            Identifier::new(context, "op_bundle_sizes"),
+                            DenseI32ArrayAttribute::new(context, &[]).into(),
+                        ),
+                    ])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.call @lumelir_string_find_plain (match)");
+                let pos_i64: Value<'c, '_> =
+                    block.append_operation(call_op).result(0).unwrap().into();
+                let zero_i64 = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let is_found: Value<'c, '_> = block
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Ne,
+                        pos_i64,
+                        zero_i64,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let out_slot =
+                    emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
+                let then_region = Region::new();
+                let then_blk = Block::new(&[]);
+                {
+                    super::tagged::emit_value_slot_store_string(
+                        context, &then_blk, out_slot, sub, types, loc,
+                    );
+                    then_blk.append_operation(scf::r#yield(&[], loc));
+                }
+                then_region.append_block(then_blk);
+                let else_region = Region::new();
+                let else_blk = Block::new(&[]);
+                {
+                    super::tagged::emit_value_slot_store_nil(
+                        context, &else_blk, out_slot, types, loc,
+                    );
+                    else_blk.append_operation(scf::r#yield(&[], loc));
+                }
+                else_region.append_block(else_blk);
+                block.append_operation(scf::r#if(is_found, &[], then_region, else_region, loc));
+                Ok(out_slot)
+            }
             Callee::Builtin(Builtin::StringChar) => {
                 // Phase 2.7v-stdlib-string-char (ADR 0113):
                 // variadic byte-producer. Lowers each arg as f64,
