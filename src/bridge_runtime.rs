@@ -33,6 +33,16 @@ pub extern "C" fn rust_add(a: f64, b: f64) -> f64 {
 // bytes (offset 0) hold the i64 byte length (ADR 0112 layout).
 // The function reads the length and returns it as f64 (Lua
 // Number ABI).
+// ADR 0225 — Bool ↔ Bool marshaling demo. Logical NOT over a
+// single bool. C ABI passes `bool` as a 1-byte value (i8 in
+// LLVM IR), but Lua's Bool slots are `i1`; the codegen extern
+// declaration is shaped to match — see `rust_not_ty` in
+// `src/codegen/emit.rs`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_not(b: bool) -> bool {
+    !b
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_strlen(s_ptr: *const u8) -> f64 {
     // SAFETY: the caller passes a Lua boxed-string-object ptr

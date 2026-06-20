@@ -630,6 +630,12 @@ pub enum Builtin {
     /// length field (i64 at offset 0 per ADR 0112) and returns
     /// it as f64. First sub-ADR of the M5 marshaling milestone.
     RustStrlen,
+    /// ADR 0225 — Rust-Lua Bridge Bool ↔ Bool demo.
+    /// `rust.not(b: Bool) -> Bool` dispatches to
+    /// `extern "C" fn rust_not(bool) -> bool` in
+    /// `src/bridge_runtime.rs`. Second sub-ADR of the M5
+    /// marshaling milestone.
+    RustNot,
 }
 
 impl Builtin {
@@ -767,6 +773,9 @@ impl Builtin {
             "add" => Some(Builtin::RustAdd),
             // ADR 0224 — String → Number marshaling.
             "strlen" => Some(Builtin::RustStrlen),
+            // ADR 0225 — Bool ↔ Bool marshaling demo. Method
+            // name is `invert` because Lua's `not` is reserved.
+            "invert" => Some(Builtin::RustNot),
             _ => None,
         }
     }
@@ -845,6 +854,7 @@ impl Builtin {
             Builtin::RustAdd => (2, 2),
             // ADR 0224 — single-String-arg signature.
             Builtin::RustStrlen => (1, 1),
+            Builtin::RustNot => (1, 1),
             // ADR 0201 — string.reverse(s).
             Builtin::StringReverse => (1, 1),
             // ADR 0210 — math.type(x).
@@ -895,6 +905,7 @@ impl Builtin {
             // ADR 0191.
             Builtin::RustAdd => "rust.add",
             Builtin::RustStrlen => "rust.strlen",
+            Builtin::RustNot => "rust.invert",
             // ADR 0201.
             Builtin::StringReverse => "string.reverse",
             // ADR 0210.
@@ -977,6 +988,8 @@ impl Builtin {
             Builtin::RustAdd => &[ValueKind::Number],
             // ADR 0224 — returns Number (the i64 string length).
             Builtin::RustStrlen => &[ValueKind::Number],
+            // ADR 0225 — rust.not returns Bool.
+            Builtin::RustNot => &[ValueKind::Bool],
             // ADR 0201 — string.reverse returns String.
             Builtin::StringReverse => &[ValueKind::String],
             // ADR 0210 — math.type returns "integer"/"float"/nil
@@ -1108,6 +1121,7 @@ impl Builtin {
             // ADR 0191 — rust.add(a, b) — both args Number.
             Builtin::RustAdd => &[ValueKind::Number, ValueKind::Number],
             Builtin::RustStrlen => &[ValueKind::String],
+            Builtin::RustNot => &[ValueKind::Bool],
             // ADR 0201 — string.reverse(s) — String arg.
             Builtin::StringReverse => &[ValueKind::String],
             // ADR 0210 — math.type accepts any Number-kind arg

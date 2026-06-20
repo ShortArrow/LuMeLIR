@@ -1849,6 +1849,23 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(rust_strlen_op.into());
+
+    // ADR 0225 — Rust-Lua Bridge Bool ↔ Bool marshaling demo:
+    // `rust_not(bool) -> bool`. The C ABI for `bool` is i8 on
+    // x86_64-linux; the codegen emit arm zext'es the i1 Lua Bool
+    // to i8 at the call site and truncates the i8 result back to
+    // i1 to match `ValueKind::Bool` MLIR storage.
+    let rust_not_ty = llvm::r#type::function(types.i8, &[types.i8], false);
+    let rust_not_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "rust_not"))
+        .function_type(TypeAttribute::new(rust_not_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(rust_not_op.into());
 }
 
 /// MLIR type for a function parameter of static [`ValueKind`]. Number
@@ -10862,6 +10879,68 @@ fn emit_expr<'a, 'c>(
                     types,
                     loc,
                 ))
+            }
+            Callee::Builtin(Builtin::RustNot) => {
+                // ADR 0225 — Rust-Lua Bridge Bool ↔ Bool. The Lua
+                // Bool reaches us as i1; widen to i8 for the C
+                // ABI, call `rust_not`, then truncate the i8
+                // result back to i1.
+                let b_i1 = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let b_i8: Value<'c, '_> = block
+                    .append_operation(
+                        OperationBuilder::new("llvm.zext", loc)
+                            .add_operands(&[b_i1])
+                            .add_results(&[types.i8])
+                            .build()
+                            .expect("llvm.zext bool i1→i8"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let call_op = OperationBuilder::new("llvm.call", loc)
+                    .add_operands(&[b_i8])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "callee"),
+                            FlatSymbolRefAttribute::new(context, "rust_not").into(),
+                        ),
+                        (
+                            Identifier::new(context, "operandSegmentSizes"),
+                            DenseI32ArrayAttribute::new(context, &[1, 0]).into(),
+                        ),
+                        (
+                            Identifier::new(context, "op_bundle_sizes"),
+                            DenseI32ArrayAttribute::new(context, &[]).into(),
+                        ),
+                    ])
+                    .add_results(&[types.i8])
+                    .build()
+                    .expect("llvm.call @rust_not");
+                let ret_i8: Value<'c, '_> =
+                    block.append_operation(call_op).result(0).unwrap().into();
+                let ret_i1: Value<'c, '_> = block
+                    .append_operation(
+                        OperationBuilder::new("llvm.trunc", loc)
+                            .add_operands(&[ret_i8])
+                            .add_results(&[types.i1])
+                            .build()
+                            .expect("llvm.trunc i8→i1"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                Ok(ret_i1)
             }
             Callee::Builtin(Builtin::StringLen) => {
                 // Phase 2.7q-stdlib-string (ADR 0103): `string.len(s)` →
