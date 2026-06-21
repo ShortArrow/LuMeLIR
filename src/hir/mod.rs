@@ -1661,7 +1661,8 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
     // the ADR 0218 chunk-safe predicate for the common case.
     let needs_g = chunk_references_name(chunk, "_G");
     let needs_env = chunk_references_name(chunk, "_ENV");
-    let synthesised_chunk: Vec<Stmt> = if needs_g || needs_env {
+    let needs_package = chunk_references_name(chunk, "package");
+    let synthesised_chunk: Vec<Stmt> = if needs_g || needs_env || needs_package {
         let mut new_chunk: Vec<Stmt> = Vec::with_capacity(chunk.len() + 2);
         let zero_span = Span::new(0, 0);
         if needs_g || needs_env {
@@ -1679,6 +1680,31 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
                 StmtKind::Local {
                     name: "_ENV".to_owned(),
                     value: Expr::new(ExprKind::Ident("_G".to_owned()), zero_span),
+                    attr: None,
+                },
+                zero_span,
+            ));
+        }
+        if needs_package {
+            // ADR 0247 — M14-A: synthesise a minimal `package`
+            // table with Lua 5.4 spec-default values for
+            // `config`, `path`, `cpath`. `loaded` defers to
+            // M14-stretch (requires require runtime).
+            use crate::parser::TableField;
+            let mk_keyed = |k: &str, v: &str| TableField::Keyed {
+                key: Expr::new(ExprKind::Str(k.to_owned()), zero_span),
+                value: Expr::new(ExprKind::Str(v.to_owned()), zero_span),
+            };
+            let fields = vec![
+                // POSIX defaults per Lua 5.4 §6.3.
+                mk_keyed("config", "/\n;\n?\n!\n-\n"),
+                mk_keyed("path", "./?.lua;./?/init.lua"),
+                mk_keyed("cpath", "./?.so"),
+            ];
+            new_chunk.push(Stmt::new(
+                StmtKind::Local {
+                    name: "package".to_owned(),
+                    value: Expr::new(ExprKind::Table(fields), zero_span),
                     attr: None,
                 },
                 zero_span,
