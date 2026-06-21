@@ -283,6 +283,9 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // ADR 0241 — M11-B variadic max/min.
             | Callee::Builtin(Builtin::MathMax)
             | Callee::Builtin(Builtin::MathMin)
+            // ADR 0242 — M11-C os.time / os.clock return Number.
+            | Callee::Builtin(Builtin::OsTime)
+            | Callee::Builtin(Builtin::OsClock)
             | Callee::Builtin(Builtin::StringLen)
             | Callee::Builtin(Builtin::StringByte)
             // ADR 0191 — rust.add(a, b) returns Number.
@@ -321,6 +324,8 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // value position takes the TaggedValue (TableRemove
             // precedent).
             Callee::Builtin(Builtin::IoRead) => ValueKind::TaggedValue,
+            // ADR 0242 — os.getenv returns String-or-Nil → TaggedValue.
+            Callee::Builtin(Builtin::OsGetenv) => ValueKind::TaggedValue,
             // ADR 0210 — math.type returns String-or-nil → TaggedValue.
             Callee::Builtin(Builtin::MathType) => ValueKind::TaggedValue,
             // ADR 0211 — math.tointeger returns Number-or-nil → TaggedValue.

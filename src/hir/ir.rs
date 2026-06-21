@@ -513,6 +513,17 @@ pub enum Builtin {
     MathMax,
     /// ADR 0241 — `math.min(a, b, ...)` variadic min.
     MathMin,
+    /// ADR 0242 — M11-C: `os.time()` returns the current Unix
+    /// epoch time in seconds via libc `time(NULL)`.
+    OsTime,
+    /// ADR 0242 — `os.clock()` returns the program's CPU time
+    /// in seconds via libc `clock() / CLOCKS_PER_SEC`. The
+    /// CLOCKS_PER_SEC constant is hardcoded to 1_000_000 (POSIX
+    /// spec) so the division is a compile-time constant.
+    OsClock,
+    /// ADR 0242 — `os.getenv(name)` reads an env var; returns
+    /// String on hit or Nil on miss → TaggedValue.
+    OsGetenv,
     /// `string.len(s)` — Lua's `#s`-equivalent function-call form.
     /// Phase 2.7q-stdlib-string (ADR 0103). Dispatched via the
     /// generic namespace chokepoint when `string` is an UNRESOLVED
@@ -831,6 +842,8 @@ impl Builtin {
             "io" => Self::io_from_method(method),
             // ADR 0191 — Rust-Lua Bridge namespace.
             "rust" => Self::rust_from_method(method),
+            // ADR 0242 — M11-C os.* namespace.
+            "os" => Self::os_from_method(method),
             _ => None,
         }
     }
@@ -840,6 +853,16 @@ impl Builtin {
     /// so `lower_call` falls through to the normal Index-callee
     /// path (which surfaces UndefinedName for unresolved `rust`,
     /// consistent with ADR 0103's math/string/table behaviour).
+    /// ADR 0242 — M11-C: map an `os.<method>` name to a Builtin.
+    pub fn os_from_method(method: &str) -> Option<Self> {
+        match method {
+            "time" => Some(Builtin::OsTime),
+            "clock" => Some(Builtin::OsClock),
+            "getenv" => Some(Builtin::OsGetenv),
+            _ => None,
+        }
+    }
+
     pub fn rust_from_method(method: &str) -> Option<Self> {
         match method {
             "add" => Some(Builtin::RustAdd),
@@ -898,6 +921,10 @@ impl Builtin {
             | Builtin::MathAtan => (1, 1),
             // ADR 0241 — math.max / math.min variadic (1+).
             Builtin::MathMax | Builtin::MathMin => (1, usize::MAX),
+            // ADR 0242 — os.* arity.
+            Builtin::OsTime => (0, 0),
+            Builtin::OsClock => (0, 0),
+            Builtin::OsGetenv => (1, 1),
             Builtin::MathPow => (2, 2),
             Builtin::MathSin | Builtin::MathCos | Builtin::MathLog | Builtin::MathExp => (1, 1),
             Builtin::StringLen | Builtin::StringUpper | Builtin::StringLower => (1, 1),
@@ -983,6 +1010,9 @@ impl Builtin {
             Builtin::MathAtan => "math.atan",
             Builtin::MathMax => "math.max",
             Builtin::MathMin => "math.min",
+            Builtin::OsTime => "os.time",
+            Builtin::OsClock => "os.clock",
+            Builtin::OsGetenv => "os.getenv",
             Builtin::StringLen => "string.len",
             Builtin::StringUpper => "string.upper",
             Builtin::StringLower => "string.lower",
@@ -1067,6 +1097,10 @@ impl Builtin {
             // ADR 0241 — M11-B variadic max/min return Number.
             | Builtin::MathMax
             | Builtin::MathMin => &[ValueKind::Number],
+            // ADR 0242 — os.time/os.clock return Number.
+            Builtin::OsTime | Builtin::OsClock => &[ValueKind::Number],
+            // ADR 0242 — os.getenv returns String-or-Nil → TaggedValue.
+            Builtin::OsGetenv => &[ValueKind::TaggedValue],
             // Phase 2.7q-stdlib-string (ADR 0103/0109).
             Builtin::StringLen | Builtin::StringByte => &[ValueKind::Number],
             // ADR 0228 / 0229 — string.find multi-return
@@ -1258,6 +1292,9 @@ impl Builtin {
             // ADR 0241 — variadic Number args; per-position
             // dispatched via `expected_param_kind`.
             Builtin::MathMax | Builtin::MathMin => &[ValueKind::Number],
+            // ADR 0242 — os.* per-position kinds.
+            Builtin::OsTime | Builtin::OsClock => &[],
+            Builtin::OsGetenv => &[ValueKind::String],
         }
     }
 

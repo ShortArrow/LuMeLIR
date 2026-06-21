@@ -29,7 +29,7 @@
 | **M8** | M1-extended (runtime slot 拡張) | ✅ 4/4-6 minimum-viable close (ADRs 0232-0235; 1540 → 1561) | A 中 | M2 (error 連動でテスト安定) |
 | **M9** | `<close>` / `<const>` + `__close` + goto/label | ✅ 2/2-3 minimum-viable close (ADRs 0236-0237; 1561 → 1571) | A 低 | — |
 | **M10** | `__gc` + `__mode` weak tables | ✅ 2/2-3 surface-pin close (ADRs 0238-0239; 1571 → 1579) — runtime semantics defer to M10-stretch (M3-extended Table DFS gating) | A 中 | M3 (GC freeing) |
-| **M11** | stdlib 拡張 (math/table/os/utf8/debug/basic select) | 8-12 | B 中 | — |
+| **M11** | stdlib 拡張 (math/table/os/utf8/debug/basic select) | ✅ 3/3-5 minimum-viable close (ADRs 0240-0242; 1579 → 1599) — math.ceil/tan/asin/acos/atan, math.max/min, os.time/clock/getenv. Stretch: table.pack/unpack/sort, utf8.*, debug.*, math.random/fmod, io.open | B 中 | — |
 | **M12** | userdata + Bridge 拡張 (error/GC interaction) | 4-6 | C 中 | M5, M10 |
 | **M13** | Coroutines runtime + coroutine library | 5-8 | A 低 (workload 大) | — |
 | **M14** | load / require / package | 6-10 | C 低 (self-hosting) | M2, M4 |

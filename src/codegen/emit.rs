@@ -1901,6 +1901,46 @@ fn emit_libm_decls<'c>(
         .build();
     module.body().append_operation(str_find_op.into());
 
+    // ADR 0242 — M11-C os.* externs: `time(NULL) -> i64`,
+    // `clock() -> i64` (CLOCKS_PER_SEC = 1_000_000 div is in
+    // the emit arm), `getenv(*const u8) -> *const u8` (NULL on
+    // miss).
+    let time_ty = llvm::r#type::function(types.i64, &[types.ptr], false);
+    let time_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "time"))
+        .function_type(TypeAttribute::new(time_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(time_op.into());
+    let clock_ty = llvm::r#type::function(types.i64, &[], false);
+    let clock_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "clock"))
+        .function_type(TypeAttribute::new(clock_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(clock_op.into());
+    let getenv_ty = llvm::r#type::function(types.ptr, &[types.ptr], false);
+    let getenv_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "getenv"))
+        .function_type(TypeAttribute::new(getenv_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(getenv_op.into());
+    let strlen2_ty = llvm::r#type::function(types.i64, &[types.ptr], false);
+    let _ = strlen2_ty; // strlen already declared.
+
     // ADR 0231 — M7-D: pattern matcher with char classes + `.`
     // wildcard. Returns a packed i64: low 32 bits = 1-indexed
     // start, high 32 bits = matched byte length.
@@ -11059,6 +11099,200 @@ fn emit_expr<'a, 'c>(
                     types,
                     loc,
                 ))
+            }
+            Callee::Builtin(Builtin::OsTime) => {
+                // ADR 0242 — `os.time()`: libc time(NULL) → i64,
+                // sitofp to f64.
+                let null_iv = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let null_ptr: Value<'c, '_> = block
+                    .append_operation(
+                        OperationBuilder::new("llvm.inttoptr", loc)
+                            .add_operands(&[null_iv])
+                            .add_results(&[types.ptr])
+                            .build()
+                            .expect("llvm.inttoptr null for time"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let call_op = OperationBuilder::new("llvm.call", loc)
+                    .add_operands(&[null_ptr])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "callee"),
+                            FlatSymbolRefAttribute::new(context, "time").into(),
+                        ),
+                        (
+                            Identifier::new(context, "operandSegmentSizes"),
+                            DenseI32ArrayAttribute::new(context, &[1, 0]).into(),
+                        ),
+                        (
+                            Identifier::new(context, "op_bundle_sizes"),
+                            DenseI32ArrayAttribute::new(context, &[]).into(),
+                        ),
+                    ])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.call @time");
+                let t_i64: Value<'c, '_> =
+                    block.append_operation(call_op).result(0).unwrap().into();
+                let t_f64: Value<'c, '_> = block
+                    .append_operation(arith::sitofp(t_i64, types.f64, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                Ok(t_f64)
+            }
+            Callee::Builtin(Builtin::OsClock) => {
+                // ADR 0242 — `os.clock()`: clock() / CLOCKS_PER_SEC
+                // (1_000_000 per POSIX).
+                let call_op = OperationBuilder::new("llvm.call", loc)
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "callee"),
+                            FlatSymbolRefAttribute::new(context, "clock").into(),
+                        ),
+                        (
+                            Identifier::new(context, "operandSegmentSizes"),
+                            DenseI32ArrayAttribute::new(context, &[0, 0]).into(),
+                        ),
+                        (
+                            Identifier::new(context, "op_bundle_sizes"),
+                            DenseI32ArrayAttribute::new(context, &[]).into(),
+                        ),
+                    ])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.call @clock");
+                let c_i64: Value<'c, '_> =
+                    block.append_operation(call_op).result(0).unwrap().into();
+                let c_f64: Value<'c, '_> = block
+                    .append_operation(arith::sitofp(c_i64, types.f64, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let cps = block
+                    .append_operation(arith::constant(
+                        context,
+                        FloatAttribute::new(context, types.f64, 1_000_000.0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let secs: Value<'c, '_> = block
+                    .append_operation(arith::divf(c_f64, cps, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                Ok(secs)
+            }
+            Callee::Builtin(Builtin::OsGetenv) => {
+                // ADR 0242 — `os.getenv(name)`: libc getenv
+                // returns NULL on miss or C-string on hit.
+                let name = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                // name is a boxed-string-object ptr; the C-string
+                // payload starts at +8 (ADR 0112 layout).
+                let name_data = emit_byte_offset_ptr(context, block, name, 8, types, loc);
+                let call_op = OperationBuilder::new("llvm.call", loc)
+                    .add_operands(&[name_data])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "callee"),
+                            FlatSymbolRefAttribute::new(context, "getenv").into(),
+                        ),
+                        (
+                            Identifier::new(context, "operandSegmentSizes"),
+                            DenseI32ArrayAttribute::new(context, &[1, 0]).into(),
+                        ),
+                        (
+                            Identifier::new(context, "op_bundle_sizes"),
+                            DenseI32ArrayAttribute::new(context, &[]).into(),
+                        ),
+                    ])
+                    .add_results(&[types.ptr])
+                    .build()
+                    .expect("llvm.call @getenv");
+                let result_ptr: Value<'c, '_> =
+                    block.append_operation(call_op).result(0).unwrap().into();
+                let result_iv: Value<'c, '_> = block
+                    .append_operation(
+                        OperationBuilder::new("llvm.ptrtoint", loc)
+                            .add_operands(&[result_ptr])
+                            .add_results(&[types.i64])
+                            .build()
+                            .expect("llvm.ptrtoint getenv result"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let zero_i64 = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let is_hit: Value<'c, '_> = block
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Ne,
+                        result_iv,
+                        zero_i64,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let out_slot =
+                    emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
+                let then_region = Region::new();
+                let then_blk = Block::new(&[]);
+                {
+                    let len = emit_libc_call_i64(
+                        context, &then_blk, "strlen", &[result_ptr], types, loc,
+                    );
+                    let boxed = emit_string_obj_from_bytes(
+                        context, &then_blk, result_ptr, len, types, loc,
+                    );
+                    super::tagged::emit_value_slot_store_string(
+                        context, &then_blk, out_slot, boxed, types, loc,
+                    );
+                    then_blk.append_operation(scf::r#yield(&[], loc));
+                }
+                then_region.append_block(then_blk);
+                let else_region = Region::new();
+                let else_blk = Block::new(&[]);
+                {
+                    super::tagged::emit_value_slot_store_nil(
+                        context, &else_blk, out_slot, types, loc,
+                    );
+                    else_blk.append_operation(scf::r#yield(&[], loc));
+                }
+                else_region.append_block(else_blk);
+                block.append_operation(scf::r#if(is_hit, &[], then_region, else_region, loc));
+                Ok(out_slot)
             }
             Callee::Builtin(b @ (Builtin::MathMax | Builtin::MathMin)) => {
                 // ADR 0241 — M11-B: variadic max/min. Lower each
