@@ -39,17 +39,22 @@ if freed > 0 then print(\"freed\") else print(\"nope\") end",
 }
 
 #[test]
-fn collect_inside_user_fn_falls_back_to_v1_safety_mode() {
-    // When collectgarbage() fires inside a user fn body, the
-    // depth guard prevents freeing — returned `freed` is 0 because
-    // mark walks all g_gc_head and paints BLACK.
+fn collect_inside_user_fn_does_real_freeing_via_frame_walk() {
+    // ADR 0257 — N2-D supersedes ADR 0219. The depth-guard
+    // fallback to v1 safety mode is dropped when the chunk is
+    // frame-safe; the frame-root walk keeps the fn's live `s`
+    // BLACK while transients dropped during the call get swept.
     let out = run_ok(
-        "local function gc_inside() local s = tostring(7); return collectgarbage() end
+        "local function gc_inside()
+  local s = tostring(7)
+  s = tostring(8)
+  return collectgarbage()
+end
 local freed = gc_inside()
-if freed == 0 then print(\"safe\") else print(\"freed\") end",
-        "lumelir_gc_inside_fn_safe",
+if freed > 0 then print(\"freed\") else print(\"zero\") end",
+        "lumelir_gc_inside_fn_real",
     );
-    assert_eq!(out.trim(), "safe");
+    assert_eq!(out.trim(), "freed");
 }
 
 #[test]

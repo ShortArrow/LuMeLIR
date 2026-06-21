@@ -214,14 +214,38 @@ pub(crate) fn emit_module_unverified<'c>(
     // mid-execution. Allows the chunk-safe predicate to relax to
     // non-capturing user functions.
     emit_mutable_i64_global(context, &module, &types, "g_gc_fn_depth", 0, loc);
+    // ADR 0257 — head of the linked frame-root chain. Each user
+    // fn entry (when the chunk is frame-safe) pushes a frame node
+    // carrying its String / Table / Function-kind body locals'
+    // slot ptrs; the mark phase walks the chain alongside the
+    // chunk root table.
+    emit_mutable_i64_global(context, &module, &types, "g_frame_root_head", 0, loc);
     // ADR 0218 — emit mark / sweep with the chunk-safe gate.
-    register_gc_runtime_funcs(context, &module, &types, chunk_safe_for_real_gc(chunk), loc);
+    // ADR 0257 — N2-D: when frame-safe, skip the v1 depth-guard
+    // fallback inside gc_mark and rely on the frame-chain walk.
+    let frame_safe = frame_safe_for_real_gc(chunk);
+    register_gc_runtime_funcs(
+        context,
+        &module,
+        &types,
+        chunk_safe_for_real_gc(chunk),
+        frame_safe,
+        loc,
+    );
     // ADR 0243 — M12-A: `lumelir_raise_error(msg_ptr)` external-
     // linkage helper for the Rust bridge to call. Wraps the
     // stash-into-g_error_value + longjmp(g_jmpbuf) dance.
     emit_raise_error_helper(context, &module, &types, loc);
     for hir_fn in &chunk.functions {
-        emit_function(context, &module, hir_fn, &chunk.functions, &types, loc)?;
+        emit_function(
+            context,
+            &module,
+            hir_fn,
+            &chunk.functions,
+            &types,
+            frame_safe,
+            loc,
+        )?;
     }
     // Phase 2.5c-full Commit 2b (ADR 0083): one closure singleton
     // global per user fn. The producer sites (`HirExprKind::FunctionRef`,
@@ -991,6 +1015,31 @@ pub(crate) fn chunk_safe_for_real_gc(chunk: &HirChunk) -> bool {
                 // BLACK.
                 | ValueKind::Table
         )
+    })
+}
+
+/// ADR 0257 — N2-D. A chunk additionally qualifies for the
+/// per-frame stack walk (in lieu of the v1 depth-guard fallback)
+/// when every user fn's locals are in the same frame-safe kind
+/// set as the chunk's. TaggedValue locals in user fns would
+/// require a parallel TV frame chain — deferred to a future
+/// sub-ADR.
+pub(crate) fn frame_safe_for_real_gc(chunk: &HirChunk) -> bool {
+    if !chunk_safe_for_real_gc(chunk) {
+        return false;
+    }
+    chunk.functions.iter().all(|f| {
+        f.locals.iter().all(|l| {
+            matches!(
+                l.kind,
+                ValueKind::Number
+                    | ValueKind::Bool
+                    | ValueKind::Nil
+                    | ValueKind::String
+                    | ValueKind::Table
+                    | ValueKind::Function(_)
+            )
+        })
     })
 }
 
@@ -2411,6 +2460,7 @@ fn emit_function<'c>(
     hir_fn: &HirFunction,
     functions: &[HirFunction],
     types: &Types<'c>,
+    frame_safe: bool,
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     let region = Region::new();
@@ -2478,6 +2528,142 @@ fn emit_function<'c>(
             _ => emit_alloca_slot_for_kind(context, &block, info.kind, types, loc),
         })
         .collect();
+
+    // ADR 0257 — N2-D: push a frame-root node. Collect this fn's
+    // String / Table / non-param Function-kind slot ptrs, null-
+    // init each, alloca a ptr array carrying the addresses, alloca
+    // the 24-byte node ({next_iv, count, arr_iv}), and link it
+    // into `g_frame_root_head`. Saved here for the matching pop
+    // at every return path. Function-kind params (block-arg-aliased)
+    // are excluded — they cannot be addressed.
+    let frame_node_value: Option<Value<'c, '_>> = if frame_safe {
+        let frame_slot_addrs: Vec<Value<'c, '_>> = hir_fn
+            .locals
+            .iter()
+            .enumerate()
+            .filter(|(i, l)| match l.kind {
+                ValueKind::String | ValueKind::Table => true,
+                ValueKind::Function(_) => *i >= hir_fn.params.len(),
+                _ => false,
+            })
+            .map(|(i, _)| slots[i])
+            .collect();
+        if frame_slot_addrs.is_empty() {
+            None
+        } else {
+            // null-init each slot.
+            let null_iv = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 0).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let null_ptr: Value<'c, '_> = block
+                .append_operation(
+                    OperationBuilder::new("llvm.inttoptr", loc)
+                        .add_operands(&[null_iv])
+                        .add_results(&[types.ptr])
+                        .build()
+                        .expect("llvm.inttoptr frame null"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            for slot in &frame_slot_addrs {
+                emit_store(&block, null_ptr, *slot, loc);
+            }
+            let count = frame_slot_addrs.len();
+            let count_i32 = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i32, count as i64).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let arr_op = OperationBuilder::new("llvm.alloca", loc)
+                .add_operands(&[count_i32])
+                .add_attributes(&[(
+                    Identifier::new(context, "elem_type"),
+                    TypeAttribute::new(types.ptr).into(),
+                )])
+                .add_results(&[types.ptr])
+                .build()
+                .expect("llvm.alloca for frame root arr");
+            let arr_ptr: Value<'c, '_> = block.append_operation(arr_op).result(0).unwrap().into();
+            for (idx, slot) in frame_slot_addrs.iter().enumerate() {
+                let entry_ptr =
+                    emit_byte_offset_ptr(context, &block, arr_ptr, (idx * 8) as i64, types, loc);
+                emit_store(&block, *slot, entry_ptr, loc);
+            }
+            let arr_iv: Value<'c, '_> = block
+                .append_operation(
+                    OperationBuilder::new("llvm.ptrtoint", loc)
+                        .add_operands(&[arr_ptr])
+                        .add_results(&[types.i64])
+                        .build()
+                        .expect("llvm.ptrtoint frame arr"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            // Allocate the 24-byte node: 3 × i64 fields.
+            let three_i32 = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i32, 3).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let node_op = OperationBuilder::new("llvm.alloca", loc)
+                .add_operands(&[three_i32])
+                .add_attributes(&[(
+                    Identifier::new(context, "elem_type"),
+                    TypeAttribute::new(types.i64).into(),
+                )])
+                .add_results(&[types.ptr])
+                .build()
+                .expect("llvm.alloca for frame node");
+            let node_ptr: Value<'c, '_> = block.append_operation(node_op).result(0).unwrap().into();
+            let head_addr = emit_addressof(context, &block, "g_frame_root_head", types, loc);
+            let prev_head = emit_load(&block, head_addr, types.i64, loc);
+            emit_store(&block, prev_head, node_ptr, loc);
+            let count_field = emit_byte_offset_ptr(context, &block, node_ptr, 8, types, loc);
+            let count_i64 = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, count as i64).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            emit_store(&block, count_i64, count_field, loc);
+            let arr_field = emit_byte_offset_ptr(context, &block, node_ptr, 16, types, loc);
+            emit_store(&block, arr_iv, arr_field, loc);
+            let node_iv: Value<'c, '_> = block
+                .append_operation(
+                    OperationBuilder::new("llvm.ptrtoint", loc)
+                        .add_operands(&[node_ptr])
+                        .add_results(&[types.i64])
+                        .build()
+                        .expect("llvm.ptrtoint frame node"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            emit_store(&block, node_iv, head_addr, loc);
+            Some(node_ptr)
+        }
+    } else {
+        None
+    };
 
     // Store each non-Function parameter (block_arg(i+1)) into its
     // alloca slot. Function-kind params keep their block_arg as the
@@ -2629,6 +2815,13 @@ fn emit_function<'c>(
             .unwrap()
             .into();
         emit_store(&block, depth_minus_one, depth_addr, loc);
+    }
+    // ADR 0257 — N2-D: pop the frame-root node. Load node[0] and
+    // restore as the new head.
+    if let Some(node_ptr) = frame_node_value {
+        let head_addr = emit_addressof(context, &block, "g_frame_root_head", types, loc);
+        let prev_head = emit_load(&block, node_ptr, types.i64, loc);
+        emit_store(&block, prev_head, head_addr, loc);
     }
     emit_llvm_return(context, &block, &ret_types, &ret_values, loc);
     region.append_block(block);
@@ -5898,6 +6091,11 @@ fn emit_call_pcall_into_locals<'a, 'c>(
     // ADR 0220 — save g_gc_fn_depth so a caught longjmp restores it.
     let depth_addr = emit_addressof(context, block, "g_gc_fn_depth", types, loc);
     let saved_depth = emit_load(block, depth_addr, types.i64, loc);
+    // ADR 0257 — N2-D: save g_frame_root_head similarly. A
+    // longjmp unwinds bad's stack but g_frame_root_head still
+    // points at the dead node — restore to the pre-pcall head.
+    let frame_head_addr = emit_addressof(context, block, "g_frame_root_head", types, loc);
+    let saved_frame_head = emit_load(block, frame_head_addr, types.i64, loc);
     let setjmp_op = OperationBuilder::new("llvm.call", loc)
         .add_operands(&[jmpbuf_ptr])
         .add_attributes(&[
@@ -5960,6 +6158,7 @@ fn emit_call_pcall_into_locals<'a, 'c>(
             loc,
         );
         emit_store(&then_blk, saved_depth, depth_addr, loc);
+        emit_store(&then_blk, saved_frame_head, frame_head_addr, loc);
         let true_i1 = then_blk
             .append_operation(arith::constant(
                 context,
@@ -5986,6 +6185,7 @@ fn emit_call_pcall_into_locals<'a, 'c>(
             loc,
         );
         emit_store(&else_blk, saved_depth, depth_addr, loc);
+        emit_store(&else_blk, saved_frame_head, frame_head_addr, loc);
         let false_i1 = else_blk
             .append_operation(arith::constant(
                 context,
@@ -10931,6 +11131,12 @@ fn emit_expr<'a, 'c>(
                 // path then never re-enters real-freeing mode).
                 let depth_addr = emit_addressof(context, block, "g_gc_fn_depth", types, loc);
                 let saved_depth = emit_load(block, depth_addr, types.i64, loc);
+                // ADR 0257 — N2-D: also save g_frame_root_head so
+                // a longjmp restores the live chain (the unwound
+                // node is dead-stack and must not stay linked).
+                let frame_head_addr =
+                    emit_addressof(context, block, "g_frame_root_head", types, loc);
+                let saved_frame_head = emit_load(block, frame_head_addr, types.i64, loc);
                 // Call _setjmp(g_jmpbuf) -> i32.
                 let setjmp_op = OperationBuilder::new("llvm.call", loc)
                     .add_operands(&[jmpbuf_ptr])
@@ -10995,6 +11201,7 @@ fn emit_expr<'a, 'c>(
                         loc,
                     );
                     emit_store(&then_blk, saved_depth, depth_addr, loc);
+                    emit_store(&then_blk, saved_frame_head, frame_head_addr, loc);
                     let true_i1 = then_blk
                         .append_operation(arith::constant(
                             context,
@@ -11021,6 +11228,7 @@ fn emit_expr<'a, 'c>(
                         loc,
                     );
                     emit_store(&else_blk, saved_depth, depth_addr, loc);
+                    emit_store(&else_blk, saved_frame_head, frame_head_addr, loc);
                     let false_i1 = else_blk
                         .append_operation(arith::constant(
                             context,
@@ -21838,6 +22046,7 @@ fn register_gc_runtime_funcs<'c>(
     module: &Module<'c>,
     types: &Types<'c>,
     chunk_safe: bool,
+    frame_safe: bool,
     loc: Location<'c>,
 ) {
     let void_ty = llvm::r#type::void(context);
@@ -21846,7 +22055,11 @@ fn register_gc_runtime_funcs<'c>(
     {
         let region = Region::new();
         let blk = Block::new(&[]);
-        if chunk_safe {
+        if chunk_safe && frame_safe {
+            // ADR 0257 — N2-D: skip the v1 depth-guard fallback.
+            // The frame-chain walk covers user-fn-frame slots.
+            emit_gc_mark_from_chunk_roots_real(context, &blk, types, loc);
+        } else if chunk_safe {
             // ADR 0218 — walk g_chunk_root_table, mark BLACK.
             emit_gc_mark_from_chunk_roots(context, &blk, types, loc);
         } else {
@@ -22501,6 +22714,14 @@ fn emit_gc_mark_from_chunk_roots_real<'a, 'c>(
     let while_op = scf::r#while(&[head_iv], &[types.i64], outer_before, outer_after, loc);
     block.append_operation(while_op);
 
+    // ADR 0257 — N2-D: walk the per-frame root chain. Each node
+    // is a 24-byte struct on the user fn's stack: [next_iv:i64,
+    // count:i64, arr_iv:i64]. `arr_iv` points at a `count`-entry
+    // array of slot ptrs (i64 each). For each slot ptr, load the
+    // i64 value the slot holds (the user_ptr written by user
+    // code) and call the membership-checked mark helper.
+    emit_gc_mark_from_frame_chain(context, block, types, loc);
+
     // ADR 0254 — N2-A: Table-array propagation pass.
     // After the chunk-roots scan, walk g_gc_head again; for each
     // object whose mark is BLACK AND whose type tag is
@@ -22509,6 +22730,183 @@ fn emit_gc_mark_from_chunk_roots_real<'a, 'c>(
     // String objects BLACK. Hash part + Tables-in-Tables
     // defer to N2-B / N2 fixpoint follow-up.
     emit_gc_mark_table_array_propagation(context, block, types, loc);
+}
+
+/// ADR 0257 — N2-D. Walk the linked frame-root chain rooted
+/// at `g_frame_root_head`. For each node iterate its slot-ptr
+/// array; for each slot, load the i64 the user code wrote into
+/// it and mark BLACK via the membership-checked helper. Static
+/// literals (.rodata) miss the membership check → safe no-op.
+fn emit_gc_mark_from_frame_chain<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let head_addr = emit_addressof(context, block, "g_frame_root_head", types, loc);
+    let head_iv = emit_load(block, head_addr, types.i64, loc);
+
+    let outer_before = Region::new();
+    let outer_before_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let cur_iv: Value<'c, '_> = outer_before_blk.argument(0).unwrap().into();
+        let zero = outer_before_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let cond: Value<'c, '_> = outer_before_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Ne,
+                cur_iv,
+                zero,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        outer_before_blk.append_operation(scf::condition(cond, &[cur_iv], loc));
+    }
+    outer_before.append_block(outer_before_blk);
+
+    let outer_after = Region::new();
+    let outer_after_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let cur_iv: Value<'c, '_> = outer_after_blk.argument(0).unwrap().into();
+        let node_ptr: Value<'c, '_> = outer_after_blk
+            .append_operation(
+                OperationBuilder::new("llvm.inttoptr", loc)
+                    .add_operands(&[cur_iv])
+                    .add_results(&[types.ptr])
+                    .build()
+                    .expect("llvm.inttoptr frame node"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        // node[0] = next_iv, node[8] = count, node[16] = arr_iv
+        let count_ptr = emit_byte_offset_ptr(context, &outer_after_blk, node_ptr, 8, types, loc);
+        let count = emit_load(&outer_after_blk, count_ptr, types.i64, loc);
+        let arr_field_ptr =
+            emit_byte_offset_ptr(context, &outer_after_blk, node_ptr, 16, types, loc);
+        let arr_iv = emit_load(&outer_after_blk, arr_field_ptr, types.i64, loc);
+        let arr_ptr: Value<'c, '_> = outer_after_blk
+            .append_operation(
+                OperationBuilder::new("llvm.inttoptr", loc)
+                    .add_operands(&[arr_iv])
+                    .add_results(&[types.ptr])
+                    .build()
+                    .expect("llvm.inttoptr frame arr"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+
+        // inner scf.while: for i in 0..count: mark arr[i]'s slot.
+        let inner_before = Region::new();
+        let inner_before_blk = Block::new(&[(types.i64, loc)]);
+        {
+            let i: Value<'c, '_> = inner_before_blk.argument(0).unwrap().into();
+            let cont: Value<'c, '_> = inner_before_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Slt,
+                    i,
+                    count,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            inner_before_blk.append_operation(scf::condition(cont, &[i], loc));
+        }
+        inner_before.append_block(inner_before_blk);
+        let inner_after = Region::new();
+        let inner_after_blk = Block::new(&[(types.i64, loc)]);
+        {
+            let i: Value<'c, '_> = inner_after_blk.argument(0).unwrap().into();
+            let eight = inner_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 8).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let byte_off: Value<'c, '_> = inner_after_blk
+                .append_operation(arith::muli(i, eight, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let entry_ptr = emit_byte_offset_ptr_dynamic(
+                context,
+                &inner_after_blk,
+                arr_ptr,
+                byte_off,
+                types,
+                loc,
+            );
+            // entry holds the slot address (ptr stored as i64? actually as ptr).
+            // We wrote them as ptr-typed stores at push time → load as ptr.
+            let slot_addr = emit_load(&inner_after_blk, entry_ptr, types.ptr, loc);
+            // The slot's content is the user_ptr the user code wrote
+            // (or a null) — load as ptr; the mark helper does its
+            // own ptrtoint + membership check internally.
+            let user_ptr = emit_load(&inner_after_blk, slot_addr, types.ptr, loc);
+            mark_user_ptr_black_if_nonnull(context, &inner_after_blk, user_ptr, types, loc);
+            let one = inner_after_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let i_next: Value<'c, '_> = inner_after_blk
+                .append_operation(arith::addi(i, one, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            inner_after_blk.append_operation(scf::r#yield(&[i_next], loc));
+        }
+        inner_after.append_block(inner_after_blk);
+        let zero_i64 = outer_after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        outer_after_blk.append_operation(scf::r#while(
+            &[zero_i64],
+            &[types.i64],
+            inner_before,
+            inner_after,
+            loc,
+        ));
+
+        // chain to next node: load node[0].
+        let next = emit_load(&outer_after_blk, node_ptr, types.i64, loc);
+        outer_after_blk.append_operation(scf::r#yield(&[next], loc));
+    }
+    outer_after.append_block(outer_after_blk);
+
+    block.append_operation(scf::r#while(
+        &[head_iv],
+        &[types.i64],
+        outer_before,
+        outer_after,
+        loc,
+    ));
 }
 
 /// ADR 0254 — given a user-visible ptr, verify membership in
