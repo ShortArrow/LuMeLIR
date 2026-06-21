@@ -1,5 +1,10 @@
 # Lua 5.4 網羅までのロードマップ — Milestone Sequence
 
+> **⚠ Superseded 2026-06-21**
+>
+> 本 doc の M1-M17 milestone path は ADR 0253 revision で再評価され、pin ADR が「shipped」扱いされていた問題が判明。新 forward path は [roadmap-2026-06-21-rebuild.md](roadmap-2026-06-21-rebuild.md) (N1-N10 体系) を参照。本 doc は historical record として残置。
+
+
 - **Date:** 2026-06-20
 - **State snapshot:** commit `4e501b1` (ADR 0214、tests 1478)
 - **Companion docs:**

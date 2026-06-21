@@ -1,188 +1,235 @@
-# 0253. Lua 5.4 Preferred-Subset Conformance Declaration
+# 0253. Lua 5.4 Conformance Scorecard — Honest Status (Revised)
 
-- **Status:** Accepted
+- **Status:** Accepted (revised 2026-06-21 — supersedes the original "preferred-subset declaration" framing)
 - **Kind:** Architecture Decision
 - **Date:** 2026-06-21
 - **Deciders:** ShortArrow
 
-## Context
+## Revision note
 
-M17 — the final milestone in the [Lua 5.4 full conformance path](../notes/lua54-full-conformance-path-2026-06-20.md). [ADR 0250](0250-phase4-close-declaration.md) closed Phase 4; [ADR 0252](0252-phase5-close-declaration.md) closed Phase 5. With M1-M16 complete, this ADR formally records LuMeLIR's conformance state against Lua 5.4 spec and declares the **preferred-subset** target met.
+The first published version of this ADR (2026-06-21 morning) declared LuMeLIR "conforms to a Lua 5.4 preferred subset" by counting pin ADRs (0238, 0239, 0244, 0245, 0247) as ✅ in the status tables. That framing was over-optimistic: those pins document surface acceptance + storage round-trip but the **runtime semantics do not work**. A user program that depends on `__gc` firing, a coroutine actually yielding, or `require` actually loading does NOT work today.
 
-The "preferred subset" framing (PRD §6 implicit; surfaced in the conformance roadmap memo) is the practical conformance contract: the language surface real Lua 5.4 programs use, minus the items that are blocked behind structural deferrals (M3-extended Table DFS, runtime parser, etc.). This ADR pins what we ship vs. what we explicitly don't.
+This revision keeps the §-by-§ table structure but uses three honest status markers:
 
-## Declaration
+- **✅ shipped** — feature compiles AND runs with spec-correct or precisely-documented behavior.
+- **⏸ pinned** — surface accepted (parser / HIR / storage), but runtime semantics are partial or deferred. User code that touches the runtime path does not get the spec answer.
+- **❌ deferred** — not implemented at any layer; spec gap explicit.
 
-**LuMeLIR conforms to a Lua 5.4 preferred subset as of 2026-06-21.**
+The original "preferred subset met" declaration is retracted. The accurate framing: LuMeLIR is a **partial Lua 5.4 AOT compiler with a documented gap catalog**, suitable for the "dominant use case" surface (closures + tables + pcall + math + string + io.write/read + bridge), with substantial deferred work catalogued.
 
-The subset is defined by the union of:
-
-1. Every Lua 5.4 §2 / §3 / §6 surface item with a ✅ row in the conformance tables below.
-2. Every M-stretch item explicitly deferred via an ADR-recorded strategy, where the deferral does NOT block the user-visible compile-and-run surface for the dominant use cases.
-
-Programs that stay within this subset compile, run, and produce results identical to (or precisely-documented deviations from) the Lua reference interpreter.
-
-## §-by-§ status
+## Honest scorecard
 
 ### §2.1 Types
 
-| Type | Status | ADR |
+| Type | Status | Notes |
 |---|---|---|
-| `nil` | ✅ | — |
-| `boolean` | ✅ | — |
-| `number` (subtype: `integer`) | ✅ Phase B + M8 static-subtype | 0209-0214, 0232-0235 |
-| `number` (subtype: `float`) | ✅ | — |
-| `string` (boxed, 8-bit clean) | ✅ | 0112 |
-| `function` (closures + upvalues) | ✅ | 0083 |
-| `userdata` | ⏸ opaque-Number shim + deferral | 0244 |
-| `thread` (coroutine) | ⏸ main-thread shipped; runtime deferred | 0245, 0246 |
-| `table` (array + hash + metatable) | ✅ | 0053-0140 |
+| `nil` | ✅ shipped | |
+| `boolean` | ✅ shipped | |
+| `number` integer subtype | ✅ shipped | Phase B silent demotion + M8 static propagation (0209-0214, 0232-0235) |
+| `number` float subtype | ✅ shipped | |
+| `string` (boxed, 8-bit clean) | ✅ shipped | 0112 |
+| `function` (closures + upvalues) | ✅ shipped | 0083 |
+| `userdata` | ❌ deferred | 0244 documents opaque-Number workaround; **no real userdata** |
+| `thread` (coroutine) | ❌ deferred | `isyieldable()` / `running()` work (0245); **create/resume/yield do not exist** |
+| `table` (array + hash + metatable) | ✅ shipped | 0053-0140 |
 
-### §2.4 Metatables and Metamethods
+### §2.4 Metamethods
 
-All `__index` / `__newindex` / arithmetic / bitwise / comparison / `__concat` / `__tostring` / `__len` / `__call` metamethods land. Storage-side acceptance of `__gc` / `__mode` pinned (ADRs 0238, 0239); runtime dispatch deferred to M10-stretch.
+| Metamethod | Status | Notes |
+|---|---|---|
+| `__index` Table form | ✅ shipped | 0134 |
+| `__index` Function form | ✅ shipped | 0150 / 0166 |
+| `__newindex` Table form | ✅ shipped | 0135 / 0168 |
+| `__newindex` Function form | ✅ shipped | 0151 / 0169 |
+| `__add` ... `__idiv` | ✅ shipped | 0147 |
+| `__band` ... `__shr` | ✅ shipped | 0148 |
+| `__eq` / `__lt` / `__le` | ✅ shipped | 0144 |
+| `__concat` / `__tostring` / `__len` | ✅ shipped | 0142 / 0143 |
+| `__call` | ✅ shipped | 0146 |
+| `__gc` | ⏸ pinned | 0238 — field accepted; **runtime dispatch does not fire** |
+| `__close` | ⏸ pinned | 0237 — `<close>` parses + readonly; **runtime hook does not fire** |
+| `__mode` | ⏸ pinned | 0239 — field accepted; **weak-key/value clearing does not fire** |
+| `__name` | ❌ deferred | |
+| `__metatable` (hide) | ❌ deferred | |
 
 ### §2.5 Garbage Collection
 
-GC mark + sweep + auto-trigger + chunk-safe real freeing for String / Function / TaggedValue slots. Tables in chunk slots deferred to M3-extended (ADR 0220 §M3-stretch). `__gc` finalizer + `__mode` weak-table clearing deferred (ADRs 0238, 0239).
+| Item | Status | Notes |
+|---|---|---|
+| Allocator wrapper | ✅ shipped | 0157 |
+| `g_gc_head` linked list | ✅ shipped | 0158 |
+| Size guard (4 GiB) | ✅ shipped | 0184 |
+| Mark phase (v1 safety mode) | ✅ shipped | 0185 |
+| Sweep phase (v1 safety mode) | ✅ shipped | 0185 |
+| Auto-trigger (1 MiB) | ✅ shipped | 0186 |
+| Chunk-safe real freeing (String / Function / TaggedValue) | ✅ shipped | 0218-0220 |
+| **Table DFS through array + hash** | ❌ **deferred (M3-extended)** | Blocks `__gc` + `__mode` + userdata + GC-tracked closures |
+| **Per-frame stack walk** | ❌ deferred | 0160 designed; not implemented |
+| **`__gc` finalizer runtime dispatch** | ❌ deferred | Blocked on M3-extended |
+| **`__mode` weak-table clearing** | ❌ deferred | Blocked on M3-extended |
 
 ### §2.3 Error Handling
 
-`pcall` / `xpcall` (single + multi-return) + `error(msg)` value propagation via setjmp/longjmp shipped (ADRs 0215-0217). Rust-side `rust.fail` bridge integration shipped (ADR 0243).
+| Item | Status | Notes |
+|---|---|---|
+| `error(msg)` | ✅ shipped | 0033 + 0215 |
+| `pcall` (single + multi-return) | ✅ shipped | 0216 / 0217 |
+| `xpcall` | ❌ deferred | |
+| Bridge error propagation | ✅ shipped | 0243 — `rust.fail` |
 
-### §2.2 Environment / Globals
+### §2.2 Environment
 
-`_G` / `_ENV` chunk-level Table synthesis + `local _ENV = {}` sandbox rebind shipped (ADRs 0221-0223). Full `_ENV`-as-upvalue + bare-name fallback to `_ENV[name]` deferred.
+| Item | Status | Notes |
+|---|---|---|
+| Auto-declared globals (ADR 0048) | ✅ shipped | |
+| `_G` / `_ENV` chunk-level Table | ✅ shipped | 0221-0223 |
+| `local _ENV = ...` sandbox rebind | ✅ shipped | 0223 |
+| Free-name fallback → `_ENV[name]` | ❌ deferred | |
+| Builtin migration to `_ENV` entries | ❌ deferred | |
 
-### §3 The Language
+### §3 Language Surface
 
-- Lexical (numbers, identifiers, comments, basic strings, hex literals, sci notation, long strings, bracket-key table) ✅.
-- Statements (`if` / `while` / `repeat` / `for` / `break` / `do` / `local`) ✅.
-- `<const>` / `<close>` attributes ✅ (ADRs 0236-0237); `__close` runtime dispatch deferred to M9-C.
-- Function definitions + closures + table constructors ✅.
-- Method call `o:m()` ✅.
-- Multi-assignment / multi-return ✅.
-- `goto` / `::label::` ⏸ — deferred (M9-stretch).
-- Varargs `...` ✅.
+| Item | Status | Notes |
+|---|---|---|
+| Lexical (numbers + identifiers + comments + strings) | ✅ shipped | |
+| Hex / sci notation / long strings | ✅ shipped | |
+| `if` / `while` / `repeat` / `for` / `break` / `do` / `local` | ✅ shipped | |
+| `<const>` | ✅ shipped | 0236 |
+| `<close>` (readonly only; no `__close` dispatch) | ⏸ pinned | 0237 |
+| Method call `o:m()` | ✅ shipped | 0092 / 0183 |
+| Multi-assign / multi-return | ✅ shipped | |
+| Varargs `...` | ✅ shipped | |
+| Function definitions + closures | ✅ shipped | |
+| Table constructor (array + named + bracket key) | ✅ shipped | 0199 |
+| **`goto` / `::label::`** | ❌ deferred | |
 
 ### §6.1 Basic Functions
 
-`assert` / `error` / `getmetatable` / `setmetatable` / `ipairs` / `pairs` / `next` / `print` / `rawequal` / `rawlen` / `rawget` / `rawset` / `tonumber` / `tostring` / `type` / `pcall` / `xpcall` / `collectgarbage` ✅.
-
-`select` / `load` / `loadfile` / `dofile` ⏸ — deferred (M14-stretch).
-
-### §6.4 String Manipulation
-
-`string.len` / `upper` / `lower` / `sub` / `rep` / `byte` / `char` / `format` / `reverse` ✅.
-
-`string.find` literal + char-class patterns ✅ (ADRs 0228, 0229, 0231); full magic-char patterns (quantifiers / sets / anchors / captures) deferred (M7-stretch).
-
-`string.match` literal ✅ (ADR 0230); pattern-aware deferred.
-
-`string.gmatch` / `gsub` ⏸ — deferred.
-
-### §6.6 Table Manipulation
-
-`table.concat` / `table.insert` / `table.remove` ✅.
-
-`table.pack` / `unpack` / `sort` / `move` ⏸ — deferred (M11-stretch).
-
-### §6.7 Math
-
-`math.sqrt` / `floor` / `abs` / `pow` / `sin` / `cos` / `log` / `exp` / `ceil` / `tan` / `asin` / `acos` / `atan` / `max` / `min` ✅.
-
-`math.huge` / `pi` / `maxinteger` / `mininteger` ✅.
-
-`math.type` / `tointeger` ✅.
-
-`math.random` / `randomseed` / `fmod` / `modf` ⏸ — deferred.
-
-### §6.8 Input/Output
-
-`io.write` / `io.read` ✅.
-
-`io.open` / `close` / `lines` / `popen` / `tmpfile` / `io.input` / `output` / `stderr` / `stdout` ⏸ — deferred.
-
-### §6.9 Operating System
-
-`os.time` / `os.clock` / `os.getenv` ✅.
-
-`os.date` / `difftime` / `exit` / `remove` / `rename` / `tmpname` ⏸ — deferred.
+| Function | Status |
+|---|---|
+| `assert` / `error` / `getmetatable` / `setmetatable` / `ipairs` / `pairs` / `next` / `print` / `rawequal` / `rawlen` / `rawget` / `rawset` / `tonumber` / `tostring` / `type` / `pcall` / `collectgarbage` | ✅ shipped |
+| `xpcall` | ❌ deferred |
+| `select` | ❌ deferred |
+| `load` / `loadfile` / `dofile` | ❌ deferred |
 
 ### §6.2 Coroutines
 
-`coroutine.isyieldable` / `coroutine.running` (main-thread spec-correct) ✅.
-
-`coroutine.create` / `resume` / `yield` / `wrap` / `status` / `close` ⏸ — deferred via documented LLVM-intrinsic / ucontext strategy (ADR 0246).
+| Function | Status | Notes |
+|---|---|---|
+| `coroutine.isyieldable` | ✅ shipped | Always `false` from main thread (spec-correct) |
+| `coroutine.running` | ✅ shipped | Always `(nil, true)` from main thread (spec-correct) |
+| `coroutine.create` / `resume` / `yield` / `wrap` / `status` / `close` | ❌ deferred | 0246 strategy |
 
 ### §6.3 Modules
 
-`package.config` / `package.path` / `package.cpath` ✅.
+| Item | Status | Notes |
+|---|---|---|
+| `package.config` | ⏸ pinned | 0247 — synthesised constant; no runtime consumer |
+| `package.path` | ⏸ pinned | 0247 — synthesised constant; no runtime consumer |
+| `package.cpath` | ⏸ pinned | 0247 — synthesised constant; no runtime consumer |
+| `package.loaded` / `package.searchers` / `package.searchpath` | ❌ deferred | |
+| `require` | ❌ deferred | 0248 strategy |
 
-`require` / `package.loaded` / `package.searchers` / `package.searchpath` ⏸ — deferred via documented self-hosting strategy (ADR 0248).
+### §6.4 String Manipulation
 
-### §6.5 utf8
+| Function | Status | Notes |
+|---|---|---|
+| `string.len` / `upper` / `lower` / `sub` / `rep` / `byte` / `char` / `reverse` | ✅ shipped | |
+| `string.format` (`%d`/`%f`/`%s`/`%x`/`%X`/`%o`/`%g`/`%e`/`%c`/`%i`/`%%`) | ✅ shipped | 0152, 0202-0205 |
+| `string.format` width / precision / `%q` | ❌ deferred | |
+| `string.find` (literal + char classes + `.`) | ⏸ pinned | 0228 / 0229 / 0231 — magic-char patterns (quantifiers, sets, anchors, captures) **deferred** |
+| `string.match` (literal only) | ⏸ pinned | 0230 — magic-char patterns deferred |
+| `string.gmatch` / `gsub` | ❌ deferred | |
 
-`utf8.char` / `codepoint` / `len` / `offset` / `codes` ⏸ — deferred.
+### §6.6 Table Manipulation
 
-### §6.10 debug
+| Function | Status |
+|---|---|
+| `table.concat` / `table.insert` / `table.remove` | ✅ shipped |
+| `table.pack` / `unpack` / `sort` / `move` | ❌ deferred |
 
-`debug.traceback` / `getinfo` / `getlocal` / `getupvalue` / `sethook` ⏸ — deferred.
+### §6.7 Math
 
-## What "preferred subset" means in practice
+| Function | Status |
+|---|---|
+| `math.sqrt` / `floor` / `abs` / `pow` / `sin` / `cos` / `log` / `exp` / `ceil` / `tan` / `asin` / `acos` / `atan` / `max` / `min` | ✅ shipped |
+| `math.huge` / `pi` / `maxinteger` / `mininteger` | ✅ shipped |
+| `math.type` / `tointeger` | ✅ shipped (Phase B static-shape + M8 Local subtype) |
+| `math.random` / `randomseed` / `fmod` / `modf` | ❌ deferred |
 
-Programs that work today within the subset:
+### §6.8 I/O
 
-- Pure functional / arithmetic / string processing.
-- Closures + upvalues + recursion.
-- Table-based data structures (array + hash + metatable).
-- Integer / Float subtype distinction (Phase B + M8 static propagation).
-- `pcall` / `error` for protected calls.
-- `_G` / `_ENV` introspection + sandbox rebind.
-- String patterns up to char-class + `.` wildcard.
-- `os.time` / `os.clock` / `os.getenv` system probes.
-- `math.*` library (15 functions).
-- File I/O via `io.write` / `io.read` (line-based).
-- Rust-Lua bridge: Number / String / Bool / multi-arg / error propagation.
+| Function | Status |
+|---|---|
+| `io.write` / `io.read` (line-based) | ✅ shipped |
+| `io.open` / `close` / `lines` / `popen` / `tmpfile` | ❌ deferred |
+| `io.input` / `output` / `stderr` / `stdout` | ❌ deferred |
 
-Programs that need the deferred items:
+### §6.9 OS
 
-- Coroutines (use cases: cooperative scheduling, generators, async). Workaround: use callbacks or transform to flat control flow.
-- `load` / `require` (use cases: dynamic code loading, modular programs). Workaround: compile each module as a separate LuMeLIR binary; coordinate via env vars or file I/O.
-- Full pattern matching with captures (use cases: complex text parsing). Workaround: use the literal + char-class subset; do more parsing in Lua control flow.
-- `table.sort` (use case: ordered iteration). Workaround: hand-roll a sort in Lua.
-- `__gc` finalizer (use case: RAII cleanup). Workaround: explicit cleanup via `<close>` (deferred) or manual code paths.
+| Function | Status |
+|---|---|
+| `os.time` / `os.clock` / `os.getenv` | ✅ shipped |
+| `os.date` / `difftime` / `exit` / `remove` / `rename` / `tmpname` | ❌ deferred |
 
-## Project status
+### §6.5 utf8 / §6.10 debug
 
-LuMeLIR is now a **shippable Lua 5.4 preferred-subset AOT compiler**. The compile-and-run surface is stable; the catalogued M-stretch items have documented implementation strategies for future work but do not block current users from the dominant use cases.
+| Library | Status |
+|---|---|
+| `utf8.*` | ❌ deferred |
+| `debug.*` | ❌ deferred |
 
-## Statistics
+## Quantitative honesty
 
-- **Total ADRs**: 253 (0001-0253).
-- **Phase 4 + 5 sub-ADRs**: 45 (0209-0253).
-- **Test count**: 1431 → 1617 (+186 e2e during M1-M16).
-- **Days for Phase 4 + 5 close**: 6 (2026-06-15 → 2026-06-21).
-- **Zero regression** across the M1-M16 sweep.
+Counting strictly:
 
-## Future work (M-stretch catalogue)
+- **✅ shipped**: 47 items work as spec-described.
+- **⏸ pinned**: 9 items have surface acceptance but no runtime semantics.
+- **❌ deferred**: 31+ items have no implementation at any layer.
 
-Each item has a strategy + architectural-delta note in its closing ADR:
+The original 0253 publication conflated ⏸ and ✅, declaring 56 items shipped. The honest count is **47 / ~87** (~54%).
 
-- **M3-extended** Tables in GC mark/sweep (ADR 0220 §M3-stretch). Unblocks 0238, 0239, 0244 runtime semantics.
-- **M9-C** `__close` runtime hook (ADR 0237).
-- **M10-stretch** `__gc` / `__mode` runtime dispatch (ADRs 0238, 0239).
-- **M11-stretch** stdlib expansion (`table.pack/unpack/sort`, `utf8.*`, `debug.*`, `math.random/fmod`, `io.open/lines`) (ADR 0242).
-- **M12-stretch** userdata `ValueKind` + Bridge GC integration (ADR 0244).
-- **M13-stretch** coroutine runtime (LLVM intrinsics or POSIX ucontext) (ADR 0246).
-- **M14-stretch** `load` / `require` runtime (embedded-pipeline self-hosting) (ADR 0248).
-- **Performance** JIT or AOT-time inlining + escape analysis to close the LuaJIT performance gap (ADR 0250).
+## What this means for users
+
+**Programs that actually work today:**
+
+- Closures, recursion, tables, metatables (excluding `__gc` / `__close` / `__mode` runtime), arithmetic, comparison, concat, length, bitwise.
+- Integer / Float subtype distinction via M8 static propagation.
+- `pcall` + `error` value propagation.
+- `_G` / `_ENV` introspection + `local _ENV = {}` sandbox.
+- `string.find` / `match` with literal + char-class patterns only (no quantifiers, sets, anchors, captures).
+- `string.format` with the basic conversion letters.
+- 15 `math.*` functions.
+- `io.write` + line-based `io.read`.
+- `os.time` / `os.clock` / `os.getenv`.
+- Rust-Lua bridge with error propagation.
+
+**Programs that do NOT work today (need ⏸ → ✅ or ❌ → ✅ work):**
+
+- Anything using coroutines (no `create` / `resume` / `yield`).
+- Anything using `require` or `load` (no runtime parser).
+- Anything depending on `__gc` finalizer firing (storage works; dispatch does not).
+- Anything depending on `__close` scope-exit hook (parser works; runtime does not).
+- Anything depending on weak tables clearing (`__mode` stored but not honored).
+- Anything using `string.find/match` with quantifiers / sets / anchors / captures.
+- Anything using `string.gmatch` / `gsub`.
+- Anything using `table.pack` / `unpack` / `sort` / `move`.
+- Anything using `utf8.*` / `debug.*`.
+- Anything using `xpcall` / `select` / `goto`.
+- Anything using file I/O beyond `io.write` + line-based `io.read`.
+- Anything using `os.date` / `os.exit` / `os.remove` / etc.
+
+## Project status after honest accounting
+
+LuMeLIR is a **partial Lua 5.4 AOT compiler** with the dominant computational + stringy I/O surface working, plus a **documented gap catalog** of substantial language features (coroutines, modules, full patterns, full GC) that need real implementation work. The original "preferred subset met" framing is retracted; the new framing is "47 of ~87 spec items shipped, with strategy + architectural-delta notes for each deferred item."
+
+The forward path lives in [`docs/notes/roadmap-2026-06-21-rebuild.md`](../notes/roadmap-2026-06-21-rebuild.md) (sibling commit). M3-extended Table DFS is the structural unblocker for 4+ deferred items and is prioritised first.
 
 ## Test count delta
 
 ```
 Step 0:  1617 (after ADR 0252)
-C1 (declaration meta-ADR, docs only): 1617 → 1617
+C1 (declaration meta-ADR — revised, docs only): 1617 → 1617
 ```
 
 ## References
@@ -194,5 +241,5 @@ C1 (declaration meta-ADR, docs only): 1617 → 1617
 - ADRs 0209-0252 — M1-M16 sub-ADR landed set.
 - [Lua 5.4 Reference Manual](https://www.lua.org/manual/5.4/) — primary source of conformance items.
 - [Lua 5.4 conformance roadmap](../notes/lua54-conformance-roadmap.md) — §-by-§ gap source.
-- [Lua 5.4 full conformance path](../notes/lua54-full-conformance-path-2026-06-20.md) — M-series sequence.
+- [Roadmap 2026-06-21 rebuild](../notes/roadmap-2026-06-21-rebuild.md) — forward path N1-N10.
 - PRD `docs/PRD.jp.md` — project scope.

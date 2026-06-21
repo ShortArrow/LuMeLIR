@@ -1,5 +1,9 @@
 # Roadmap Status — 2026-06-20
 
+> **⚠ Superseded 2026-06-21**
+>
+> 本 doc は M1-M16 minimum-viable close を milestone 制覇として記録した「前ロードマップ」。ADR 0253 revision で pin ADR が `✅ shipped` 扱いされていた構造的問題が判明、honest scorecard に置換。新 forward path は [roadmap-2026-06-21-rebuild.md](roadmap-2026-06-21-rebuild.md) を参照。本 doc は historical record として残置。
+
 差分整理。元 doc: [roadmap-revision-2026-06-16.md](roadmap-revision-2026-06-16.md)。M1 minimal close + M2-M6 残量再確認。
 
 ## Roadmap doc 階層 (canonical 順)
