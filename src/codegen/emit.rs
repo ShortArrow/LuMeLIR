@@ -967,8 +967,13 @@ fn emit_fmt_global<'c>(
 /// TaggedValue locals remain disqualifying — DFS through child
 /// objects is deferred to a future ADR.
 pub(crate) fn chunk_safe_for_real_gc(chunk: &HirChunk) -> bool {
-    let all_fns_non_capturing = chunk.functions.iter().all(|f| f.upvalues.is_empty());
-    let locals_ok = chunk.locals.iter().all(|l| {
+    // ADR 0256 — N2-C: capturing closures allowed. The chunk
+    // root table now includes Function-typed slots; the
+    // propagation pass walks BLACK closure cells' upvalue boxes
+    // and marks them BLACK so they survive sweep. Upvalue box
+    // values (String / Table contents) are NOT yet followed —
+    // see ADR 0256 §Scope for the bounded leak.
+    chunk.locals.iter().all(|l| {
         matches!(
             l.kind,
             ValueKind::Number
@@ -983,11 +988,10 @@ pub(crate) fn chunk_safe_for_real_gc(chunk: &HirChunk) -> bool {
                 // slots register their user_ptr as a chunk
                 // root; the new propagation pass walks BLACK
                 // Tables' array_buf and marks referenced Strings
-                // BLACK. Tables-in-Tables defer to N2-B.
+                // BLACK.
                 | ValueKind::Table
         )
-    });
-    all_fns_non_capturing && locals_ok
+    })
 }
 
 /// Emit a **raw C-string global** (NUL-terminated `[N x i8]`).
@@ -2698,11 +2702,25 @@ fn emit_main<'c>(
         // table layout. The new Table-array propagation pass
         // (emit_gc_mark_table_array_propagation) handles the
         // transitive marking of referenced Strings.
+        // ADR 0256 — N2-C: Function-kind slots also register.
+        // Slots for non-capturing fns are never written (the
+        // LocalInit alias-skip rule in `emit_stmt` reads the
+        // static `@<fn>_closure` global directly); the null
+        // init below makes the root scan a safe no-op for those.
+        // Capturing closures store a heap cell ptr that DOES
+        // need root tracking. Param slots (idx < params_len) of
+        // the chunk's own main fn don't apply — main has no
+        // params — so every Function-kind local is body-local.
         let string_slot_addrs: Vec<Value<'c, '_>> = chunk
             .locals
             .iter()
             .enumerate()
-            .filter(|(_, l)| matches!(l.kind, ValueKind::String | ValueKind::Table))
+            .filter(|(_, l)| {
+                matches!(
+                    l.kind,
+                    ValueKind::String | ValueKind::Table | ValueKind::Function(_)
+                )
+            })
             .map(|(i, _)| {
                 // Null-init every root slot so the root walk
                 // skips it before the first user store. Without
@@ -22709,7 +22727,287 @@ fn emit_gc_mark_table_array_propagation<'c>(
     let iter_count = 8i64;
     for _ in 0..iter_count {
         emit_gc_mark_table_propagation_pass(context, block, types, loc);
+        // ADR 0256 — N2-C: closure-cell propagation. Marks
+        // upvalue boxes of BLACK closure cells so sweep doesn't
+        // free them. Runs in the same fixpoint loop so
+        // capturing-closure chains are eventually fully marked.
+        emit_gc_mark_closure_cell_propagation_pass(context, block, types, loc);
     }
+}
+
+/// ADR 0256 — N2-C: walk g_gc_head; for each obj that is BLACK
+/// AND `GC_TYPE_CLOSURE_CELL`, read `upvalue_count` from the
+/// cell header and mark each upvalue box BLACK via the
+/// existing membership-checked helper. Upvalue box CONTENTS
+/// (String / Table values held inside boxes) are NOT followed —
+/// without per-upvalue type metadata at runtime we can't tell
+/// whether the i64 box payload is a ptr or a Number. See ADR
+/// 0256 §Scope for the bounded leak rationale.
+fn emit_gc_mark_closure_cell_propagation_pass<'c>(
+    context: &'c Context,
+    block: &Block<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let head_addr = emit_addressof(context, block, "g_gc_head", types, loc);
+    let head_iv = emit_load(block, head_addr, types.i64, loc);
+    let outer_before = Region::new();
+    let outer_before_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let cur_iv: Value<'c, '_> = outer_before_blk.argument(0).unwrap().into();
+        let zero = outer_before_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let cond: Value<'c, '_> = outer_before_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Ne,
+                cur_iv,
+                zero,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        outer_before_blk.append_operation(scf::condition(cond, &[cur_iv], loc));
+    }
+    outer_before.append_block(outer_before_blk);
+    let outer_after = Region::new();
+    let outer_after_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let cur_iv: Value<'c, '_> = outer_after_blk.argument(0).unwrap().into();
+        let cur_ptr: Value<'c, '_> = outer_after_blk
+            .append_operation(
+                OperationBuilder::new("llvm.inttoptr", loc)
+                    .add_operands(&[cur_iv])
+                    .add_results(&[types.ptr])
+                    .build()
+                    .expect("llvm.inttoptr cc cur"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let mark_field_ptr = emit_byte_offset_ptr(
+            context,
+            &outer_after_blk,
+            cur_ptr,
+            GC_HEADER_OFF_MARK,
+            types,
+            loc,
+        );
+        let mark_byte = emit_load(&outer_after_blk, mark_field_ptr, types.i8, loc);
+        let black_i8 = outer_after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i8, GC_MARK_BLACK).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_black: Value<'c, '_> = outer_after_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                mark_byte,
+                black_i8,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let type_tag_ptr = emit_byte_offset_ptr(
+            context,
+            &outer_after_blk,
+            cur_ptr,
+            crate::codegen::tagged::GC_HEADER_OFF_TYPE_TAG,
+            types,
+            loc,
+        );
+        let type_tag = emit_load(&outer_after_blk, type_tag_ptr, types.i8, loc);
+        let cc_tag = outer_after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(
+                    types.i8,
+                    crate::codegen::tagged::GC_TYPE_CLOSURE_CELL as i64,
+                )
+                .into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_cc: Value<'c, '_> = outer_after_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                type_tag,
+                cc_tag,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let should: Value<'c, '_> = outer_after_blk
+            .append_operation(arith::andi(is_black, is_cc, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        let then_region = Region::new();
+        let then_blk = Block::new(&[]);
+        {
+            let cell_user = emit_byte_offset_ptr(
+                context,
+                &then_blk,
+                cur_ptr,
+                crate::codegen::tagged::GC_HEADER_SIZE,
+                types,
+                loc,
+            );
+            // upvalue_count at offset 8 from user_ptr.
+            let count_field = emit_byte_offset_ptr(
+                context,
+                &then_blk,
+                cell_user,
+                super::closure::CLOSURE_OFF_UPVALUE_COUNT,
+                types,
+                loc,
+            );
+            let upv_count = emit_load(&then_blk, count_field, types.i64, loc);
+            let upv_before = Region::new();
+            let upv_before_blk = Block::new(&[(types.i64, loc)]);
+            {
+                let i: Value<'c, '_> = upv_before_blk.argument(0).unwrap().into();
+                let cond: Value<'c, '_> = upv_before_blk
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Slt,
+                        i,
+                        upv_count,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                upv_before_blk.append_operation(scf::condition(cond, &[i], loc));
+            }
+            upv_before.append_block(upv_before_blk);
+            let upv_after = Region::new();
+            let upv_after_blk = Block::new(&[(types.i64, loc)]);
+            {
+                let i: Value<'c, '_> = upv_after_blk.argument(0).unwrap().into();
+                let eight = upv_after_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 8).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let entry_off: Value<'c, '_> = upv_after_blk
+                    .append_operation(arith::muli(i, eight, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let base_off = upv_after_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, super::closure::CLOSURE_OFF_BOXES_BASE)
+                            .into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let total_off: Value<'c, '_> = upv_after_blk
+                    .append_operation(arith::addi(entry_off, base_off, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let box_slot = emit_byte_offset_ptr_dynamic(
+                    context,
+                    &upv_after_blk,
+                    cell_user,
+                    total_off,
+                    types,
+                    loc,
+                );
+                let box_ptr = emit_load(&upv_after_blk, box_slot, types.ptr, loc);
+                mark_user_ptr_black_if_nonnull(context, &upv_after_blk, box_ptr, types, loc);
+                let one = upv_after_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 1).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let next_i: Value<'c, '_> = upv_after_blk
+                    .append_operation(arith::addi(i, one, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                upv_after_blk.append_operation(scf::r#yield(&[next_i], loc));
+            }
+            upv_after.append_block(upv_after_blk);
+            let zero_i64 = then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 0).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            then_blk.append_operation(scf::r#while(
+                &[zero_i64],
+                &[types.i64],
+                upv_before,
+                upv_after,
+                loc,
+            ));
+            then_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        then_region.append_block(then_blk);
+        let else_region = Region::new();
+        let else_blk = Block::new(&[]);
+        else_blk.append_operation(scf::r#yield(&[], loc));
+        else_region.append_block(else_blk);
+        outer_after_blk.append_operation(scf::r#if(should, &[], then_region, else_region, loc));
+        let next_field_ptr = emit_byte_offset_ptr(
+            context,
+            &outer_after_blk,
+            cur_ptr,
+            GC_HEADER_OFF_NEXT,
+            types,
+            loc,
+        );
+        let next_val = emit_load(&outer_after_blk, next_field_ptr, types.ptr, loc);
+        let next_iv: Value<'c, '_> = outer_after_blk
+            .append_operation(
+                OperationBuilder::new("llvm.ptrtoint", loc)
+                    .add_operands(&[next_val])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.ptrtoint cc next"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        outer_after_blk.append_operation(scf::r#yield(&[next_iv], loc));
+    }
+    outer_after.append_block(outer_after_blk);
+    let while_op = scf::r#while(&[head_iv], &[types.i64], outer_before, outer_after, loc);
+    block.append_operation(while_op);
 }
 
 fn emit_gc_mark_table_propagation_pass<'a, 'c>(
