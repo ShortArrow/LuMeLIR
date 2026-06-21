@@ -22493,13 +22493,15 @@ fn emit_gc_mark_from_chunk_roots_real<'a, 'c>(
     emit_gc_mark_table_array_propagation(context, block, types, loc);
 }
 
-/// ADR 0254 — N2-A: given a user-visible ptr (could be heap-
-/// allocated via emit_gc_alloc OR a static string literal),
-/// verify membership in g_gc_head by scanning; if present,
-/// mark the underlying header BLACK. The g_gc_head scan is
-/// load-bearing — static String literals (ADR 0024 / 0112)
-/// live in .rodata and writing their "mark byte" would
-/// segfault.
+/// ADR 0254 — given a user-visible ptr, verify membership in
+/// g_gc_head and mark BLACK if found. Static String literals
+/// (ADR 0024 / 0112) live in .rodata; the membership check
+/// returns no-op for them, preventing .rodata segfaults.
+///
+/// ADR 0255 (N2-B): callers no longer need a "did mark" flag —
+/// the fixpoint is driven by a fixed-iteration outer loop in
+/// emit_gc_mark_table_array_propagation that bounds the
+/// Tables-in-Tables nesting depth.
 fn mark_user_ptr_black_if_nonnull<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
@@ -22541,8 +22543,6 @@ fn mark_user_ptr_black_if_nonnull<'a, 'c>(
     let then_region = Region::new();
     let then_blk = Block::new(&[]);
     {
-        // Scan g_gc_head; if any tracked obj's user_ptr (raw +
-        // GC_HEADER_SIZE) equals user_iv, mark its header BLACK.
         let head_addr = emit_addressof(context, &then_blk, "g_gc_head", types, loc);
         let head_iv = emit_load(&then_blk, head_addr, types.i64, loc);
         let scan_before = Region::new();
@@ -22686,11 +22686,33 @@ fn mark_user_ptr_black_if_nonnull<'a, 'c>(
     block.append_operation(scf::r#if(is_nonnull, &[], then_region, else_region, loc));
 }
 
-/// ADR 0254 — N2-A: walk every BLACK Table in g_gc_head, scan
-/// its array_buf for TAG_STRING references, mark each
-/// referenced String BLACK. Single-level depth (TAG_TABLE
-/// elements ignored — N2-B widens to recursive / fixpoint).
-fn emit_gc_mark_table_array_propagation<'a, 'c>(
+/// ADR 0254 / 0255 — walk every BLACK Table in g_gc_head, scan
+/// its array_buf AND hash_buf for TAG_STRING / TAG_TABLE
+/// references, mark each referenced object BLACK. Wrapped in a
+/// fixed-iteration outer loop (N=8) so Tables-of-Tables up to 8
+/// nesting levels deep are fully marked.
+///
+/// ADR 0255 (N2-B) adds:
+///   - Hash-bucket walk (key + value slots × hash_cap).
+///   - TAG_TABLE element propagation (Tables-in-Tables).
+///   - Fixed-iteration outer loop for transitive marking.
+fn emit_gc_mark_table_array_propagation<'c>(
+    context: &'c Context,
+    block: &Block<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    // ADR 0255 — fixpoint depth. 8 iterations cover practical
+    // Tables-in-Tables nesting; the fixpoint cost is dominated
+    // by the inner g_gc_head scan which itself is O(N) per
+    // mark attempt.
+    let iter_count = 8i64;
+    for _ in 0..iter_count {
+        emit_gc_mark_table_propagation_pass(context, block, types, loc);
+    }
+}
+
+fn emit_gc_mark_table_propagation_pass<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     types: &Types<'c>,
@@ -22914,17 +22936,43 @@ fn emit_gc_mark_table_array_propagation<'a, 'c>(
                     .result(0)
                     .unwrap()
                     .into();
+                // ADR 0255 — also follow TAG_TABLE refs.
+                let tag_table = elem_after_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, crate::codegen::tagged::TAG_TABLE).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let is_table_elem: Value<'c, '_> = elem_after_blk
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Eq,
+                        tag,
+                        tag_table,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let is_ref: Value<'c, '_> = elem_after_blk
+                    .append_operation(arith::ori(is_string, is_table_elem, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
                 let str_then = Region::new();
                 let str_then_blk = Block::new(&[]);
                 {
                     // Payload ptr at slot+8.
                     let payload_field =
                         emit_byte_offset_ptr(context, &str_then_blk, slot_ptr, 8, types, loc);
-                    let user_str_ptr = emit_load(&str_then_blk, payload_field, types.ptr, loc);
+                    let user_ref_ptr = emit_load(&str_then_blk, payload_field, types.ptr, loc);
                     mark_user_ptr_black_if_nonnull(
                         context,
                         &str_then_blk,
-                        user_str_ptr,
+                        user_ref_ptr,
                         types,
                         loc,
                     );
@@ -22935,7 +22983,7 @@ fn emit_gc_mark_table_array_propagation<'a, 'c>(
                 let str_else_blk = Block::new(&[]);
                 str_else_blk.append_operation(scf::r#yield(&[], loc));
                 str_else.append_block(str_else_blk);
-                elem_after_blk.append_operation(scf::r#if(is_string, &[], str_then, str_else, loc));
+                elem_after_blk.append_operation(scf::r#if(is_ref, &[], str_then, str_else, loc));
                 let one = elem_after_blk
                     .append_operation(arith::constant(
                         context,
@@ -22967,6 +23015,244 @@ fn emit_gc_mark_table_array_propagation<'a, 'c>(
                 &[types.i64],
                 elem_before,
                 elem_after,
+                loc,
+            ));
+            // ADR 0255 — hash-bucket walk. When hash_buf != null,
+            // read hash_cap from offset 0; iterate buckets
+            // [0..hash_cap); each bucket is 32 bytes (16-byte
+            // key tagged slot + 16-byte value tagged slot). For
+            // TAG_STRING / TAG_TABLE in either slot, mark.
+            let hash_iv: Value<'c, '_> = then_blk
+                .append_operation(
+                    OperationBuilder::new("llvm.ptrtoint", loc)
+                        .add_operands(&[hash_buf])
+                        .add_results(&[types.i64])
+                        .build()
+                        .expect("llvm.ptrtoint hash_buf"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let zero_check = then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 0).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let has_hash: Value<'c, '_> = then_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Ne,
+                    hash_iv,
+                    zero_check,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let hash_then_region = Region::new();
+            let hash_then_blk = Block::new(&[]);
+            {
+                // hash_cap at HASH_OFF_CAP (0).
+                let cap_field = emit_byte_offset_ptr(
+                    context,
+                    &hash_then_blk,
+                    hash_buf,
+                    HASH_OFF_CAP,
+                    types,
+                    loc,
+                );
+                let hash_cap = emit_load(&hash_then_blk, cap_field, types.i64, loc);
+                // Walk buckets.
+                let hb_before = Region::new();
+                let hb_before_blk = Block::new(&[(types.i64, loc)]);
+                {
+                    let i: Value<'c, '_> = hb_before_blk.argument(0).unwrap().into();
+                    let cond: Value<'c, '_> = hb_before_blk
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Slt,
+                            i,
+                            hash_cap,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    hb_before_blk.append_operation(scf::condition(cond, &[i], loc));
+                }
+                hb_before.append_block(hb_before_blk);
+                let hb_after = Region::new();
+                let hb_after_blk = Block::new(&[(types.i64, loc)]);
+                {
+                    let i: Value<'c, '_> = hb_after_blk.argument(0).unwrap().into();
+                    let entry_size = hb_after_blk
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let entry_off: Value<'c, '_> = hb_after_blk
+                        .append_operation(arith::muli(i, entry_size, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let header_size = hb_after_blk
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let total_off: Value<'c, '_> = hb_after_blk
+                        .append_operation(arith::addi(entry_off, header_size, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let entry_ptr = emit_byte_offset_ptr_dynamic(
+                        context,
+                        &hb_after_blk,
+                        hash_buf,
+                        total_off,
+                        types,
+                        loc,
+                    );
+                    // For each of the two slots (key, value) walk:
+                    for slot_off in [HASH_ENTRY_OFF_KEY_SLOT, HASH_ENTRY_OFF_VALUE_SLOT] {
+                        let slot_ptr = emit_byte_offset_ptr(
+                            context,
+                            &hb_after_blk,
+                            entry_ptr,
+                            slot_off,
+                            types,
+                            loc,
+                        );
+                        let stag = emit_load(&hb_after_blk, slot_ptr, types.i64, loc);
+                        let tag_s = hb_after_blk
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(
+                                    types.i64,
+                                    crate::codegen::tagged::TAG_STRING,
+                                )
+                                .into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let is_s: Value<'c, '_> = hb_after_blk
+                            .append_operation(arith::cmpi(
+                                context,
+                                arith::CmpiPredicate::Eq,
+                                stag,
+                                tag_s,
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let tag_t = hb_after_blk
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(types.i64, crate::codegen::tagged::TAG_TABLE)
+                                    .into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let is_t: Value<'c, '_> = hb_after_blk
+                            .append_operation(arith::cmpi(
+                                context,
+                                arith::CmpiPredicate::Eq,
+                                stag,
+                                tag_t,
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let is_r: Value<'c, '_> = hb_after_blk
+                            .append_operation(arith::ori(is_s, is_t, loc))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let r_then = Region::new();
+                        let r_then_blk = Block::new(&[]);
+                        {
+                            let payload_field =
+                                emit_byte_offset_ptr(context, &r_then_blk, slot_ptr, 8, types, loc);
+                            let user_p = emit_load(&r_then_blk, payload_field, types.ptr, loc);
+                            mark_user_ptr_black_if_nonnull(
+                                context,
+                                &r_then_blk,
+                                user_p,
+                                types,
+                                loc,
+                            );
+                            r_then_blk.append_operation(scf::r#yield(&[], loc));
+                        }
+                        r_then.append_block(r_then_blk);
+                        let r_else = Region::new();
+                        let r_else_blk = Block::new(&[]);
+                        r_else_blk.append_operation(scf::r#yield(&[], loc));
+                        r_else.append_block(r_else_blk);
+                        hb_after_blk.append_operation(scf::r#if(is_r, &[], r_then, r_else, loc));
+                    }
+                    let one = hb_after_blk
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 1).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let next_i: Value<'c, '_> = hb_after_blk
+                        .append_operation(arith::addi(i, one, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    hb_after_blk.append_operation(scf::r#yield(&[next_i], loc));
+                }
+                hb_after.append_block(hb_after_blk);
+                let hb_zero = hash_then_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                hash_then_blk.append_operation(scf::r#while(
+                    &[hb_zero],
+                    &[types.i64],
+                    hb_before,
+                    hb_after,
+                    loc,
+                ));
+                hash_then_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            hash_then_region.append_block(hash_then_blk);
+            let hash_else_region = Region::new();
+            let hash_else_blk = Block::new(&[]);
+            hash_else_blk.append_operation(scf::r#yield(&[], loc));
+            hash_else_region.append_block(hash_else_blk);
+            then_blk.append_operation(scf::r#if(
+                has_hash,
+                &[],
+                hash_then_region,
+                hash_else_region,
                 loc,
             ));
             then_blk.append_operation(scf::r#yield(&[], loc));
