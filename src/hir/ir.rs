@@ -524,6 +524,15 @@ pub enum Builtin {
     /// ADR 0242 — `os.getenv(name)` reads an env var; returns
     /// String on hit or Nil on miss → TaggedValue.
     OsGetenv,
+    /// ADR 0245 — M13-A: `coroutine.isyieldable()` returns true
+    /// when the current execution is inside a coroutine that can
+    /// yield. Without a coroutine runtime (M13-stretch) the
+    /// answer is always `false` — main-thread code in Lua spec.
+    CoroutineIsYieldable,
+    /// ADR 0245 — `coroutine.running()` returns the current
+    /// thread + an `is_main` Bool. Without a coroutine runtime
+    /// the answer from main thread is `(nil, true)`.
+    CoroutineRunning,
     /// `string.len(s)` — Lua's `#s`-equivalent function-call form.
     /// Phase 2.7q-stdlib-string (ADR 0103). Dispatched via the
     /// generic namespace chokepoint when `string` is an UNRESOLVED
@@ -851,6 +860,8 @@ impl Builtin {
             "rust" => Self::rust_from_method(method),
             // ADR 0242 — M11-C os.* namespace.
             "os" => Self::os_from_method(method),
+            // ADR 0245 — M13-A coroutine.* namespace (partial).
+            "coroutine" => Self::coroutine_from_method(method),
             _ => None,
         }
     }
@@ -866,6 +877,19 @@ impl Builtin {
             "time" => Some(Builtin::OsTime),
             "clock" => Some(Builtin::OsClock),
             "getenv" => Some(Builtin::OsGetenv),
+            _ => None,
+        }
+    }
+
+    /// ADR 0245 — M13-A: map a `coroutine.<method>` name to a
+    /// Builtin variant. Only the two spec-conformant-without-
+    /// runtime members ship today; `create`, `resume`, `yield`,
+    /// `wrap`, `status` all defer to M13-stretch (full
+    /// coroutine runtime).
+    pub fn coroutine_from_method(method: &str) -> Option<Self> {
+        match method {
+            "isyieldable" => Some(Builtin::CoroutineIsYieldable),
+            "running" => Some(Builtin::CoroutineRunning),
             _ => None,
         }
     }
@@ -934,6 +958,9 @@ impl Builtin {
             Builtin::OsTime => (0, 0),
             Builtin::OsClock => (0, 0),
             Builtin::OsGetenv => (1, 1),
+            // ADR 0245 — arity 0 for both.
+            Builtin::CoroutineIsYieldable => (0, 0),
+            Builtin::CoroutineRunning => (0, 0),
             Builtin::MathPow => (2, 2),
             Builtin::MathSin | Builtin::MathCos | Builtin::MathLog | Builtin::MathExp => (1, 1),
             Builtin::StringLen | Builtin::StringUpper | Builtin::StringLower => (1, 1),
@@ -1023,6 +1050,8 @@ impl Builtin {
             Builtin::OsTime => "os.time",
             Builtin::OsClock => "os.clock",
             Builtin::OsGetenv => "os.getenv",
+            Builtin::CoroutineIsYieldable => "coroutine.isyieldable",
+            Builtin::CoroutineRunning => "coroutine.running",
             Builtin::StringLen => "string.len",
             Builtin::StringUpper => "string.upper",
             Builtin::StringLower => "string.lower",
@@ -1112,6 +1141,12 @@ impl Builtin {
             Builtin::OsTime | Builtin::OsClock => &[ValueKind::Number],
             // ADR 0242 — os.getenv returns String-or-Nil → TaggedValue.
             Builtin::OsGetenv => &[ValueKind::TaggedValue],
+            // ADR 0245 — coroutine.isyieldable returns Bool.
+            Builtin::CoroutineIsYieldable => &[ValueKind::Bool],
+            // ADR 0245 — coroutine.running returns (thread, Bool).
+            // The thread slot is Nil when running on the main
+            // thread; widening to TaggedValue covers the nil shape.
+            Builtin::CoroutineRunning => &[ValueKind::TaggedValue, ValueKind::Bool],
             // Phase 2.7q-stdlib-string (ADR 0103/0109).
             Builtin::StringLen | Builtin::StringByte => &[ValueKind::Number],
             // ADR 0228 / 0229 — string.find multi-return
@@ -1309,6 +1344,8 @@ impl Builtin {
             // ADR 0242 — os.* per-position kinds.
             Builtin::OsTime | Builtin::OsClock => &[],
             Builtin::OsGetenv => &[ValueKind::String],
+            // ADR 0245 — no args.
+            Builtin::CoroutineIsYieldable | Builtin::CoroutineRunning => &[],
         }
     }
 

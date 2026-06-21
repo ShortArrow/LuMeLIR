@@ -5676,8 +5676,28 @@ fn emit_multi_assign_from_builtin<'a, 'c>(
             in_function_cell_ptr,
             loc,
         ),
+        // ADR 0245 — coroutine.running returns (thread, is_main).
+        // No coroutine runtime → (nil, true).
+        Builtin::CoroutineRunning => {
+            debug_assert_eq!(dst_ids.len(), 2);
+            debug_assert_eq!(args.len(), 0);
+            let thread_slot = slots[dst_ids[0].0];
+            let main_slot = slots[dst_ids[1].0];
+            super::tagged::emit_value_slot_store_nil(context, block, thread_slot, types, loc);
+            let true_i1 = block
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i1, 1).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            emit_store(block, true_i1, main_slot, loc);
+            Ok(())
+        }
         _ => unreachable!(
-            "multi-assign from builtin {:?} not supported (Next / Pcall / StringFind declare multi-return)",
+            "multi-assign from builtin {:?} not supported (Next / Pcall / StringFind / CoroutineRunning declare multi-return)",
             b
         ),
     }
@@ -11184,6 +11204,28 @@ fn emit_expr<'a, 'c>(
                     types,
                     loc,
                 ))
+            }
+            Callee::Builtin(Builtin::CoroutineIsYieldable) => {
+                // ADR 0245 — M13-A: without a coroutine runtime
+                // (M13-stretch) the answer from main thread is
+                // always `false` per Lua 5.4 §6.2.
+                let attr = IntegerAttribute::new(types.i1, 0);
+                let op = arith::constant(context, attr.into(), loc);
+                Ok(block.append_operation(op).result(0).unwrap().into())
+            }
+            Callee::Builtin(Builtin::CoroutineRunning) => {
+                // ADR 0245 — single-result position. Emit a
+                // Nil-tagged tmp TaggedValue slot. The multi-
+                // return form is in emit_multi_assign_from_builtin.
+                let out_slot = emit_alloca_slot_for_kind(
+                    context,
+                    block,
+                    ValueKind::TaggedValue,
+                    types,
+                    loc,
+                );
+                super::tagged::emit_value_slot_store_nil(context, block, out_slot, types, loc);
+                Ok(out_slot)
             }
             Callee::Builtin(Builtin::OsTime) => {
                 // ADR 0242 — `os.time()`: libc time(NULL) → i64,

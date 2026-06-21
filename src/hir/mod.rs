@@ -259,6 +259,12 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             Callee::Builtin(Builtin::Error) => ValueKind::Number,
             // ADR 0216 — pcall returns Bool (success / caught flag).
             Callee::Builtin(Builtin::Pcall) => ValueKind::Bool,
+            // ADR 0245 — coroutine.isyieldable returns Bool.
+            Callee::Builtin(Builtin::CoroutineIsYieldable) => ValueKind::Bool,
+            // ADR 0245 — coroutine.running single-result position
+            // truncates to its first return — Nil-or-thread →
+            // TaggedValue (no thread runtime → always Nil).
+            Callee::Builtin(Builtin::CoroutineRunning) => ValueKind::TaggedValue,
             // Phase 2.8e-iter-next (ADR 0081): `next(...)` in
             // single-value position truncates to the first result —
             // the next key, which is a TaggedValue.
@@ -286,6 +292,9 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // ADR 0242 — M11-C os.time / os.clock return Number.
             | Callee::Builtin(Builtin::OsTime)
             | Callee::Builtin(Builtin::OsClock)
+            // ADR 0245 — coroutine.isyieldable returns Bool (no
+            // Number arm; sentinel below).
+
             | Callee::Builtin(Builtin::StringLen)
             | Callee::Builtin(Builtin::StringByte)
             // ADR 0191 — rust.add(a, b) returns Number.
