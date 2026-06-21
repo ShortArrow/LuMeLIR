@@ -11060,6 +11060,49 @@ fn emit_expr<'a, 'c>(
                     loc,
                 ))
             }
+            Callee::Builtin(b @ (Builtin::MathMax | Builtin::MathMin)) => {
+                // ADR 0241 — M11-B: variadic max/min. Lower each
+                // arg as f64 and reduce left-to-right via
+                // arith.maximumf / arith.minimumf.
+                let mut acc = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                for a in &args[1..] {
+                    let next = emit_expr(
+                        context,
+                        block,
+                        a,
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
+                    )?;
+                    let op_name = match b {
+                        Builtin::MathMax => "arith.maximumf",
+                        Builtin::MathMin => "arith.minimumf",
+                        _ => unreachable!(),
+                    };
+                    let op = OperationBuilder::new(op_name, loc)
+                        .add_operands(&[acc, next])
+                        .add_results(&[types.f64])
+                        .build()
+                        .expect("arith.maximumf/minimumf");
+                    acc = block.append_operation(op).result(0).unwrap().into();
+                }
+                Ok(acc)
+            }
             Callee::Builtin(Builtin::MathPow) => {
                 // ADR 0102 — binary `math.pow(x, y)` via libm `pow`.
                 // The only binary math.* builtin today; explicit

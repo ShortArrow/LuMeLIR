@@ -507,6 +507,12 @@ pub enum Builtin {
     /// ADR 0240 — `math.atan(x)` via libm `atan` (single-arg
     /// form only; two-arg `atan2` deferred).
     MathAtan,
+    /// ADR 0241 — M11-B: `math.max(a, b, ...)` variadic max.
+    /// Arity 1+, all Number args. Codegen reduces left-to-right
+    /// via arith.maximumf.
+    MathMax,
+    /// ADR 0241 — `math.min(a, b, ...)` variadic min.
+    MathMin,
     /// `string.len(s)` — Lua's `#s`-equivalent function-call form.
     /// Phase 2.7q-stdlib-string (ADR 0103). Dispatched via the
     /// generic namespace chokepoint when `string` is an UNRESOLVED
@@ -733,6 +739,9 @@ impl Builtin {
             "asin" => Some(Builtin::MathAsin),
             "acos" => Some(Builtin::MathAcos),
             "atan" => Some(Builtin::MathAtan),
+            // ADR 0241 — M11-B variadic max/min.
+            "max" => Some(Builtin::MathMax),
+            "min" => Some(Builtin::MathMin),
             // ADR 0102 — math.* continuation.
             "pow" => Some(Builtin::MathPow),
             "sin" => Some(Builtin::MathSin),
@@ -887,6 +896,8 @@ impl Builtin {
             | Builtin::MathAsin
             | Builtin::MathAcos
             | Builtin::MathAtan => (1, 1),
+            // ADR 0241 — math.max / math.min variadic (1+).
+            Builtin::MathMax | Builtin::MathMin => (1, usize::MAX),
             Builtin::MathPow => (2, 2),
             Builtin::MathSin | Builtin::MathCos | Builtin::MathLog | Builtin::MathExp => (1, 1),
             Builtin::StringLen | Builtin::StringUpper | Builtin::StringLower => (1, 1),
@@ -970,6 +981,8 @@ impl Builtin {
             Builtin::MathAsin => "math.asin",
             Builtin::MathAcos => "math.acos",
             Builtin::MathAtan => "math.atan",
+            Builtin::MathMax => "math.max",
+            Builtin::MathMin => "math.min",
             Builtin::StringLen => "string.len",
             Builtin::StringUpper => "string.upper",
             Builtin::StringLower => "string.lower",
@@ -1050,7 +1063,10 @@ impl Builtin {
             | Builtin::MathTan
             | Builtin::MathAsin
             | Builtin::MathAcos
-            | Builtin::MathAtan => &[ValueKind::Number],
+            | Builtin::MathAtan
+            // ADR 0241 — M11-B variadic max/min return Number.
+            | Builtin::MathMax
+            | Builtin::MathMin => &[ValueKind::Number],
             // Phase 2.7q-stdlib-string (ADR 0103/0109).
             Builtin::StringLen | Builtin::StringByte => &[ValueKind::Number],
             // ADR 0228 / 0229 — string.find multi-return
@@ -1239,6 +1255,9 @@ impl Builtin {
             Builtin::MathType => &[ValueKind::Number],
             // ADR 0211 — math.tointeger accepts Number.
             Builtin::MathToInteger => &[ValueKind::Number],
+            // ADR 0241 — variadic Number args; per-position
+            // dispatched via `expected_param_kind`.
+            Builtin::MathMax | Builtin::MathMin => &[ValueKind::Number],
         }
     }
 
@@ -1256,6 +1275,9 @@ impl Builtin {
         match self {
             // Every position is Number, regardless of argc.
             Builtin::StringChar => Some(ValueKind::Number),
+            // ADR 0241 — math.max / math.min: every position is
+            // Number, variadic 1+.
+            Builtin::MathMax | Builtin::MathMin => Some(ValueKind::Number),
             // ADR 0152 — per-arg kind is specifier-driven; HIR
             // lower validates directly. Use the TaggedValue
             // sentinel here to skip the standard kind check.

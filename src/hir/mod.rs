@@ -280,6 +280,9 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             | Callee::Builtin(Builtin::MathAsin)
             | Callee::Builtin(Builtin::MathAcos)
             | Callee::Builtin(Builtin::MathAtan)
+            // ADR 0241 — M11-B variadic max/min.
+            | Callee::Builtin(Builtin::MathMax)
+            | Callee::Builtin(Builtin::MathMin)
             | Callee::Builtin(Builtin::StringLen)
             | Callee::Builtin(Builtin::StringByte)
             // ADR 0191 — rust.add(a, b) returns Number.

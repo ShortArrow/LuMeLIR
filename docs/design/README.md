@@ -296,6 +296,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0238 — gc-finalizer-field-pin](0238-gc-finalizer-field-pin.md) — First M10 sub-ADR. Pins existing `__gc` metatable-field capability as a regression contract; documents runtime auto-dispatch as M10-stretch (gated on M3-extended Tables-as-chunk-roots). No new code; 3 e2e pin metatable storage + setmetatable acceptance + multi-Table sharing.
 - [0239 — gc-mode-field-pin](0239-gc-mode-field-pin.md) — Second (closing) M10 sub-ADR. Pins `__mode = "k"` / `"v"` / `"kv"` metatable-field storage + round-trip; documents weak-table runtime semantics as M10-stretch. Closes M10 at 2/2-3 minimum-viable. Runtime `__gc` dispatch + weak-key/value clearing both gated on M3-extended Table DFS.
 - [0240 — math-unary-expansion](0240-math-unary-expansion.md) — First M11 sub-ADR. Adds `math.ceil`, `math.tan`, `math.asin`, `math.acos`, `math.atan` via libm extern declarations sharing the existing f64→f64 dispatch shape (ADRs 0101 / 0102). Bundles 5 functions in one ADR — per-function overhead is one HIR variant + one libm name + one match row.
+- [0241 — math-max-min-variadic](0241-math-max-min-variadic.md) — Second M11 sub-ADR. Variadic `math.max(x, ...)` / `math.min(x, ...)` lowered as a left-to-right reduce over `arith.maximumf` / `arith.minimumf`. Shares the variadic-Number per-position kind dispatch with `string.char` (ADR 0113).
 
 ### Feature Implementation Memos
 
