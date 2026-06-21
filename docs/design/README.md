@@ -298,6 +298,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0240 — math-unary-expansion](0240-math-unary-expansion.md) — First M11 sub-ADR. Adds `math.ceil`, `math.tan`, `math.asin`, `math.acos`, `math.atan` via libm extern declarations sharing the existing f64→f64 dispatch shape (ADRs 0101 / 0102). Bundles 5 functions in one ADR — per-function overhead is one HIR variant + one libm name + one match row.
 - [0241 — math-max-min-variadic](0241-math-max-min-variadic.md) — Second M11 sub-ADR. Variadic `math.max(x, ...)` / `math.min(x, ...)` lowered as a left-to-right reduce over `arith.maximumf` / `arith.minimumf`. Shares the variadic-Number per-position kind dispatch with `string.char` (ADR 0113).
 - [0242 — os-namespace-mvp](0242-os-namespace-mvp.md) — Third (closing) M11 sub-ADR. New `os` namespace adds `os.time()` (libc `time(NULL)`), `os.clock()` (libc `clock() / 1_000_000`), and `os.getenv(name)` (libc `getenv` with String-or-Nil TaggedValue return). Closes M11 at 3/3-5 minimum-viable.
+- [0243 — bridge-error-propagation](0243-bridge-error-propagation.md) — First M12 sub-ADR. `rust.fail(msg)` raises a Lua error from Rust via setjmp/longjmp. Routes through a new external-linkage `lumelir_raise_error(msg_ptr)` codegen helper (the Internal-linkage `g_error_value` / `g_jmpbuf` globals stay invisible to the bridge object). Composes with `pcall` for catchable error flow.
 
 ### Feature Implementation Memos
 

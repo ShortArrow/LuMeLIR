@@ -28,6 +28,30 @@ pub extern "C" fn rust_add(a: f64, b: f64) -> f64 {
     a + b
 }
 
+// ADR 0243 — M12-A: Bridge error propagation. The lumelir
+// codegen exports a `lumelir_raise_error(msg_ptr)` wrapper (with
+// External linkage) that stashes msg into g_error_value and
+// longjmps. Routing through that helper keeps the bridge object
+// free of direct symbol references to the lumelir globals (which
+// have Internal linkage and aren't visible at link time).
+unsafe extern "C" {
+    fn lumelir_raise_error(msg_ptr: *const u8) -> !;
+}
+
+/// ADR 0243 — `rust.fail(msg)` raises a Lua error from Rust.
+/// `msg_ptr` is the user-visible boxed-string-object ptr (ADR
+/// 0112 layout). The function delegates to the codegen-emitted
+/// `lumelir_raise_error` which stashes the value and longjmps
+/// to the nearest landing pad. Inside `pcall`, the caught path
+/// returns `(false, msg)`; otherwise the chunk-level pad prints
+/// the message and exits 1.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_fail(msg_ptr: *const u8) -> ! {
+    unsafe {
+        lumelir_raise_error(msg_ptr);
+    }
+}
+
 // ADR 0224 — String → Number marshaling. `s_ptr` is the user-
 // visible pointer of a Lua boxed-string object whose first 8
 // bytes (offset 0) hold the i64 byte length (ADR 0112 layout).

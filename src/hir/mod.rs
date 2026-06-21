@@ -291,7 +291,9 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // ADR 0191 — rust.add(a, b) returns Number.
             | Callee::Builtin(Builtin::RustAdd)
             // ADR 0224 — rust.strlen(s) returns Number.
-            | Callee::Builtin(Builtin::RustStrlen) => ValueKind::Number,
+            | Callee::Builtin(Builtin::RustStrlen)
+            // ADR 0243 — rust.fail is noreturn; placeholder Number.
+            | Callee::Builtin(Builtin::RustFail) => ValueKind::Number,
             // ADR 0225 — rust.not(b) returns Bool.
             // ADR 0226 — rust.starts_with(s, p) returns Bool.
             Callee::Builtin(Builtin::RustNot) | Callee::Builtin(Builtin::RustStartsWith) => {

@@ -216,6 +216,10 @@ pub(crate) fn emit_module_unverified<'c>(
     emit_mutable_i64_global(context, &module, &types, "g_gc_fn_depth", 0, loc);
     // ADR 0218 — emit mark / sweep with the chunk-safe gate.
     register_gc_runtime_funcs(context, &module, &types, chunk_safe_for_real_gc(chunk), loc);
+    // ADR 0243 — M12-A: `lumelir_raise_error(msg_ptr)` external-
+    // linkage helper for the Rust bridge to call. Wraps the
+    // stash-into-g_error_value + longjmp(g_jmpbuf) dance.
+    emit_raise_error_helper(context, &module, &types, loc);
     for hir_fn in &chunk.functions {
         emit_function(context, &module, hir_fn, &chunk.functions, &types, loc)?;
     }
@@ -1571,6 +1575,71 @@ fn emit_mutable_byte_array_global<'c>(
     module.body().append_operation(global_op.into());
 }
 
+/// ADR 0243 — M12-A: emit `lumelir_raise_error(msg_ptr)` with
+/// External linkage so the Rust bridge object can call it. The
+/// body stashes `msg_ptr` into `g_error_value` and longjmps to
+/// `g_jmpbuf`. Mirrors the inlined logic in the `Builtin::Error`
+/// emit arm but as a callable function shared across the module
+/// + bridge object.
+fn emit_raise_error_helper<'c>(
+    context: &'c Context,
+    module: &Module<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let region = Region::new();
+    let block = Block::new(&[(types.ptr, loc)]);
+    let msg_ptr: Value<'c, '_> = block.argument(0).unwrap().into();
+    let err_addr = emit_addressof(context, &block, "g_error_value", types, loc);
+    emit_store(&block, msg_ptr, err_addr, loc);
+    let jmpbuf_ptr = emit_addressof(context, &block, "g_jmpbuf", types, loc);
+    let one_i32 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i32, 1).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let longjmp_op = OperationBuilder::new("llvm.call", loc)
+        .add_operands(&[jmpbuf_ptr, one_i32])
+        .add_attributes(&[
+            (
+                Identifier::new(context, "callee"),
+                FlatSymbolRefAttribute::new(context, "longjmp").into(),
+            ),
+            (
+                Identifier::new(context, "operandSegmentSizes"),
+                DenseI32ArrayAttribute::new(context, &[2, 0]).into(),
+            ),
+            (
+                Identifier::new(context, "op_bundle_sizes"),
+                DenseI32ArrayAttribute::new(context, &[]).into(),
+            ),
+        ])
+        .build()
+        .expect("llvm.call @longjmp lumelir_raise_error");
+    block.append_operation(longjmp_op);
+    block.append_operation(
+        OperationBuilder::new("llvm.unreachable", loc)
+            .build()
+            .expect("llvm.unreachable"),
+    );
+    region.append_block(block);
+    let fn_ty = llvm::r#type::function(llvm::r#type::void(context), &[types.ptr], false);
+    let fn_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(region)
+        .sym_name(StringAttribute::new(context, "lumelir_raise_error"))
+        .function_type(TypeAttribute::new(fn_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(fn_op.into());
+}
+
 /// Phase 2.7a (ADR 0024): declare libc `strlen(ptr) -> i64` so the
 /// `#s` length operator can compile to a single call without
 /// statically tracking each string's byte length.
@@ -1885,6 +1954,22 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(rust_starts_with_op.into());
+
+    // ADR 0243 — M12-A bridge error propagation. `rust_fail
+    // (msg_ptr)` is noreturn; stashes msg into g_error_value
+    // and longjmps. Declared as void return; emit arm yields an
+    // unreachable f64 placeholder.
+    let rust_fail_ty = llvm::r#type::function(llvm::r#type::void(context), &[types.ptr], false);
+    let rust_fail_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "rust_fail"))
+        .function_type(TypeAttribute::new(rust_fail_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(rust_fail_op.into());
 
     // ADR 0228 — M7-A: `string.find(s, sub)` literal substring
     // runtime helper. Shares the bridge object file but is
@@ -11565,6 +11650,50 @@ fn emit_expr<'a, 'c>(
                     .unwrap()
                     .into();
                 Ok(ret_i1)
+            }
+            Callee::Builtin(Builtin::RustFail) => {
+                // ADR 0243 — M12-A bridge error propagation.
+                // `rust.fail(msg)` calls the Rust extern which
+                // stashes msg + longjmps. Symbolic f64 placeholder
+                // satisfies the expression-position contract; LLVM
+                // eliminates as dead after the noreturn call.
+                let msg = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let call_op = OperationBuilder::new("llvm.call", loc)
+                    .add_operands(&[msg])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "callee"),
+                            FlatSymbolRefAttribute::new(context, "rust_fail").into(),
+                        ),
+                        (
+                            Identifier::new(context, "operandSegmentSizes"),
+                            DenseI32ArrayAttribute::new(context, &[1, 0]).into(),
+                        ),
+                        (
+                            Identifier::new(context, "op_bundle_sizes"),
+                            DenseI32ArrayAttribute::new(context, &[]).into(),
+                        ),
+                    ])
+                    .build()
+                    .expect("llvm.call @rust_fail");
+                block.append_operation(call_op);
+                let zero = arith::constant(
+                    context,
+                    FloatAttribute::new(context, types.f64, 0.0).into(),
+                    loc,
+                );
+                Ok(block.append_operation(zero).result(0).unwrap().into())
             }
             Callee::Builtin(Builtin::StringLen) => {
                 // Phase 2.7q-stdlib-string (ADR 0103): `string.len(s)` →
