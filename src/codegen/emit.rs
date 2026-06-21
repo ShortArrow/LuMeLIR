@@ -979,6 +979,12 @@ pub(crate) fn chunk_safe_for_real_gc(chunk: &HirChunk) -> bool {
                 // ADR 0220 — TaggedValue slot scanning via tag
                 // dispatch (TAG_STRING follows the payload ptr).
                 | ValueKind::TaggedValue
+                // ADR 0254 — N2-A: Table slot scanning. Table
+                // slots register their user_ptr as a chunk
+                // root; the new propagation pass walks BLACK
+                // Tables' array_buf and marks referenced Strings
+                // BLACK. Tables-in-Tables defer to N2-B.
+                | ValueKind::Table
         )
     });
     all_fns_non_capturing && locals_ok
@@ -2686,12 +2692,23 @@ fn emit_main<'c>(
             .result(0)
             .unwrap()
             .into();
+        // ADR 0254 — N2-A: Table slots also register as chunk
+        // roots. They store a single user_ptr at offset 0 like
+        // String slots, so they fit the existing g_chunk_root_
+        // table layout. The new Table-array propagation pass
+        // (emit_gc_mark_table_array_propagation) handles the
+        // transitive marking of referenced Strings.
         let string_slot_addrs: Vec<Value<'c, '_>> = chunk
             .locals
             .iter()
             .enumerate()
-            .filter(|(_, l)| matches!(l.kind, ValueKind::String))
+            .filter(|(_, l)| matches!(l.kind, ValueKind::String | ValueKind::Table))
             .map(|(i, _)| {
+                // Null-init every root slot so the root walk
+                // skips it before the first user store. Without
+                // this an auto-trigger collectgarbage during
+                // table allocation could read uninitialised
+                // garbage in the slot.
                 emit_store(&main_block, null_ptr, slots[i], loc);
                 slots[i]
             })
@@ -22455,6 +22472,535 @@ fn emit_gc_mark_from_chunk_roots_real<'a, 'c>(
                     .add_results(&[types.i64])
                     .build()
                     .expect("llvm.ptrtoint next"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        outer_after_blk.append_operation(scf::r#yield(&[next_iv], loc));
+    }
+    outer_after.append_block(outer_after_blk);
+
+    let while_op = scf::r#while(&[head_iv], &[types.i64], outer_before, outer_after, loc);
+    block.append_operation(while_op);
+
+    // ADR 0254 — N2-A: Table-array propagation pass.
+    // After the chunk-roots scan, walk g_gc_head again; for each
+    // object whose mark is BLACK AND whose type tag is
+    // GC_TYPE_TABLE, walk its array_buf (16-byte tagged slots,
+    // length stored at TABLE_OFF_LEN) and mark referenced
+    // String objects BLACK. Hash part + Tables-in-Tables
+    // defer to N2-B / N2 fixpoint follow-up.
+    emit_gc_mark_table_array_propagation(context, block, types, loc);
+}
+
+/// ADR 0254 — N2-A: given a user-visible ptr (could be heap-
+/// allocated via emit_gc_alloc OR a static string literal),
+/// verify membership in g_gc_head by scanning; if present,
+/// mark the underlying header BLACK. The g_gc_head scan is
+/// load-bearing — static String literals (ADR 0024 / 0112)
+/// live in .rodata and writing their "mark byte" would
+/// segfault.
+fn mark_user_ptr_black_if_nonnull<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    user_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let user_iv: Value<'c, 'a> = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[user_ptr])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint mark_user"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let is_nonnull: Value<'c, 'a> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Ne,
+            user_iv,
+            zero,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        // Scan g_gc_head; if any tracked obj's user_ptr (raw +
+        // GC_HEADER_SIZE) equals user_iv, mark its header BLACK.
+        let head_addr = emit_addressof(context, &then_blk, "g_gc_head", types, loc);
+        let head_iv = emit_load(&then_blk, head_addr, types.i64, loc);
+        let scan_before = Region::new();
+        let scan_before_blk = Block::new(&[(types.i64, loc)]);
+        {
+            let cur_iv: Value<'c, '_> = scan_before_blk.argument(0).unwrap().into();
+            let zero_b = scan_before_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 0).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let cond: Value<'c, '_> = scan_before_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Ne,
+                    cur_iv,
+                    zero_b,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            scan_before_blk.append_operation(scf::condition(cond, &[cur_iv], loc));
+        }
+        scan_before.append_block(scan_before_blk);
+        let scan_after = Region::new();
+        let scan_after_blk = Block::new(&[(types.i64, loc)]);
+        {
+            let cur_iv: Value<'c, '_> = scan_after_blk.argument(0).unwrap().into();
+            let cur_ptr_inner: Value<'c, '_> = scan_after_blk
+                .append_operation(
+                    OperationBuilder::new("llvm.inttoptr", loc)
+                        .add_operands(&[cur_iv])
+                        .add_results(&[types.ptr])
+                        .build()
+                        .expect("llvm.inttoptr scan cur"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let user_inner = emit_byte_offset_ptr(
+                context,
+                &scan_after_blk,
+                cur_ptr_inner,
+                crate::codegen::tagged::GC_HEADER_SIZE,
+                types,
+                loc,
+            );
+            let user_inner_iv: Value<'c, '_> = scan_after_blk
+                .append_operation(
+                    OperationBuilder::new("llvm.ptrtoint", loc)
+                        .add_operands(&[user_inner])
+                        .add_results(&[types.i64])
+                        .build()
+                        .expect("llvm.ptrtoint scan user"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let eq: Value<'c, '_> = scan_after_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    user_inner_iv,
+                    user_iv,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let mark_then = Region::new();
+            let mark_then_blk = Block::new(&[]);
+            {
+                let mark_addr = emit_byte_offset_ptr(
+                    context,
+                    &mark_then_blk,
+                    cur_ptr_inner,
+                    GC_HEADER_OFF_MARK,
+                    types,
+                    loc,
+                );
+                let black_i8 = mark_then_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i8, GC_MARK_BLACK).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                emit_store(&mark_then_blk, black_i8, mark_addr, loc);
+                mark_then_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            mark_then.append_block(mark_then_blk);
+            let mark_else = Region::new();
+            let mark_else_blk = Block::new(&[]);
+            mark_else_blk.append_operation(scf::r#yield(&[], loc));
+            mark_else.append_block(mark_else_blk);
+            scan_after_blk.append_operation(scf::r#if(eq, &[], mark_then, mark_else, loc));
+            let next_field = emit_byte_offset_ptr(
+                context,
+                &scan_after_blk,
+                cur_ptr_inner,
+                GC_HEADER_OFF_NEXT,
+                types,
+                loc,
+            );
+            let next_val = emit_load(&scan_after_blk, next_field, types.ptr, loc);
+            let next_iv: Value<'c, '_> = scan_after_blk
+                .append_operation(
+                    OperationBuilder::new("llvm.ptrtoint", loc)
+                        .add_operands(&[next_val])
+                        .add_results(&[types.i64])
+                        .build()
+                        .expect("llvm.ptrtoint scan next"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            scan_after_blk.append_operation(scf::r#yield(&[next_iv], loc));
+        }
+        scan_after.append_block(scan_after_blk);
+        then_blk.append_operation(scf::r#while(
+            &[head_iv],
+            &[types.i64],
+            scan_before,
+            scan_after,
+            loc,
+        ));
+        then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(is_nonnull, &[], then_region, else_region, loc));
+}
+
+/// ADR 0254 — N2-A: walk every BLACK Table in g_gc_head, scan
+/// its array_buf for TAG_STRING references, mark each
+/// referenced String BLACK. Single-level depth (TAG_TABLE
+/// elements ignored — N2-B widens to recursive / fixpoint).
+fn emit_gc_mark_table_array_propagation<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    let head_addr = emit_addressof(context, block, "g_gc_head", types, loc);
+    let head_iv = emit_load(block, head_addr, types.i64, loc);
+
+    // Outer scf.while over g_gc_head chain.
+    let outer_before = Region::new();
+    let outer_before_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let cur_iv: Value<'c, '_> = outer_before_blk.argument(0).unwrap().into();
+        let zero = outer_before_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let cond: Value<'c, '_> = outer_before_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Ne,
+                cur_iv,
+                zero,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        outer_before_blk.append_operation(scf::condition(cond, &[cur_iv], loc));
+    }
+    outer_before.append_block(outer_before_blk);
+
+    let outer_after = Region::new();
+    let outer_after_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let cur_iv: Value<'c, '_> = outer_after_blk.argument(0).unwrap().into();
+        let cur_ptr: Value<'c, '_> = outer_after_blk
+            .append_operation(
+                OperationBuilder::new("llvm.inttoptr", loc)
+                    .add_operands(&[cur_iv])
+                    .add_results(&[types.ptr])
+                    .build()
+                    .expect("llvm.inttoptr propagation cur"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        // Read mark byte; only propagate if BLACK.
+        let mark_field_ptr = emit_byte_offset_ptr(
+            context,
+            &outer_after_blk,
+            cur_ptr,
+            GC_HEADER_OFF_MARK,
+            types,
+            loc,
+        );
+        let mark_byte = emit_load(&outer_after_blk, mark_field_ptr, types.i8, loc);
+        let black_i8 = outer_after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i8, GC_MARK_BLACK).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_black: Value<'c, '_> = outer_after_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                mark_byte,
+                black_i8,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        // Read type tag; only propagate if GC_TYPE_TABLE.
+        let type_tag_ptr = emit_byte_offset_ptr(
+            context,
+            &outer_after_blk,
+            cur_ptr,
+            crate::codegen::tagged::GC_HEADER_OFF_TYPE_TAG,
+            types,
+            loc,
+        );
+        let type_tag = emit_load(&outer_after_blk, type_tag_ptr, types.i8, loc);
+        let table_tag = outer_after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i8, GC_TYPE_TABLE as i64).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_table: Value<'c, '_> = outer_after_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                type_tag,
+                table_tag,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let should_propagate: Value<'c, '_> = outer_after_blk
+            .append_operation(arith::andi(is_black, is_table, loc))
+            .result(0)
+            .unwrap()
+            .into();
+
+        let then_region = Region::new();
+        let then_blk = Block::new(&[]);
+        {
+            // user-visible Table header ptr = raw + GC_HEADER_SIZE.
+            let table_ptr = emit_byte_offset_ptr(
+                context,
+                &then_blk,
+                cur_ptr,
+                crate::codegen::tagged::GC_HEADER_SIZE,
+                types,
+                loc,
+            );
+            // Read length at TABLE_OFF_LEN.
+            let len_field =
+                emit_byte_offset_ptr(context, &then_blk, table_ptr, TABLE_OFF_LEN, types, loc);
+            let len = emit_load(&then_blk, len_field, types.i64, loc);
+            // Read array_buf at TABLE_OFF_ARRAY_BUF.
+            let array_buf_field = emit_byte_offset_ptr(
+                context,
+                &then_blk,
+                table_ptr,
+                TABLE_OFF_ARRAY_BUF,
+                types,
+                loc,
+            );
+            let array_buf = emit_load(&then_blk, array_buf_field, types.ptr, loc);
+            // ADR 0254 — Mark array_buf BLACK so sweep doesn't
+            // free it before we walk it (and so future reads
+            // through the live Table still succeed).
+            mark_user_ptr_black_if_nonnull(context, &then_blk, array_buf, types, loc);
+            // Also mark hash_buf BLACK if present. Hash-part
+            // entry-walking is N2-B; we conservatively keep the
+            // buffer alive here.
+            let hash_buf_field = emit_byte_offset_ptr(
+                context,
+                &then_blk,
+                table_ptr,
+                TABLE_OFF_HASH_BUF,
+                types,
+                loc,
+            );
+            let hash_buf = emit_load(&then_blk, hash_buf_field, types.ptr, loc);
+            mark_user_ptr_black_if_nonnull(context, &then_blk, hash_buf, types, loc);
+            // Walk array_buf [0..len). Each entry is a 16-byte
+            // tagged slot: i64 tag at offset 0, payload at +8.
+            let elem_before = Region::new();
+            let elem_before_blk = Block::new(&[(types.i64, loc)]);
+            {
+                let i: Value<'c, '_> = elem_before_blk.argument(0).unwrap().into();
+                let cond: Value<'c, '_> = elem_before_blk
+                    .append_operation(arith::cmpi(context, arith::CmpiPredicate::Slt, i, len, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                elem_before_blk.append_operation(scf::condition(cond, &[i], loc));
+            }
+            elem_before.append_block(elem_before_blk);
+            let elem_after = Region::new();
+            let elem_after_blk = Block::new(&[(types.i64, loc)]);
+            {
+                let i: Value<'c, '_> = elem_after_blk.argument(0).unwrap().into();
+                let sixteen = elem_after_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 16).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let off: Value<'c, '_> = elem_after_blk
+                    .append_operation(arith::muli(i, sixteen, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let slot_ptr = emit_byte_offset_ptr_dynamic(
+                    context,
+                    &elem_after_blk,
+                    array_buf,
+                    off,
+                    types,
+                    loc,
+                );
+                // Tag at slot+0.
+                let tag = emit_load(&elem_after_blk, slot_ptr, types.i64, loc);
+                let tag_string = elem_after_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, crate::codegen::tagged::TAG_STRING).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let is_string: Value<'c, '_> = elem_after_blk
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Eq,
+                        tag,
+                        tag_string,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let str_then = Region::new();
+                let str_then_blk = Block::new(&[]);
+                {
+                    // Payload ptr at slot+8.
+                    let payload_field =
+                        emit_byte_offset_ptr(context, &str_then_blk, slot_ptr, 8, types, loc);
+                    let user_str_ptr = emit_load(&str_then_blk, payload_field, types.ptr, loc);
+                    mark_user_ptr_black_if_nonnull(
+                        context,
+                        &str_then_blk,
+                        user_str_ptr,
+                        types,
+                        loc,
+                    );
+                    str_then_blk.append_operation(scf::r#yield(&[], loc));
+                }
+                str_then.append_block(str_then_blk);
+                let str_else = Region::new();
+                let str_else_blk = Block::new(&[]);
+                str_else_blk.append_operation(scf::r#yield(&[], loc));
+                str_else.append_block(str_else_blk);
+                elem_after_blk.append_operation(scf::r#if(is_string, &[], str_then, str_else, loc));
+                let one = elem_after_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 1).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let next_i: Value<'c, '_> = elem_after_blk
+                    .append_operation(arith::addi(i, one, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                elem_after_blk.append_operation(scf::r#yield(&[next_i], loc));
+            }
+            elem_after.append_block(elem_after_blk);
+            let zero_i64 = then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 0).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            then_blk.append_operation(scf::r#while(
+                &[zero_i64],
+                &[types.i64],
+                elem_before,
+                elem_after,
+                loc,
+            ));
+            then_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        then_region.append_block(then_blk);
+        let else_region = Region::new();
+        let else_blk = Block::new(&[]);
+        else_blk.append_operation(scf::r#yield(&[], loc));
+        else_region.append_block(else_blk);
+        outer_after_blk.append_operation(scf::r#if(
+            should_propagate,
+            &[],
+            then_region,
+            else_region,
+            loc,
+        ));
+
+        // Next.
+        let next_field_ptr = emit_byte_offset_ptr(
+            context,
+            &outer_after_blk,
+            cur_ptr,
+            GC_HEADER_OFF_NEXT,
+            types,
+            loc,
+        );
+        let next_val = emit_load(&outer_after_blk, next_field_ptr, types.ptr, loc);
+        let next_iv: Value<'c, '_> = outer_after_blk
+            .append_operation(
+                OperationBuilder::new("llvm.ptrtoint", loc)
+                    .add_operands(&[next_val])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.ptrtoint propagation next"),
             )
             .result(0)
             .unwrap()
