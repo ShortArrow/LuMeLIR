@@ -34,7 +34,7 @@
 | **M13** | Coroutines runtime + coroutine library | ✅ 2/2-3 minimum-viable close (ADRs 0245-0246; 1606 → 1611) — main-thread `isyieldable`/`running` spec-conformant; full runtime (create/resume/yield) defers via documented LLVM-intrinsic / ucontext strategy | A 低 (workload 大) | — |
 | **M14** | load / require / package | ✅ 2/2-3 minimum-viable close (ADRs 0247-0248; 1611 → 1617) — `package.config`/`path`/`cpath` synthesised via HIR pre-pass; load/require runtime defers via documented self-hosting strategy | C 低 (self-hosting) | M2, M4 |
 | **M15** | Phase 4 完了宣言 + production hardening | ✅ 2/2-3 full close (ADRs 0249-0250; 1617 → 1617 docs only). Phase 4 declared closed; PRD §7 perf/size metrics accepted with explicit gap notes. | — | M11-M14 |
-| **M16** | Phase 5 (CI matrix / release / security audit) | 4-6 | — | M15 |
+| **M16** | Phase 5 (CI matrix / release / security audit) | ✅ 2/2-3 full close (ADRs 0251-0252). Phase 5 declared closed; cargo audit added to CI; multi-target matrix + release artifacts deferred via documented strategies. | — | M15 |
 | **M17** | Lua 5.4 preferred-subset 網羅宣言 | 0.5 | — | all |
 
 **合計**: ~16 milestone、累計 **52-90 session** (M1 既達分 6 除外)、focused 3-6 ヶ月。

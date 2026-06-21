@@ -37,3 +37,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --no-fail-fast
+
+  audit:
+    name: cargo audit (security advisories)
+    runs-on: ubuntu-24.04
+    # ADR 0251 — Phase 5 production hardening: continuously
+    # check Cargo.lock against the RustSec advisory database.
+    # `--deny warnings` so any unmaintained / yanked / vulnerable
+    # dependency surfaces as a CI failure.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit --deny warnings
