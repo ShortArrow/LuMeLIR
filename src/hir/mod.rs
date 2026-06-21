@@ -274,6 +274,12 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             | Callee::Builtin(Builtin::MathCos)
             | Callee::Builtin(Builtin::MathLog)
             | Callee::Builtin(Builtin::MathExp)
+            // ADR 0240 — M11-A unary math sweep.
+            | Callee::Builtin(Builtin::MathCeil)
+            | Callee::Builtin(Builtin::MathTan)
+            | Callee::Builtin(Builtin::MathAsin)
+            | Callee::Builtin(Builtin::MathAcos)
+            | Callee::Builtin(Builtin::MathAtan)
             | Callee::Builtin(Builtin::StringLen)
             | Callee::Builtin(Builtin::StringByte)
             // ADR 0191 — rust.add(a, b) returns Number.

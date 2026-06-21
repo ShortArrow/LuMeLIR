@@ -295,6 +295,7 @@ Foundational + decision-grade entries. Read these to understand *why* the codeba
 - [0237 — close-readonly-multi-attr](0237-close-readonly-multi-attr.md) — Second M9 sub-ADR. `<close>` widens to the same readonly enforcement as `<const>` per Lua 5.4 §3.3.8. Multi-binding `local NAME <ATTR>, ...` now applies per-name attribute enforcement (both the parallel and single-Call-expansion branches). The `__close` metamethod dispatch is still M9-C scope.
 - [0238 — gc-finalizer-field-pin](0238-gc-finalizer-field-pin.md) — First M10 sub-ADR. Pins existing `__gc` metatable-field capability as a regression contract; documents runtime auto-dispatch as M10-stretch (gated on M3-extended Tables-as-chunk-roots). No new code; 3 e2e pin metatable storage + setmetatable acceptance + multi-Table sharing.
 - [0239 — gc-mode-field-pin](0239-gc-mode-field-pin.md) — Second (closing) M10 sub-ADR. Pins `__mode = "k"` / `"v"` / `"kv"` metatable-field storage + round-trip; documents weak-table runtime semantics as M10-stretch. Closes M10 at 2/2-3 minimum-viable. Runtime `__gc` dispatch + weak-key/value clearing both gated on M3-extended Table DFS.
+- [0240 — math-unary-expansion](0240-math-unary-expansion.md) — First M11 sub-ADR. Adds `math.ceil`, `math.tan`, `math.asin`, `math.acos`, `math.atan` via libm extern declarations sharing the existing f64→f64 dispatch shape (ADRs 0101 / 0102). Bundles 5 functions in one ADR — per-function overhead is one HIR variant + one libm name + one match row.
 
 ### Feature Implementation Memos
 

@@ -1805,7 +1805,11 @@ fn emit_libm_decls<'c>(
     // ADR 0102 — math.* continuation: sin/cos/log/exp externs.
     // pow is already declared above (for both Lua `^` operator and
     // math.pow).
-    for libm_name in ["sin", "cos", "log", "exp"] {
+    // ADR 0240 — M11-A: math expansion sweep — ceil + tan / asin /
+    // acos / atan all share the same f64 → f64 libm shape.
+    for libm_name in [
+        "sin", "cos", "log", "exp", "ceil", "tan", "asin", "acos", "atan",
+    ] {
         let ty = llvm::r#type::function(types.f64, &[types.f64], false);
         let op = LLVMFuncOperationBuilder::new(context, loc)
             .body(Region::new())
@@ -11008,7 +11012,13 @@ fn emit_expr<'a, 'c>(
                 | Builtin::MathSin
                 | Builtin::MathCos
                 | Builtin::MathLog
-                | Builtin::MathExp),
+                | Builtin::MathExp
+                // ADR 0240 — M11-A unary math sweep.
+                | Builtin::MathCeil
+                | Builtin::MathTan
+                | Builtin::MathAsin
+                | Builtin::MathAcos
+                | Builtin::MathAtan),
             ) => {
                 // Phase 2.7q-stdlib-math (ADR 0101 / ADR 0102): emit a
                 // unary libm call. Arg lowered as f64 (Number-kind);
@@ -11034,6 +11044,11 @@ fn emit_expr<'a, 'c>(
                     Builtin::MathCos => "cos",
                     Builtin::MathLog => "log",
                     Builtin::MathExp => "exp",
+                    Builtin::MathCeil => "ceil",
+                    Builtin::MathTan => "tan",
+                    Builtin::MathAsin => "asin",
+                    Builtin::MathAcos => "acos",
+                    Builtin::MathAtan => "atan",
                     _ => unreachable!(),
                 };
                 Ok(emit_libc_call_f64(

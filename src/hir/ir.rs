@@ -495,6 +495,18 @@ pub enum Builtin {
     MathLog,
     /// `math.exp(x)` — exponential via libm `exp` (ADR 0102).
     MathExp,
+    /// ADR 0240 — M11-A: `math.ceil(x)` smallest integer ≥ x via
+    /// libm `ceil`. Same dispatch shape as MathFloor.
+    MathCeil,
+    /// ADR 0240 — `math.tan(x)` via libm `tan`.
+    MathTan,
+    /// ADR 0240 — `math.asin(x)` via libm `asin`.
+    MathAsin,
+    /// ADR 0240 — `math.acos(x)` via libm `acos`.
+    MathAcos,
+    /// ADR 0240 — `math.atan(x)` via libm `atan` (single-arg
+    /// form only; two-arg `atan2` deferred).
+    MathAtan,
     /// `string.len(s)` — Lua's `#s`-equivalent function-call form.
     /// Phase 2.7q-stdlib-string (ADR 0103). Dispatched via the
     /// generic namespace chokepoint when `string` is an UNRESOLVED
@@ -715,6 +727,12 @@ impl Builtin {
             "sqrt" => Some(Builtin::MathSqrt),
             "floor" => Some(Builtin::MathFloor),
             "abs" => Some(Builtin::MathAbs),
+            // ADR 0240 — M11-A math expansion.
+            "ceil" => Some(Builtin::MathCeil),
+            "tan" => Some(Builtin::MathTan),
+            "asin" => Some(Builtin::MathAsin),
+            "acos" => Some(Builtin::MathAcos),
+            "atan" => Some(Builtin::MathAtan),
             // ADR 0102 — math.* continuation.
             "pow" => Some(Builtin::MathPow),
             "sin" => Some(Builtin::MathSin),
@@ -863,6 +881,12 @@ impl Builtin {
             // ADR 0200 — collectgarbage("setpause", n) → arity widens to (0, 2).
             Builtin::CollectGarbage => (0, 2),
             Builtin::MathSqrt | Builtin::MathFloor | Builtin::MathAbs => (1, 1),
+            // ADR 0240 — unary math expansion sweep.
+            Builtin::MathCeil
+            | Builtin::MathTan
+            | Builtin::MathAsin
+            | Builtin::MathAcos
+            | Builtin::MathAtan => (1, 1),
             Builtin::MathPow => (2, 2),
             Builtin::MathSin | Builtin::MathCos | Builtin::MathLog | Builtin::MathExp => (1, 1),
             Builtin::StringLen | Builtin::StringUpper | Builtin::StringLower => (1, 1),
@@ -941,6 +965,11 @@ impl Builtin {
             Builtin::MathCos => "math.cos",
             Builtin::MathLog => "math.log",
             Builtin::MathExp => "math.exp",
+            Builtin::MathCeil => "math.ceil",
+            Builtin::MathTan => "math.tan",
+            Builtin::MathAsin => "math.asin",
+            Builtin::MathAcos => "math.acos",
+            Builtin::MathAtan => "math.atan",
             Builtin::StringLen => "string.len",
             Builtin::StringUpper => "string.upper",
             Builtin::StringLower => "string.lower",
@@ -1015,7 +1044,13 @@ impl Builtin {
             | Builtin::MathSin
             | Builtin::MathCos
             | Builtin::MathLog
-            | Builtin::MathExp => &[ValueKind::Number],
+            | Builtin::MathExp
+            // ADR 0240 — M11-A unary sweep.
+            | Builtin::MathCeil
+            | Builtin::MathTan
+            | Builtin::MathAsin
+            | Builtin::MathAcos
+            | Builtin::MathAtan => &[ValueKind::Number],
             // Phase 2.7q-stdlib-string (ADR 0103/0109).
             Builtin::StringLen | Builtin::StringByte => &[ValueKind::Number],
             // ADR 0228 / 0229 — string.find multi-return
@@ -1122,7 +1157,13 @@ impl Builtin {
             | Builtin::MathSin
             | Builtin::MathCos
             | Builtin::MathLog
-            | Builtin::MathExp => &[ValueKind::Number],
+            | Builtin::MathExp
+            // ADR 0240 — unary math expansion.
+            | Builtin::MathCeil
+            | Builtin::MathTan
+            | Builtin::MathAsin
+            | Builtin::MathAcos
+            | Builtin::MathAtan => &[ValueKind::Number],
             Builtin::MathPow => &[ValueKind::Number, ValueKind::Number],
             // string.* — first arg String; bounds args Number.
             Builtin::StringLen | Builtin::StringUpper | Builtin::StringLower => {
