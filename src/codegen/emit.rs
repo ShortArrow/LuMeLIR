@@ -1976,6 +1976,30 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(remove_op.into());
+    // ADR 0266 — rename(const char*, const char*) -> i32 (N7-5).
+    let rename_ty = llvm::r#type::function(types.i32, &[types.ptr, types.ptr], false);
+    let rename_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "rename"))
+        .function_type(TypeAttribute::new(rename_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(rename_op.into());
+    // ADR 0267 — tmpnam(NULL) -> const char* for os.tmpname (N7-6).
+    let tmpnam_ty = llvm::r#type::function(types.ptr, &[types.ptr], false);
+    let tmpnam_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "tmpnam"))
+        .function_type(TypeAttribute::new(tmpnam_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(tmpnam_op.into());
 
     // floor(f64) -> f64
     let floor_ty = llvm::r#type::function(types.f64, &[types.f64], false);
@@ -11570,6 +11594,75 @@ fn emit_expr<'a, 'c>(
                 );
                 super::tagged::emit_value_slot_store_nil(context, block, out_slot, types, loc);
                 Ok(out_slot)
+            }
+            Callee::Builtin(Builtin::OsTmpname) => {
+                // ADR 0267 — libc tmpnam(NULL) returns a static buffer
+                // ptr (POSIX deprecation flag aside; this is the
+                // simplest Lua-spec-aligned form). Wrap the returned
+                // ptr's bytes in a fresh String object via
+                // emit_string_obj_from_bytes(strlen).
+                let null_iv = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let null_p: Value<'c, '_> = block
+                    .append_operation(
+                        OperationBuilder::new("llvm.inttoptr", loc)
+                            .add_operands(&[null_iv])
+                            .add_results(&[types.ptr])
+                            .build()
+                            .expect("inttoptr null"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let buf = emit_libc_call_ptr(context, block, "tmpnam", &[null_p], types, loc);
+                let len = emit_libc_call_i64(context, block, "strlen", &[buf], types, loc);
+                Ok(emit_string_obj_from_bytes(
+                    context, block, buf, len, types, loc,
+                ))
+            }
+            Callee::Builtin(Builtin::OsRename) => {
+                // ADR 0266 — libc rename(old, new). Returns 0 on
+                // success → Bool true; non-zero → false.
+                let old = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let new_ = emit_expr(
+                    context, block, &args[1], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let old_d = emit_string_obj_data(context, block, old, types, loc);
+                let new_d = emit_string_obj_data(context, block, new_, types, loc);
+                let r = emit_libc_call_i32(
+                    context, block, "rename", &[old_d, new_d], types, loc,
+                );
+                let zero = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i32, 0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                Ok(block
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Eq,
+                        r,
+                        zero,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into())
             }
             Callee::Builtin(Builtin::OsRemove) => {
                 // ADR 0265 — os.remove(filename) via libc `remove(s)`.

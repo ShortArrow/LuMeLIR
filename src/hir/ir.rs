@@ -564,6 +564,13 @@ pub enum Builtin {
     /// Returns true on success (Bool); spec wants (nil, errmsg) on
     /// failure → today's simplification returns Bool only.
     OsRemove,
+    /// ADR 0266 — N7-5: `os.rename(old, new)` via libc `rename`.
+    /// Returns Bool on success; (nil, errmsg) form deferred.
+    OsRename,
+    /// ADR 0267 — N7-6: `os.tmpname()` via libc `tmpnam(NULL)`.
+    /// Returns a String of a fresh tmp path. Spec warns about race
+    /// conditions; we mirror the spec API.
+    OsTmpname,
     OsTime,
     /// ADR 0242 — `os.clock()` returns the program's CPU time
     /// in seconds via libc `clock() / CLOCKS_PER_SEC`. The
@@ -929,6 +936,8 @@ impl Builtin {
             "time" => Some(Builtin::OsTime),
             "exit" => Some(Builtin::OsExit),
             "remove" => Some(Builtin::OsRemove),
+            "rename" => Some(Builtin::OsRename),
+            "tmpname" => Some(Builtin::OsTmpname),
             "clock" => Some(Builtin::OsClock),
             "getenv" => Some(Builtin::OsGetenv),
             _ => None,
@@ -1014,6 +1023,8 @@ impl Builtin {
             Builtin::OsTime => (0, 0),
             Builtin::OsExit => (0, 1),
             Builtin::OsRemove => (1, 1),
+            Builtin::OsRename => (2, 2),
+            Builtin::OsTmpname => (0, 0),
             Builtin::OsClock => (0, 0),
             Builtin::OsGetenv => (1, 1),
             // ADR 0245 — arity 0 for both.
@@ -1113,6 +1124,8 @@ impl Builtin {
             Builtin::OsTime => "os.time",
             Builtin::OsExit => "os.exit",
             Builtin::OsRemove => "os.remove",
+            Builtin::OsRename => "os.rename",
+            Builtin::OsTmpname => "os.tmpname",
             Builtin::OsClock => "os.clock",
             Builtin::OsGetenv => "os.getenv",
             Builtin::CoroutineIsYieldable => "coroutine.isyieldable",
@@ -1211,6 +1224,10 @@ impl Builtin {
             Builtin::OsExit => &[ValueKind::Number],
             // ADR 0265 — os.remove returns Bool (success flag).
             Builtin::OsRemove => &[ValueKind::Bool],
+            // ADR 0266 — os.rename returns Bool.
+            Builtin::OsRename => &[ValueKind::Bool],
+            // ADR 0267 — os.tmpname returns String.
+            Builtin::OsTmpname => &[ValueKind::String],
             // ADR 0242 — os.getenv returns String-or-Nil → TaggedValue.
             Builtin::OsGetenv => &[ValueKind::TaggedValue],
             // ADR 0245 — coroutine.isyieldable returns Bool.
@@ -1425,6 +1442,10 @@ impl Builtin {
             Builtin::OsExit => &[ValueKind::Number],
             // ADR 0265 — os.remove takes filename String.
             Builtin::OsRemove => &[ValueKind::String],
+            // ADR 0266 — os.rename takes (oldpath, newpath).
+            Builtin::OsRename => &[ValueKind::String, ValueKind::String],
+            // ADR 0267 — os.tmpname takes no args.
+            Builtin::OsTmpname => &[],
             // ADR 0245 — no args.
             Builtin::CoroutineIsYieldable | Builtin::CoroutineRunning => &[],
         }

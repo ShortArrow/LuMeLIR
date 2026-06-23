@@ -362,6 +362,8 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // ADR 0137 — rawequal returns Bool; rawlen returns Number.
             Callee::Builtin(Builtin::RawEqual) => ValueKind::Bool,
             Callee::Builtin(Builtin::OsRemove) => ValueKind::Bool,
+            Callee::Builtin(Builtin::OsRename) => ValueKind::Bool,
+            Callee::Builtin(Builtin::OsTmpname) => ValueKind::String,
             Callee::Builtin(Builtin::RawLen) => ValueKind::Number,
             // ADR 0157 — collectgarbage returns Number.
             Callee::Builtin(Builtin::CollectGarbage) => ValueKind::Number,
