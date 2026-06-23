@@ -1964,6 +1964,18 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(rand_op.into());
+    // ADR 0265 — remove(const char*) -> i32 for os.remove (N7-4).
+    let remove_ty = llvm::r#type::function(types.i32, &[types.ptr], false);
+    let remove_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "remove"))
+        .function_type(TypeAttribute::new(remove_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(remove_op.into());
 
     // floor(f64) -> f64
     let floor_ty = llvm::r#type::function(types.f64, &[types.f64], false);
@@ -11558,6 +11570,72 @@ fn emit_expr<'a, 'c>(
                 );
                 super::tagged::emit_value_slot_store_nil(context, block, out_slot, types, loc);
                 Ok(out_slot)
+            }
+            Callee::Builtin(Builtin::OsRemove) => {
+                // ADR 0265 — os.remove(filename) via libc `remove(s)`.
+                // Returns 0 on success → Bool true; non-zero → Bool false.
+                let s_ptr = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let data_ptr = emit_string_obj_data(context, block, s_ptr, types, loc);
+                let r = emit_libc_call_i32(context, block, "remove", &[data_ptr], types, loc);
+                let zero = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i32, 0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let ok: Value<'c, '_> = block
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Eq,
+                        r,
+                        zero,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                Ok(ok)
+            }
+            Callee::Builtin(Builtin::OsExit) => {
+                // ADR 0264 — os.exit([code]) — libc exit(int).
+                let code_f64 = if args.is_empty() {
+                    block
+                        .append_operation(arith::constant(
+                            context,
+                            FloatAttribute::new(context, types.f64, 0.0).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into()
+                } else {
+                    emit_expr(
+                        context, block, &args[0], slots, locals, functions, types, params_len,
+                        in_function_cell_ptr, loc,
+                    )?
+                };
+                let code_i32: Value<'c, '_> = block
+                    .append_operation(arith::fptosi(code_f64, types.i32, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                emit_libc_call_void(context, block, "exit", &[code_i32], loc);
+                // Diverges; emit a dummy f64 for the type system.
+                Ok(block
+                    .append_operation(arith::constant(
+                        context,
+                        FloatAttribute::new(context, types.f64, 0.0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into())
             }
             Callee::Builtin(Builtin::OsTime) => {
                 // ADR 0242 — `os.time()`: libc time(NULL) → i64,

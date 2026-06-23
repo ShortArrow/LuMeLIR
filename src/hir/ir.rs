@@ -555,6 +555,15 @@ pub enum Builtin {
     MathMin,
     /// ADR 0242 — M11-C: `os.time()` returns the current Unix
     /// epoch time in seconds via libc `time(NULL)`.
+    /// ADR 0264 — N7-3: `os.exit([code])` terminates the program
+    /// via libc `exit(int)`. Default code = 0 per Lua 5.4 §6.9.
+    /// `boolean` code form (true=0, false=1) and `close` flag are
+    /// out of scope.
+    OsExit,
+    /// ADR 0265 — N7-4: `os.remove(filename)` via libc `remove(s)`.
+    /// Returns true on success (Bool); spec wants (nil, errmsg) on
+    /// failure → today's simplification returns Bool only.
+    OsRemove,
     OsTime,
     /// ADR 0242 — `os.clock()` returns the program's CPU time
     /// in seconds via libc `clock() / CLOCKS_PER_SEC`. The
@@ -918,6 +927,8 @@ impl Builtin {
     pub fn os_from_method(method: &str) -> Option<Self> {
         match method {
             "time" => Some(Builtin::OsTime),
+            "exit" => Some(Builtin::OsExit),
+            "remove" => Some(Builtin::OsRemove),
             "clock" => Some(Builtin::OsClock),
             "getenv" => Some(Builtin::OsGetenv),
             _ => None,
@@ -1001,6 +1012,8 @@ impl Builtin {
             Builtin::MathMax | Builtin::MathMin => (1, usize::MAX),
             // ADR 0242 — os.* arity.
             Builtin::OsTime => (0, 0),
+            Builtin::OsExit => (0, 1),
+            Builtin::OsRemove => (1, 1),
             Builtin::OsClock => (0, 0),
             Builtin::OsGetenv => (1, 1),
             // ADR 0245 — arity 0 for both.
@@ -1098,6 +1111,8 @@ impl Builtin {
             Builtin::MathMax => "math.max",
             Builtin::MathMin => "math.min",
             Builtin::OsTime => "os.time",
+            Builtin::OsExit => "os.exit",
+            Builtin::OsRemove => "os.remove",
             Builtin::OsClock => "os.clock",
             Builtin::OsGetenv => "os.getenv",
             Builtin::CoroutineIsYieldable => "coroutine.isyieldable",
@@ -1192,6 +1207,10 @@ impl Builtin {
             | Builtin::MathMin => &[ValueKind::Number],
             // ADR 0242 — os.time/os.clock return Number.
             Builtin::OsTime | Builtin::OsClock => &[ValueKind::Number],
+            // ADR 0264 — os.exit diverges; pick Number as placeholder.
+            Builtin::OsExit => &[ValueKind::Number],
+            // ADR 0265 — os.remove returns Bool (success flag).
+            Builtin::OsRemove => &[ValueKind::Bool],
             // ADR 0242 — os.getenv returns String-or-Nil → TaggedValue.
             Builtin::OsGetenv => &[ValueKind::TaggedValue],
             // ADR 0245 — coroutine.isyieldable returns Bool.
@@ -1402,6 +1421,10 @@ impl Builtin {
             // ADR 0242 — os.* per-position kinds.
             Builtin::OsTime | Builtin::OsClock => &[],
             Builtin::OsGetenv => &[ValueKind::String],
+            // ADR 0264 — os.exit accepts optional Number code.
+            Builtin::OsExit => &[ValueKind::Number],
+            // ADR 0265 — os.remove takes filename String.
+            Builtin::OsRemove => &[ValueKind::String],
             // ADR 0245 — no args.
             Builtin::CoroutineIsYieldable | Builtin::CoroutineRunning => &[],
         }
