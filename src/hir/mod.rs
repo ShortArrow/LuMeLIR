@@ -297,6 +297,7 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             // ADR 0242 — M11-C os.time / os.clock return Number.
             | Callee::Builtin(Builtin::OsTime)
             | Callee::Builtin(Builtin::OsExit)
+            | Callee::Builtin(Builtin::OsDifftime)
             | Callee::Builtin(Builtin::OsClock)
             // ADR 0245 — coroutine.isyieldable returns Bool (no
             // Number arm; sentinel below).

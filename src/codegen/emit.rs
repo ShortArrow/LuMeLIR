@@ -11595,6 +11595,22 @@ fn emit_expr<'a, 'c>(
                 super::tagged::emit_value_slot_store_nil(context, block, out_slot, types, loc);
                 Ok(out_slot)
             }
+            Callee::Builtin(Builtin::OsDifftime) => {
+                // ADR 0269 — os.difftime(t2, t1) = t2 - t1.
+                let t2 = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let t1 = emit_expr(
+                    context, block, &args[1], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                Ok(block
+                    .append_operation(arith::subf(t2, t1, loc))
+                    .result(0)
+                    .unwrap()
+                    .into())
+            }
             Callee::Builtin(Builtin::OsTmpname) => {
                 // ADR 0267 — libc tmpnam(NULL) returns a static buffer
                 // ptr (POSIX deprecation flag aside; this is the

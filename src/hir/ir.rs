@@ -575,6 +575,9 @@ pub enum Builtin {
     /// Returns a String of a fresh tmp path. Spec warns about race
     /// conditions; we mirror the spec API.
     OsTmpname,
+    /// ADR 0269 — N7-8: `os.difftime(t2, t1)` returns `t2 - t1` in
+    /// seconds. Per Lua 5.4 §6.9.
+    OsDifftime,
     OsTime,
     /// ADR 0242 — `os.clock()` returns the program's CPU time
     /// in seconds via libc `clock() / CLOCKS_PER_SEC`. The
@@ -944,6 +947,7 @@ impl Builtin {
             "remove" => Some(Builtin::OsRemove),
             "rename" => Some(Builtin::OsRename),
             "tmpname" => Some(Builtin::OsTmpname),
+            "difftime" => Some(Builtin::OsDifftime),
             "clock" => Some(Builtin::OsClock),
             "getenv" => Some(Builtin::OsGetenv),
             _ => None,
@@ -1031,6 +1035,7 @@ impl Builtin {
             Builtin::OsRemove => (1, 1),
             Builtin::OsRename => (2, 2),
             Builtin::OsTmpname => (0, 0),
+            Builtin::OsDifftime => (2, 2),
             Builtin::OsClock => (0, 0),
             Builtin::OsGetenv => (1, 1),
             // ADR 0245 — arity 0 for both.
@@ -1136,6 +1141,7 @@ impl Builtin {
             Builtin::OsRemove => "os.remove",
             Builtin::OsRename => "os.rename",
             Builtin::OsTmpname => "os.tmpname",
+            Builtin::OsDifftime => "os.difftime",
             Builtin::OsClock => "os.clock",
             Builtin::OsGetenv => "os.getenv",
             Builtin::CoroutineIsYieldable => "coroutine.isyieldable",
@@ -1240,6 +1246,8 @@ impl Builtin {
             Builtin::OsRename => &[ValueKind::Bool],
             // ADR 0267 — os.tmpname returns String.
             Builtin::OsTmpname => &[ValueKind::String],
+            // ADR 0269 — os.difftime returns Number (seconds delta).
+            Builtin::OsDifftime => &[ValueKind::Number],
             // ADR 0242 — os.getenv returns String-or-Nil → TaggedValue.
             Builtin::OsGetenv => &[ValueKind::TaggedValue],
             // ADR 0245 — coroutine.isyieldable returns Bool.
@@ -1460,6 +1468,8 @@ impl Builtin {
             Builtin::OsRename => &[ValueKind::String, ValueKind::String],
             // ADR 0267 — os.tmpname takes no args.
             Builtin::OsTmpname => &[],
+            // ADR 0269 — os.difftime(t2, t1) takes two Numbers.
+            Builtin::OsDifftime => &[ValueKind::Number, ValueKind::Number],
             // ADR 0245 — no args.
             Builtin::CoroutineIsYieldable | Builtin::CoroutineRunning => &[],
         }
