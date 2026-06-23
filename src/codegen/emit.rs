@@ -2182,6 +2182,18 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(time_op.into());
+    // ADR 0272 — system(const char*) -> i32 for os.execute (N7-11).
+    let system_ty = llvm::r#type::function(types.i32, &[types.ptr], false);
+    let system_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "system"))
+        .function_type(TypeAttribute::new(system_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(system_op.into());
     // ADR 0271 — N7-10: ctime(const time_t*) -> char* for os.date.
     let ctime_ty = llvm::r#type::function(types.ptr, &[types.ptr], false);
     let ctime_op = LLVMFuncOperationBuilder::new(context, loc)
@@ -11616,6 +11628,30 @@ fn emit_expr<'a, 'c>(
                 );
                 super::tagged::emit_value_slot_store_nil(context, block, out_slot, types, loc);
                 Ok(out_slot)
+            }
+            Callee::Builtin(Builtin::OsExecute) => {
+                // ADR 0272 — os.execute(cmd) via libc system. Returns
+                // Bool = (rc == 0).
+                let s_ptr = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let data = emit_string_obj_data(context, block, s_ptr, types, loc);
+                let r = emit_libc_call_i32(context, block, "system", &[data], types, loc);
+                let zero = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i32, 0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                Ok(block
+                    .append_operation(arith::cmpi(context, arith::CmpiPredicate::Eq, r, zero, loc))
+                    .result(0)
+                    .unwrap()
+                    .into())
             }
             Callee::Builtin(Builtin::OsDate) => {
                 // ADR 0271 — os.date() no-arg: ctime(&time(NULL)) and

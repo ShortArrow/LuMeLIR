@@ -583,6 +583,11 @@ pub enum Builtin {
     /// trailing newline stripped. Spec format-string forms and the
     /// 2nd `time` arg require strftime — deferred.
     OsDate,
+    /// ADR 0272 — N7-11: `os.execute(cmd)` via libc `system(cmd)`.
+    /// Returns Bool (true on exit-code 0, false otherwise). The
+    /// spec's full multi-return form (success, exit kind, code)
+    /// is deferred.
+    OsExecute,
     OsTime,
     /// ADR 0242 — `os.clock()` returns the program's CPU time
     /// in seconds via libc `clock() / CLOCKS_PER_SEC`. The
@@ -954,6 +959,7 @@ impl Builtin {
             "tmpname" => Some(Builtin::OsTmpname),
             "difftime" => Some(Builtin::OsDifftime),
             "date" => Some(Builtin::OsDate),
+            "execute" => Some(Builtin::OsExecute),
             "clock" => Some(Builtin::OsClock),
             "getenv" => Some(Builtin::OsGetenv),
             _ => None,
@@ -1042,6 +1048,7 @@ impl Builtin {
             Builtin::OsTmpname => (0, 0),
             Builtin::OsDifftime => (2, 2),
             Builtin::OsDate => (0, 0),
+            Builtin::OsExecute => (1, 1),
             Builtin::OsClock => (0, 0),
             Builtin::OsGetenv => (1, 1),
             // ADR 0245 — arity 0 for both.
@@ -1149,6 +1156,7 @@ impl Builtin {
             Builtin::OsTmpname => "os.tmpname",
             Builtin::OsDifftime => "os.difftime",
             Builtin::OsDate => "os.date",
+            Builtin::OsExecute => "os.execute",
             Builtin::OsClock => "os.clock",
             Builtin::OsGetenv => "os.getenv",
             Builtin::CoroutineIsYieldable => "coroutine.isyieldable",
@@ -1257,6 +1265,8 @@ impl Builtin {
             Builtin::OsDifftime => &[ValueKind::Number],
             // ADR 0271 — os.date returns String.
             Builtin::OsDate => &[ValueKind::String],
+            // ADR 0272 — os.execute returns Bool.
+            Builtin::OsExecute => &[ValueKind::Bool],
             // ADR 0242 — os.getenv returns String-or-Nil → TaggedValue.
             Builtin::OsGetenv => &[ValueKind::TaggedValue],
             // ADR 0245 — coroutine.isyieldable returns Bool.
@@ -1482,6 +1492,8 @@ impl Builtin {
             Builtin::OsDifftime => &[ValueKind::Number, ValueKind::Number],
             // ADR 0271 — os.date no-arg form.
             Builtin::OsDate => &[],
+            // ADR 0272 — os.execute takes shell command String.
+            Builtin::OsExecute => &[ValueKind::String],
             // ADR 0245 — no args.
             Builtin::CoroutineIsYieldable | Builtin::CoroutineRunning => &[],
         }
