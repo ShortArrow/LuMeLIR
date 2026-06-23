@@ -1952,6 +1952,18 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(fmod_op.into());
+    // ADR 0270 — atan2(f64, f64) -> f64 for math.atan(y, x) (N7-9).
+    let atan2_ty = llvm::r#type::function(types.f64, &[types.f64, types.f64], false);
+    let atan2_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "atan2"))
+        .function_type(TypeAttribute::new(atan2_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(atan2_op.into());
     // ADR 0263 — rand() -> i32 for math.random (N7-2).
     let rand_ty = llvm::r#type::function(types.i32, &[], false);
     let rand_op = LLVMFuncOperationBuilder::new(context, loc)
@@ -11530,8 +11542,7 @@ fn emit_expr<'a, 'c>(
                 | Builtin::MathCeil
                 | Builtin::MathTan
                 | Builtin::MathAsin
-                | Builtin::MathAcos
-                | Builtin::MathAtan),
+                | Builtin::MathAcos),
             ) => {
                 // Phase 2.7q-stdlib-math (ADR 0101 / ADR 0102): emit a
                 // unary libm call. Arg lowered as f64 (Number-kind);
@@ -11561,7 +11572,6 @@ fn emit_expr<'a, 'c>(
                     Builtin::MathTan => "tan",
                     Builtin::MathAsin => "asin",
                     Builtin::MathAcos => "acos",
-                    Builtin::MathAtan => "atan",
                     _ => unreachable!(),
                 };
                 Ok(emit_libc_call_f64(
@@ -11982,6 +11992,24 @@ fn emit_expr<'a, 'c>(
                     acc = block.append_operation(op).result(0).unwrap().into();
                 }
                 Ok(acc)
+            }
+            Callee::Builtin(Builtin::MathAtan) => {
+                // ADR 0270 — 1-arg: libm atan(y); 2-arg: libm atan2(y, x).
+                let y = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                if args.len() == 1 {
+                    Ok(emit_libc_call_f64(context, block, "atan", &[y], types, loc))
+                } else {
+                    let x = emit_expr(
+                        context, block, &args[1], slots, locals, functions, types, params_len,
+                        in_function_cell_ptr, loc,
+                    )?;
+                    Ok(emit_libc_call_f64(
+                        context, block, "atan2", &[y, x], types, loc,
+                    ))
+                }
             }
             Callee::Builtin(Builtin::MathDeg) => {
                 // ADR 0268 — math.deg(x) = x * (180 / pi).

@@ -1022,11 +1022,10 @@ impl Builtin {
             Builtin::CollectGarbage => (0, 2),
             Builtin::MathSqrt | Builtin::MathFloor | Builtin::MathAbs => (1, 1),
             // ADR 0240 — unary math expansion sweep.
-            Builtin::MathCeil
-            | Builtin::MathTan
-            | Builtin::MathAsin
-            | Builtin::MathAcos
-            | Builtin::MathAtan => (1, 1),
+            Builtin::MathCeil | Builtin::MathTan | Builtin::MathAsin | Builtin::MathAcos => (1, 1),
+            // ADR 0270 — N7-9: math.atan accepts optional 2nd arg
+            // (replacing deprecated math.atan2 per Lua 5.4 §6.7).
+            Builtin::MathAtan => (1, 2),
             // ADR 0241 — math.max / math.min variadic (1+).
             Builtin::MathMax | Builtin::MathMin => (1, usize::MAX),
             // ADR 0242 — os.* arity.
@@ -1370,8 +1369,9 @@ impl Builtin {
             | Builtin::MathCeil
             | Builtin::MathTan
             | Builtin::MathAsin
-            | Builtin::MathAcos
-            | Builtin::MathAtan => &[ValueKind::Number],
+            | Builtin::MathAcos => &[ValueKind::Number],
+            // ADR 0270 — N7-9: variable arity 1-or-2 Numbers.
+            Builtin::MathAtan => &[ValueKind::Number, ValueKind::Number],
             Builtin::MathPow => &[ValueKind::Number, ValueKind::Number],
             Builtin::MathFmod => &[ValueKind::Number, ValueKind::Number],
             // ADR 0263 — accepts up to 2 Number args; lower-arity
