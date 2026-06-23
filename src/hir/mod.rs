@@ -279,6 +279,8 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             | Callee::Builtin(Builtin::MathPow)
             | Callee::Builtin(Builtin::MathFmod)
             | Callee::Builtin(Builtin::MathRandom)
+            | Callee::Builtin(Builtin::MathDeg)
+            | Callee::Builtin(Builtin::MathRad)
             | Callee::Builtin(Builtin::MathSin)
             | Callee::Builtin(Builtin::MathCos)
             | Callee::Builtin(Builtin::MathLog)

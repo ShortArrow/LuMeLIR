@@ -11967,6 +11967,58 @@ fn emit_expr<'a, 'c>(
                 }
                 Ok(acc)
             }
+            Callee::Builtin(Builtin::MathDeg) => {
+                // ADR 0268 — math.deg(x) = x * (180 / pi).
+                let x = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let factor = block
+                    .append_operation(arith::constant(
+                        context,
+                        FloatAttribute::new(
+                            context,
+                            types.f64,
+                            180.0 / std::f64::consts::PI,
+                        )
+                        .into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                Ok(block
+                    .append_operation(arith::mulf(x, factor, loc))
+                    .result(0)
+                    .unwrap()
+                    .into())
+            }
+            Callee::Builtin(Builtin::MathRad) => {
+                // ADR 0268 — math.rad(x) = x * (pi / 180).
+                let x = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let factor = block
+                    .append_operation(arith::constant(
+                        context,
+                        FloatAttribute::new(
+                            context,
+                            types.f64,
+                            std::f64::consts::PI / 180.0,
+                        )
+                        .into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                Ok(block
+                    .append_operation(arith::mulf(x, factor, loc))
+                    .result(0)
+                    .unwrap()
+                    .into())
+            }
             Callee::Builtin(Builtin::MathFmod) => {
                 // ADR 0262 — `math.fmod(x, y)` via libm `fmod`.
                 let x = emit_expr(

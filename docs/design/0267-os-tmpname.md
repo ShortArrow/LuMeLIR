@@ -1,7 +1,9 @@
 # 0267. `os.tmpname()` (N7-6)
 
 - **Status:** Accepted
+- **Kind:** Architecture Decision
 - **Date:** 2026-06-23
+- **Deciders:** ShortArrow
 
 ## Scope (literal)
 

@@ -1,7 +1,9 @@
 # 0266. `os.rename(old, new)` (N7-5)
 
 - **Status:** Accepted
+- **Kind:** Architecture Decision
 - **Date:** 2026-06-23
+- **Deciders:** ShortArrow
 
 ## Scope (literal)
 
