@@ -67,6 +67,12 @@ pub(crate) const TAG_TABLE: i64 = 5;
 // resolves. Replaces the previous ptr-sentinel
 // `HASH_DELETED_KEY=1` (retired by ADR 0079).
 pub(crate) const TAG_DELETED: i64 = 6;
+/// ADR 0261 — N3-C: userdata tag. Pure-Lua source has no creation
+/// API (Lua spec relies on the C FFI). The tag + typename plumbing
+/// lands so that if a future FFI / runtime-bridge Builtin returns a
+/// userdata value, `type(ud)` correctly returns `"userdata"` and
+/// metatable machinery (setmetatable / getmetatable) round-trips.
+pub(crate) const TAG_USERDATA: i64 = 7;
 
 // ADR 0156 / 0157 — Phase 3 GC header layout. Every GC-managed
 // allocation is prefixed with a 16-byte header:
@@ -110,6 +116,11 @@ pub(crate) const GC_TYPE_STRING_OBJ: u8 = 4;
 pub(crate) const GC_TYPE_CLOSURE_CELL: u8 = 5;
 pub(crate) const GC_TYPE_UPVALUE_BOX: u8 = 6;
 pub(crate) const GC_TYPE_SCRATCH_BUF: u8 = 7;
+/// ADR 0261 — N3-C: userdata GC type tag. Userdata payloads carry no
+/// outgoing refs in this minimal landing (no nested Lua values inside);
+/// `has_outgoing_refs = false` keeps them out of the mark-propagation
+/// passes (ADR 0254-0257).
+pub(crate) const GC_TYPE_USERDATA: u8 = 8;
 
 /// ADR 0184 — pre-mark-phase metadata per `GC_TYPE_*` tag.
 ///
@@ -156,6 +167,10 @@ pub(crate) fn gc_type_meta(type_tag: u8) -> &'static GcTypeMeta {
         },
         GC_TYPE_SCRATCH_BUF => &GcTypeMeta {
             name: "scratch_buf",
+            has_outgoing_refs: false,
+        },
+        GC_TYPE_USERDATA => &GcTypeMeta {
+            name: "userdata",
             has_outgoing_refs: false,
         },
         _ => unreachable!("unknown GC type tag: {type_tag}"),
@@ -1430,10 +1445,51 @@ pub(crate) fn emit_type_tagged_local<'a, 'c>(
                         tbl_then.append_block(tbl_then_blk);
                         let tbl_else = Region::new();
                         let tbl_else_blk = Block::new(&[]);
-                        emit_tagged_unknown_tag_trap(context, &tbl_else_blk, types, loc);
-                        let placeholder =
-                            emit_addressof(context, &tbl_else_blk, "s_typename_number", types, loc);
-                        tbl_else_blk.append_operation(scf::r#yield(&[placeholder], loc));
+                        {
+                            // ADR 0261 — N3-C: TAG_USERDATA → "userdata".
+                            let tag_userdata = make_const_i64(&tbl_else_blk, TAG_USERDATA);
+                            let is_userdata: Value<'c, '_> = tbl_else_blk
+                                .append_operation(arith::cmpi(
+                                    context,
+                                    arith::CmpiPredicate::Eq,
+                                    tag,
+                                    tag_userdata,
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let ud_then = Region::new();
+                            let ud_then_blk = Block::new(&[]);
+                            let ud_str = emit_addressof(
+                                context,
+                                &ud_then_blk,
+                                "s_typename_userdata",
+                                types,
+                                loc,
+                            );
+                            ud_then_blk.append_operation(scf::r#yield(&[ud_str], loc));
+                            ud_then.append_block(ud_then_blk);
+                            let ud_else = Region::new();
+                            let ud_else_blk = Block::new(&[]);
+                            emit_tagged_unknown_tag_trap(context, &ud_else_blk, types, loc);
+                            let placeholder = emit_addressof(
+                                context,
+                                &ud_else_blk,
+                                "s_typename_number",
+                                types,
+                                loc,
+                            );
+                            ud_else_blk.append_operation(scf::r#yield(&[placeholder], loc));
+                            ud_else.append_block(ud_else_blk);
+                            let ud_op = scf::r#if(is_userdata, &[types.ptr], ud_then, ud_else, loc);
+                            let ud_result: Value<'c, '_> = tbl_else_blk
+                                .append_operation(ud_op)
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            tbl_else_blk.append_operation(scf::r#yield(&[ud_result], loc));
+                        }
                         tbl_else.append_block(tbl_else_blk);
                         let tbl_op = scf::r#if(is_table, &[types.ptr], tbl_then, tbl_else, loc);
                         let tbl_result: Value<'c, '_> = fn_else_blk

@@ -47,6 +47,12 @@ pub struct LocalInfo {
     /// ADR 0236 — M9-A: `<const>` attribute. When `true` the HIR
     /// rejects any Assign to this Local.
     pub is_const: bool,
+    /// ADR 0258 — N3-D: `<close>` attribute. When `true` codegen
+    /// emits a metamethod `__close` dispatch at the Local's scope
+    /// exit (in reverse declaration order with sibling `<close>`s).
+    /// `<close>` is also `<const>` per Lua 5.4 §3.3.8, so
+    /// `is_const` is always also set when `is_close` is.
+    pub is_close: bool,
 }
 
 /// A name-resolved program — the input to codegen.
@@ -218,6 +224,22 @@ pub enum HirStmtKind {
         value: HirExpr,
     },
     ExprStmt(HirExpr),
+    /// ADR 0258 — N3-D: scope-exit `__close` metamethod dispatch.
+    /// Appended by `lower_scoped_body` at the end of any scope that
+    /// declared one or more `<close>` Locals. `ids` is in declaration
+    /// order; codegen iterates in **reverse** per Lua 5.4 §3.3.8.
+    /// Nil / false / non-Table values skip silently.
+    ///
+    /// `candidates` is the compile-time filter of user fns whose
+    /// declared signature matches the `__close` call ABI shape
+    /// (`(Number, Number) → ()` per ADR 0258 — user fns default to
+    /// Number params when not explicitly widened). Codegen uses the
+    /// existing dispatch-chain helper to cmp the loaded fn ptr
+    /// against each candidate's `@user_fn_NN` address.
+    CloseLocals {
+        ids: Vec<LocalId>,
+        candidates: Vec<FuncId>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -401,6 +423,14 @@ pub enum Builtin {
     /// `false`. Phase 2.7g (ADR 0030); the broader Lua signature
     /// (any kind, optional message arg, return value) is deferred.
     Assert,
+    /// ADR 0261 — N3-C: `newproxy(b)` — Lua's de-facto userdata
+    /// creation API (deprecated in 5.0 but commonly emulated). Allocates
+    /// a fresh GC-tracked TAG_USERDATA value. Today's signature accepts
+    /// any single arg (the spec `b` flag controls metatable inheritance
+    /// which we don't yet model — the arg is ignored). Returns a
+    /// TaggedValue whose tag is `TAG_USERDATA` and payload is the
+    /// allocated GC object's payload ptr.
+    Newproxy,
     /// `error(msg)` — unconditional failure. Prints `msg` then
     /// `exit(1)`s. Phase 2.7h (ADR 0033); the optional `level`
     /// arg and table-as-message form are deferred.
@@ -732,6 +762,7 @@ impl Builtin {
             "tonumber" => Some(Builtin::ToNumber),
             "type" => Some(Builtin::Type),
             "assert" => Some(Builtin::Assert),
+            "newproxy" => Some(Builtin::Newproxy),
             "error" => Some(Builtin::Error),
             // ADR 0216 — protected call.
             "pcall" => Some(Builtin::Pcall),
@@ -929,6 +960,8 @@ impl Builtin {
             Builtin::Type => (1, 1),
             // ADR 0030 / 0051: assert(v) or assert(v, msg).
             Builtin::Assert => (1, 2),
+            // ADR 0261 — newproxy(b). Accepts the spec bool but ignores it.
+            Builtin::Newproxy => (1, 1),
             Builtin::Error => (1, 1),
             // ADR 0216 — pcall(f) only at minimum scope; ADR 0217
             // widens to pcall(f, args...).
@@ -1022,6 +1055,7 @@ impl Builtin {
             Builtin::ToNumber => "tonumber",
             Builtin::Type => "type",
             Builtin::Assert => "assert",
+            Builtin::Newproxy => "newproxy",
             Builtin::Error => "error",
             Builtin::Pcall => "pcall",
             Builtin::Next => "next",
@@ -1096,6 +1130,7 @@ impl Builtin {
             Builtin::ToNumber => &[ValueKind::Number],
             Builtin::Type => &[ValueKind::String],
             Builtin::Assert => &[ValueKind::Bool],
+            Builtin::Newproxy => &[ValueKind::TaggedValue],
             Builtin::Error => &[ValueKind::Number],
             // ADR 0216 — pcall single-return Bool.
             // ADR 0217 — pcall multi-return (Bool, TaggedValue).
@@ -1230,6 +1265,7 @@ impl Builtin {
             | Builtin::ToNumber
             | Builtin::Type
             | Builtin::Assert
+            | Builtin::Newproxy
             | Builtin::Error
             // ADR 0216 — per-arg validation in `lower_builtin_call`.
             | Builtin::Pcall

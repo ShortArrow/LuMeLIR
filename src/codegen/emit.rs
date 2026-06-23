@@ -49,11 +49,12 @@ use super::tagged::{
     GC_HEADER_OFF_SIZE, GC_HEADER_SIZE, GC_MARK_BLACK, GC_MARK_WHITE, GC_PAUSE_INIT,
     GC_THRESHOLD_INIT, GC_TYPE_ARRAY_BUF, GC_TYPE_HASH_BUF, GC_TYPE_SCRATCH_BUF, GC_TYPE_TABLE,
     HashKeyValidityPolicy, TAG_BOOL, TAG_DELETED, TAG_FUNCTION, TAG_NIL, TAG_NUMBER, TAG_STRING,
-    TAG_TABLE, TaggedArithOperandPlan, emit_alloca_slot_for_kind, emit_print_tagged_local,
-    emit_tag_and_payload_ptr, emit_tagged_eq_local_local, emit_tagged_unknown_tag_trap,
-    emit_type_tagged_local, emit_value_slot_check_number, emit_value_slot_store_dispatched,
-    emit_value_slot_store_nil, emit_value_slot_store_number, emit_value_slot_store_string,
-    emit_value_slot_store_table, policy_for_tag, policy_for_tagged_arith_operand,
+    TAG_TABLE, TAG_USERDATA, TaggedArithOperandPlan, emit_alloca_slot_for_kind,
+    emit_print_tagged_local, emit_tag_and_payload_ptr, emit_tagged_eq_local_local,
+    emit_tagged_unknown_tag_trap, emit_type_tagged_local, emit_value_slot_check_number,
+    emit_value_slot_store_dispatched, emit_value_slot_store_nil, emit_value_slot_store_number,
+    emit_value_slot_store_string, emit_value_slot_store_table, policy_for_tag,
+    policy_for_tagged_arith_operand,
 };
 
 // =============================================================
@@ -224,12 +225,30 @@ pub(crate) fn emit_module_unverified<'c>(
     // ADR 0257 — N2-D: when frame-safe, skip the v1 depth-guard
     // fallback inside gc_mark and rely on the frame-chain walk.
     let frame_safe = frame_safe_for_real_gc(chunk);
+    // ADR 0259 — N3-A: collect user fns matching `__gc` shape
+    // `(Number) → ()` (default param kind = Number, empty ret_kinds).
+    // Same heuristic as N3-D (ADR 0258).
+    let gc_candidates: Vec<FuncId> = chunk
+        .functions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            let pk: Vec<ValueKind> = f.params.iter().map(|p| p.kind).collect();
+            if pk == [ValueKind::Number] && f.ret_kinds.is_empty() {
+                Some(FuncId(i))
+            } else {
+                None
+            }
+        })
+        .collect();
     register_gc_runtime_funcs(
         context,
         &module,
         &types,
         chunk_safe_for_real_gc(chunk),
         frame_safe,
+        &gc_candidates,
+        &chunk.functions,
         loc,
     );
     // ADR 0243 — M12-A: `lumelir_raise_error(msg_ptr)` external-
@@ -359,6 +378,15 @@ fn emit_fmt_global<'c>(
     );
     // Phase 2.6a-min (ADR 0053): typename for `type(t)` on tables.
     emit_string_global(context, module, i8_type, "s_typename_table", "table\0", loc);
+    // ADR 0261 — N3-C: typename for `type(ud)` on userdata.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_typename_userdata",
+        "userdata\0",
+        loc,
+    );
     // ADR 0210 — math.type subtype names ("integer" / "float").
     // Distinct from s_typename_number to match Lua 5.4 §6.7
     // subtype semantics (type(42) returns "number" but
@@ -575,6 +603,26 @@ fn emit_fmt_global<'c>(
         i8_type,
         "s_metatable_call_field_name",
         "__call\0",
+        loc,
+    );
+    // ADR 0258 — `__close` metamethod field name (N3-D).
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_close_field_name",
+        "__close\0",
+        loc,
+    );
+    // ADR 0259 — `__gc` finalizer metamethod field name (N3-A).
+    emit_string_global(context, module, i8_type, "s_gc_field_name", "__gc\0", loc);
+    // ADR 0260 — `__mode` weak-table metamethod field name (N3-B).
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_mode_field_name",
+        "__mode\0",
         loc,
     );
     // ADR 0147 — arith metamethods field names + trap message.
@@ -1533,6 +1581,7 @@ fn collect_string_pool(chunk: &HirChunk) -> std::collections::HashMap<String, St
                 visit_expr(key, set);
                 visit_expr(value, set);
             }
+            HirStmtKind::CloseLocals { .. } => {}
         }
     }
     let mut set: BTreeSet<String> = BTreeSet::new();
@@ -5216,6 +5265,21 @@ fn emit_stmt<'a, 'c>(
                 }
                 _ => unreachable!("HIR rejects non-Number/String key kinds"),
             }
+        }
+        HirStmtKind::CloseLocals { ids, candidates } => {
+            emit_close_locals(
+                context,
+                block,
+                ids,
+                candidates,
+                slots,
+                locals,
+                functions,
+                types,
+                params_len,
+                in_function_cell_ptr,
+                loc,
+            )?;
         }
     }
     Ok(())
@@ -13151,6 +13215,55 @@ fn emit_expr<'a, 'c>(
                 }
                 Ok(out_slot)
             }
+            Callee::Builtin(Builtin::Newproxy) => {
+                // ADR 0261 — N3-C: allocate a 16-byte GC-tracked
+                // userdata payload (size is arbitrary; minimum keeps
+                // the alloc footprint small while still being a real
+                // GC object — distinct identity, freeable). Wrap the
+                // payload ptr in a TaggedValue slot with TAG_USERDATA.
+                // The arg is ignored (spec b flag for metatable
+                // inheritance is not yet modeled).
+                let size_const = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 16).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let payload_ptr = emit_gc_alloc(
+                    context,
+                    block,
+                    size_const,
+                    crate::codegen::tagged::GC_TYPE_USERDATA,
+                    types,
+                    loc,
+                );
+                let out_slot =
+                    emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
+                // Store tag + payload manually (no dedicated helper).
+                let tag_ud = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, TAG_USERDATA).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                emit_store(block, tag_ud, out_slot, loc);
+                let payload_slot = emit_byte_offset_ptr(
+                    context,
+                    block,
+                    out_slot,
+                    ARRAY_ELEM_OFF_VALUE,
+                    types,
+                    loc,
+                );
+                emit_store(block, payload_ptr, payload_slot, loc);
+                Ok(out_slot)
+            }
             Callee::Builtin(Builtin::IoRead) => {
                 // Phase 2.7x-stdlib-io-read (ADR 0119):
                 // `io.read([format])` — arity 0 (default "*l")
@@ -17554,6 +17667,929 @@ fn emit_hash_indexassign_with_newindex<'a, 'c>(
     raw_else_blk.append_operation(scf::r#yield(&[], loc));
     raw_else.append_block(raw_else_blk);
     block.append_operation(scf::r#if(not_handled, &[], raw_then, raw_else, loc));
+}
+
+/// ADR 0260 — N3-B: weak-table clear pass.
+///
+/// Walks `g_gc_head`. For each `GC_TYPE_TABLE` node:
+///   - Loads `metatable_ptr`; null → skip.
+///   - Probes `mt["__mode"]`; Nil tag → skip (strong table).
+///   - Walks the table's hash bucket entries. For each entry whose
+///     value tag is `TAG_TABLE`, loads the payload ptr (offset 8),
+///     locates the GC header (payload - `GC_HEADER_SIZE`), reads the
+///     mark byte, and if `GC_MARK_WHITE` writes `TAG_NIL` to the
+///     value slot's tag word (clearing the entry).
+///
+/// Simplification: any non-Nil `__mode` triggers weak-value clearing.
+/// The spec-precise dispatch on "k"/"v"/"kv" string contents is a
+/// future refinement (would require runtime strchr / first-char check).
+fn emit_gc_weak_clear_pass<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    use crate::codegen::tagged::{GC_HEADER_OFF_MARK, GC_HEADER_OFF_TYPE_TAG, GC_HEADER_SIZE};
+
+    let head_addr = emit_addressof(context, block, "g_gc_head", types, loc);
+    let head_iv = emit_load(block, head_addr, types.i64, loc);
+
+    let before_region = Region::new();
+    let before_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let cur_iv: Value<'c, '_> = before_blk.argument(0).unwrap().into();
+        let zero = before_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let cond: Value<'c, '_> = before_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Ne,
+                cur_iv,
+                zero,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        before_blk.append_operation(scf::condition(cond, &[cur_iv], loc));
+    }
+    before_region.append_block(before_blk);
+
+    let after_region = Region::new();
+    let after_blk = Block::new(&[(types.i64, loc)]);
+    {
+        let cur_iv: Value<'c, '_> = after_blk.argument(0).unwrap().into();
+        let cur_ptr: Value<'c, '_> = after_blk
+            .append_operation(
+                OperationBuilder::new("llvm.inttoptr", loc)
+                    .add_operands(&[cur_iv])
+                    .add_results(&[types.ptr])
+                    .build()
+                    .expect("llvm.inttoptr weak cur"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let next_field_ptr =
+            emit_byte_offset_ptr(context, &after_blk, cur_ptr, GC_HEADER_OFF_NEXT, types, loc);
+        let next_val = emit_load(&after_blk, next_field_ptr, types.ptr, loc);
+        let next_iv: Value<'c, '_> = after_blk
+            .append_operation(
+                OperationBuilder::new("llvm.ptrtoint", loc)
+                    .add_operands(&[next_val])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.ptrtoint weak next"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+
+        let type_tag_ptr = emit_byte_offset_ptr(
+            context,
+            &after_blk,
+            cur_ptr,
+            GC_HEADER_OFF_TYPE_TAG,
+            types,
+            loc,
+        );
+        let type_tag = emit_load(&after_blk, type_tag_ptr, types.i8, loc);
+        let table_tag = after_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i8, GC_TYPE_TABLE as i64).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let is_table: Value<'c, '_> = after_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Eq,
+                type_tag,
+                table_tag,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let then_region = Region::new();
+        let then_blk = Block::new(&[]);
+        {
+            let payload_ptr =
+                emit_byte_offset_ptr(context, &then_blk, cur_ptr, GC_HEADER_SIZE, types, loc);
+            let mt_slot = emit_byte_offset_ptr(
+                context,
+                &then_blk,
+                payload_ptr,
+                TABLE_OFF_METATABLE,
+                types,
+                loc,
+            );
+            let mt_ptr = emit_load(&then_blk, mt_slot, types.ptr, loc);
+            let mt_iv: Value<'c, '_> = then_blk
+                .append_operation(
+                    OperationBuilder::new("llvm.ptrtoint", loc)
+                        .add_operands(&[mt_ptr])
+                        .add_results(&[types.i64])
+                        .build()
+                        .expect("llvm.ptrtoint weak mt"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let mt_zero = then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 0).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let mt_present: Value<'c, '_> = then_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Ne,
+                    mt_iv,
+                    mt_zero,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let mt_then = Region::new();
+            let mt_then_blk = Block::new(&[]);
+            {
+                let field_str =
+                    emit_addressof(context, &mt_then_blk, "s_mode_field_name", types, loc);
+                let search_slot = emit_build_search_key_slot(
+                    context,
+                    &mt_then_blk,
+                    ValueKind::String,
+                    field_str,
+                    types,
+                    loc,
+                );
+                let probe_slot = emit_alloca_slot_for_kind(
+                    context,
+                    &mt_then_blk,
+                    ValueKind::TaggedValue,
+                    types,
+                    loc,
+                );
+                emit_value_slot_store_nil(context, &mt_then_blk, probe_slot, types, loc);
+                emit_hash_lookup_into_tagged_slot(
+                    context,
+                    &mt_then_blk,
+                    mt_ptr,
+                    search_slot,
+                    probe_slot,
+                    HashLookupOutcome::NilOnMissing,
+                    types,
+                    loc,
+                );
+                let probe_tag = emit_load(&mt_then_blk, probe_slot, types.i64, loc);
+                let nil_tag = mt_then_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let is_weak: Value<'c, '_> = mt_then_blk
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Ne,
+                        probe_tag,
+                        nil_tag,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let weak_then = Region::new();
+                let weak_then_blk = Block::new(&[]);
+                {
+                    emit_weak_clear_hash_buckets(context, &weak_then_blk, payload_ptr, types, loc);
+                    weak_then_blk.append_operation(scf::r#yield(&[], loc));
+                }
+                weak_then.append_block(weak_then_blk);
+                let weak_else = Region::new();
+                let weak_else_blk = Block::new(&[]);
+                weak_else_blk.append_operation(scf::r#yield(&[], loc));
+                weak_else.append_block(weak_else_blk);
+                mt_then_blk.append_operation(scf::r#if(is_weak, &[], weak_then, weak_else, loc));
+                mt_then_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            mt_then.append_block(mt_then_blk);
+            let mt_else = Region::new();
+            let mt_else_blk = Block::new(&[]);
+            mt_else_blk.append_operation(scf::r#yield(&[], loc));
+            mt_else.append_block(mt_else_blk);
+            then_blk.append_operation(scf::r#if(mt_present, &[], mt_then, mt_else, loc));
+            then_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        then_region.append_block(then_blk);
+        let else_region = Region::new();
+        let else_blk = Block::new(&[]);
+        else_blk.append_operation(scf::r#yield(&[], loc));
+        else_region.append_block(else_blk);
+        after_blk.append_operation(scf::r#if(is_table, &[], then_region, else_region, loc));
+
+        // Suppress the GC_HEADER_OFF_MARK unused warning.
+        let _ = GC_HEADER_OFF_MARK;
+
+        after_blk.append_operation(scf::r#yield(&[next_iv], loc));
+    }
+    after_region.append_block(after_blk);
+
+    let while_op = scf::r#while(&[head_iv], &[types.i64], before_region, after_region, loc);
+    block.append_operation(while_op);
+}
+
+/// ADR 0260 — N3-B helper: iterate `payload_ptr`'s hash bucket entries
+/// and clear (set tag = TAG_NIL on the value slot) any whose value is
+/// `TAG_TABLE` pointing to a WHITE GC node.
+fn emit_weak_clear_hash_buckets<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    payload_ptr: Value<'c, 'a>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    use crate::codegen::tagged::{GC_HEADER_OFF_MARK, GC_HEADER_SIZE};
+
+    let hash_buf_slot =
+        emit_byte_offset_ptr(context, block, payload_ptr, TABLE_OFF_HASH_BUF, types, loc);
+    let hash_buf = emit_load(block, hash_buf_slot, types.ptr, loc);
+    let hb_iv: Value<'c, '_> = block
+        .append_operation(
+            OperationBuilder::new("llvm.ptrtoint", loc)
+                .add_operands(&[hash_buf])
+                .add_results(&[types.i64])
+                .build()
+                .expect("llvm.ptrtoint weak hash_buf"),
+        )
+        .result(0)
+        .unwrap()
+        .into();
+    let zero_i64 = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i64, 0).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let hb_present: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Ne,
+            hb_iv,
+            zero_i64,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        let cap_ptr = emit_byte_offset_ptr(context, &then_blk, hash_buf, HASH_OFF_CAP, types, loc);
+        let cap = emit_load(&then_blk, cap_ptr, types.i64, loc);
+        // for i = 0; i < cap; i++
+        let zero = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let one = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 1).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let before_r = Region::new();
+        let before_b = Block::new(&[(types.i64, loc)]);
+        {
+            let i: Value<'c, '_> = before_b.argument(0).unwrap().into();
+            let cond: Value<'c, '_> = before_b
+                .append_operation(arith::cmpi(context, arith::CmpiPredicate::Slt, i, cap, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            before_b.append_operation(scf::condition(cond, &[i], loc));
+        }
+        before_r.append_block(before_b);
+        let after_r = Region::new();
+        let after_b = Block::new(&[(types.i64, loc)]);
+        {
+            let i: Value<'c, '_> = after_b.argument(0).unwrap().into();
+            // entry_off = HASH_OFF_ENTRIES + i * HASH_ENTRY_SIZE
+            let entry_size = after_b
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, HASH_ENTRY_SIZE).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let entries_off = after_b
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, HASH_OFF_ENTRIES).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let mul: Value<'c, '_> = after_b
+                .append_operation(arith::muli(i, entry_size, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let entry_off: Value<'c, '_> = after_b
+                .append_operation(arith::addi(mul, entries_off, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            let entry_ptr =
+                emit_byte_offset_ptr_dynamic(context, &after_b, hash_buf, entry_off, types, loc);
+            // value_slot = entry_ptr + HASH_ENTRY_OFF_VALUE_SLOT
+            let value_slot = emit_byte_offset_ptr(
+                context,
+                &after_b,
+                entry_ptr,
+                HASH_ENTRY_OFF_VALUE_SLOT,
+                types,
+                loc,
+            );
+            let value_tag = emit_load(&after_b, value_slot, types.i64, loc);
+            let tag_table = after_b
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, TAG_TABLE).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let is_table_v: Value<'c, '_> = after_b
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    value_tag,
+                    tag_table,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let inner_then = Region::new();
+            let inner_then_blk = Block::new(&[]);
+            {
+                // Load payload ptr at value_slot + 8.
+                let payload_off = inner_then_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, ARRAY_ELEM_OFF_VALUE).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let payload_slot = emit_byte_offset_ptr_dynamic(
+                    context,
+                    &inner_then_blk,
+                    value_slot,
+                    payload_off,
+                    types,
+                    loc,
+                );
+                let referent_payload = emit_load(&inner_then_blk, payload_slot, types.ptr, loc);
+                // Subtract GC_HEADER_SIZE → header_ptr.
+                let neg_header = inner_then_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, -GC_HEADER_SIZE).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let header_ptr = emit_byte_offset_ptr_dynamic(
+                    context,
+                    &inner_then_blk,
+                    referent_payload,
+                    neg_header,
+                    types,
+                    loc,
+                );
+                let mark_ptr = emit_byte_offset_ptr(
+                    context,
+                    &inner_then_blk,
+                    header_ptr,
+                    GC_HEADER_OFF_MARK,
+                    types,
+                    loc,
+                );
+                let mark = emit_load(&inner_then_blk, mark_ptr, types.i8, loc);
+                let white_i8 = inner_then_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i8, GC_MARK_WHITE).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let is_white: Value<'c, '_> = inner_then_blk
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Eq,
+                        mark,
+                        white_i8,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let clear_then = Region::new();
+                let clear_then_blk = Block::new(&[]);
+                {
+                    // Write TAG_NIL = 0 at value_slot.
+                    emit_value_slot_store_nil(context, &clear_then_blk, value_slot, types, loc);
+                    clear_then_blk.append_operation(scf::r#yield(&[], loc));
+                }
+                clear_then.append_block(clear_then_blk);
+                let clear_else = Region::new();
+                let clear_else_blk = Block::new(&[]);
+                clear_else_blk.append_operation(scf::r#yield(&[], loc));
+                clear_else.append_block(clear_else_blk);
+                inner_then_blk.append_operation(scf::r#if(
+                    is_white,
+                    &[],
+                    clear_then,
+                    clear_else,
+                    loc,
+                ));
+                inner_then_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            inner_then.append_block(inner_then_blk);
+            let inner_else = Region::new();
+            let inner_else_blk = Block::new(&[]);
+            inner_else_blk.append_operation(scf::r#yield(&[], loc));
+            inner_else.append_block(inner_else_blk);
+            after_b.append_operation(scf::r#if(is_table_v, &[], inner_then, inner_else, loc));
+
+            let next_i: Value<'c, '_> = after_b
+                .append_operation(arith::addi(i, one, loc))
+                .result(0)
+                .unwrap()
+                .into();
+            after_b.append_operation(scf::r#yield(&[next_i], loc));
+        }
+        after_r.append_block(after_b);
+        let inner_while = scf::r#while(&[zero], &[types.i64], before_r, after_r, loc);
+        then_blk.append_operation(inner_while);
+        then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(hb_present, &[], then_region, else_region, loc));
+}
+
+/// ADR 0259 — N3-A: `__gc` finalizer dispatch from sweep WHITE branch.
+///
+/// `cur_ptr` is the GC header start of the WHITE object about to be
+/// freed. If its type_tag is `GC_TYPE_TABLE`, locate the table payload
+/// (`cur_ptr + GC_HEADER_SIZE`), load `metatable_ptr` at payload + 32,
+/// probe `mt["__gc"]`, tag-check `TAG_FUNCTION`, and dispatch via
+/// `emit_dispatch_chain_from_slot_ptr` with sig `(Number) → ()` and
+/// placeholder arg `0.0` (matches user fn default param ABI per ADR
+/// 0258 §"Why this ABI"). All non-Table objects, missing metatable,
+/// missing `__gc` field, and non-Function `__gc` skip silently.
+#[allow(clippy::too_many_arguments)]
+fn emit_gc_finalizer_dispatch<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    cur_ptr: Value<'c, 'a>,
+    gc_candidates: &[FuncId],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) {
+    use crate::codegen::tagged::{GC_HEADER_OFF_TYPE_TAG, GC_HEADER_SIZE};
+    // Read type tag at cur_ptr+1.
+    let type_tag_ptr =
+        emit_byte_offset_ptr(context, block, cur_ptr, GC_HEADER_OFF_TYPE_TAG, types, loc);
+    let type_tag = emit_load(block, type_tag_ptr, types.i8, loc);
+    let table_tag = block
+        .append_operation(arith::constant(
+            context,
+            IntegerAttribute::new(types.i8, GC_TYPE_TABLE as i64).into(),
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let is_table: Value<'c, '_> = block
+        .append_operation(arith::cmpi(
+            context,
+            arith::CmpiPredicate::Eq,
+            type_tag,
+            table_tag,
+            loc,
+        ))
+        .result(0)
+        .unwrap()
+        .into();
+    let then_region = Region::new();
+    let then_blk = Block::new(&[]);
+    {
+        // payload_ptr = cur_ptr + GC_HEADER_SIZE.
+        let payload_ptr =
+            emit_byte_offset_ptr(context, &then_blk, cur_ptr, GC_HEADER_SIZE, types, loc);
+        // metatable_ptr at payload + TABLE_OFF_METATABLE.
+        let mt_slot = emit_byte_offset_ptr(
+            context,
+            &then_blk,
+            payload_ptr,
+            TABLE_OFF_METATABLE,
+            types,
+            loc,
+        );
+        let mt_ptr = emit_load(&then_blk, mt_slot, types.ptr, loc);
+        let mt_iv: Value<'c, '_> = then_blk
+            .append_operation(
+                OperationBuilder::new("llvm.ptrtoint", loc)
+                    .add_operands(&[mt_ptr])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.ptrtoint gc mt"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let mt_zero = then_blk
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let mt_present: Value<'c, '_> = then_blk
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Ne,
+                mt_iv,
+                mt_zero,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let mt_then = Region::new();
+        let mt_then_blk = Block::new(&[]);
+        {
+            let field_str = emit_addressof(context, &mt_then_blk, "s_gc_field_name", types, loc);
+            let search_slot = emit_build_search_key_slot(
+                context,
+                &mt_then_blk,
+                ValueKind::String,
+                field_str,
+                types,
+                loc,
+            );
+            let probe_slot = emit_alloca_slot_for_kind(
+                context,
+                &mt_then_blk,
+                ValueKind::TaggedValue,
+                types,
+                loc,
+            );
+            emit_value_slot_store_nil(context, &mt_then_blk, probe_slot, types, loc);
+            emit_hash_lookup_into_tagged_slot(
+                context,
+                &mt_then_blk,
+                mt_ptr,
+                search_slot,
+                probe_slot,
+                HashLookupOutcome::NilOnMissing,
+                types,
+                loc,
+            );
+            let probe_tag = emit_load(&mt_then_blk, probe_slot, types.i64, loc);
+            let tag_fn = mt_then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let is_function: Value<'c, '_> = mt_then_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Eq,
+                    probe_tag,
+                    tag_fn,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let fn_then = Region::new();
+            let fn_then_blk = Block::new(&[]);
+            {
+                let sig = IndirectSig {
+                    param_kinds: vec![ValueKind::Number],
+                    ret_kinds: vec![],
+                };
+                let zero_f64 = fn_then_blk
+                    .append_operation(arith::constant(
+                        context,
+                        FloatAttribute::new(context, types.f64, 0.0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let arg_vals: Vec<Value<'c, '_>> = vec![zero_f64];
+                let _ = emit_dispatch_chain_from_slot_ptr(
+                    context,
+                    &fn_then_blk,
+                    probe_slot,
+                    &sig,
+                    gc_candidates,
+                    &arg_vals,
+                    functions,
+                    types,
+                    loc,
+                );
+                fn_then_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            fn_then.append_block(fn_then_blk);
+            let fn_else = Region::new();
+            let fn_else_blk = Block::new(&[]);
+            fn_else_blk.append_operation(scf::r#yield(&[], loc));
+            fn_else.append_block(fn_else_blk);
+            mt_then_blk.append_operation(scf::r#if(is_function, &[], fn_then, fn_else, loc));
+            mt_then_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        mt_then.append_block(mt_then_blk);
+        let mt_else = Region::new();
+        let mt_else_blk = Block::new(&[]);
+        mt_else_blk.append_operation(scf::r#yield(&[], loc));
+        mt_else.append_block(mt_else_blk);
+        then_blk.append_operation(scf::r#if(mt_present, &[], mt_then, mt_else, loc));
+        then_blk.append_operation(scf::r#yield(&[], loc));
+    }
+    then_region.append_block(then_blk);
+    let else_region = Region::new();
+    let else_blk = Block::new(&[]);
+    else_blk.append_operation(scf::r#yield(&[], loc));
+    else_region.append_block(else_blk);
+    block.append_operation(scf::r#if(is_table, &[], then_region, else_region, loc));
+}
+
+/// ADR 0258 — N3-D: scope-exit `<close>` dispatch.
+///
+/// For each Table-kind id in **reverse** declaration order:
+///   - Load t_ptr; null → skip.
+///   - Load metatable_ptr; null → skip.
+///   - Probe `mt["__close"]` via hash lookup into a tmp TaggedValue.
+///   - Tag-check TAG_FUNCTION; non-match → skip silently per Lua spec.
+///   - Dispatch via `emit_dispatch_chain_from_slot_ptr` with sig
+///     `(Number, Number) → ()` (matches user fn default param kinds);
+///     args are `(0.0, 0.0)` as the canonical placeholder for the
+///     `(value, errobj)` shape — the call ABI policy lets the
+///     metamethod body access the receiver via captured state or
+///     ignore it entirely. ADR 0258 §"Why this ABI".
+#[allow(clippy::too_many_arguments)]
+fn emit_close_locals<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    ids: &[LocalId],
+    candidates: &[FuncId],
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    functions: &[HirFunction],
+    types: &Types<'c>,
+    _params_len: usize,
+    _in_function_cell_ptr: Option<Value<'c, 'a>>,
+    loc: Location<'c>,
+) -> Result<(), CodegenError> {
+    for id in ids.iter().rev() {
+        let info = &locals[id.0];
+        if !matches!(info.kind, ValueKind::Table) {
+            continue;
+        }
+        let t_ptr = emit_load(block, slots[id.0], types.ptr, loc);
+        let t_iv: Value<'c, '_> = block
+            .append_operation(
+                OperationBuilder::new("llvm.ptrtoint", loc)
+                    .add_operands(&[t_ptr])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.ptrtoint close t_ptr"),
+            )
+            .result(0)
+            .unwrap()
+            .into();
+        let zero_i64 = block
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, 0).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let t_present: Value<'c, '_> = block
+            .append_operation(arith::cmpi(
+                context,
+                arith::CmpiPredicate::Ne,
+                t_iv,
+                zero_i64,
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into();
+        let then_region = Region::new();
+        let then_blk = Block::new(&[]);
+        {
+            // Load metatable_ptr.
+            let mt_slot =
+                emit_byte_offset_ptr(context, &then_blk, t_ptr, TABLE_OFF_METATABLE, types, loc);
+            let mt_ptr = emit_load(&then_blk, mt_slot, types.ptr, loc);
+            let mt_iv: Value<'c, '_> = then_blk
+                .append_operation(
+                    OperationBuilder::new("llvm.ptrtoint", loc)
+                        .add_operands(&[mt_ptr])
+                        .add_results(&[types.i64])
+                        .build()
+                        .expect("llvm.ptrtoint close mt_ptr"),
+                )
+                .result(0)
+                .unwrap()
+                .into();
+            let mt_zero = then_blk
+                .append_operation(arith::constant(
+                    context,
+                    IntegerAttribute::new(types.i64, 0).into(),
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let mt_present: Value<'c, '_> = then_blk
+                .append_operation(arith::cmpi(
+                    context,
+                    arith::CmpiPredicate::Ne,
+                    mt_iv,
+                    mt_zero,
+                    loc,
+                ))
+                .result(0)
+                .unwrap()
+                .into();
+            let mt_then = Region::new();
+            let mt_then_blk = Block::new(&[]);
+            {
+                // Probe mt["__close"] into a tmp TaggedValue slot.
+                let field_str =
+                    emit_addressof(context, &mt_then_blk, "s_close_field_name", types, loc);
+                let search_slot = emit_build_search_key_slot(
+                    context,
+                    &mt_then_blk,
+                    ValueKind::String,
+                    field_str,
+                    types,
+                    loc,
+                );
+                let probe_slot = emit_alloca_slot_for_kind(
+                    context,
+                    &mt_then_blk,
+                    ValueKind::TaggedValue,
+                    types,
+                    loc,
+                );
+                emit_value_slot_store_nil(context, &mt_then_blk, probe_slot, types, loc);
+                emit_hash_lookup_into_tagged_slot(
+                    context,
+                    &mt_then_blk,
+                    mt_ptr,
+                    search_slot,
+                    probe_slot,
+                    HashLookupOutcome::NilOnMissing,
+                    types,
+                    loc,
+                );
+                // Tag check TAG_FUNCTION — silent skip on miss.
+                let probe_tag = emit_load(&mt_then_blk, probe_slot, types.i64, loc);
+                let tag_fn = mt_then_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, TAG_FUNCTION).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let is_function: Value<'c, '_> = mt_then_blk
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Eq,
+                        probe_tag,
+                        tag_fn,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let fn_then = Region::new();
+                let fn_then_blk = Block::new(&[]);
+                {
+                    // Dispatch: sig (Number, Number) → (), args (0.0, 0.0).
+                    let sig = IndirectSig {
+                        param_kinds: vec![ValueKind::Number, ValueKind::Number],
+                        ret_kinds: vec![],
+                    };
+                    let zero_f64 = fn_then_blk
+                        .append_operation(arith::constant(
+                            context,
+                            FloatAttribute::new(context, types.f64, 0.0).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let arg_vals: Vec<Value<'c, '_>> = vec![zero_f64, zero_f64];
+                    let _ = emit_dispatch_chain_from_slot_ptr(
+                        context,
+                        &fn_then_blk,
+                        probe_slot,
+                        &sig,
+                        candidates,
+                        &arg_vals,
+                        functions,
+                        types,
+                        loc,
+                    );
+                    fn_then_blk.append_operation(scf::r#yield(&[], loc));
+                }
+                fn_then.append_block(fn_then_blk);
+                let fn_else = Region::new();
+                let fn_else_blk = Block::new(&[]);
+                fn_else_blk.append_operation(scf::r#yield(&[], loc));
+                fn_else.append_block(fn_else_blk);
+                mt_then_blk.append_operation(scf::r#if(is_function, &[], fn_then, fn_else, loc));
+                mt_then_blk.append_operation(scf::r#yield(&[], loc));
+            }
+            mt_then.append_block(mt_then_blk);
+            let mt_else = Region::new();
+            let mt_else_blk = Block::new(&[]);
+            mt_else_blk.append_operation(scf::r#yield(&[], loc));
+            mt_else.append_block(mt_else_blk);
+            then_blk.append_operation(scf::r#if(mt_present, &[], mt_then, mt_else, loc));
+            then_blk.append_operation(scf::r#yield(&[], loc));
+        }
+        then_region.append_block(then_blk);
+        let else_region = Region::new();
+        let else_blk = Block::new(&[]);
+        else_blk.append_operation(scf::r#yield(&[], loc));
+        else_region.append_block(else_blk);
+        block.append_operation(scf::r#if(t_present, &[], then_region, else_region, loc));
+    }
+    Ok(())
 }
 
 /// ADR 0140 — probe `mt["__metatable"]` into a fresh TaggedValue
@@ -22041,12 +23077,15 @@ fn build_for_cond_region<'c, 'a>(
 // extended in-place by ADR 0187 (DFS lift).
 // =============================================================
 
+#[allow(clippy::too_many_arguments)]
 fn register_gc_runtime_funcs<'c>(
     context: &'c Context,
     module: &Module<'c>,
     types: &Types<'c>,
     chunk_safe: bool,
     frame_safe: bool,
+    gc_candidates: &[FuncId],
+    functions: &[HirFunction],
     loc: Location<'c>,
 ) {
     let void_ty = llvm::r#type::void(context);
@@ -22079,7 +23118,7 @@ fn register_gc_runtime_funcs<'c>(
     {
         let region = Region::new();
         let blk = Block::new(&[]);
-        emit_gc_sweep_inline(context, &blk, types, loc);
+        emit_gc_sweep_inline(context, &blk, types, gc_candidates, functions, loc);
         blk.append_operation(
             OperationBuilder::new("llvm.return", loc)
                 .build()
@@ -23570,6 +24609,157 @@ fn emit_gc_mark_table_propagation_pass<'a, 'c>(
             );
             let hash_buf = emit_load(&then_blk, hash_buf_field, types.ptr, loc);
             mark_user_ptr_black_if_nonnull(context, &then_blk, hash_buf, types, loc);
+            // ADR 0260 — N3-B-2: compute `not_weak` for this Table.
+            // If `mt["__mode"]` is non-Nil, skip propagation through
+            // the table's entries so referenced values/keys stay
+            // WHITE for the pre-sweep weak-clear pass.
+            // Stash in an i8 alloca so nested scf.if regions can
+            // load it without SSA-scope concerns.
+            let not_weak_slot: Value<'c, '_> = {
+                let one = then_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 1).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let slot = then_blk
+                    .append_operation(
+                        OperationBuilder::new("llvm.alloca", loc)
+                            .add_operands(&[one])
+                            .add_results(&[types.ptr])
+                            .add_attributes(&[(
+                                Identifier::new(context, "elem_type"),
+                                TypeAttribute::new(types.i8).into(),
+                            )])
+                            .build()
+                            .expect("alloca not_weak"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let mt_slot_p = emit_byte_offset_ptr(
+                    context,
+                    &then_blk,
+                    table_ptr,
+                    TABLE_OFF_METATABLE,
+                    types,
+                    loc,
+                );
+                let mt_ptr_p = emit_load(&then_blk, mt_slot_p, types.ptr, loc);
+                let mt_iv_p: Value<'c, '_> = then_blk
+                    .append_operation(
+                        OperationBuilder::new("llvm.ptrtoint", loc)
+                            .add_operands(&[mt_ptr_p])
+                            .add_results(&[types.i64])
+                            .build()
+                            .expect("llvm.ptrtoint prop mt"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let zero_p = then_blk
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let mt_null_p: Value<'c, '_> = then_blk
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Eq,
+                        mt_iv_p,
+                        zero_p,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let mp_then = Region::new();
+                let mp_then_blk = Block::new(&[]);
+                {
+                    let one_i8 = mp_then_blk
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i8, 1).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    emit_store(&mp_then_blk, one_i8, slot, loc);
+                    mp_then_blk.append_operation(scf::r#yield(&[], loc));
+                }
+                mp_then.append_block(mp_then_blk);
+                let mp_else = Region::new();
+                let mp_else_blk = Block::new(&[]);
+                {
+                    let field_str =
+                        emit_addressof(context, &mp_else_blk, "s_mode_field_name", types, loc);
+                    let search_slot = emit_build_search_key_slot(
+                        context,
+                        &mp_else_blk,
+                        ValueKind::String,
+                        field_str,
+                        types,
+                        loc,
+                    );
+                    let probe_slot = emit_alloca_slot_for_kind(
+                        context,
+                        &mp_else_blk,
+                        ValueKind::TaggedValue,
+                        types,
+                        loc,
+                    );
+                    emit_value_slot_store_nil(context, &mp_else_blk, probe_slot, types, loc);
+                    emit_hash_lookup_into_tagged_slot(
+                        context,
+                        &mp_else_blk,
+                        mt_ptr_p,
+                        search_slot,
+                        probe_slot,
+                        HashLookupOutcome::NilOnMissing,
+                        types,
+                        loc,
+                    );
+                    let ptag_p = emit_load(&mp_else_blk, probe_slot, types.i64, loc);
+                    let nil_tag_p = mp_else_blk
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, TAG_NIL).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let is_nil_p: Value<'c, '_> = mp_else_blk
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Eq,
+                            ptag_p,
+                            nil_tag_p,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let as_i8: Value<'c, '_> = mp_else_blk
+                        .append_operation(arith::extui(is_nil_p, types.i8, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    emit_store(&mp_else_blk, as_i8, slot, loc);
+                    mp_else_blk.append_operation(scf::r#yield(&[], loc));
+                }
+                mp_else.append_block(mp_else_blk);
+                then_blk.append_operation(scf::r#if(mt_null_p, &[], mp_then, mp_else, loc));
+                slot
+            };
             // Walk array_buf [0..len). Each entry is a 16-byte
             // tagged slot: i64 tag at offset 0, payload at +8.
             let elem_before = Region::new();
@@ -23665,13 +24855,38 @@ fn emit_gc_mark_table_propagation_pass<'a, 'c>(
                     let payload_field =
                         emit_byte_offset_ptr(context, &str_then_blk, slot_ptr, 8, types, loc);
                     let user_ref_ptr = emit_load(&str_then_blk, payload_field, types.ptr, loc);
-                    mark_user_ptr_black_if_nonnull(
-                        context,
-                        &str_then_blk,
-                        user_ref_ptr,
-                        types,
-                        loc,
-                    );
+                    // ADR 0260 — N3-B-2: gate the mark on `not_weak`.
+                    let nw_byte = emit_load(&str_then_blk, not_weak_slot, types.i8, loc);
+                    let nw_zero = str_then_blk
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i8, 0).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let do_mark: Value<'c, '_> = str_then_blk
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Ne,
+                            nw_byte,
+                            nw_zero,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let mark_t = Region::new();
+                    let mark_t_blk = Block::new(&[]);
+                    mark_user_ptr_black_if_nonnull(context, &mark_t_blk, user_ref_ptr, types, loc);
+                    mark_t_blk.append_operation(scf::r#yield(&[], loc));
+                    mark_t.append_block(mark_t_blk);
+                    let mark_e = Region::new();
+                    let mark_e_blk = Block::new(&[]);
+                    mark_e_blk.append_operation(scf::r#yield(&[], loc));
+                    mark_e.append_block(mark_e_blk);
+                    str_then_blk.append_operation(scf::r#if(do_mark, &[], mark_t, mark_e, loc));
                     str_then_blk.append_operation(scf::r#yield(&[], loc));
                 }
                 str_then.append_block(str_then_blk);
@@ -23888,13 +25103,38 @@ fn emit_gc_mark_table_propagation_pass<'a, 'c>(
                             let payload_field =
                                 emit_byte_offset_ptr(context, &r_then_blk, slot_ptr, 8, types, loc);
                             let user_p = emit_load(&r_then_blk, payload_field, types.ptr, loc);
-                            mark_user_ptr_black_if_nonnull(
-                                context,
-                                &r_then_blk,
-                                user_p,
-                                types,
-                                loc,
-                            );
+                            // ADR 0260 — N3-B-2: hash-walk mark gate.
+                            let nw_byte_h = emit_load(&r_then_blk, not_weak_slot, types.i8, loc);
+                            let nw_zero_h = r_then_blk
+                                .append_operation(arith::constant(
+                                    context,
+                                    IntegerAttribute::new(types.i8, 0).into(),
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let do_mark_h: Value<'c, '_> = r_then_blk
+                                .append_operation(arith::cmpi(
+                                    context,
+                                    arith::CmpiPredicate::Ne,
+                                    nw_byte_h,
+                                    nw_zero_h,
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let mh_t = Region::new();
+                            let mh_t_blk = Block::new(&[]);
+                            mark_user_ptr_black_if_nonnull(context, &mh_t_blk, user_p, types, loc);
+                            mh_t_blk.append_operation(scf::r#yield(&[], loc));
+                            mh_t.append_block(mh_t_blk);
+                            let mh_e = Region::new();
+                            let mh_e_blk = Block::new(&[]);
+                            mh_e_blk.append_operation(scf::r#yield(&[], loc));
+                            mh_e.append_block(mh_e_blk);
+                            r_then_blk.append_operation(scf::r#if(do_mark_h, &[], mh_t, mh_e, loc));
                             r_then_blk.append_operation(scf::r#yield(&[], loc));
                         }
                         r_then.append_block(r_then_blk);
@@ -23999,8 +25239,19 @@ fn emit_gc_sweep_inline<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,
     types: &Types<'c>,
+    gc_candidates: &[FuncId],
+    functions: &[HirFunction],
     loc: Location<'c>,
 ) {
+    // ADR 0260 — N3-B: weak-table clear pass runs BEFORE the WHITE
+    // free loop. Walks every BLACK Table whose metatable has a
+    // non-Nil `__mode` field, and clears any hash-bucket value slot
+    // that holds a TAG_TABLE pointing to a still-WHITE object. The
+    // simplification: any non-Nil `__mode` triggers weak-value
+    // clearing; the spec distinction between "k"/"v"/"kv" is a
+    // future refinement.
+    emit_gc_weak_clear_pass(context, block, types, loc);
+
     let zero_iv = block
         .append_operation(arith::constant(
             context,
@@ -24117,6 +25368,20 @@ fn emit_gc_sweep_inline<'a, 'c>(
         let else_region = Region::new();
         let else_blk = Block::new(&[]);
         {
+            // ADR 0259 — N3-A: __gc finalizer dispatch BEFORE free.
+            // If type_tag == GC_TYPE_TABLE, probe payload's metatable
+            // for __gc; if Function, dispatch via the same chain
+            // pattern as ADR 0258. Sig (Number) → () matches user fn
+            // default param ABI; arg is placeholder 0.0.
+            emit_gc_finalizer_dispatch(
+                context,
+                &else_blk,
+                cur_ptr,
+                gc_candidates,
+                functions,
+                types,
+                loc,
+            );
             // WHITE branch: decrement total_bytes, unlink, free.
             let size_ptr =
                 emit_byte_offset_ptr(context, &else_blk, cur_ptr, GC_HEADER_OFF_SIZE, types, loc);

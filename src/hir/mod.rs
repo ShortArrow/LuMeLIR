@@ -253,6 +253,7 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             Callee::Builtin(Builtin::ToNumber) => ValueKind::Number,
             Callee::Builtin(Builtin::Type) => ValueKind::String,
             Callee::Builtin(Builtin::Assert) => ValueKind::Bool,
+            Callee::Builtin(Builtin::Newproxy) => ValueKind::TaggedValue,
             // Phase 2.7h (ADR 0033): error never returns at run-
             // time. The kind is a Number placeholder for static
             // typing only — code after `error(...)` is unreachable.
@@ -1445,6 +1446,7 @@ fn register_function_signature(
                 is_captured: false,
                 subtype: NumberSubtype::Unknown,
                 is_const: false,
+                is_close: false,
             })
             .collect(),
         upvalues: Vec::new(),
@@ -1485,6 +1487,7 @@ fn alloc_method_signature(
                 is_captured: false,
                 subtype: NumberSubtype::Unknown,
                 is_const: false,
+                is_close: false,
             })
             .collect(),
         upvalues: Vec::new(),
@@ -2289,6 +2292,7 @@ fn check_mutual_in_stmt(
             check_mutual_in_expr(key, enclosing_fid, functions, stmt.span.start)?;
             check_mutual_in_expr(value, enclosing_fid, functions, stmt.span.start)
         }
+        HirStmtKind::CloseLocals { .. } => Ok(()),
     }
 }
 
@@ -2669,9 +2673,14 @@ impl LowerCtx {
         }
 
         let span = stmts.first().map(|s| s.span).unwrap_or(Span::new(0, 0));
+        // ADR 0258 — N3-D: snapshot before user body lowers so
+        // `<close>` Locals declared in the body get a scope-exit
+        // CloseLocals stmt at natural fall-off.
+        let scope_local_start = self.locals.len();
         self.loop_break_targets.push(Some(returned_id));
-        let lowered = self.lower_stmts(stmts)?;
+        let mut lowered = self.lower_stmts(stmts)?;
         self.loop_break_targets.pop();
+        self.append_close_locals_if_any(&mut lowered, scope_local_start, stmts);
 
         let mut out = Vec::with_capacity(stmts.len() + 2);
         out.push(HirStmt {
@@ -2736,9 +2745,12 @@ impl LowerCtx {
     /// post-`break` code is skipped at runtime (ADR 0015).
     fn lower_scoped_body(&mut self, stmts: &[Stmt]) -> Result<Vec<HirStmt>, HirError> {
         self.scopes.push(HashMap::new());
+        let scope_local_start = self.locals.len();
         let result = self.lower_stmts_maybe_guarded(stmts);
         self.scopes.pop();
-        result
+        let mut body = result?;
+        self.append_close_locals_if_any(&mut body, scope_local_start, stmts);
+        Ok(body)
     }
 
     /// Same as `lower_scoped_body` but the caller is responsible for the
@@ -2746,6 +2758,49 @@ impl LowerCtx {
     /// declare the read-only loop variable inside the body's own scope.
     fn lower_scoped_body_no_push(&mut self, stmts: &[Stmt]) -> Result<Vec<HirStmt>, HirError> {
         self.lower_stmts_maybe_guarded(stmts)
+    }
+
+    /// ADR 0258 — N3-D: scan locals declared in this scope range; if any
+    /// carry `is_close = true`, append a `CloseLocals { ids }` stmt with
+    /// the ids in declaration order. Codegen iterates in reverse per Lua
+    /// 5.4 §3.3.8.
+    fn append_close_locals_if_any(
+        &self,
+        body: &mut Vec<HirStmt>,
+        scope_local_start: usize,
+        source_stmts: &[Stmt],
+    ) {
+        let ids: Vec<LocalId> = (scope_local_start..self.locals.len())
+            .filter(|i| self.locals[*i].is_close)
+            .map(LocalId)
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        // ADR 0258: `__close` call ABI is `(Number, Number) → ()` —
+        // user fns default param kind is Number, default ret kind is
+        // empty. Any 2-arg user fn with no return matches.
+        let candidates: Vec<FuncId> = self
+            .functions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| {
+                let pk: Vec<ValueKind> = f.params.iter().map(|p| p.kind).collect();
+                if pk == [ValueKind::Number, ValueKind::Number] && f.ret_kinds.is_empty() {
+                    Some(FuncId(i))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let span = source_stmts
+            .last()
+            .map(|s| s.span)
+            .unwrap_or(crate::lexer::Span { start: 0, end: 0 });
+        body.push(HirStmt {
+            kind: HirStmtKind::CloseLocals { ids, candidates },
+            span,
+        });
     }
 
     fn lower_stmts_maybe_guarded(&mut self, stmts: &[Stmt]) -> Result<Vec<HirStmt>, HirError> {
@@ -2791,6 +2846,7 @@ impl LowerCtx {
             is_captured: false,
             subtype: NumberSubtype::Unknown,
             is_const: false,
+            is_close: false,
         });
         self.scopes
             .last_mut()
@@ -2870,6 +2926,9 @@ impl LowerCtx {
                     self.locals[id.0].is_const = true;
                     self.readonly_locals.insert(id);
                 }
+                if matches!(attr.as_deref(), Some("close")) {
+                    self.locals[id.0].is_close = true;
+                }
                 Ok(HirStmt {
                     kind: HirStmtKind::LocalInit { id, value },
                     span: stmt.span,
@@ -2881,9 +2940,13 @@ impl LowerCtx {
             }
             StmtKind::Block(body) => {
                 self.scopes.push(HashMap::new());
+                let scope_local_start = self.locals.len();
                 let result = self.lower_stmts(body);
                 self.scopes.pop();
-                let stmts = result?;
+                let mut stmts = result?;
+                // ADR 0258 — N3-D: close any <close> Locals declared in
+                // this `do ... end` block at the scope's natural end.
+                self.append_close_locals_if_any(&mut stmts, scope_local_start, body);
                 Ok(HirStmt {
                     kind: HirStmtKind::Block { stmts },
                     span: stmt.span,
@@ -4005,6 +4068,7 @@ impl LowerCtx {
                     is_captured: false,
                     subtype: NumberSubtype::Unknown,
                     is_const: false,
+                    is_close: false,
                 });
                 self.scopes[0].insert(name.to_owned(), id);
                 Ok((id, true))
@@ -4382,6 +4446,9 @@ impl LowerCtx {
                     self.locals[id.0].is_const = true;
                     self.readonly_locals.insert(id);
                 }
+                if matches!(attr.as_deref(), Some("close")) {
+                    self.locals[id.0].is_close = true;
+                }
                 stmts.push(HirStmt {
                     kind: HirStmtKind::LocalInit { id, value: v },
                     span,
@@ -4435,6 +4502,9 @@ impl LowerCtx {
                 if matches!(attr.as_deref(), Some("const") | Some("close")) {
                     self.locals[id.0].is_const = true;
                     self.readonly_locals.insert(id);
+                }
+                if matches!(attr.as_deref(), Some("close")) {
+                    self.locals[id.0].is_close = true;
                 }
                 dst_ids.push(id);
             }
@@ -4802,6 +4872,7 @@ impl LowerCtx {
                                 is_captured: false,
                                 subtype: NumberSubtype::Unknown,
                                 is_const: false,
+                                is_close: false,
                             })
                             .collect(),
                         upvalues: Vec::new(),
