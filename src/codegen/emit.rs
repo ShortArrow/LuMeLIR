@@ -2182,6 +2182,18 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(time_op.into());
+    // ADR 0271 — N7-10: ctime(const time_t*) -> char* for os.date.
+    let ctime_ty = llvm::r#type::function(types.ptr, &[types.ptr], false);
+    let ctime_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "ctime"))
+        .function_type(TypeAttribute::new(ctime_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(ctime_op.into());
     let clock_ty = llvm::r#type::function(types.i64, &[], false);
     let clock_op = LLVMFuncOperationBuilder::new(context, loc)
         .body(Region::new())
@@ -11604,6 +11616,77 @@ fn emit_expr<'a, 'c>(
                 );
                 super::tagged::emit_value_slot_store_nil(context, block, out_slot, types, loc);
                 Ok(out_slot)
+            }
+            Callee::Builtin(Builtin::OsDate) => {
+                // ADR 0271 — os.date() no-arg: ctime(&time(NULL)) and
+                // strip the trailing '\n'. We stash time(NULL)'s i64
+                // in an alloca, pass its ptr to ctime, then wrap
+                // strlen(buf) - 1 bytes via emit_string_obj_from_bytes.
+                let one = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 1).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let t_slot: Value<'c, '_> = block
+                    .append_operation(
+                        OperationBuilder::new("llvm.alloca", loc)
+                            .add_operands(&[one])
+                            .add_results(&[types.ptr])
+                            .add_attributes(&[(
+                                Identifier::new(context, "elem_type"),
+                                TypeAttribute::new(types.i64).into(),
+                            )])
+                            .build()
+                            .expect("alloca time_t"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let null_iv = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let null_p: Value<'c, '_> = block
+                    .append_operation(
+                        OperationBuilder::new("llvm.inttoptr", loc)
+                            .add_operands(&[null_iv])
+                            .add_results(&[types.ptr])
+                            .build()
+                            .expect("inttoptr null"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let now_i64 = emit_libc_call_i64(context, block, "time", &[null_p], types, loc);
+                emit_store(block, now_i64, t_slot, loc);
+                let cstr = emit_libc_call_ptr(context, block, "ctime", &[t_slot], types, loc);
+                let len = emit_libc_call_i64(context, block, "strlen", &[cstr], types, loc);
+                let one_i64 = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 1).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let len_trim: Value<'c, '_> = block
+                    .append_operation(arith::subi(len, one_i64, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                Ok(emit_string_obj_from_bytes(
+                    context, block, cstr, len_trim, types, loc,
+                ))
             }
             Callee::Builtin(Builtin::OsDifftime) => {
                 // ADR 0269 — os.difftime(t2, t1) = t2 - t1.

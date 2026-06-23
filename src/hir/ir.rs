@@ -578,6 +578,11 @@ pub enum Builtin {
     /// ADR 0269 — N7-8: `os.difftime(t2, t1)` returns `t2 - t1` in
     /// seconds. Per Lua 5.4 §6.9.
     OsDifftime,
+    /// ADR 0271 — N7-10: `os.date()` no-arg form returns the current
+    /// time as a String via libc `ctime(&time(NULL))` with the
+    /// trailing newline stripped. Spec format-string forms and the
+    /// 2nd `time` arg require strftime — deferred.
+    OsDate,
     OsTime,
     /// ADR 0242 — `os.clock()` returns the program's CPU time
     /// in seconds via libc `clock() / CLOCKS_PER_SEC`. The
@@ -948,6 +953,7 @@ impl Builtin {
             "rename" => Some(Builtin::OsRename),
             "tmpname" => Some(Builtin::OsTmpname),
             "difftime" => Some(Builtin::OsDifftime),
+            "date" => Some(Builtin::OsDate),
             "clock" => Some(Builtin::OsClock),
             "getenv" => Some(Builtin::OsGetenv),
             _ => None,
@@ -1035,6 +1041,7 @@ impl Builtin {
             Builtin::OsRename => (2, 2),
             Builtin::OsTmpname => (0, 0),
             Builtin::OsDifftime => (2, 2),
+            Builtin::OsDate => (0, 0),
             Builtin::OsClock => (0, 0),
             Builtin::OsGetenv => (1, 1),
             // ADR 0245 — arity 0 for both.
@@ -1141,6 +1148,7 @@ impl Builtin {
             Builtin::OsRename => "os.rename",
             Builtin::OsTmpname => "os.tmpname",
             Builtin::OsDifftime => "os.difftime",
+            Builtin::OsDate => "os.date",
             Builtin::OsClock => "os.clock",
             Builtin::OsGetenv => "os.getenv",
             Builtin::CoroutineIsYieldable => "coroutine.isyieldable",
@@ -1247,6 +1255,8 @@ impl Builtin {
             Builtin::OsTmpname => &[ValueKind::String],
             // ADR 0269 — os.difftime returns Number (seconds delta).
             Builtin::OsDifftime => &[ValueKind::Number],
+            // ADR 0271 — os.date returns String.
+            Builtin::OsDate => &[ValueKind::String],
             // ADR 0242 — os.getenv returns String-or-Nil → TaggedValue.
             Builtin::OsGetenv => &[ValueKind::TaggedValue],
             // ADR 0245 — coroutine.isyieldable returns Bool.
@@ -1470,6 +1480,8 @@ impl Builtin {
             Builtin::OsTmpname => &[],
             // ADR 0269 — os.difftime(t2, t1) takes two Numbers.
             Builtin::OsDifftime => &[ValueKind::Number, ValueKind::Number],
+            // ADR 0271 — os.date no-arg form.
+            Builtin::OsDate => &[],
             // ADR 0245 — no args.
             Builtin::CoroutineIsYieldable | Builtin::CoroutineRunning => &[],
         }
