@@ -516,6 +516,16 @@ pub enum Builtin {
     /// 2.7q-stdlib-math (ADR 0102). The only binary math.* builtin
     /// today; arity=2 vs unary group=1.
     MathPow,
+    /// ADR 0262 — N7-1: `math.fmod(x, y)` — IEEE remainder via libm
+    /// `fmod`. Distinct from Lua's `%` operator (which uses floor-mod);
+    /// `fmod` is C-style truncation-mod per Lua 5.4 §6.7.
+    MathFmod,
+    /// ADR 0263 — N7-2: `math.random([m[, n]])`. Variadic 0/1/2-arg
+    /// shape: `()` → float in `[0, 1)`; `(n)` → integer in `[1, n]`;
+    /// `(m, n)` → integer in `[m, n]`. Uses libc `rand()` /
+    /// `RAND_MAX` for the underlying PRNG; non-determinism matches
+    /// Lua spec (use `math.randomseed` to fix — deferred).
+    MathRandom,
     /// `math.sin(x)` — sine via libm `sin` (ADR 0102).
     MathSin,
     /// `math.cos(x)` — cosine via libm `cos` (ADR 0102).
@@ -802,6 +812,8 @@ impl Builtin {
             "min" => Some(Builtin::MathMin),
             // ADR 0102 — math.* continuation.
             "pow" => Some(Builtin::MathPow),
+            "fmod" => Some(Builtin::MathFmod),
+            "random" => Some(Builtin::MathRandom),
             "sin" => Some(Builtin::MathSin),
             "cos" => Some(Builtin::MathCos),
             "log" => Some(Builtin::MathLog),
@@ -995,6 +1007,8 @@ impl Builtin {
             Builtin::CoroutineIsYieldable => (0, 0),
             Builtin::CoroutineRunning => (0, 0),
             Builtin::MathPow => (2, 2),
+            Builtin::MathFmod => (2, 2),
+            Builtin::MathRandom => (0, 2),
             Builtin::MathSin | Builtin::MathCos | Builtin::MathLog | Builtin::MathExp => (1, 1),
             Builtin::StringLen | Builtin::StringUpper | Builtin::StringLower => (1, 1),
             // ADR 0104 — string.sub(s, i) or string.sub(s, i, j).
@@ -1070,6 +1084,8 @@ impl Builtin {
             Builtin::MathFloor => "math.floor",
             Builtin::MathAbs => "math.abs",
             Builtin::MathPow => "math.pow",
+            Builtin::MathFmod => "math.fmod",
+            Builtin::MathRandom => "math.random",
             Builtin::MathSin => "math.sin",
             Builtin::MathCos => "math.cos",
             Builtin::MathLog => "math.log",
@@ -1159,6 +1175,8 @@ impl Builtin {
             | Builtin::MathFloor
             | Builtin::MathAbs
             | Builtin::MathPow
+            | Builtin::MathFmod
+            | Builtin::MathRandom
             | Builtin::MathSin
             | Builtin::MathCos
             | Builtin::MathLog
@@ -1299,6 +1317,10 @@ impl Builtin {
             | Builtin::MathAcos
             | Builtin::MathAtan => &[ValueKind::Number],
             Builtin::MathPow => &[ValueKind::Number, ValueKind::Number],
+            Builtin::MathFmod => &[ValueKind::Number, ValueKind::Number],
+            // ADR 0263 — accepts up to 2 Number args; lower-arity
+            // calls are HIR-validated by the arity bounds (0, 2).
+            Builtin::MathRandom => &[ValueKind::Number, ValueKind::Number],
             // string.* — first arg String; bounds args Number.
             Builtin::StringLen | Builtin::StringUpper | Builtin::StringLower => {
                 &[ValueKind::String]

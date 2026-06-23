@@ -1940,6 +1940,31 @@ fn emit_libm_decls<'c>(
         .build();
     module.body().append_operation(pow_op.into());
 
+    // ADR 0262 — fmod(f64, f64) -> f64 for math.fmod (N7-1).
+    let fmod_ty = llvm::r#type::function(types.f64, &[types.f64, types.f64], false);
+    let fmod_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "fmod"))
+        .function_type(TypeAttribute::new(fmod_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(fmod_op.into());
+    // ADR 0263 — rand() -> i32 for math.random (N7-2).
+    let rand_ty = llvm::r#type::function(types.i32, &[], false);
+    let rand_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "rand"))
+        .function_type(TypeAttribute::new(rand_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(rand_op.into());
+
     // floor(f64) -> f64
     let floor_ty = llvm::r#type::function(types.f64, &[types.f64], false);
     let floor_op = LLVMFuncOperationBuilder::new(context, loc)
@@ -11770,6 +11795,119 @@ fn emit_expr<'a, 'c>(
                     acc = block.append_operation(op).result(0).unwrap().into();
                 }
                 Ok(acc)
+            }
+            Callee::Builtin(Builtin::MathFmod) => {
+                // ADR 0262 — `math.fmod(x, y)` via libm `fmod`.
+                let x = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let y = emit_expr(
+                    context, block, &args[1], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                Ok(emit_libc_call_f64(context, block, "fmod", &[x, y], types, loc))
+            }
+            Callee::Builtin(Builtin::MathRandom) => {
+                // ADR 0263 — math.random().
+                // arity 0: rand() / RAND_MAX → f64 in [0, 1).
+                // arity 1: (rand() % n) + 1 → [1, n].
+                // arity 2: m + (rand() % (n - m + 1)) → [m, n].
+                let r_i32 = emit_libc_call_i32(context, block, "rand", &[], types, loc);
+                let r_f64: Value<'c, '_> = block
+                    .append_operation(arith::sitofp(r_i32, types.f64, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                match args.len() {
+                    0 => {
+                        // Divide by RAND_MAX (POSIX min: 32767;
+                        // glibc: 2147483647). Use 2147483647.0 — over-
+                        // shoots POSIX-min by ~16 bits but the result
+                        // still lies in [0, 1) on glibc, and bounded
+                        // < 1 on any conforming libc.
+                        let rand_max = block
+                            .append_operation(arith::constant(
+                                context,
+                                FloatAttribute::new(context, types.f64, 2147483647.0).into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        Ok(block
+                            .append_operation(arith::divf(r_f64, rand_max, loc))
+                            .result(0)
+                            .unwrap()
+                            .into())
+                    }
+                    1 => {
+                        // (rand() mod n) + 1 as f64.
+                        let n_f64 = emit_expr(
+                            context, block, &args[0], slots, locals, functions, types,
+                            params_len, in_function_cell_ptr, loc,
+                        )?;
+                        let modv: Value<'c, '_> = block
+                            .append_operation(arith::remf(r_f64, n_f64, loc))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let one = block
+                            .append_operation(arith::constant(
+                                context,
+                                FloatAttribute::new(context, types.f64, 1.0).into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        Ok(block
+                            .append_operation(arith::addf(modv, one, loc))
+                            .result(0)
+                            .unwrap()
+                            .into())
+                    }
+                    _ => {
+                        // 2-arg: m + (rand() mod (n - m + 1)).
+                        let m_f64 = emit_expr(
+                            context, block, &args[0], slots, locals, functions, types,
+                            params_len, in_function_cell_ptr, loc,
+                        )?;
+                        let n_f64 = emit_expr(
+                            context, block, &args[1], slots, locals, functions, types,
+                            params_len, in_function_cell_ptr, loc,
+                        )?;
+                        let one = block
+                            .append_operation(arith::constant(
+                                context,
+                                FloatAttribute::new(context, types.f64, 1.0).into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let diff: Value<'c, '_> = block
+                            .append_operation(arith::subf(n_f64, m_f64, loc))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let range: Value<'c, '_> = block
+                            .append_operation(arith::addf(diff, one, loc))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let modv: Value<'c, '_> = block
+                            .append_operation(arith::remf(r_f64, range, loc))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        Ok(block
+                            .append_operation(arith::addf(m_f64, modv, loc))
+                            .result(0)
+                            .unwrap()
+                            .into())
+                    }
+                }
             }
             Callee::Builtin(Builtin::MathPow) => {
                 // ADR 0102 — binary `math.pow(x, y)` via libm `pow`.
