@@ -760,6 +760,10 @@ pub enum Builtin {
     /// (single-result position). Multi-return `(int, frac)`
     /// form deferred. Codegen uses libm `trunc(x)`.
     MathModf,
+    /// ADR 0277 — N7-16: `utf8.len(s)` count of UTF-8 codepoints.
+    /// Codegen scans bytes and counts those whose top 2 bits ≠ 0b10
+    /// (i.e. non-continuation bytes).
+    Utf8Len,
     /// ADR 0216 — `pcall(f)` runs `f()` under a setjmp landing pad
     /// (ADR 0215). Returns `true` if `f` returned normally; `false`
     /// if any `error(msg)` longjmp'd back. The error message is
@@ -955,6 +959,8 @@ impl Builtin {
             "os" => Self::os_from_method(method),
             // ADR 0245 — M13-A coroutine.* namespace (partial).
             "coroutine" => Self::coroutine_from_method(method),
+            // ADR 0277 — N7-16 utf8.* namespace (partial).
+            "utf8" => Self::utf8_from_method(method),
             _ => None,
         }
     }
@@ -992,6 +998,15 @@ impl Builtin {
         match method {
             "isyieldable" => Some(Builtin::CoroutineIsYieldable),
             "running" => Some(Builtin::CoroutineRunning),
+            _ => None,
+        }
+    }
+
+    /// ADR 0277 — N7-16: `utf8.*` namespace partial. Currently only
+    /// `utf8.len(s)` (count codepoints). variadic/range forms deferred.
+    pub fn utf8_from_method(method: &str) -> Option<Self> {
+        match method {
+            "len" => Some(Builtin::Utf8Len),
             _ => None,
         }
     }
@@ -1131,6 +1146,7 @@ impl Builtin {
             Builtin::MathToInteger => (1, 1),
             Builtin::MathUlt => (2, 2),
             Builtin::MathModf => (1, 1),
+            Builtin::Utf8Len => (1, 1),
         }
     }
 
@@ -1213,6 +1229,7 @@ impl Builtin {
             Builtin::MathToInteger => "math.tointeger",
             Builtin::MathUlt => "math.ult",
             Builtin::MathModf => "math.modf",
+            Builtin::Utf8Len => "utf8.len",
         }
     }
 
@@ -1357,6 +1374,8 @@ impl Builtin {
             Builtin::MathUlt => &[ValueKind::Bool],
             // ADR 0275 — single-result returns Number (integer part).
             Builtin::MathModf => &[ValueKind::Number],
+            // ADR 0277 — utf8.len returns Number.
+            Builtin::Utf8Len => &[ValueKind::Number],
         }
     }
 
@@ -1510,6 +1529,8 @@ impl Builtin {
             Builtin::MathUlt => &[ValueKind::Number, ValueKind::Number],
             // ADR 0275 — math.modf takes one Number.
             Builtin::MathModf => &[ValueKind::Number],
+            // ADR 0277 — utf8.len takes a String.
+            Builtin::Utf8Len => &[ValueKind::String],
             // ADR 0241 — variadic Number args; per-position
             // dispatched via `expected_param_kind`.
             Builtin::MathMax | Builtin::MathMin => &[ValueKind::Number],

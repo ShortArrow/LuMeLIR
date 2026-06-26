@@ -12186,6 +12186,142 @@ fn emit_expr<'a, 'c>(
                     ))
                 }
             }
+            Callee::Builtin(Builtin::Utf8Len) => {
+                // ADR 0277 — utf8.len(s): count codepoints by scanning
+                // the byte buffer and incrementing for every byte whose
+                // top 2 bits are NOT 0b10 (non-continuation byte).
+                let s_obj = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let buf = emit_string_obj_data(context, block, s_obj, types, loc);
+                let len_i64 = emit_string_obj_len(block, s_obj, types, loc);
+                let zero_i64 = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let one_i64 = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 1).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let mask_i8 = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i8, 0xC0_u8 as i8 as i64).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let cont_i8 = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i8, 0x80_u8 as i8 as i64).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                // scf::while carrier = (i, count) both i64.
+                let before_region = Region::new();
+                let before_blk = Block::new(&[(types.i64, loc), (types.i64, loc)]);
+                {
+                    let i_arg: Value<'c, '_> = before_blk.argument(0).unwrap().into();
+                    let c_arg: Value<'c, '_> = before_blk.argument(1).unwrap().into();
+                    let cond: Value<'c, '_> = before_blk
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Slt,
+                            i_arg,
+                            len_i64,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    before_blk.append_operation(scf::condition(cond, &[i_arg, c_arg], loc));
+                }
+                before_region.append_block(before_blk);
+                let after_region = Region::new();
+                let after_blk = Block::new(&[(types.i64, loc), (types.i64, loc)]);
+                {
+                    let i_arg: Value<'c, '_> = after_blk.argument(0).unwrap().into();
+                    let c_arg: Value<'c, '_> = after_blk.argument(1).unwrap().into();
+                    let byte_ptr =
+                        emit_byte_offset_ptr_dynamic(context, &after_blk, buf, i_arg, types, loc);
+                    let byte_val: Value<'c, '_> = after_blk
+                        .append_operation(
+                            OperationBuilder::new("llvm.load", loc)
+                                .add_operands(&[byte_ptr])
+                                .add_results(&[types.i8])
+                                .build()
+                                .expect("llvm.load i8"),
+                        )
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let masked: Value<'c, '_> = after_blk
+                        .append_operation(arith::andi(byte_val, mask_i8, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let is_cont: Value<'c, '_> = after_blk
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Eq,
+                            masked,
+                            cont_i8,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let inc: Value<'c, '_> = after_blk
+                        .append_operation(arith::select(is_cont, zero_i64, one_i64, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let c_next: Value<'c, '_> = after_blk
+                        .append_operation(arith::addi(c_arg, inc, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let i_next: Value<'c, '_> = after_blk
+                        .append_operation(arith::addi(i_arg, one_i64, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    after_blk.append_operation(scf::r#yield(&[i_next, c_next], loc));
+                }
+                after_region.append_block(after_blk);
+                let while_op = scf::r#while(
+                    &[zero_i64, zero_i64],
+                    &[types.i64, types.i64],
+                    before_region,
+                    after_region,
+                    loc,
+                );
+                let count_i64: Value<'c, '_> = block
+                    .append_operation(while_op)
+                    .result(1)
+                    .unwrap()
+                    .into();
+                Ok(block
+                    .append_operation(arith::sitofp(count_i64, types.f64, loc))
+                    .result(0)
+                    .unwrap()
+                    .into())
+            }
             Callee::Builtin(Builtin::MathUlt) => {
                 // ADR 0274 — math.ult(m, n): unsigned i64 less-than.
                 // Convert both f64 args to i64 (fptosi), then arith.cmpi

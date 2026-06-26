@@ -319,6 +319,8 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             Callee::Builtin(Builtin::MathUlt) => ValueKind::Bool,
             // ADR 0275 — math.modf single-result returns Number.
             Callee::Builtin(Builtin::MathModf) => ValueKind::Number,
+            // ADR 0277 — utf8.len returns Number.
+            Callee::Builtin(Builtin::Utf8Len) => ValueKind::Number,
             // Phase 2.7q-stdlib-string (ADR 0103): string.upper /
             // string.lower allocate and return a new String.
             Callee::Builtin(Builtin::StringUpper)
