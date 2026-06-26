@@ -597,6 +597,10 @@ pub enum Builtin {
     /// ADR 0242 — `os.getenv(name)` reads an env var; returns
     /// String on hit or Nil on miss → TaggedValue.
     OsGetenv,
+    /// ADR 0276 — N7-15: `os.setlocale()` no-arg form returns the
+    /// current LC_ALL locale string. Codegen calls libc
+    /// `setlocale(LC_ALL, NULL)`. 1-/2-arg setter form deferred.
+    OsSetlocale,
     /// ADR 0245 — M13-A: `coroutine.isyieldable()` returns true
     /// when the current execution is inside a coroutine that can
     /// yield. Without a coroutine runtime (M13-stretch) the
@@ -973,6 +977,8 @@ impl Builtin {
             "execute" => Some(Builtin::OsExecute),
             "clock" => Some(Builtin::OsClock),
             "getenv" => Some(Builtin::OsGetenv),
+            // ADR 0276 (N7-15): os.setlocale() — query current LC_ALL.
+            "setlocale" => Some(Builtin::OsSetlocale),
             _ => None,
         }
     }
@@ -1062,6 +1068,7 @@ impl Builtin {
             Builtin::OsExecute => (1, 1),
             Builtin::OsClock => (0, 0),
             Builtin::OsGetenv => (1, 1),
+            Builtin::OsSetlocale => (0, 0),
             // ADR 0245 — arity 0 for both.
             Builtin::CoroutineIsYieldable => (0, 0),
             Builtin::CoroutineRunning => (0, 0),
@@ -1174,6 +1181,7 @@ impl Builtin {
             Builtin::OsExecute => "os.execute",
             Builtin::OsClock => "os.clock",
             Builtin::OsGetenv => "os.getenv",
+            Builtin::OsSetlocale => "os.setlocale",
             Builtin::CoroutineIsYieldable => "coroutine.isyieldable",
             Builtin::CoroutineRunning => "coroutine.running",
             Builtin::StringLen => "string.len",
@@ -1286,6 +1294,8 @@ impl Builtin {
             Builtin::OsExecute => &[ValueKind::Bool],
             // ADR 0242 — os.getenv returns String-or-Nil → TaggedValue.
             Builtin::OsGetenv => &[ValueKind::TaggedValue],
+            // ADR 0276 — os.setlocale() returns String.
+            Builtin::OsSetlocale => &[ValueKind::String],
             // ADR 0245 — coroutine.isyieldable returns Bool.
             Builtin::CoroutineIsYieldable => &[ValueKind::Bool],
             // ADR 0245 — coroutine.running returns (thread, Bool).
@@ -1506,6 +1516,8 @@ impl Builtin {
             // ADR 0242 — os.* per-position kinds.
             Builtin::OsTime | Builtin::OsClock => &[],
             Builtin::OsGetenv => &[ValueKind::String],
+            // ADR 0276 — no-arg form.
+            Builtin::OsSetlocale => &[],
             // ADR 0264 — os.exit accepts optional Number code.
             Builtin::OsExit => &[ValueKind::Number],
             // ADR 0265 — os.remove takes filename String.

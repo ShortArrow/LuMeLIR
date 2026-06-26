@@ -371,6 +371,8 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             Callee::Builtin(Builtin::OsRemove) => ValueKind::Bool,
             Callee::Builtin(Builtin::OsRename) => ValueKind::Bool,
             Callee::Builtin(Builtin::OsTmpname) => ValueKind::String,
+            // ADR 0276 — os.setlocale() returns String.
+            Callee::Builtin(Builtin::OsSetlocale) => ValueKind::String,
             Callee::Builtin(Builtin::OsDate) => ValueKind::String,
             Callee::Builtin(Builtin::OsExecute) => ValueKind::Bool,
             Callee::Builtin(Builtin::RawLen) => ValueKind::Number,

@@ -2206,6 +2206,19 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(ctime_op.into());
+    // ADR 0276 — N7-15: setlocale(int, const char*) -> char*.
+    let setlocale_ty =
+        llvm::r#type::function(types.ptr, &[types.i32, types.ptr], false);
+    let setlocale_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "setlocale"))
+        .function_type(TypeAttribute::new(setlocale_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(setlocale_op.into());
     let clock_ty = llvm::r#type::function(types.i64, &[], false);
     let clock_op = LLVMFuncOperationBuilder::new(context, loc)
         .body(Region::new())
@@ -11740,6 +11753,48 @@ fn emit_expr<'a, 'c>(
                     .result(0)
                     .unwrap()
                     .into())
+            }
+            Callee::Builtin(Builtin::OsSetlocale) => {
+                // ADR 0276 — setlocale(LC_ALL=6 on glibc-linux, NULL)
+                // queries the current locale. Returns a non-NULL static
+                // ptr (per POSIX after init); wrap via
+                // emit_string_obj_from_bytes(strlen).
+                let lc_all = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i32, 6).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let null_iv = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let null_p: Value<'c, '_> = block
+                    .append_operation(
+                        OperationBuilder::new("llvm.inttoptr", loc)
+                            .add_operands(&[null_iv])
+                            .add_results(&[types.ptr])
+                            .build()
+                            .expect("inttoptr null"),
+                    )
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let buf = emit_libc_call_ptr(
+                    context, block, "setlocale", &[lc_all, null_p], types, loc,
+                );
+                let len = emit_libc_call_i64(context, block, "strlen", &[buf], types, loc);
+                Ok(emit_string_obj_from_bytes(
+                    context, block, buf, len, types, loc,
+                ))
             }
             Callee::Builtin(Builtin::OsTmpname) => {
                 // ADR 0267 — libc tmpnam(NULL) returns a static buffer
