@@ -11560,7 +11560,6 @@ fn emit_expr<'a, 'c>(
                 | Builtin::MathAbs
                 | Builtin::MathSin
                 | Builtin::MathCos
-                | Builtin::MathLog
                 | Builtin::MathExp
                 // ADR 0240 — M11-A unary math sweep.
                 | Builtin::MathCeil
@@ -11590,7 +11589,6 @@ fn emit_expr<'a, 'c>(
                     Builtin::MathAbs => "fabs",
                     Builtin::MathSin => "sin",
                     Builtin::MathCos => "cos",
-                    Builtin::MathLog => "log",
                     Builtin::MathExp => "exp",
                     Builtin::MathCeil => "ceil",
                     Builtin::MathTan => "tan",
@@ -12128,6 +12126,29 @@ fn emit_expr<'a, 'c>(
                     Ok(emit_libc_call_f64(
                         context, block, "atan2", &[y, x], types, loc,
                     ))
+                }
+            }
+            Callee::Builtin(Builtin::MathLog) => {
+                // ADR 0273 — 1-arg: libm log(x); 2-arg: log(x)/log(base).
+                let x = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let log_x = emit_libc_call_f64(context, block, "log", &[x], types, loc);
+                if args.len() == 1 {
+                    Ok(log_x)
+                } else {
+                    let base = emit_expr(
+                        context, block, &args[1], slots, locals, functions, types, params_len,
+                        in_function_cell_ptr, loc,
+                    )?;
+                    let log_base =
+                        emit_libc_call_f64(context, block, "log", &[base], types, loc);
+                    Ok(block
+                        .append_operation(arith::divf(log_x, log_base, loc))
+                        .result(0)
+                        .unwrap()
+                        .into())
                 }
             }
             Callee::Builtin(Builtin::MathDeg) => {

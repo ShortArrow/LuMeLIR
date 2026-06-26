@@ -1059,7 +1059,9 @@ impl Builtin {
             Builtin::MathRandom => (0, 2),
             Builtin::MathDeg => (1, 1),
             Builtin::MathRad => (1, 1),
-            Builtin::MathSin | Builtin::MathCos | Builtin::MathLog | Builtin::MathExp => (1, 1),
+            Builtin::MathSin | Builtin::MathCos | Builtin::MathExp => (1, 1),
+            // ADR 0273 — math.log(x [, base]); 2-arg form = log(x)/log(base).
+            Builtin::MathLog => (1, 2),
             Builtin::StringLen | Builtin::StringUpper | Builtin::StringLower => (1, 1),
             // ADR 0104 — string.sub(s, i) or string.sub(s, i, j).
             Builtin::StringSub => (2, 3),
@@ -1383,7 +1385,6 @@ impl Builtin {
             | Builtin::MathAbs
             | Builtin::MathSin
             | Builtin::MathCos
-            | Builtin::MathLog
             | Builtin::MathExp
             // ADR 0240 — unary math expansion.
             | Builtin::MathCeil
@@ -1392,6 +1393,8 @@ impl Builtin {
             | Builtin::MathAcos => &[ValueKind::Number],
             // ADR 0270 — N7-9: variable arity 1-or-2 Numbers.
             Builtin::MathAtan => &[ValueKind::Number, ValueKind::Number],
+            // ADR 0273 — N7-12: math.log variable arity 1-or-2 Numbers.
+            Builtin::MathLog => &[ValueKind::Number, ValueKind::Number],
             Builtin::MathPow => &[ValueKind::Number, ValueKind::Number],
             Builtin::MathFmod => &[ValueKind::Number, ValueKind::Number],
             // ADR 0263 — accepts up to 2 Number args; lower-arity
