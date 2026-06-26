@@ -749,6 +749,9 @@ pub enum Builtin {
     /// literals and Locals / Calls / BinOp results. Phase C lifts
     /// the runtime case.
     MathToInteger,
+    /// ADR 0274 — N7-13: `math.ult(m, n)` unsigned 64-bit
+    /// less-than comparison. Returns Bool.
+    MathUlt,
     /// ADR 0216 — `pcall(f)` runs `f()` under a setjmp landing pad
     /// (ADR 0215). Returns `true` if `f` returned normally; `false`
     /// if any `error(msg)` longjmp'd back. The error message is
@@ -861,6 +864,8 @@ impl Builtin {
             // form of an exactly-representable Integer / Number
             // literal; nil otherwise.
             "tointeger" => Some(Builtin::MathToInteger),
+            // ADR 0273+1 (N7-13): math.ult unsigned integer compare.
+            "ult" => Some(Builtin::MathUlt),
             _ => None,
         }
     }
@@ -1111,6 +1116,7 @@ impl Builtin {
             Builtin::MathType => (1, 1),
             // ADR 0211 — math.tointeger(x).
             Builtin::MathToInteger => (1, 1),
+            Builtin::MathUlt => (2, 2),
         }
     }
 
@@ -1190,6 +1196,7 @@ impl Builtin {
             Builtin::MathType => "math.type",
             // ADR 0211.
             Builtin::MathToInteger => "math.tointeger",
+            Builtin::MathUlt => "math.ult",
         }
     }
 
@@ -1328,6 +1335,8 @@ impl Builtin {
             // (i64-as-f64 at Phase B; Phase C will use Integer
             // tagged value).
             Builtin::MathToInteger => &[ValueKind::TaggedValue],
+            // ADR 0274 — math.ult returns Bool.
+            Builtin::MathUlt => &[ValueKind::Bool],
         }
     }
 
@@ -1477,6 +1486,8 @@ impl Builtin {
             Builtin::MathType => &[ValueKind::Number],
             // ADR 0211 — math.tointeger accepts Number.
             Builtin::MathToInteger => &[ValueKind::Number],
+            // ADR 0274 — math.ult takes two Numbers (treated as i64).
+            Builtin::MathUlt => &[ValueKind::Number, ValueKind::Number],
             // ADR 0241 — variadic Number args; per-position
             // dispatched via `expected_param_kind`.
             Builtin::MathMax | Builtin::MathMin => &[ValueKind::Number],

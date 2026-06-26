@@ -12128,6 +12128,40 @@ fn emit_expr<'a, 'c>(
                     ))
                 }
             }
+            Callee::Builtin(Builtin::MathUlt) => {
+                // ADR 0274 — math.ult(m, n): unsigned i64 less-than.
+                // Convert both f64 args to i64 (fptosi), then arith.cmpi
+                // with the unsigned-less-than predicate. Result is i1.
+                let m_f = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let n_f = emit_expr(
+                    context, block, &args[1], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let m_i = block
+                    .append_operation(arith::fptosi(m_f, types.i64, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let n_i = block
+                    .append_operation(arith::fptosi(n_f, types.i64, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                Ok(block
+                    .append_operation(arith::cmpi(
+                        context,
+                        arith::CmpiPredicate::Ult,
+                        m_i,
+                        n_i,
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into())
+            }
             Callee::Builtin(Builtin::MathLog) => {
                 // ADR 0273 — 1-arg: libm log(x); 2-arg: log(x)/log(base).
                 let x = emit_expr(
