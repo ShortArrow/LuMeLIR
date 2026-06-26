@@ -2058,7 +2058,7 @@ fn emit_libm_decls<'c>(
     // ADR 0240 — M11-A: math expansion sweep — ceil + tan / asin /
     // acos / atan all share the same f64 → f64 libm shape.
     for libm_name in [
-        "sin", "cos", "log", "exp", "ceil", "tan", "asin", "acos", "atan",
+        "sin", "cos", "log", "exp", "ceil", "tan", "asin", "acos", "atan", "trunc",
     ] {
         let ty = llvm::r#type::function(types.f64, &[types.f64], false);
         let op = LLVMFuncOperationBuilder::new(context, loc)
@@ -11561,6 +11561,8 @@ fn emit_expr<'a, 'c>(
                 | Builtin::MathSin
                 | Builtin::MathCos
                 | Builtin::MathExp
+                // ADR 0275 — N7-14: math.modf integer-part via libm trunc.
+                | Builtin::MathModf
                 // ADR 0240 — M11-A unary math sweep.
                 | Builtin::MathCeil
                 | Builtin::MathTan
@@ -11590,6 +11592,7 @@ fn emit_expr<'a, 'c>(
                     Builtin::MathSin => "sin",
                     Builtin::MathCos => "cos",
                     Builtin::MathExp => "exp",
+                    Builtin::MathModf => "trunc",
                     Builtin::MathCeil => "ceil",
                     Builtin::MathTan => "tan",
                     Builtin::MathAsin => "asin",

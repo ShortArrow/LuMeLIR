@@ -752,6 +752,10 @@ pub enum Builtin {
     /// ADR 0274 — N7-13: `math.ult(m, n)` unsigned 64-bit
     /// less-than comparison. Returns Bool.
     MathUlt,
+    /// ADR 0275 — N7-14: `math.modf(x)` integer part only
+    /// (single-result position). Multi-return `(int, frac)`
+    /// form deferred. Codegen uses libm `trunc(x)`.
+    MathModf,
     /// ADR 0216 — `pcall(f)` runs `f()` under a setjmp landing pad
     /// (ADR 0215). Returns `true` if `f` returned normally; `false`
     /// if any `error(msg)` longjmp'd back. The error message is
@@ -866,6 +870,8 @@ impl Builtin {
             "tointeger" => Some(Builtin::MathToInteger),
             // ADR 0273+1 (N7-13): math.ult unsigned integer compare.
             "ult" => Some(Builtin::MathUlt),
+            // ADR 0275 (N7-14): math.modf integer part (single-result scope).
+            "modf" => Some(Builtin::MathModf),
             _ => None,
         }
     }
@@ -1117,6 +1123,7 @@ impl Builtin {
             // ADR 0211 — math.tointeger(x).
             Builtin::MathToInteger => (1, 1),
             Builtin::MathUlt => (2, 2),
+            Builtin::MathModf => (1, 1),
         }
     }
 
@@ -1197,6 +1204,7 @@ impl Builtin {
             // ADR 0211.
             Builtin::MathToInteger => "math.tointeger",
             Builtin::MathUlt => "math.ult",
+            Builtin::MathModf => "math.modf",
         }
     }
 
@@ -1337,6 +1345,8 @@ impl Builtin {
             Builtin::MathToInteger => &[ValueKind::TaggedValue],
             // ADR 0274 — math.ult returns Bool.
             Builtin::MathUlt => &[ValueKind::Bool],
+            // ADR 0275 — single-result returns Number (integer part).
+            Builtin::MathModf => &[ValueKind::Number],
         }
     }
 
@@ -1488,6 +1498,8 @@ impl Builtin {
             Builtin::MathToInteger => &[ValueKind::Number],
             // ADR 0274 — math.ult takes two Numbers (treated as i64).
             Builtin::MathUlt => &[ValueKind::Number, ValueKind::Number],
+            // ADR 0275 — math.modf takes one Number.
+            Builtin::MathModf => &[ValueKind::Number],
             // ADR 0241 — variadic Number args; per-position
             // dispatched via `expected_param_kind`.
             Builtin::MathMax | Builtin::MathMin => &[ValueKind::Number],
