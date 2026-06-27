@@ -13535,40 +13535,25 @@ fn emit_expr<'a, 'c>(
                 Ok(out_slot)
             }
             Callee::Builtin(Builtin::StringMatch) => {
-                // ADR 0230 — M7-C: literal-only `string.match(s,
-                // sub)`. Plain mode: matched substring == sub
-                // itself when found, Nil otherwise. Reuses the
-                // ADR 0228 find helper for the substring search.
+                // ADR 0278 — N4-A: `string.match(s, pat)` returns the
+                // matched substring (not the pattern). Calls the
+                // ADR 0231 pattern engine `lumelir_string_match_extents`
+                // which returns packed (len<<32 | pos). Builds a fresh
+                // String object from the matched byte range.
                 let s = emit_expr(
-                    context,
-                    block,
-                    &args[0],
-                    slots,
-                    locals,
-                    functions,
-                    types,
-                    params_len,
-                    in_function_cell_ptr,
-                    loc,
+                    context, block, &args[0], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
                 )?;
-                let sub = emit_expr(
-                    context,
-                    block,
-                    &args[1],
-                    slots,
-                    locals,
-                    functions,
-                    types,
-                    params_len,
-                    in_function_cell_ptr,
-                    loc,
+                let pat = emit_expr(
+                    context, block, &args[1], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
                 )?;
                 let call_op = OperationBuilder::new("llvm.call", loc)
-                    .add_operands(&[s, sub])
+                    .add_operands(&[s, pat])
                     .add_attributes(&[
                         (
                             Identifier::new(context, "callee"),
-                            FlatSymbolRefAttribute::new(context, "lumelir_string_find_plain")
+                            FlatSymbolRefAttribute::new(context, "lumelir_string_match_extents")
                                 .into(),
                         ),
                         (
@@ -13582,8 +13567,8 @@ fn emit_expr<'a, 'c>(
                     ])
                     .add_results(&[types.i64])
                     .build()
-                    .expect("llvm.call @lumelir_string_find_plain (match)");
-                let pos_i64: Value<'c, '_> =
+                    .expect("llvm.call @lumelir_string_match_extents (match)");
+                let packed: Value<'c, '_> =
                     block.append_operation(call_op).result(0).unwrap().into();
                 let zero_i64 = block
                     .append_operation(arith::constant(
@@ -13598,7 +13583,7 @@ fn emit_expr<'a, 'c>(
                     .append_operation(arith::cmpi(
                         context,
                         arith::CmpiPredicate::Ne,
-                        pos_i64,
+                        packed,
                         zero_i64,
                         loc,
                     ))
@@ -13610,8 +13595,56 @@ fn emit_expr<'a, 'c>(
                 let then_region = Region::new();
                 let then_blk = Block::new(&[]);
                 {
+                    let mask_low = then_blk
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 0xFFFFFFFF).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let pos_1: Value<'c, '_> = then_blk
+                        .append_operation(arith::andi(packed, mask_low, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let shift32 = then_blk
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 32).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let mlen: Value<'c, '_> = then_blk
+                        .append_operation(arith::shrui(packed, shift32, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let one_i64 = then_blk
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 1).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let pos_0: Value<'c, '_> = then_blk
+                        .append_operation(arith::subi(pos_1, one_i64, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let s_data = emit_string_obj_data(context, &then_blk, s, types, loc);
+                    let start_ptr =
+                        emit_byte_offset_ptr_dynamic(context, &then_blk, s_data, pos_0, types, loc);
+                    let new_obj = emit_string_obj_from_bytes(
+                        context, &then_blk, start_ptr, mlen, types, loc,
+                    );
                     super::tagged::emit_value_slot_store_string(
-                        context, &then_blk, out_slot, sub, types, loc,
+                        context, &then_blk, out_slot, new_obj, types, loc,
                     );
                     then_blk.append_operation(scf::r#yield(&[], loc));
                 }
