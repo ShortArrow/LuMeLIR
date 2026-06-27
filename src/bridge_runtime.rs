@@ -108,38 +108,110 @@ fn matches_class(c: u8, class: u8) -> bool {
     }
 }
 
+// All slice accesses below use `get_unchecked` because the
+// `#![no_std]` bridge object has no `core::panicking::*`
+// resolution; each call site explicitly bounds-checks first.
+
+#[inline]
+unsafe fn at(s: &[u8], i: usize) -> u8 {
+    unsafe { *s.get_unchecked(i) }
+}
+
+// ADR 0231 — single-byte atom test: literal, `.`, or `%X` class.
+// SAFETY: caller guarantees p_i < pat.len(); for `%X` atoms,
+// caller also guarantees p_i + 1 < pat.len() (via atom_len).
+unsafe fn matches_atom(c: u8, pat: &[u8], p_i: usize) -> bool {
+    let p = unsafe { at(pat, p_i) };
+    if p == b'%' {
+        matches_class(c, unsafe { at(pat, p_i + 1) })
+    } else if p == b'.' {
+        true
+    } else {
+        c == p
+    }
+}
+
+// Returns the byte length of a single pattern atom (1 for
+// literal / `.`, 2 for `%X`). SAFETY: caller guarantees
+// p_i < pat.len().
+unsafe fn atom_len(pat: &[u8], p_i: usize) -> usize {
+    if unsafe { at(pat, p_i) } == b'%' { 2 } else { 1 }
+}
+
+// ADR 0279 — N4-B: recursive backtracking match with quantifiers
+// `*` / `+` / `?`. Returns Some(s_end_index) on success.
+unsafe fn match_pattern(s: &[u8], s_i: usize, pat: &[u8], p_i: usize) -> Option<usize> {
+    if p_i >= pat.len() {
+        return Some(s_i);
+    }
+    let alen = unsafe { atom_len(pat, p_i) };
+    // Truncated escape — treat as no-match (defensive; ADR 0231
+    // returned None on this shape too).
+    if p_i + alen > pat.len() {
+        return None;
+    }
+    let after_atom = p_i + alen;
+    let quant = if after_atom < pat.len() {
+        let q = unsafe { at(pat, after_atom) };
+        if q == b'*' || q == b'+' || q == b'?' { Some(q) } else { None }
+    } else {
+        None
+    };
+    match quant {
+        Some(b'*') => unsafe { match_max(s, s_i, pat, p_i, after_atom + 1, 0) },
+        Some(b'+') => unsafe { match_max(s, s_i, pat, p_i, after_atom + 1, 1) },
+        Some(b'?') => unsafe { match_opt(s, s_i, pat, p_i, after_atom + 1) },
+        _ => {
+            if s_i >= s.len() {
+                return None;
+            }
+            if unsafe { matches_atom(at(s, s_i), pat, p_i) } {
+                unsafe { match_pattern(s, s_i + 1, pat, after_atom) }
+            } else {
+                None
+            }
+        }
+    }
+}
+
+unsafe fn match_max(
+    s: &[u8],
+    s_i: usize,
+    pat: &[u8],
+    atom_p: usize,
+    rest_p: usize,
+    min: usize,
+) -> Option<usize> {
+    let mut count = 0usize;
+    while s_i + count < s.len() && unsafe { matches_atom(at(s, s_i + count), pat, atom_p) } {
+        count += 1;
+    }
+    loop {
+        if count >= min {
+            if let Some(end) = unsafe { match_pattern(s, s_i + count, pat, rest_p) } {
+                return Some(end);
+            }
+        }
+        if count == 0 {
+            return None;
+        }
+        count -= 1;
+    }
+}
+
+unsafe fn match_opt(s: &[u8], s_i: usize, pat: &[u8], atom_p: usize, rest_p: usize) -> Option<usize> {
+    if s_i < s.len() && unsafe { matches_atom(at(s, s_i), pat, atom_p) } {
+        if let Some(end) = unsafe { match_pattern(s, s_i + 1, pat, rest_p) } {
+            return Some(end);
+        }
+    }
+    unsafe { match_pattern(s, s_i, pat, rest_p) }
+}
+
 // Try to match `pat` starting at `s[s_start]`. Returns
 // `Some(consumed_s_bytes)` on success.
 fn try_match_at(s: &[u8], s_start: usize, pat: &[u8]) -> Option<usize> {
-    let mut s_i = s_start;
-    let mut p_i = 0;
-    while p_i < pat.len() {
-        if s_i >= s.len() {
-            return None;
-        }
-        let p = pat[p_i];
-        if p == b'%' {
-            // %X — class or literal escape.
-            if p_i + 1 >= pat.len() {
-                return None;
-            }
-            if !matches_class(s[s_i], pat[p_i + 1]) {
-                return None;
-            }
-            p_i += 2;
-            s_i += 1;
-        } else if p == b'.' {
-            // Wildcard.
-            p_i += 1;
-            s_i += 1;
-        } else if s[s_i] == p {
-            p_i += 1;
-            s_i += 1;
-        } else {
-            return None;
-        }
-    }
-    Some(s_i - s_start)
+    unsafe { match_pattern(s, s_start, pat, 0) }.map(|end| end - s_start)
 }
 
 #[unsafe(no_mangle)]

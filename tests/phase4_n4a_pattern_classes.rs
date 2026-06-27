@@ -78,9 +78,6 @@ fn match_literal_in_pattern_returns_literal() {
 #[test]
 fn match_mixed_class_and_literal() {
     // "%d:" matches digit followed by colon.
-    let out = run_ok(
-        "print(string.match(\"time=9:30\", \"%d:\"))",
-        "n4a_mixed",
-    );
+    let out = run_ok("print(string.match(\"time=9:30\", \"%d:\"))", "n4a_mixed");
     assert_eq!(out.trim(), "9:");
 }

@@ -2207,8 +2207,7 @@ fn emit_libm_decls<'c>(
         .build();
     module.body().append_operation(ctime_op.into());
     // ADR 0276 — N7-15: setlocale(int, const char*) -> char*.
-    let setlocale_ty =
-        llvm::r#type::function(types.ptr, &[types.i32, types.ptr], false);
+    let setlocale_ty = llvm::r#type::function(types.ptr, &[types.i32, types.ptr], false);
     let setlocale_op = LLVMFuncOperationBuilder::new(context, loc)
         .body(Region::new())
         .sym_name(StringAttribute::new(context, "setlocale"))
