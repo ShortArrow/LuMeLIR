@@ -140,9 +140,17 @@ unsafe fn atom_len(pat: &[u8], p_i: usize) -> usize {
 
 // ADR 0279 — N4-B: recursive backtracking match with quantifiers
 // `*` / `+` / `?`. Returns Some(s_end_index) on success.
+// ADR 0280 — N4-C: `$` at the final pattern position anchors to
+// end-of-string.
 unsafe fn match_pattern(s: &[u8], s_i: usize, pat: &[u8], p_i: usize) -> Option<usize> {
     if p_i >= pat.len() {
         return Some(s_i);
+    }
+    // End-of-string anchor: `$` as the *last* pattern byte means
+    // the match must consume up to s.len(). Anywhere else it's a
+    // literal `$` (handled by the normal atom path).
+    if p_i + 1 == pat.len() && unsafe { at(pat, p_i) } == b'$' {
+        return if s_i == s.len() { Some(s_i) } else { None };
     }
     let alen = unsafe { atom_len(pat, p_i) };
     // Truncated escape — treat as no-match (defensive; ADR 0231
@@ -225,16 +233,27 @@ pub extern "C" fn lumelir_string_match_extents(s_ptr: *const u8, pat_ptr: *const
             // Empty pattern matches at start with zero length.
             return 1;
         }
+        // ADR 0280 — N4-C: `^` at pattern start anchors the search
+        // to s_start=0; strip it before delegating so the engine
+        // doesn't see it as a literal.
+        let (anchored, pat) = if *pat.get_unchecked(0) == b'^' {
+            (true, core::slice::from_raw_parts(pat.as_ptr().add(1), pat_len - 1))
+        } else {
+            (false, pat)
+        };
         let mut start = 0;
-        while start <= s_len {
+        let stop = if anchored { 0 } else { s_len };
+        loop {
             if let Some(consumed) = try_match_at(s, start, pat) {
                 let pos = (start as i64) + 1;
                 let len = consumed as i64;
                 return (len << 32) | pos;
             }
+            if start >= stop {
+                return 0;
+            }
             start += 1;
         }
-        0
     }
 }
 
