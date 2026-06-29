@@ -2260,6 +2260,24 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(str_match_extents_op.into());
+
+    // ADR 0281 — N4-D: capture-aware variant. Same packed result;
+    // returns the first capture extent when the pattern contains
+    // one, otherwise the overall match extent.
+    let str_match_cap1_ty = llvm::r#type::function(types.i64, &[types.ptr, types.ptr], false);
+    let str_match_cap1_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(
+            context,
+            "lumelir_string_match_capture1",
+        ))
+        .function_type(TypeAttribute::new(str_match_cap1_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(str_match_cap1_op.into());
 }
 
 /// MLIR type for a function parameter of static [`ValueKind`]. Number
@@ -13552,7 +13570,7 @@ fn emit_expr<'a, 'c>(
                     .add_attributes(&[
                         (
                             Identifier::new(context, "callee"),
-                            FlatSymbolRefAttribute::new(context, "lumelir_string_match_extents")
+                            FlatSymbolRefAttribute::new(context, "lumelir_string_match_capture1")
                                 .into(),
                         ),
                         (
@@ -13566,7 +13584,7 @@ fn emit_expr<'a, 'c>(
                     ])
                     .add_results(&[types.i64])
                     .build()
-                    .expect("llvm.call @lumelir_string_match_extents (match)");
+                    .expect("llvm.call @lumelir_string_match_capture1 (match)");
                 let packed: Value<'c, '_> =
                     block.append_operation(call_op).result(0).unwrap().into();
                 let zero_i64 = block

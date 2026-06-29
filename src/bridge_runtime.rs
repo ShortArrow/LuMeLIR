@@ -138,11 +138,29 @@ unsafe fn atom_len(pat: &[u8], p_i: usize) -> usize {
     if unsafe { at(pat, p_i) } == b'%' { 2 } else { 1 }
 }
 
+// ADR 0281 — N4-D: single non-nested capture state threaded
+// through `match_pattern`. Snapshot-restored on every failed try.
+#[derive(Copy, Clone, Default)]
+struct CapState {
+    has_pending: bool,
+    pending_start: usize,
+    captured: bool,
+    cap_start: usize,
+    cap_end: usize,
+}
+
 // ADR 0279 — N4-B: recursive backtracking match with quantifiers
 // `*` / `+` / `?`. Returns Some(s_end_index) on success.
 // ADR 0280 — N4-C: `$` at the final pattern position anchors to
 // end-of-string.
-unsafe fn match_pattern(s: &[u8], s_i: usize, pat: &[u8], p_i: usize) -> Option<usize> {
+// ADR 0281 — N4-D: `(` / `)` record/commit a single capture.
+unsafe fn match_pattern(
+    s: &[u8],
+    s_i: usize,
+    pat: &[u8],
+    p_i: usize,
+    cap: &mut CapState,
+) -> Option<usize> {
     if p_i >= pat.len() {
         return Some(s_i);
     }
@@ -151,6 +169,36 @@ unsafe fn match_pattern(s: &[u8], s_i: usize, pat: &[u8], p_i: usize) -> Option<
     // literal `$` (handled by the normal atom path).
     if p_i + 1 == pat.len() && unsafe { at(pat, p_i) } == b'$' {
         return if s_i == s.len() { Some(s_i) } else { None };
+    }
+    // ADR 0281 — capture open.
+    if unsafe { at(pat, p_i) } == b'(' {
+        if cap.has_pending {
+            return None;
+        }
+        let saved = *cap;
+        cap.has_pending = true;
+        cap.pending_start = s_i;
+        if let Some(end) = unsafe { match_pattern(s, s_i, pat, p_i + 1, cap) } {
+            return Some(end);
+        }
+        *cap = saved;
+        return None;
+    }
+    // ADR 0281 — capture close.
+    if unsafe { at(pat, p_i) } == b')' {
+        if !cap.has_pending {
+            return None;
+        }
+        let saved = *cap;
+        cap.has_pending = false;
+        cap.captured = true;
+        cap.cap_start = saved.pending_start;
+        cap.cap_end = s_i;
+        if let Some(end) = unsafe { match_pattern(s, s_i, pat, p_i + 1, cap) } {
+            return Some(end);
+        }
+        *cap = saved;
+        return None;
     }
     let alen = unsafe { atom_len(pat, p_i) };
     // Truncated escape — treat as no-match (defensive; ADR 0231
@@ -166,15 +214,15 @@ unsafe fn match_pattern(s: &[u8], s_i: usize, pat: &[u8], p_i: usize) -> Option<
         None
     };
     match quant {
-        Some(b'*') => unsafe { match_max(s, s_i, pat, p_i, after_atom + 1, 0) },
-        Some(b'+') => unsafe { match_max(s, s_i, pat, p_i, after_atom + 1, 1) },
-        Some(b'?') => unsafe { match_opt(s, s_i, pat, p_i, after_atom + 1) },
+        Some(b'*') => unsafe { match_max(s, s_i, pat, p_i, after_atom + 1, 0, cap) },
+        Some(b'+') => unsafe { match_max(s, s_i, pat, p_i, after_atom + 1, 1, cap) },
+        Some(b'?') => unsafe { match_opt(s, s_i, pat, p_i, after_atom + 1, cap) },
         _ => {
             if s_i >= s.len() {
                 return None;
             }
             if unsafe { matches_atom(at(s, s_i), pat, p_i) } {
-                unsafe { match_pattern(s, s_i + 1, pat, after_atom) }
+                unsafe { match_pattern(s, s_i + 1, pat, after_atom, cap) }
             } else {
                 None
             }
@@ -189,6 +237,7 @@ unsafe fn match_max(
     atom_p: usize,
     rest_p: usize,
     min: usize,
+    cap: &mut CapState,
 ) -> Option<usize> {
     let mut count = 0usize;
     while s_i + count < s.len() && unsafe { matches_atom(at(s, s_i + count), pat, atom_p) } {
@@ -196,9 +245,11 @@ unsafe fn match_max(
     }
     loop {
         if count >= min {
-            if let Some(end) = unsafe { match_pattern(s, s_i + count, pat, rest_p) } {
+            let saved = *cap;
+            if let Some(end) = unsafe { match_pattern(s, s_i + count, pat, rest_p, cap) } {
                 return Some(end);
             }
+            *cap = saved;
         }
         if count == 0 {
             return None;
@@ -207,53 +258,99 @@ unsafe fn match_max(
     }
 }
 
-unsafe fn match_opt(s: &[u8], s_i: usize, pat: &[u8], atom_p: usize, rest_p: usize) -> Option<usize> {
+unsafe fn match_opt(
+    s: &[u8],
+    s_i: usize,
+    pat: &[u8],
+    atom_p: usize,
+    rest_p: usize,
+    cap: &mut CapState,
+) -> Option<usize> {
     if s_i < s.len() && unsafe { matches_atom(at(s, s_i), pat, atom_p) } {
-        if let Some(end) = unsafe { match_pattern(s, s_i + 1, pat, rest_p) } {
+        let saved = *cap;
+        if let Some(end) = unsafe { match_pattern(s, s_i + 1, pat, rest_p, cap) } {
             return Some(end);
         }
+        *cap = saved;
     }
-    unsafe { match_pattern(s, s_i, pat, rest_p) }
+    unsafe { match_pattern(s, s_i, pat, rest_p, cap) }
 }
 
 // Try to match `pat` starting at `s[s_start]`. Returns
-// `Some(consumed_s_bytes)` on success.
-fn try_match_at(s: &[u8], s_start: usize, pat: &[u8]) -> Option<usize> {
-    unsafe { match_pattern(s, s_start, pat, 0) }.map(|end| end - s_start)
+// `Some((consumed_s_bytes, CapState))` on success.
+fn try_match_at(s: &[u8], s_start: usize, pat: &[u8]) -> Option<(usize, CapState)> {
+    let mut cap = CapState::default();
+    let end = unsafe { match_pattern(s, s_start, pat, 0, &mut cap) }?;
+    Some((end - s_start, cap))
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn lumelir_string_match_extents(s_ptr: *const u8, pat_ptr: *const u8) -> i64 {
+// ADR 0281 — packed result of an overall pattern search:
+// (start, len) where start is 1-indexed and 0 means no match.
+// Captures live in the threaded CapState; the caller decides
+// whether to expose them.
+unsafe fn run_pattern(s_ptr: *const u8, pat_ptr: *const u8) -> Option<(usize, usize, CapState)> {
     unsafe {
         let s_len = core::ptr::read_unaligned(s_ptr.cast::<i64>()) as usize;
         let pat_len = core::ptr::read_unaligned(pat_ptr.cast::<i64>()) as usize;
         let s = core::slice::from_raw_parts(s_ptr.add(8), s_len);
         let pat = core::slice::from_raw_parts(pat_ptr.add(8), pat_len);
         if pat_len == 0 {
-            // Empty pattern matches at start with zero length.
-            return 1;
+            return Some((0, 0, CapState::default()));
         }
-        // ADR 0280 — N4-C: `^` at pattern start anchors the search
-        // to s_start=0; strip it before delegating so the engine
-        // doesn't see it as a literal.
         let (anchored, pat) = if *pat.get_unchecked(0) == b'^' {
-            (true, core::slice::from_raw_parts(pat.as_ptr().add(1), pat_len - 1))
+            (
+                true,
+                core::slice::from_raw_parts(pat.as_ptr().add(1), pat_len - 1),
+            )
         } else {
             (false, pat)
         };
         let mut start = 0;
         let stop = if anchored { 0 } else { s_len };
         loop {
-            if let Some(consumed) = try_match_at(s, start, pat) {
-                let pos = (start as i64) + 1;
-                let len = consumed as i64;
-                return (len << 32) | pos;
+            if let Some((consumed, cap)) = try_match_at(s, start, pat) {
+                return Some((start, consumed, cap));
             }
             if start >= stop {
-                return 0;
+                return None;
             }
             start += 1;
         }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lumelir_string_match_extents(s_ptr: *const u8, pat_ptr: *const u8) -> i64 {
+    match unsafe { run_pattern(s_ptr, pat_ptr) } {
+        Some((start, consumed, _cap)) => {
+            let pos = (start as i64) + 1;
+            let len = consumed as i64;
+            (len << 32) | pos
+        }
+        None => 0,
+    }
+}
+
+// ADR 0281 — N4-D: like `lumelir_string_match_extents`, but if
+// the pattern contained a capture, returns that capture's
+// (pos, len) instead of the overall match. Returns the overall
+// match extent when no capture is present (Lua spec for
+// `string.match`).
+#[unsafe(no_mangle)]
+pub extern "C" fn lumelir_string_match_capture1(s_ptr: *const u8, pat_ptr: *const u8) -> i64 {
+    match unsafe { run_pattern(s_ptr, pat_ptr) } {
+        Some((start, consumed, cap)) => {
+            if cap.captured {
+                let pos = (cap.cap_start as i64) + 1;
+                let len = (cap.cap_end - cap.cap_start) as i64;
+                (len << 32) | pos
+            } else {
+                let pos = (start as i64) + 1;
+                let len = consumed as i64;
+                (len << 32) | pos
+            }
+        }
+        None => 0,
     }
 }
 
