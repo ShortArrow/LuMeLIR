@@ -260,14 +260,31 @@ impl<'t> Parser<'t> {
             return Ok(Stmt::new(stmt_kind, span));
         }
         if matches!(self.peek().kind, TokenKind::Keyword(Keyword::In)) {
-            // Single-variable `for k in iter() do ...` would be the
-            // 1-name form of generic-for; ADR 0085 Phase 1 scope
-            // requires both index and value bindings (`for k, v in
-            // ...`). 1-name is parser-rejected; the user can pad with
-            // `_` to force the 2-name form.
-            return Err(ParseError::UnsupportedIterator {
-                offset: self.peek().span.start,
-            });
+            // ADR 0285 — N4-F-2a: 1-name generic-for. Desugar to
+            // the existing 2-name `ForGeneric` shape with synthetic
+            // `_for1_discard` placeholder + `state, ctl = nil, nil`.
+            // The iter must still return `(TaggedValue, TaggedValue)`
+            // per the existing 2-name contract — gmatch et al. are
+            // expected to produce the discarded second value as nil.
+            let in_tok = self.bump(); // consume `in`
+            let iter_expr = self.parse_expr(0)?;
+            self.expect_keyword(Keyword::Do)?;
+            let body =
+                self.parse_chunk_until(&[TokenKind::Keyword(Keyword::End), TokenKind::Eof])?;
+            let end_tok = self.expect_keyword(Keyword::End)?;
+            let span = Span::new(for_tok.span.start, end_tok.span.end);
+            let nil_state = Expr::new(ExprKind::Nil, in_tok.span);
+            let nil_ctl = Expr::new(ExprKind::Nil, in_tok.span);
+            return Ok(Stmt::new(
+                StmtKind::ForGeneric {
+                    names: vec![var, "_for1_discard".to_owned()],
+                    iter: iter_expr,
+                    state: nil_state,
+                    ctl: nil_ctl,
+                    body,
+                },
+                span,
+            ));
         }
         self.expect_token(TokenKind::Equals)?;
         let start = self.parse_expr(0)?;
