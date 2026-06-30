@@ -2278,6 +2278,22 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(str_match_cap1_op.into());
+
+    // ADR 0283 — N4-F-1: string.find(s, pat, init) entry point.
+    // Same packed return shape as match_extents; takes a 1-indexed
+    // init position as a third i64 argument.
+    let str_find_init_ty =
+        llvm::r#type::function(types.i64, &[types.ptr, types.ptr, types.i64], false);
+    let str_find_init_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "lumelir_string_find_init"))
+        .function_type(TypeAttribute::new(str_find_init_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(str_find_init_op.into());
 }
 
 /// MLIR type for a function parameter of static [`ValueKind`]. Number
@@ -6420,7 +6436,7 @@ fn emit_call_string_find_into_locals<'a, 'c>(
     loc: Location<'c>,
 ) -> Result<(), CodegenError> {
     debug_assert_eq!(dst_ids.len(), 2);
-    debug_assert_eq!(args.len(), 2);
+    debug_assert!(args.len() == 2 || args.len() == 3);
     let s = emit_expr(
         context,
         block,
@@ -6445,25 +6461,67 @@ fn emit_call_string_find_into_locals<'a, 'c>(
         in_function_cell_ptr,
         loc,
     )?;
-    let call_op = OperationBuilder::new("llvm.call", loc)
-        .add_operands(&[s, sub])
-        .add_attributes(&[
-            (
-                Identifier::new(context, "callee"),
-                FlatSymbolRefAttribute::new(context, "lumelir_string_match_extents").into(),
-            ),
-            (
-                Identifier::new(context, "operandSegmentSizes"),
-                DenseI32ArrayAttribute::new(context, &[2, 0]).into(),
-            ),
-            (
-                Identifier::new(context, "op_bundle_sizes"),
-                DenseI32ArrayAttribute::new(context, &[]).into(),
-            ),
-        ])
-        .add_results(&[types.i64])
-        .build()
-        .expect("llvm.call @lumelir_string_match_extents (multi-return)");
+    // ADR 0283 — 3-arg form passes a 1-indexed init position to
+    // `lumelir_string_find_init`; 2-arg form keeps the original
+    // `lumelir_string_match_extents` entry point.
+    let call_op = if args.len() == 3 {
+        let init_f = emit_expr(
+            context,
+            block,
+            &args[2],
+            slots,
+            locals,
+            functions,
+            types,
+            params_len,
+            in_function_cell_ptr,
+            loc,
+        )?;
+        let init_i: Value<'c, '_> = block
+            .append_operation(arith::fptosi(init_f, types.i64, loc))
+            .result(0)
+            .unwrap()
+            .into();
+        OperationBuilder::new("llvm.call", loc)
+            .add_operands(&[s, sub, init_i])
+            .add_attributes(&[
+                (
+                    Identifier::new(context, "callee"),
+                    FlatSymbolRefAttribute::new(context, "lumelir_string_find_init").into(),
+                ),
+                (
+                    Identifier::new(context, "operandSegmentSizes"),
+                    DenseI32ArrayAttribute::new(context, &[3, 0]).into(),
+                ),
+                (
+                    Identifier::new(context, "op_bundle_sizes"),
+                    DenseI32ArrayAttribute::new(context, &[]).into(),
+                ),
+            ])
+            .add_results(&[types.i64])
+            .build()
+            .expect("llvm.call @lumelir_string_find_init (multi-return)")
+    } else {
+        OperationBuilder::new("llvm.call", loc)
+            .add_operands(&[s, sub])
+            .add_attributes(&[
+                (
+                    Identifier::new(context, "callee"),
+                    FlatSymbolRefAttribute::new(context, "lumelir_string_match_extents").into(),
+                ),
+                (
+                    Identifier::new(context, "operandSegmentSizes"),
+                    DenseI32ArrayAttribute::new(context, &[2, 0]).into(),
+                ),
+                (
+                    Identifier::new(context, "op_bundle_sizes"),
+                    DenseI32ArrayAttribute::new(context, &[]).into(),
+                ),
+            ])
+            .add_results(&[types.i64])
+            .build()
+            .expect("llvm.call @lumelir_string_match_extents (multi-return)")
+    };
     let packed: Value<'c, '_> = block.append_operation(call_op).result(0).unwrap().into();
     let zero_i64 = block
         .append_operation(arith::constant(
@@ -13466,26 +13524,67 @@ fn emit_expr<'a, 'c>(
                     in_function_cell_ptr,
                     loc,
                 )?;
-                let call_op = OperationBuilder::new("llvm.call", loc)
-                    .add_operands(&[s, sub])
-                    .add_attributes(&[
-                        (
-                            Identifier::new(context, "callee"),
-                            FlatSymbolRefAttribute::new(context, "lumelir_string_match_extents")
-                                .into(),
-                        ),
-                        (
-                            Identifier::new(context, "operandSegmentSizes"),
-                            DenseI32ArrayAttribute::new(context, &[2, 0]).into(),
-                        ),
-                        (
-                            Identifier::new(context, "op_bundle_sizes"),
-                            DenseI32ArrayAttribute::new(context, &[]).into(),
-                        ),
-                    ])
-                    .add_results(&[types.i64])
-                    .build()
-                    .expect("llvm.call @lumelir_string_match_extents");
+                // ADR 0283 — 3-arg form routes through find_init.
+                let call_op = if args.len() == 3 {
+                    let init_f = emit_expr(
+                        context,
+                        block,
+                        &args[2],
+                        slots,
+                        locals,
+                        functions,
+                        types,
+                        params_len,
+                        in_function_cell_ptr,
+                        loc,
+                    )?;
+                    let init_i: Value<'c, '_> = block
+                        .append_operation(arith::fptosi(init_f, types.i64, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    OperationBuilder::new("llvm.call", loc)
+                        .add_operands(&[s, sub, init_i])
+                        .add_attributes(&[
+                            (
+                                Identifier::new(context, "callee"),
+                                FlatSymbolRefAttribute::new(context, "lumelir_string_find_init")
+                                    .into(),
+                            ),
+                            (
+                                Identifier::new(context, "operandSegmentSizes"),
+                                DenseI32ArrayAttribute::new(context, &[3, 0]).into(),
+                            ),
+                            (
+                                Identifier::new(context, "op_bundle_sizes"),
+                                DenseI32ArrayAttribute::new(context, &[]).into(),
+                            ),
+                        ])
+                        .add_results(&[types.i64])
+                        .build()
+                        .expect("llvm.call @lumelir_string_find_init")
+                } else {
+                    OperationBuilder::new("llvm.call", loc)
+                        .add_operands(&[s, sub])
+                        .add_attributes(&[
+                            (
+                                Identifier::new(context, "callee"),
+                                FlatSymbolRefAttribute::new(context, "lumelir_string_match_extents")
+                                    .into(),
+                            ),
+                            (
+                                Identifier::new(context, "operandSegmentSizes"),
+                                DenseI32ArrayAttribute::new(context, &[2, 0]).into(),
+                            ),
+                            (
+                                Identifier::new(context, "op_bundle_sizes"),
+                                DenseI32ArrayAttribute::new(context, &[]).into(),
+                            ),
+                        ])
+                        .add_results(&[types.i64])
+                        .build()
+                        .expect("llvm.call @lumelir_string_match_extents")
+                };
                 let packed: Value<'c, '_> =
                     block.append_operation(call_op).result(0).unwrap().into();
                 let zero_i64 = block

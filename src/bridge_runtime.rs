@@ -357,14 +357,21 @@ fn try_match_at(s: &[u8], s_start: usize, pat: &[u8]) -> Option<(usize, CapState
 // (start, len) where start is 1-indexed and 0 means no match.
 // Captures live in the threaded CapState; the caller decides
 // whether to expose them.
-unsafe fn run_pattern(s_ptr: *const u8, pat_ptr: *const u8) -> Option<(usize, usize, CapState)> {
+// ADR 0283 — N4-F-1: `init_byte` is the 0-indexed starting byte
+// offset within `s`. Passing 0 reproduces the ADRs 0231 / 0281
+// behaviour.
+unsafe fn run_pattern_from(
+    s_ptr: *const u8,
+    pat_ptr: *const u8,
+    init_byte: usize,
+) -> Option<(usize, usize, CapState)> {
     unsafe {
         let s_len = core::ptr::read_unaligned(s_ptr.cast::<i64>()) as usize;
         let pat_len = core::ptr::read_unaligned(pat_ptr.cast::<i64>()) as usize;
         let s = core::slice::from_raw_parts(s_ptr.add(8), s_len);
         let pat = core::slice::from_raw_parts(pat_ptr.add(8), pat_len);
         if pat_len == 0 {
-            return Some((0, 0, CapState::default()));
+            return Some((init_byte.min(s_len), 0, CapState::default()));
         }
         let (anchored, pat) = if *pat.get_unchecked(0) == b'^' {
             (
@@ -374,8 +381,11 @@ unsafe fn run_pattern(s_ptr: *const u8, pat_ptr: *const u8) -> Option<(usize, us
         } else {
             (false, pat)
         };
-        let mut start = 0;
-        let stop = if anchored { 0 } else { s_len };
+        if init_byte > s_len {
+            return None;
+        }
+        let mut start = init_byte;
+        let stop = if anchored { init_byte } else { s_len };
         loop {
             if let Some((consumed, cap)) = try_match_at(s, start, pat) {
                 return Some((start, consumed, cap));
@@ -388,9 +398,38 @@ unsafe fn run_pattern(s_ptr: *const u8, pat_ptr: *const u8) -> Option<(usize, us
     }
 }
 
+unsafe fn run_pattern(s_ptr: *const u8, pat_ptr: *const u8) -> Option<(usize, usize, CapState)> {
+    unsafe { run_pattern_from(s_ptr, pat_ptr, 0) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn lumelir_string_match_extents(s_ptr: *const u8, pat_ptr: *const u8) -> i64 {
     match unsafe { run_pattern(s_ptr, pat_ptr) } {
+        Some((start, consumed, _cap)) => {
+            let pos = (start as i64) + 1;
+            let len = consumed as i64;
+            (len << 32) | pos
+        }
+        None => 0,
+    }
+}
+
+// ADR 0283 — N4-F-1: `string.find(s, pat, init)` 3-arg form.
+// `init_1based` is the 1-indexed start position; passing 1
+// reproduces the no-init behaviour. Returns the overall match
+// extent (start, len) packed in i64; 0 = no match.
+#[unsafe(no_mangle)]
+pub extern "C" fn lumelir_string_find_init(
+    s_ptr: *const u8,
+    pat_ptr: *const u8,
+    init_1based: i64,
+) -> i64 {
+    let init_byte = if init_1based <= 1 {
+        0
+    } else {
+        (init_1based - 1) as usize
+    };
+    match unsafe { run_pattern_from(s_ptr, pat_ptr, init_byte) } {
         Some((start, consumed, _cap)) => {
             let pos = (start as i64) + 1;
             let len = consumed as i64;

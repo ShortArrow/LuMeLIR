@@ -1105,7 +1105,8 @@ impl Builtin {
             Builtin::StringByte => (1, 2),
             // ADR 0228 — string.find(s, sub) — `init` and `plain`
             // args deferred to a future sub-ADR.
-            Builtin::StringFind => (2, 2),
+            // ADR 0283 — N4-F-1: 3-arg form adds `init`.
+            Builtin::StringFind => (2, 3),
             Builtin::StringMatch => (2, 2),
             // ADR 0113 — string.char(...) variadic byte-producer.
             // Print precedent for variadic (0, usize::MAX).
@@ -1458,7 +1459,8 @@ impl Builtin {
             Builtin::StringRep => &[ValueKind::String, ValueKind::Number],
             Builtin::StringByte => &[ValueKind::String, ValueKind::Number],
             // ADR 0228 — string.find(s, sub).
-            Builtin::StringFind => &[ValueKind::String, ValueKind::String],
+            // ADR 0283 — N4-F-1: 3rd arg is the 1-indexed init position.
+            Builtin::StringFind => &[ValueKind::String, ValueKind::String, ValueKind::Number],
             Builtin::StringMatch => &[ValueKind::String, ValueKind::String],
             // table.* — first arg Table; sep String; bounds Number.
             Builtin::TableConcat => &[
