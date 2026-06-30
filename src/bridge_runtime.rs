@@ -117,7 +117,48 @@ unsafe fn at(s: &[u8], i: usize) -> u8 {
     unsafe { *s.get_unchecked(i) }
 }
 
-// ADR 0231 — single-byte atom test: literal, `.`, or `%X` class.
+// ADR 0282 — N4-E: set body match. `pat[p_i]` is `[`. Walks
+// the body until `]`, testing each element (literal char, `%X`
+// class, or `a-z` range). Leading `^` negates.
+unsafe fn matches_set(c: u8, pat: &[u8], p_i: usize) -> bool {
+    let mut j = p_i + 1;
+    let negate = j < pat.len() && unsafe { at(pat, j) } == b'^';
+    if negate {
+        j += 1;
+    }
+    let mut matched = false;
+    while j < pat.len() && unsafe { at(pat, j) } != b']' {
+        let b = unsafe { at(pat, j) };
+        if b == b'%' && j + 1 < pat.len() {
+            if matches_class(c, unsafe { at(pat, j + 1) }) {
+                matched = true;
+            }
+            j += 2;
+            continue;
+        }
+        // Range `b-X` (X must not be `]`).
+        if j + 2 < pat.len()
+            && unsafe { at(pat, j + 1) } == b'-'
+            && unsafe { at(pat, j + 2) } != b']'
+        {
+            let lo = b;
+            let hi = unsafe { at(pat, j + 2) };
+            if c >= lo && c <= hi {
+                matched = true;
+            }
+            j += 3;
+            continue;
+        }
+        if c == b {
+            matched = true;
+        }
+        j += 1;
+    }
+    matched != negate
+}
+
+// ADR 0231 — single-byte atom test: literal, `.`, `%X` class,
+// or ADR 0282 `[...]` set.
 // SAFETY: caller guarantees p_i < pat.len(); for `%X` atoms,
 // caller also guarantees p_i + 1 < pat.len() (via atom_len).
 unsafe fn matches_atom(c: u8, pat: &[u8], p_i: usize) -> bool {
@@ -126,16 +167,44 @@ unsafe fn matches_atom(c: u8, pat: &[u8], p_i: usize) -> bool {
         matches_class(c, unsafe { at(pat, p_i + 1) })
     } else if p == b'.' {
         true
+    } else if p == b'[' {
+        unsafe { matches_set(c, pat, p_i) }
     } else {
         c == p
     }
 }
 
 // Returns the byte length of a single pattern atom (1 for
-// literal / `.`, 2 for `%X`). SAFETY: caller guarantees
-// p_i < pat.len().
+// literal / `.`, 2 for `%X`, variable for `[...]`).
+// SAFETY: caller guarantees p_i < pat.len().
 unsafe fn atom_len(pat: &[u8], p_i: usize) -> usize {
-    if unsafe { at(pat, p_i) } == b'%' { 2 } else { 1 }
+    let p = unsafe { at(pat, p_i) };
+    if p == b'%' {
+        return 2;
+    }
+    if p != b'[' {
+        return 1;
+    }
+    // ADR 0282 — span to closing `]`. `%X` inside the set
+    // consumes two bytes so a literal `%]` doesn't close.
+    let mut j = p_i + 1;
+    if j < pat.len() && unsafe { at(pat, j) } == b'^' {
+        j += 1;
+    }
+    while j < pat.len() {
+        let b = unsafe { at(pat, j) };
+        if b == b'%' && j + 1 < pat.len() {
+            j += 2;
+            continue;
+        }
+        if b == b']' {
+            return j - p_i + 1;
+        }
+        j += 1;
+    }
+    // Malformed — treat as rest of pattern (match_pattern's
+    // bounds check will then refuse to advance).
+    pat.len() - p_i
 }
 
 // ADR 0281 — N4-D: single non-nested capture state threaded
