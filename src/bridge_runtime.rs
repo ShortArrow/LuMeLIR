@@ -218,11 +218,60 @@ struct CapState {
     cap_end: usize,
 }
 
+// ADR 0287 — N4-H: `%bxy` balanced-match. Returns Some(end)
+// on match, else None. `p_i` points at the first byte past `%b`.
+unsafe fn match_balanced(
+    s: &[u8],
+    s_i: usize,
+    x: u8,
+    y: u8,
+    pat: &[u8],
+    rest_p: usize,
+    cap: &mut CapState,
+) -> Option<usize> {
+    if s_i >= s.len() || unsafe { at(s, s_i) } != x {
+        return None;
+    }
+    let mut depth: usize = 1;
+    let mut j = s_i + 1;
+    while j < s.len() {
+        let c = unsafe { at(s, j) };
+        if c == x {
+            depth += 1;
+        } else if c == y {
+            depth -= 1;
+            if depth == 0 {
+                return unsafe { match_pattern(s, j + 1, pat, rest_p, cap) };
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
+// ADR 0287 — `%f[set]` frontier: zero-width match at a position
+// where the prev char is NOT in set AND the current char IS in
+// set. Beginning / end of s treated as `\0`.
+unsafe fn is_frontier(s: &[u8], s_i: usize, pat: &[u8], set_p_i: usize) -> bool {
+    let prev = if s_i == 0 {
+        0u8
+    } else {
+        unsafe { at(s, s_i - 1) }
+    };
+    let cur = if s_i >= s.len() {
+        0u8
+    } else {
+        unsafe { at(s, s_i) }
+    };
+    unsafe { !matches_set(prev, pat, set_p_i) && matches_set(cur, pat, set_p_i) }
+}
+
 // ADR 0279 — N4-B: recursive backtracking match with quantifiers
 // `*` / `+` / `?`. Returns Some(s_end_index) on success.
 // ADR 0280 — N4-C: `$` at the final pattern position anchors to
 // end-of-string.
 // ADR 0281 — N4-D: `(` / `)` record/commit a single capture.
+// ADR 0287 — N4-H: `%bxy` and `%f[set]` special atoms.
 unsafe fn match_pattern(
     s: &[u8],
     s_i: usize,
@@ -238,6 +287,22 @@ unsafe fn match_pattern(
     // literal `$` (handled by the normal atom path).
     if p_i + 1 == pat.len() && unsafe { at(pat, p_i) } == b'$' {
         return if s_i == s.len() { Some(s_i) } else { None };
+    }
+    // ADR 0287 — special `%b` and `%f` atoms.
+    if unsafe { at(pat, p_i) } == b'%' && p_i + 1 < pat.len() {
+        let esc = unsafe { at(pat, p_i + 1) };
+        if esc == b'b' && p_i + 3 < pat.len() {
+            let x = unsafe { at(pat, p_i + 2) };
+            let y = unsafe { at(pat, p_i + 3) };
+            return unsafe { match_balanced(s, s_i, x, y, pat, p_i + 4, cap) };
+        }
+        if esc == b'f' && p_i + 2 < pat.len() && unsafe { at(pat, p_i + 2) } == b'[' {
+            let set_span = unsafe { atom_len(pat, p_i + 2) };
+            if !unsafe { is_frontier(s, s_i, pat, p_i + 2) } {
+                return None;
+            }
+            return unsafe { match_pattern(s, s_i, pat, p_i + 2 + set_span, cap) };
+        }
     }
     // ADR 0281 — capture open.
     if unsafe { at(pat, p_i) } == b'(' {
