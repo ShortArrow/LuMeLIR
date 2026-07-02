@@ -486,6 +486,42 @@ pub extern "C" fn lumelir_string_match_extents(s_ptr: *const u8, pat_ptr: *const
     }
 }
 
+// ADR 0288 — N7-17: `utf8.char(n)` single-codepoint form. Writes
+// 1-4 bytes of the UTF-8 encoding of `codepoint` into `out_buf`
+// and returns the byte count. Invalid codepoints (< 0, > 0x10FFFF,
+// surrogate range 0xD800..=0xDFFF) return 0 without writing.
+#[unsafe(no_mangle)]
+pub extern "C" fn lumelir_utf8_char_one(codepoint: i64, out_buf: *mut u8) -> i64 {
+    if codepoint < 0 || codepoint > 0x10_FFFF {
+        return 0;
+    }
+    if (0xD800..=0xDFFF).contains(&codepoint) {
+        return 0;
+    }
+    let cp = codepoint as u32;
+    unsafe {
+        if cp < 0x80 {
+            *out_buf = cp as u8;
+            1
+        } else if cp < 0x800 {
+            *out_buf = 0xC0 | ((cp >> 6) as u8);
+            *out_buf.add(1) = 0x80 | ((cp & 0x3F) as u8);
+            2
+        } else if cp < 0x1_0000 {
+            *out_buf = 0xE0 | ((cp >> 12) as u8);
+            *out_buf.add(1) = 0x80 | (((cp >> 6) & 0x3F) as u8);
+            *out_buf.add(2) = 0x80 | ((cp & 0x3F) as u8);
+            3
+        } else {
+            *out_buf = 0xF0 | ((cp >> 18) as u8);
+            *out_buf.add(1) = 0x80 | (((cp >> 12) & 0x3F) as u8);
+            *out_buf.add(2) = 0x80 | (((cp >> 6) & 0x3F) as u8);
+            *out_buf.add(3) = 0x80 | ((cp & 0x3F) as u8);
+            4
+        }
+    }
+}
+
 // ADR 0286 — N4-G: `string.gsub(s, pat, repl)` string-repl form.
 // Writes at most `out_max` bytes of the substituted output into
 // `out_buf` and returns the actual byte length written. The

@@ -333,6 +333,8 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             | Callee::Builtin(Builtin::StringReverse)
             // ADR 0286 — N4-G: gsub returns a String result.
             | Callee::Builtin(Builtin::StringGsub)
+            // ADR 0288 — N7-17: utf8.char returns a String.
+            | Callee::Builtin(Builtin::Utf8Char)
             | Callee::Builtin(Builtin::TableConcat) => ValueKind::String,
             // ADR 0111 — table.insert is void; expression-position
             // use synthesises a Number placeholder (same shape as

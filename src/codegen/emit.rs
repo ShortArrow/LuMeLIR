@@ -2315,6 +2315,20 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(str_gsub_op.into());
+
+    // ADR 0288 — N7-17: utf8.char one-arg encoder.
+    // (codepoint_i64, out_buf) -> bytes_written.
+    let utf8_char_ty = llvm::r#type::function(types.i64, &[types.i64, types.ptr], false);
+    let utf8_char_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "lumelir_utf8_char_one"))
+        .function_type(TypeAttribute::new(utf8_char_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(utf8_char_op.into());
 }
 
 /// MLIR type for a function parameter of static [`ValueKind`]. Number
@@ -12281,6 +12295,56 @@ fn emit_expr<'a, 'c>(
                         context, block, "atan2", &[y, x], types, loc,
                     ))
                 }
+            }
+            Callee::Builtin(Builtin::Utf8Char) => {
+                // ADR 0288 — N7-17: encode one codepoint. Allocate
+                // a String obj of capacity 4, hand payload to the
+                // runtime, rewrite length header to the actual
+                // count, NUL-terminate. Same shape as gsub.
+                let cp_f = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let cp_i: Value<'c, '_> = block
+                    .append_operation(arith::fptosi(cp_f, types.i64, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let cap = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 4).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let obj = emit_string_obj_alloc(context, block, cap, types, loc);
+                let data = emit_string_obj_data(context, block, obj, types, loc);
+                let call_op = OperationBuilder::new("llvm.call", loc)
+                    .add_operands(&[cp_i, data])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "callee"),
+                            FlatSymbolRefAttribute::new(context, "lumelir_utf8_char_one").into(),
+                        ),
+                        (
+                            Identifier::new(context, "operandSegmentSizes"),
+                            DenseI32ArrayAttribute::new(context, &[2, 0]).into(),
+                        ),
+                        (
+                            Identifier::new(context, "op_bundle_sizes"),
+                            DenseI32ArrayAttribute::new(context, &[]).into(),
+                        ),
+                    ])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.call @lumelir_utf8_char_one");
+                let actual_len: Value<'c, '_> =
+                    block.append_operation(call_op).result(0).unwrap().into();
+                emit_store(block, actual_len, obj, loc);
+                emit_string_obj_finalize_nul(context, block, obj, actual_len, types, loc);
+                Ok(obj)
             }
             Callee::Builtin(Builtin::Utf8Len) => {
                 // ADR 0277 — utf8.len(s): count codepoints by scanning

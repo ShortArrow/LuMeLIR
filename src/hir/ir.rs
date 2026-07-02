@@ -769,6 +769,9 @@ pub enum Builtin {
     /// Codegen scans bytes and counts those whose top 2 bits ≠ 0b10
     /// (i.e. non-continuation bytes).
     Utf8Len,
+    /// ADR 0288 — N7-17: `utf8.char(n)` single-codepoint form.
+    /// Variadic form deferred (blocked on varargs).
+    Utf8Char,
     /// ADR 0216 — `pcall(f)` runs `f()` under a setjmp landing pad
     /// (ADR 0215). Returns `true` if `f` returned normally; `false`
     /// if any `error(msg)` longjmp'd back. The error message is
@@ -1014,6 +1017,8 @@ impl Builtin {
     pub fn utf8_from_method(method: &str) -> Option<Self> {
         match method {
             "len" => Some(Builtin::Utf8Len),
+            // ADR 0288 — N7-17: single-codepoint utf8.char.
+            "char" => Some(Builtin::Utf8Char),
             _ => None,
         }
     }
@@ -1157,6 +1162,7 @@ impl Builtin {
             Builtin::MathUlt => (2, 2),
             Builtin::MathModf => (1, 1),
             Builtin::Utf8Len => (1, 1),
+            Builtin::Utf8Char => (1, 1),
         }
     }
 
@@ -1241,6 +1247,7 @@ impl Builtin {
             Builtin::MathUlt => "math.ult",
             Builtin::MathModf => "math.modf",
             Builtin::Utf8Len => "utf8.len",
+            Builtin::Utf8Char => "utf8.char",
         }
     }
 
@@ -1387,6 +1394,8 @@ impl Builtin {
             Builtin::MathModf => &[ValueKind::Number],
             // ADR 0277 — utf8.len returns Number.
             Builtin::Utf8Len => &[ValueKind::Number],
+            // ADR 0288 — N7-17: utf8.char returns String.
+            Builtin::Utf8Char => &[ValueKind::String],
             // ADR 0286 — N4-G: gsub returns String (result buffer).
             Builtin::StringGsub => &[ValueKind::String],
         }
@@ -1547,6 +1556,8 @@ impl Builtin {
             Builtin::MathModf => &[ValueKind::Number],
             // ADR 0277 — utf8.len takes a String.
             Builtin::Utf8Len => &[ValueKind::String],
+            // ADR 0288 — utf8.char takes a Number (codepoint).
+            Builtin::Utf8Char => &[ValueKind::Number],
             // ADR 0241 — variadic Number args; per-position
             // dispatched via `expected_param_kind`.
             Builtin::MathMax | Builtin::MathMin => &[ValueKind::Number],
