@@ -2329,6 +2329,20 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(utf8_char_op.into());
+
+    // ADR 0289 — N7-18: utf8.codepoint one-position decoder.
+    // (s_ptr, i_1based) -> codepoint i64 (-1 on error).
+    let utf8_cp_ty = llvm::r#type::function(types.i64, &[types.ptr, types.i64], false);
+    let utf8_cp_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "lumelir_utf8_codepoint_one"))
+        .function_type(TypeAttribute::new(utf8_cp_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(utf8_cp_op.into());
 }
 
 /// MLIR type for a function parameter of static [`ValueKind`]. Number
@@ -12295,6 +12309,50 @@ fn emit_expr<'a, 'c>(
                         context, block, "atan2", &[y, x], types, loc,
                     ))
                 }
+            }
+            Callee::Builtin(Builtin::Utf8Codepoint) => {
+                // ADR 0289 — N7-18: decode one codepoint at 1-based
+                // byte position i. Returns Number (codepoint as f64).
+                let s = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let i_f = emit_expr(
+                    context, block, &args[1], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let i_i: Value<'c, '_> = block
+                    .append_operation(arith::fptosi(i_f, types.i64, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let call_op = OperationBuilder::new("llvm.call", loc)
+                    .add_operands(&[s, i_i])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "callee"),
+                            FlatSymbolRefAttribute::new(context, "lumelir_utf8_codepoint_one")
+                                .into(),
+                        ),
+                        (
+                            Identifier::new(context, "operandSegmentSizes"),
+                            DenseI32ArrayAttribute::new(context, &[2, 0]).into(),
+                        ),
+                        (
+                            Identifier::new(context, "op_bundle_sizes"),
+                            DenseI32ArrayAttribute::new(context, &[]).into(),
+                        ),
+                    ])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.call @lumelir_utf8_codepoint_one");
+                let cp_i: Value<'c, '_> =
+                    block.append_operation(call_op).result(0).unwrap().into();
+                Ok(block
+                    .append_operation(arith::sitofp(cp_i, types.f64, loc))
+                    .result(0)
+                    .unwrap()
+                    .into())
             }
             Callee::Builtin(Builtin::Utf8Char) => {
                 // ADR 0288 — N7-17: encode one codepoint. Allocate

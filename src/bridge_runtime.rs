@@ -486,6 +486,74 @@ pub extern "C" fn lumelir_string_match_extents(s_ptr: *const u8, pat_ptr: *const
     }
 }
 
+// ADR 0289 — N7-18: `utf8.codepoint(s, i)` decodes the UTF-8
+// codepoint that starts at byte index `i` (1-indexed) of `s`.
+// Returns the codepoint as i64, or -1 on invalid input / bounds.
+#[unsafe(no_mangle)]
+pub extern "C" fn lumelir_utf8_codepoint_one(s_ptr: *const u8, i_1based: i64) -> i64 {
+    unsafe {
+        let s_len = core::ptr::read_unaligned(s_ptr.cast::<i64>()) as usize;
+        if i_1based < 1 {
+            return -1;
+        }
+        let start = (i_1based - 1) as usize;
+        if start >= s_len {
+            return -1;
+        }
+        let data = s_ptr.add(8);
+        let b0 = *data.add(start);
+        if b0 < 0x80 {
+            return b0 as i64;
+        }
+        if b0 < 0xC0 {
+            // continuation byte at start — invalid.
+            return -1;
+        }
+        if b0 < 0xE0 {
+            if start + 1 >= s_len {
+                return -1;
+            }
+            let b1 = *data.add(start + 1);
+            if (b1 & 0xC0) != 0x80 {
+                return -1;
+            }
+            let cp = (((b0 & 0x1F) as u32) << 6) | ((b1 & 0x3F) as u32);
+            return cp as i64;
+        }
+        if b0 < 0xF0 {
+            if start + 2 >= s_len {
+                return -1;
+            }
+            let b1 = *data.add(start + 1);
+            let b2 = *data.add(start + 2);
+            if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 {
+                return -1;
+            }
+            let cp = (((b0 & 0x0F) as u32) << 12)
+                | (((b1 & 0x3F) as u32) << 6)
+                | ((b2 & 0x3F) as u32);
+            return cp as i64;
+        }
+        if b0 < 0xF8 {
+            if start + 3 >= s_len {
+                return -1;
+            }
+            let b1 = *data.add(start + 1);
+            let b2 = *data.add(start + 2);
+            let b3 = *data.add(start + 3);
+            if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80 {
+                return -1;
+            }
+            let cp = (((b0 & 0x07) as u32) << 18)
+                | (((b1 & 0x3F) as u32) << 12)
+                | (((b2 & 0x3F) as u32) << 6)
+                | ((b3 & 0x3F) as u32);
+            return cp as i64;
+        }
+        -1
+    }
+}
+
 // ADR 0288 — N7-17: `utf8.char(n)` single-codepoint form. Writes
 // 1-4 bytes of the UTF-8 encoding of `codepoint` into `out_buf`
 // and returns the byte count. Invalid codepoints (< 0, > 0x10FFFF,

@@ -772,6 +772,9 @@ pub enum Builtin {
     /// ADR 0288 — N7-17: `utf8.char(n)` single-codepoint form.
     /// Variadic form deferred (blocked on varargs).
     Utf8Char,
+    /// ADR 0289 — N7-18: `utf8.codepoint(s, i)` single-position.
+    /// Multi-position range form deferred.
+    Utf8Codepoint,
     /// ADR 0216 — `pcall(f)` runs `f()` under a setjmp landing pad
     /// (ADR 0215). Returns `true` if `f` returned normally; `false`
     /// if any `error(msg)` longjmp'd back. The error message is
@@ -1019,6 +1022,8 @@ impl Builtin {
             "len" => Some(Builtin::Utf8Len),
             // ADR 0288 — N7-17: single-codepoint utf8.char.
             "char" => Some(Builtin::Utf8Char),
+            // ADR 0289 — N7-18: single-position utf8.codepoint.
+            "codepoint" => Some(Builtin::Utf8Codepoint),
             _ => None,
         }
     }
@@ -1163,6 +1168,7 @@ impl Builtin {
             Builtin::MathModf => (1, 1),
             Builtin::Utf8Len => (1, 1),
             Builtin::Utf8Char => (1, 1),
+            Builtin::Utf8Codepoint => (2, 2),
         }
     }
 
@@ -1248,6 +1254,7 @@ impl Builtin {
             Builtin::MathModf => "math.modf",
             Builtin::Utf8Len => "utf8.len",
             Builtin::Utf8Char => "utf8.char",
+            Builtin::Utf8Codepoint => "utf8.codepoint",
         }
     }
 
@@ -1396,6 +1403,8 @@ impl Builtin {
             Builtin::Utf8Len => &[ValueKind::Number],
             // ADR 0288 — N7-17: utf8.char returns String.
             Builtin::Utf8Char => &[ValueKind::String],
+            // ADR 0289 — N7-18: utf8.codepoint returns Number.
+            Builtin::Utf8Codepoint => &[ValueKind::Number],
             // ADR 0286 — N4-G: gsub returns String (result buffer).
             Builtin::StringGsub => &[ValueKind::String],
         }
@@ -1558,6 +1567,8 @@ impl Builtin {
             Builtin::Utf8Len => &[ValueKind::String],
             // ADR 0288 — utf8.char takes a Number (codepoint).
             Builtin::Utf8Char => &[ValueKind::Number],
+            // ADR 0289 — utf8.codepoint takes (String, Number).
+            Builtin::Utf8Codepoint => &[ValueKind::String, ValueKind::Number],
             // ADR 0241 — variadic Number args; per-position
             // dispatched via `expected_param_kind`.
             Builtin::MathMax | Builtin::MathMin => &[ValueKind::Number],
