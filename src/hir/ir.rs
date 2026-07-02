@@ -783,6 +783,9 @@ pub enum Builtin {
     /// the n-th codepoint starting from byte 1. 3-arg form with
     /// explicit start offset deferred.
     Utf8Offset,
+    /// ADR 0292 — N7-21: `debug.traceback()` no-arg stub. Returns
+    /// an empty String until real stack walking lands.
+    DebugTraceback,
     /// ADR 0216 — `pcall(f)` runs `f()` under a setjmp landing pad
     /// (ADR 0215). Returns `true` if `f` returned normally; `false`
     /// if any `error(msg)` longjmp'd back. The error message is
@@ -984,6 +987,8 @@ impl Builtin {
             "coroutine" => Self::coroutine_from_method(method),
             // ADR 0277 — N7-16 utf8.* namespace (partial).
             "utf8" => Self::utf8_from_method(method),
+            // ADR 0292 — N7-21 debug.* namespace (stubs only).
+            "debug" => Self::debug_from_method(method),
             _ => None,
         }
     }
@@ -1027,6 +1032,17 @@ impl Builtin {
 
     /// ADR 0277 — N7-16: `utf8.*` namespace partial. Currently only
     /// `utf8.len(s)` (count codepoints). variadic/range forms deferred.
+    /// ADR 0292 — N7-21: `debug.*` namespace (partial).
+    /// Currently only `debug.traceback()` no-arg stub — returns an
+    /// empty String. Real stack walking is out of scope until
+    /// libunwind wiring lands.
+    pub fn debug_from_method(method: &str) -> Option<Self> {
+        match method {
+            "traceback" => Some(Builtin::DebugTraceback),
+            _ => None,
+        }
+    }
+
     pub fn utf8_from_method(method: &str) -> Option<Self> {
         match method {
             "len" => Some(Builtin::Utf8Len),
@@ -1183,6 +1199,7 @@ impl Builtin {
             Builtin::Utf8Char => (1, 1),
             Builtin::Utf8Codepoint => (2, 2),
             Builtin::Utf8Offset => (2, 2),
+            Builtin::DebugTraceback => (0, 0),
         }
     }
 
@@ -1271,6 +1288,7 @@ impl Builtin {
             Builtin::Utf8Char => "utf8.char",
             Builtin::Utf8Codepoint => "utf8.codepoint",
             Builtin::Utf8Offset => "utf8.offset",
+            Builtin::DebugTraceback => "debug.traceback",
         }
     }
 
@@ -1425,6 +1443,8 @@ impl Builtin {
             Builtin::Utf8Codepoint => &[ValueKind::Number],
             // ADR 0290 — N7-19: utf8.offset returns Number.
             Builtin::Utf8Offset => &[ValueKind::Number],
+            // ADR 0292 — N7-21: debug.traceback returns String.
+            Builtin::DebugTraceback => &[ValueKind::String],
             // ADR 0286 — N4-G: gsub returns String (result buffer).
             Builtin::StringGsub => &[ValueKind::String],
         }
@@ -1593,6 +1613,8 @@ impl Builtin {
             Builtin::Utf8Codepoint => &[ValueKind::String, ValueKind::Number],
             // ADR 0290 — utf8.offset takes (String, Number).
             Builtin::Utf8Offset => &[ValueKind::String, ValueKind::Number],
+            // ADR 0292 — debug.traceback no-arg.
+            Builtin::DebugTraceback => &[],
             // ADR 0241 — variadic Number args; per-position
             // dispatched via `expected_param_kind`.
             Builtin::MathMax | Builtin::MathMin => &[ValueKind::Number],

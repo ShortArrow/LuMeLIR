@@ -12338,6 +12338,10 @@ fn emit_expr<'a, 'c>(
                     ))
                 }
             }
+            Callee::Builtin(Builtin::DebugTraceback) => {
+                // ADR 0292 — N7-21: stub returns empty String.
+                Ok(emit_empty_string(context, block, types, loc))
+            }
             Callee::Builtin(Builtin::MathRandomSeed) => {
                 // ADR 0291 — N7-20: srand(seed as u32).
                 let seed_f = emit_expr(
