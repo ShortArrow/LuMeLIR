@@ -526,6 +526,10 @@ pub enum Builtin {
     /// `RAND_MAX` for the underlying PRNG; non-determinism matches
     /// Lua spec (use `math.randomseed` to fix — deferred).
     MathRandom,
+    /// ADR 0291 — N7-20: `math.randomseed(seed)` sets libc `srand`.
+    /// Multi-return `(x1, x2)` no-arg form (Lua 5.4 secure seed)
+    /// deferred.
+    MathRandomSeed,
     /// ADR 0268 — N7-7: `math.deg(x)` = `x * (180 / π)`.
     MathDeg,
     /// ADR 0268 — N7-7: `math.rad(x)` = `x * (π / 180)`.
@@ -877,6 +881,8 @@ impl Builtin {
             "pow" => Some(Builtin::MathPow),
             "fmod" => Some(Builtin::MathFmod),
             "random" => Some(Builtin::MathRandom),
+            // ADR 0291 — N7-20: srand wrapper.
+            "randomseed" => Some(Builtin::MathRandomSeed),
             "deg" => Some(Builtin::MathDeg),
             "rad" => Some(Builtin::MathRad),
             "sin" => Some(Builtin::MathSin),
@@ -1113,6 +1119,7 @@ impl Builtin {
             Builtin::MathPow => (2, 2),
             Builtin::MathFmod => (2, 2),
             Builtin::MathRandom => (0, 2),
+            Builtin::MathRandomSeed => (1, 1),
             Builtin::MathDeg => (1, 1),
             Builtin::MathRad => (1, 1),
             Builtin::MathSin | Builtin::MathCos | Builtin::MathExp => (1, 1),
@@ -1203,6 +1210,7 @@ impl Builtin {
             Builtin::MathPow => "math.pow",
             Builtin::MathFmod => "math.fmod",
             Builtin::MathRandom => "math.random",
+            Builtin::MathRandomSeed => "math.randomseed",
             Builtin::MathDeg => "math.deg",
             Builtin::MathRad => "math.rad",
             Builtin::MathSin => "math.sin",
@@ -1326,6 +1334,8 @@ impl Builtin {
             // ADR 0241 — M11-B variadic max/min return Number.
             | Builtin::MathMax
             | Builtin::MathMin => &[ValueKind::Number],
+            // ADR 0291 — N7-20: math.randomseed is void.
+            Builtin::MathRandomSeed => &[],
             // ADR 0242 — os.time/os.clock return Number.
             Builtin::OsTime | Builtin::OsClock => &[ValueKind::Number],
             // ADR 0264 — os.exit diverges; pick Number as placeholder.
@@ -1489,6 +1499,8 @@ impl Builtin {
             // ADR 0263 — accepts up to 2 Number args; lower-arity
             // calls are HIR-validated by the arity bounds (0, 2).
             Builtin::MathRandom => &[ValueKind::Number, ValueKind::Number],
+            // ADR 0291 — N7-20: math.randomseed(seed) Number arg.
+            Builtin::MathRandomSeed => &[ValueKind::Number],
             Builtin::MathDeg => &[ValueKind::Number],
             Builtin::MathRad => &[ValueKind::Number],
             // string.* — first arg String; bounds args Number.

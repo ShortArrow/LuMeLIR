@@ -323,6 +323,8 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             Callee::Builtin(Builtin::Utf8Len) => ValueKind::Number,
             // ADR 0289 — utf8.codepoint returns Number.
             Callee::Builtin(Builtin::Utf8Codepoint) => ValueKind::Number,
+            // ADR 0291 — math.randomseed void (Print placeholder).
+            Callee::Builtin(Builtin::MathRandomSeed) => ValueKind::Number,
             // ADR 0290 — utf8.offset returns Number.
             Callee::Builtin(Builtin::Utf8Offset) => ValueKind::Number,
             // Phase 2.7q-stdlib-string (ADR 0103): string.upper /

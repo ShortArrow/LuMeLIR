@@ -1976,6 +1976,18 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(rand_op.into());
+    // ADR 0291 — srand(u32) -> void for math.randomseed (N7-20).
+    let srand_ty = llvm::r#type::function(llvm::r#type::void(context), &[types.i32], false);
+    let srand_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "srand"))
+        .function_type(TypeAttribute::new(srand_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(srand_op.into());
     // ADR 0265 — remove(const char*) -> i32 for os.remove (N7-4).
     let remove_ty = llvm::r#type::function(types.i32, &[types.ptr], false);
     let remove_op = LLVMFuncOperationBuilder::new(context, loc)
@@ -12325,6 +12337,53 @@ fn emit_expr<'a, 'c>(
                         context, block, "atan2", &[y, x], types, loc,
                     ))
                 }
+            }
+            Callee::Builtin(Builtin::MathRandomSeed) => {
+                // ADR 0291 — N7-20: srand(seed as u32).
+                let seed_f = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let seed_i64: Value<'c, '_> = block
+                    .append_operation(arith::fptosi(seed_f, types.i64, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let seed_i32: Value<'c, '_> = block
+                    .append_operation(arith::trunci(seed_i64, types.i32, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let call_op = OperationBuilder::new("llvm.call", loc)
+                    .add_operands(&[seed_i32])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "callee"),
+                            FlatSymbolRefAttribute::new(context, "srand").into(),
+                        ),
+                        (
+                            Identifier::new(context, "operandSegmentSizes"),
+                            DenseI32ArrayAttribute::new(context, &[1, 0]).into(),
+                        ),
+                        (
+                            Identifier::new(context, "op_bundle_sizes"),
+                            DenseI32ArrayAttribute::new(context, &[]).into(),
+                        ),
+                    ])
+                    .add_results(&[])
+                    .build()
+                    .expect("llvm.call @srand");
+                block.append_operation(call_op);
+                // Placeholder Number result (Print precedent).
+                Ok(block
+                    .append_operation(arith::constant(
+                        context,
+                        FloatAttribute::new(context, types.f64, 0.0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into())
             }
             Callee::Builtin(Builtin::Utf8Offset) => {
                 // ADR 0290 — N7-19: utf8.offset(s, n) from start.
