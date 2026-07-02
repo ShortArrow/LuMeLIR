@@ -384,6 +384,13 @@ unsafe fn run_pattern_from(
         if init_byte > s_len {
             return None;
         }
+        // ADR 0280 anchor semantics: `^` is anchored to the start
+        // of the string, not the start of the search range. When
+        // we re-enter with `init_byte > 0`, an anchored pattern
+        // can never succeed.
+        if anchored && init_byte != 0 {
+            return None;
+        }
         let mut start = init_byte;
         let stop = if anchored { init_byte } else { s_len };
         loop {
@@ -414,6 +421,103 @@ pub extern "C" fn lumelir_string_match_extents(s_ptr: *const u8, pat_ptr: *const
     }
 }
 
+// ADR 0286 — N4-G: `string.gsub(s, pat, repl)` string-repl form.
+// Writes at most `out_max` bytes of the substituted output into
+// `out_buf` and returns the actual byte length written. The
+// caller (codegen) sizes `out_buf` to a conservative upper bound
+// based on `len(s) * (len(repl) + 1)` and finalizes a String obj
+// around it. Function-form `repl` and multi-return (result,
+// count) deferred.
+#[unsafe(no_mangle)]
+pub extern "C" fn lumelir_string_gsub_string_repl(
+    s_ptr: *const u8,
+    pat_ptr: *const u8,
+    repl_ptr: *const u8,
+    out_buf: *mut u8,
+    out_max: i64,
+) -> i64 {
+    unsafe {
+        let s_len = core::ptr::read_unaligned(s_ptr.cast::<i64>()) as usize;
+        let pat_len = core::ptr::read_unaligned(pat_ptr.cast::<i64>()) as usize;
+        let repl_len = core::ptr::read_unaligned(repl_ptr.cast::<i64>()) as usize;
+        let s = core::slice::from_raw_parts(s_ptr.add(8), s_len);
+        let pat = core::slice::from_raw_parts(pat_ptr.add(8), pat_len);
+        let repl = core::slice::from_raw_parts(repl_ptr.add(8), repl_len);
+        let out_max_u = if out_max < 0 { 0 } else { out_max as usize };
+        let mut wrote = 0usize;
+        let mut cursor = 0usize;
+        let mut write_byte = |b: u8, wrote: &mut usize| {
+            if *wrote < out_max_u {
+                *out_buf.add(*wrote) = b;
+                *wrote += 1;
+            }
+        };
+        let write_slice = |bytes: &[u8], wrote: &mut usize| {
+            let mut i = 0;
+            while i < bytes.len() {
+                if *wrote < out_max_u {
+                    *out_buf.add(*wrote) = *bytes.get_unchecked(i);
+                    *wrote += 1;
+                }
+                i += 1;
+            }
+        };
+        // Empty pattern: gsub with empty pattern equals the input
+        // unchanged in Lua 5.4 (matches at each position with zero
+        // consumption; each produces the repl once). Keep it
+        // simple — write the input as-is to avoid infinite spin.
+        if pat_len == 0 {
+            let mut i = 0;
+            while i < s_len {
+                write_byte(*s.get_unchecked(i), &mut wrote);
+                i += 1;
+            }
+            return wrote as i64;
+        }
+        while cursor <= s_len {
+            match run_pattern_from(s_ptr, pat_ptr, cursor) {
+                Some((mstart, mconsumed, _cap)) => {
+                    // Copy verbatim s[cursor..mstart]
+                    let mut i = cursor;
+                    while i < mstart {
+                        write_byte(*s.get_unchecked(i), &mut wrote);
+                        i += 1;
+                    }
+                    write_slice(repl, &mut wrote);
+                    // Advance past the match; if zero-width, step by 1
+                    // so the loop terminates.
+                    let new_cursor = if mconsumed == 0 {
+                        // Emit the char at mstart verbatim to preserve
+                        // Lua semantics on empty matches.
+                        if mstart < s_len {
+                            write_byte(*s.get_unchecked(mstart), &mut wrote);
+                        }
+                        mstart + 1
+                    } else {
+                        mstart + mconsumed
+                    };
+                    if new_cursor <= cursor {
+                        // Defensive: shouldn't happen, but avoid spin.
+                        cursor += 1;
+                    } else {
+                        cursor = new_cursor;
+                    }
+                }
+                None => {
+                    // Copy rest of s and stop.
+                    let mut i = cursor;
+                    while i < s_len {
+                        write_byte(*s.get_unchecked(i), &mut wrote);
+                        i += 1;
+                    }
+                    break;
+                }
+            }
+        }
+        wrote as i64
+    }
+}
+
 // ADR 0283 — N4-F-1: `string.find(s, pat, init)` 3-arg form.
 // `init_1based` is the 1-indexed start position; passing 1
 // reproduces the no-init behaviour. Returns the overall match
@@ -438,6 +542,7 @@ pub extern "C" fn lumelir_string_find_init(
         None => 0,
     }
 }
+
 
 // ADR 0281 — N4-D: like `lumelir_string_match_extents`, but if
 // the pattern contained a capture, returns that capture's

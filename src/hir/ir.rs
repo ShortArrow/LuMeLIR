@@ -760,6 +760,11 @@ pub enum Builtin {
     /// (single-result position). Multi-return `(int, frac)`
     /// form deferred. Codegen uses libm `trunc(x)`.
     MathModf,
+    /// ADR 0286 — N4-G: `string.gsub(s, pat, repl)` with a
+    /// String replacement. Single-return (result String) scope;
+    /// multi-return `(result, count)` and Function-form `repl`
+    /// deferred to N4-G follow-up ADRs.
+    StringGsub,
     /// ADR 0277 — N7-16: `utf8.len(s)` count of UTF-8 codepoints.
     /// Codegen scans bytes and counts those whose top 2 bits ≠ 0b10
     /// (i.e. non-continuation bytes).
@@ -908,6 +913,8 @@ impl Builtin {
             "format" => Some(Builtin::StringFormat),
             // ADR 0201 — string.reverse byte-wise.
             "reverse" => Some(Builtin::StringReverse),
+            // ADR 0286 — N4-G: string.gsub(s, pat, repl) string-repl form.
+            "gsub" => Some(Builtin::StringGsub),
             _ => None,
         }
     }
@@ -1095,6 +1102,8 @@ impl Builtin {
             Builtin::MathSin | Builtin::MathCos | Builtin::MathExp => (1, 1),
             // ADR 0273 — math.log(x [, base]); 2-arg form = log(x)/log(base).
             Builtin::MathLog => (1, 2),
+            // ADR 0286 — N4-G: string.gsub(s, pat, repl).
+            Builtin::StringGsub => (3, 3),
             Builtin::StringLen | Builtin::StringUpper | Builtin::StringLower => (1, 1),
             // ADR 0104 — string.sub(s, i) or string.sub(s, i, j).
             Builtin::StringSub => (2, 3),
@@ -1180,6 +1189,7 @@ impl Builtin {
             Builtin::MathSin => "math.sin",
             Builtin::MathCos => "math.cos",
             Builtin::MathLog => "math.log",
+            Builtin::StringGsub => "string.gsub",
             Builtin::MathExp => "math.exp",
             Builtin::MathCeil => "math.ceil",
             Builtin::MathTan => "math.tan",
@@ -1377,6 +1387,8 @@ impl Builtin {
             Builtin::MathModf => &[ValueKind::Number],
             // ADR 0277 — utf8.len returns Number.
             Builtin::Utf8Len => &[ValueKind::Number],
+            // ADR 0286 — N4-G: gsub returns String (result buffer).
+            Builtin::StringGsub => &[ValueKind::String],
         }
     }
 
@@ -1461,6 +1473,8 @@ impl Builtin {
             // ADR 0228 — string.find(s, sub).
             // ADR 0283 — N4-F-1: 3rd arg is the 1-indexed init position.
             Builtin::StringFind => &[ValueKind::String, ValueKind::String, ValueKind::Number],
+            // ADR 0286 — N4-G: (s, pat, repl) all String.
+            Builtin::StringGsub => &[ValueKind::String, ValueKind::String, ValueKind::String],
             Builtin::StringMatch => &[ValueKind::String, ValueKind::String],
             // table.* — first arg Table; sep String; bounds Number.
             Builtin::TableConcat => &[

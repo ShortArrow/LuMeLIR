@@ -2294,6 +2294,27 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(str_find_init_op.into());
+
+    // ADR 0286 — N4-G: string.gsub(s, pat, repl) string-repl form.
+    // (s, pat, repl, out_buf, out_max) -> actual bytes written.
+    let str_gsub_ty = llvm::r#type::function(
+        types.i64,
+        &[types.ptr, types.ptr, types.ptr, types.ptr, types.i64],
+        false,
+    );
+    let str_gsub_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(
+            context,
+            "lumelir_string_gsub_string_repl",
+        ))
+        .function_type(TypeAttribute::new(str_gsub_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(str_gsub_op.into());
 }
 
 /// MLIR type for a function parameter of static [`ValueKind`]. Number
@@ -13047,6 +13068,96 @@ fn emit_expr<'a, 'c>(
                 else_region.append_block(else_blk);
                 let if_op = scf::r#if(in_range, &[types.f64], then_region, else_region, loc);
                 Ok(block.append_operation(if_op).result(0).unwrap().into())
+            }
+            Callee::Builtin(Builtin::StringGsub) => {
+                // ADR 0286 — N4-G: string.gsub(s, pat, repl) string-repl form.
+                let s = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let pat = emit_expr(
+                    context, block, &args[1], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let repl = emit_expr(
+                    context, block, &args[2], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let s_len = emit_string_obj_len(block, s, types, loc);
+                let repl_len = emit_string_obj_len(block, repl, types, loc);
+                let one_i64 = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 1).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let eight_i64 = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, 8).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                // upper = (s_len + 1) * (repl_len + 1) + repl_len + 8
+                let s_plus1 = block
+                    .append_operation(arith::addi(s_len, one_i64, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let repl_plus1 = block
+                    .append_operation(arith::addi(repl_len, one_i64, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let product: Value<'c, '_> = block
+                    .append_operation(arith::muli(s_plus1, repl_plus1, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let with_repl = block
+                    .append_operation(arith::addi(product, repl_len, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let upper: Value<'c, '_> = block
+                    .append_operation(arith::addi(with_repl, eight_i64, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let obj = emit_string_obj_alloc(context, block, upper, types, loc);
+                let data = emit_string_obj_data(context, block, obj, types, loc);
+                let call_op = OperationBuilder::new("llvm.call", loc)
+                    .add_operands(&[s, pat, repl, data, upper])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "callee"),
+                            FlatSymbolRefAttribute::new(context, "lumelir_string_gsub_string_repl")
+                                .into(),
+                        ),
+                        (
+                            Identifier::new(context, "operandSegmentSizes"),
+                            DenseI32ArrayAttribute::new(context, &[5, 0]).into(),
+                        ),
+                        (
+                            Identifier::new(context, "op_bundle_sizes"),
+                            DenseI32ArrayAttribute::new(context, &[]).into(),
+                        ),
+                    ])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.call @lumelir_string_gsub_string_repl");
+                let actual_len: Value<'c, '_> =
+                    block.append_operation(call_op).result(0).unwrap().into();
+                // Overwrite length header (offset 0) with actual length,
+                // then NUL-terminate at data+actual_len.
+                emit_store(block, actual_len, obj, loc);
+                emit_string_obj_finalize_nul(context, block, obj, actual_len, types, loc);
+                Ok(obj)
             }
             Callee::Builtin(Builtin::StringReverse) => {
                 // ADR 0201 — byte-wise string reversal.
