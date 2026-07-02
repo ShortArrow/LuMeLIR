@@ -2343,6 +2343,22 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(utf8_cp_op.into());
+
+    // ADR 0290 — N7-19: utf8.offset(s, n) from start.
+    let utf8_off_ty = llvm::r#type::function(types.i64, &[types.ptr, types.i64], false);
+    let utf8_off_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(
+            context,
+            "lumelir_utf8_offset_from_start",
+        ))
+        .function_type(TypeAttribute::new(utf8_off_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(utf8_off_op.into());
 }
 
 /// MLIR type for a function parameter of static [`ValueKind`]. Number
@@ -12309,6 +12325,52 @@ fn emit_expr<'a, 'c>(
                         context, block, "atan2", &[y, x], types, loc,
                     ))
                 }
+            }
+            Callee::Builtin(Builtin::Utf8Offset) => {
+                // ADR 0290 — N7-19: utf8.offset(s, n) from start.
+                let s = emit_expr(
+                    context, block, &args[0], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let n_f = emit_expr(
+                    context, block, &args[1], slots, locals, functions, types, params_len,
+                    in_function_cell_ptr, loc,
+                )?;
+                let n_i: Value<'c, '_> = block
+                    .append_operation(arith::fptosi(n_f, types.i64, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                let call_op = OperationBuilder::new("llvm.call", loc)
+                    .add_operands(&[s, n_i])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "callee"),
+                            FlatSymbolRefAttribute::new(
+                                context,
+                                "lumelir_utf8_offset_from_start",
+                            )
+                            .into(),
+                        ),
+                        (
+                            Identifier::new(context, "operandSegmentSizes"),
+                            DenseI32ArrayAttribute::new(context, &[2, 0]).into(),
+                        ),
+                        (
+                            Identifier::new(context, "op_bundle_sizes"),
+                            DenseI32ArrayAttribute::new(context, &[]).into(),
+                        ),
+                    ])
+                    .add_results(&[types.i64])
+                    .build()
+                    .expect("llvm.call @lumelir_utf8_offset_from_start");
+                let off_i: Value<'c, '_> =
+                    block.append_operation(call_op).result(0).unwrap().into();
+                Ok(block
+                    .append_operation(arith::sitofp(off_i, types.f64, loc))
+                    .result(0)
+                    .unwrap()
+                    .into())
             }
             Callee::Builtin(Builtin::Utf8Codepoint) => {
                 // ADR 0289 — N7-18: decode one codepoint at 1-based

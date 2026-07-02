@@ -486,6 +486,41 @@ pub extern "C" fn lumelir_string_match_extents(s_ptr: *const u8, pat_ptr: *const
     }
 }
 
+// ADR 0290 — N7-19: `utf8.offset(s, n)` 2-arg form (implicit
+// start = 1). Returns 1-indexed byte offset of the n-th codepoint
+// from the start of s. n=1 always returns 1 for non-empty s.
+// n > 0: walk forward. n = 0 returns the byte position aligned to
+// current codepoint boundary (byte 1 in the from-1 case; matches
+// Lua spec's default). Returns -1 on out-of-range.
+#[unsafe(no_mangle)]
+pub extern "C" fn lumelir_utf8_offset_from_start(s_ptr: *const u8, n: i64) -> i64 {
+    unsafe {
+        let s_len = core::ptr::read_unaligned(s_ptr.cast::<i64>()) as usize;
+        let data = s_ptr.add(8);
+        if n < 0 {
+            return -1;
+        }
+        if n == 0 {
+            return 1;
+        }
+        // Walk forward, counting non-continuation bytes.
+        let mut byte_i: usize = 0;
+        let mut cp_count: i64 = 0;
+        while byte_i <= s_len {
+            let is_boundary =
+                byte_i == s_len || (*data.add(byte_i) & 0xC0) != 0x80;
+            if is_boundary {
+                cp_count += 1;
+                if cp_count == n {
+                    return (byte_i as i64) + 1;
+                }
+            }
+            byte_i += 1;
+        }
+        -1
+    }
+}
+
 // ADR 0289 — N7-18: `utf8.codepoint(s, i)` decodes the UTF-8
 // codepoint that starts at byte index `i` (1-indexed) of `s`.
 // Returns the codepoint as i64, or -1 on invalid input / bounds.

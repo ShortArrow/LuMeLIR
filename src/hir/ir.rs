@@ -775,6 +775,10 @@ pub enum Builtin {
     /// ADR 0289 — N7-18: `utf8.codepoint(s, i)` single-position.
     /// Multi-position range form deferred.
     Utf8Codepoint,
+    /// ADR 0290 — N7-19: `utf8.offset(s, n)` — byte position of
+    /// the n-th codepoint starting from byte 1. 3-arg form with
+    /// explicit start offset deferred.
+    Utf8Offset,
     /// ADR 0216 — `pcall(f)` runs `f()` under a setjmp landing pad
     /// (ADR 0215). Returns `true` if `f` returned normally; `false`
     /// if any `error(msg)` longjmp'd back. The error message is
@@ -1024,6 +1028,8 @@ impl Builtin {
             "char" => Some(Builtin::Utf8Char),
             // ADR 0289 — N7-18: single-position utf8.codepoint.
             "codepoint" => Some(Builtin::Utf8Codepoint),
+            // ADR 0290 — N7-19: single-index utf8.offset(s, n).
+            "offset" => Some(Builtin::Utf8Offset),
             _ => None,
         }
     }
@@ -1169,6 +1175,7 @@ impl Builtin {
             Builtin::Utf8Len => (1, 1),
             Builtin::Utf8Char => (1, 1),
             Builtin::Utf8Codepoint => (2, 2),
+            Builtin::Utf8Offset => (2, 2),
         }
     }
 
@@ -1255,6 +1262,7 @@ impl Builtin {
             Builtin::Utf8Len => "utf8.len",
             Builtin::Utf8Char => "utf8.char",
             Builtin::Utf8Codepoint => "utf8.codepoint",
+            Builtin::Utf8Offset => "utf8.offset",
         }
     }
 
@@ -1405,6 +1413,8 @@ impl Builtin {
             Builtin::Utf8Char => &[ValueKind::String],
             // ADR 0289 — N7-18: utf8.codepoint returns Number.
             Builtin::Utf8Codepoint => &[ValueKind::Number],
+            // ADR 0290 — N7-19: utf8.offset returns Number.
+            Builtin::Utf8Offset => &[ValueKind::Number],
             // ADR 0286 — N4-G: gsub returns String (result buffer).
             Builtin::StringGsub => &[ValueKind::String],
         }
@@ -1569,6 +1579,8 @@ impl Builtin {
             Builtin::Utf8Char => &[ValueKind::Number],
             // ADR 0289 — utf8.codepoint takes (String, Number).
             Builtin::Utf8Codepoint => &[ValueKind::String, ValueKind::Number],
+            // ADR 0290 — utf8.offset takes (String, Number).
+            Builtin::Utf8Offset => &[ValueKind::String, ValueKind::Number],
             // ADR 0241 — variadic Number args; per-position
             // dispatched via `expected_param_kind`.
             Builtin::MathMax | Builtin::MathMin => &[ValueKind::Number],
