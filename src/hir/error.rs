@@ -168,6 +168,11 @@ pub enum HirError {
          (ADR 0092): must be Ident, Index suffixes, or literal"
     )]
     ComplexMethodReceiver { offset: usize },
+    #[error(
+        "varargs `...` are recognised by the parser (ADR 0293) but \
+         HIR / codegen wiring is deferred to F1-B / F1-C"
+    )]
+    VarargUnsupported { offset: usize },
 }
 
 impl HirError {
@@ -189,6 +194,7 @@ impl HirError {
             | HirError::IndirectCallNonNumberReturn { offset, .. }
             | HirError::MutualCapturingRecursion { offset, .. }
             | HirError::ComplexMethodReceiver { offset }
+            | HirError::VarargUnsupported { offset }
             | HirError::UnknownAttribute { offset, .. } => *offset,
         }
     }

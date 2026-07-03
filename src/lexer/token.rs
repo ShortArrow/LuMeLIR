@@ -69,6 +69,9 @@ pub enum TokenKind {
     GtGt,
     /// `..` string concatenation (Phase 2.7b, ADR 0025).
     DotDot,
+    /// `...` varargs (Lua 5.4 §3.4.11). Parser-only in ADR 0293;
+    /// HIR / codegen wiring lands in F1-B / F1-C.
+    DotDotDot,
     /// `.` field-access separator (Phase 2.6b-hash, ADR 0058).
     /// Lone `.` was a lex error until field access landed.
     Dot,

@@ -748,7 +748,7 @@ impl<'t> Parser<'t> {
         }
         let method = segments.pop().expect("segments has ≥2 entries");
         let receiver_chain = segments;
-        let (params, body, end_tok) = self.parse_function_signature_and_body()?;
+        let (params, is_vararg, body, end_tok) = self.parse_function_signature_and_body()?;
         let span = Span::new(fn_tok.span.start, end_tok.span.end);
         Ok(Stmt::new(
             StmtKind::MethodDef {
@@ -756,6 +756,7 @@ impl<'t> Parser<'t> {
                 method,
                 is_colon,
                 params,
+                is_vararg,
                 body,
             },
             span,
@@ -782,10 +783,15 @@ impl<'t> Parser<'t> {
                 });
             }
         };
-        let (params, body, end_tok) = self.parse_function_signature_and_body()?;
+        let (params, is_vararg, body, end_tok) = self.parse_function_signature_and_body()?;
         let span = Span::new(local_tok.span.start, end_tok.span.end);
         Ok(Stmt::new(
-            StmtKind::FunctionDef { name, params, body },
+            StmtKind::FunctionDef {
+                name,
+                params,
+                is_vararg,
+                body,
+            },
             span,
         ))
     }
@@ -794,9 +800,10 @@ impl<'t> Parser<'t> {
     /// (named) and `parse_function_expr` (anonymous, Phase 2.5b).
     fn parse_function_signature_and_body(
         &mut self,
-    ) -> Result<(Vec<String>, Chunk, Token), ParseError> {
+    ) -> Result<(Vec<String>, bool, Chunk, Token), ParseError> {
         self.expect_token(TokenKind::LParen)?;
         let mut params = Vec::new();
+        let mut is_vararg = false;
         if !matches!(self.peek().kind, TokenKind::RParen) {
             loop {
                 let p_tok = self.peek().clone();
@@ -804,6 +811,12 @@ impl<'t> Parser<'t> {
                     TokenKind::Ident(n) => {
                         self.bump();
                         params.push(n);
+                    }
+                    // ADR 0293 — F1-A: trailing `...` in signature.
+                    TokenKind::DotDotDot => {
+                        self.bump();
+                        is_vararg = true;
+                        break;
                     }
                     other => {
                         return Err(ParseError::UnexpectedToken {
@@ -822,7 +835,7 @@ impl<'t> Parser<'t> {
         self.expect_token(TokenKind::RParen)?;
         let body = self.parse_chunk_until(&[TokenKind::Keyword(Keyword::End), TokenKind::Eof])?;
         let end_tok = self.expect_keyword(Keyword::End)?;
-        Ok((params, body, end_tok))
+        Ok((params, is_vararg, body, end_tok))
     }
 
     fn parse_return(&mut self) -> Result<Stmt, ParseError> {
@@ -953,11 +966,24 @@ impl<'t> Parser<'t> {
                 self.bump();
                 Ok(Expr::new(ExprKind::Nil, tok.span))
             }
+            // ADR 0293 — F1-A: `...` in expression position.
+            TokenKind::DotDotDot => {
+                self.bump();
+                Ok(Expr::new(ExprKind::Vararg, tok.span))
+            }
             TokenKind::Keyword(Keyword::Function) => {
                 self.bump();
-                let (params, body, end_tok) = self.parse_function_signature_and_body()?;
+                let (params, is_vararg, body, end_tok) =
+                    self.parse_function_signature_and_body()?;
                 let span = Span::new(tok.span.start, end_tok.span.end);
-                Ok(Expr::new(ExprKind::FunctionExpr { params, body }, span))
+                Ok(Expr::new(
+                    ExprKind::FunctionExpr {
+                        params,
+                        is_vararg,
+                        body,
+                    },
+                    span,
+                ))
             }
             TokenKind::LParen => {
                 self.bump();
@@ -1450,10 +1476,16 @@ mod tests {
                 op,
                 operand: Box::new(strip_span_expr(*operand)),
             },
-            ExprKind::FunctionExpr { params, body } => ExprKind::FunctionExpr {
+            ExprKind::FunctionExpr {
                 params,
+                is_vararg,
+                body,
+            } => ExprKind::FunctionExpr {
+                params,
+                is_vararg,
                 body: body.into_iter().map(strip_span_stmt).collect(),
             },
+            ExprKind::Vararg => ExprKind::Vararg,
             ExprKind::Table(fields) => ExprKind::Table(
                 fields
                     .into_iter()
@@ -1573,9 +1605,15 @@ mod tests {
                 body: body.into_iter().map(strip_span_stmt).collect(),
             },
             StmtKind::Break => StmtKind::Break,
-            StmtKind::FunctionDef { name, params, body } => StmtKind::FunctionDef {
+            StmtKind::FunctionDef {
                 name,
                 params,
+                is_vararg,
+                body,
+            } => StmtKind::FunctionDef {
+                name,
+                params,
+                is_vararg,
                 body: body.into_iter().map(strip_span_stmt).collect(),
             },
             StmtKind::MethodDef {
@@ -1583,12 +1621,14 @@ mod tests {
                 method,
                 is_colon,
                 params,
+                is_vararg,
                 body,
             } => StmtKind::MethodDef {
                 receiver_chain,
                 method,
                 is_colon,
                 params,
+                is_vararg,
                 body: body.into_iter().map(strip_span_stmt).collect(),
             },
             StmtKind::Return { value } => StmtKind::Return {
@@ -2279,7 +2319,12 @@ mod tests {
         let stmt =
             parse_single_stmt("local function add(a, b) return a + b end").expect("must parse");
         match stmt.kind {
-            StmtKind::FunctionDef { name, params, body } => {
+            StmtKind::FunctionDef {
+                name,
+                params,
+                is_vararg: _,
+                body,
+            } => {
                 assert_eq!(name, "add");
                 assert_eq!(params, vec!["a".to_owned(), "b".to_owned()]);
                 assert_eq!(body.len(), 1);
@@ -2325,7 +2370,11 @@ mod tests {
     fn parse_anonymous_function_expr_yields_function_expr() {
         let kind = parse_single_expr("function() return 1 end").expect("must parse");
         match kind {
-            ExprKind::FunctionExpr { params, body } => {
+            ExprKind::FunctionExpr {
+                params,
+                is_vararg: _,
+                body,
+            } => {
                 assert!(params.is_empty());
                 assert_eq!(body.len(), 1);
             }
@@ -2349,7 +2398,11 @@ mod tests {
     fn parse_function_expr_with_params_and_body() {
         let kind = parse_single_expr("function(a, b) return a + b end").expect("must parse");
         match kind {
-            ExprKind::FunctionExpr { params, body } => {
+            ExprKind::FunctionExpr {
+                params,
+                is_vararg: _,
+                body,
+            } => {
                 assert_eq!(params, vec!["a".to_owned(), "b".to_owned()]);
                 assert_eq!(body.len(), 1);
             }

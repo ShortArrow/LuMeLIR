@@ -139,6 +139,21 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                 ('.', _) => (TokenKind::Dot, false),
                 _ => unreachable!(),
             };
+            // ADR 0293 — F1-A: `...` varargs token. `..` above may
+            // extend to `...` if a third dot follows.
+            if matches!(kind, TokenKind::DotDot) {
+                chars.next(); // consume the second `.`
+                if matches!(chars.peek(), Some((_, '.'))) {
+                    chars.next(); // consume the third `.`
+                    let end = offset + 3;
+                    tokens.push(Token::new(TokenKind::DotDotDot, Span::new(offset, end)));
+                    continue;
+                }
+                // Not `...` — emit `..` with the already-consumed second dot.
+                let end = offset + 2;
+                tokens.push(Token::new(TokenKind::DotDot, Span::new(offset, end)));
+                continue;
+            }
             let end = if two_char {
                 chars.next();
                 offset + ch.len_utf8() + 1

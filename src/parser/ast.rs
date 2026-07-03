@@ -46,10 +46,20 @@ pub enum ExprKind {
     /// `function(params) body end` — anonymous function expression
     /// (Phase 2.5b, ADR 0017). Lowered to a `HirFunction` registered
     /// with the mangled name `user_anon_<idx>`.
+    ///
+    /// ADR 0293 — F1-A: `is_vararg` reflects a trailing `...` in the
+    /// signature. HIR / codegen wiring lands in F1-B / F1-C; for
+    /// F1-A the flag is captured but not yet consumed (HIR errors
+    /// early with `VarargUnsupported`).
     FunctionExpr {
         params: Vec<String>,
+        is_vararg: bool,
         body: Chunk,
     },
+    /// ADR 0293 — F1-A: `...` in expression position. Represents
+    /// the variadic pack visible inside a vararg function body.
+    /// HIR / codegen wiring is F1-B / F1-C.
+    Vararg,
     /// `{ field1, field2, … }` table constructor (Phase 2.6a-min,
     /// ADR 0053 for the empty form; ADR 0054 for the populated
     /// array form; ADR 0199 for keyed forms). Each field is one of
@@ -284,10 +294,12 @@ pub enum StmtKind {
     /// `break` outside of any loop with `BreakOutsideLoop`.
     Break,
     /// `local function NAME(PARAMS) BODY end` (Phase 2.5a, ADR 0016).
-    /// First-class anonymous functions arrive in 2.5b.
+    /// First-class anonymous functions arrive in 2.5b. ADR 0293 adds
+    /// `is_vararg` for the parser-only trailing `...`.
     FunctionDef {
         name: String,
         params: Vec<String>,
+        is_vararg: bool,
         body: Chunk,
     },
     /// `function recv.field(...) end` (`is_colon=false`) or
@@ -308,6 +320,7 @@ pub enum StmtKind {
         method: String,
         is_colon: bool,
         params: Vec<String>,
+        is_vararg: bool,
         body: Chunk,
     },
     /// `return [expr]`. HIR rejects `return` outside any function with

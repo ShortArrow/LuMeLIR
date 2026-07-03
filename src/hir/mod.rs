@@ -1682,7 +1682,8 @@ fn expr_references_name(expr: &Expr, name: &str) -> bool {
         | ExprKind::Integer(_)
         | ExprKind::Str(_)
         | ExprKind::Bool(_)
-        | ExprKind::Nil => false,
+        | ExprKind::Nil
+        | ExprKind::Vararg => false,
     }
 }
 
@@ -3081,7 +3082,17 @@ impl LowerCtx {
             // level, and emit an empty Block as the definition's
             // runtime no-op (the function code is read from
             // `chunk.functions`, not the enclosing body).
-            StmtKind::FunctionDef { name, params, body } => {
+            StmtKind::FunctionDef {
+                name,
+                params,
+                is_vararg,
+                body,
+            } => {
+                if *is_vararg {
+                    return Err(HirError::VarargUnsupported {
+                        offset: stmt.span.start,
+                    });
+                }
                 let &fid = self.function_names.get(name).expect(
                     "lower_function_body's pass 1 always registers nested \
                      FunctionDef names",
@@ -4031,8 +4042,16 @@ impl LowerCtx {
                 method,
                 is_colon,
                 params,
+                is_vararg,
                 body,
-            } => self.lower_method_def(receiver_chain, method, *is_colon, params, body, stmt.span),
+            } => {
+                if *is_vararg {
+                    return Err(HirError::VarargUnsupported {
+                        offset: stmt.span.start,
+                    });
+                }
+                self.lower_method_def(receiver_chain, method, *is_colon, params, body, stmt.span)
+            }
         }
     }
 
@@ -4586,6 +4605,13 @@ impl LowerCtx {
             },
             ExprKind::Bool(b) => HirExprKind::Bool(*b),
             ExprKind::Nil => HirExprKind::Nil,
+            // ADR 0293 — F1-A: `...` in expression position. HIR
+            // wiring is F1-B; today the compiler refuses to lower.
+            ExprKind::Vararg => {
+                return Err(HirError::VarargUnsupported {
+                    offset: expr.span.start,
+                });
+            }
             ExprKind::BinOp { op, lhs, rhs } => {
                 let lhs_hir = self.lower_expr(lhs)?;
                 let rhs_hir = self.lower_expr(rhs)?;
@@ -4869,7 +4895,16 @@ impl LowerCtx {
                     operand: Box::new(operand_hir),
                 }
             }
-            ExprKind::FunctionExpr { params, body } => {
+            ExprKind::FunctionExpr {
+                params,
+                is_vararg,
+                body,
+            } => {
+                if *is_vararg {
+                    return Err(HirError::VarargUnsupported {
+                        offset: expr.span.start,
+                    });
+                }
                 // ADR 0141 — if Pass-2 chunk walker armed a
                 // pre-allocated FuncId for this FunctionExpr (top-
                 // level `IndexAssign(chain, Str(key), FunctionExpr)`
@@ -6451,6 +6486,8 @@ fn check_method_receiver_shape(expr: &Expr) -> Result<(), HirError> {
         | ExprKind::MethodCall { .. }
         | ExprKind::FunctionExpr { .. }
         | ExprKind::BinOp { .. }
+        // ADR 0293 — F1-A: `...` as a method receiver is illegal.
+        | ExprKind::Vararg
         | ExprKind::UnaryOp { .. } => Err(HirError::ComplexMethodReceiver {
             offset: expr.span.start,
         }),
