@@ -10193,6 +10193,11 @@ fn emit_expr<'a, 'c>(
             let op = arith::constant(context, attr.into(), loc);
             Ok(block.append_operation(op).result(0).unwrap().into())
         }
+        // ADR 0294 — F1-B: variadic pack placeholder. Codegen
+        // expansion (call-site spread + hidden param) is F1-C.
+        HirExprKind::Vararg => Err(CodegenError::UnsupportedExpr(
+            "vararg `...` codegen is deferred to F1-C (ADR 0294)".to_owned(),
+        )),
         // Phase 2.7a (ADR 0024): a string literal materialises as
         // `llvm.mlir.addressof @lstr_<i>`. The corresponding global
         // was emitted by `emit_user_string_globals` at module top.

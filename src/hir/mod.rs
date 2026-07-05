@@ -199,6 +199,8 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
         HirExprKind::Integer(_) => ValueKind::Number,
         HirExprKind::Bool(_) => ValueKind::Bool,
         HirExprKind::Nil => ValueKind::Nil,
+        // ADR 0294 — F1-B: variadic pack. Elements carry a runtime tag.
+        HirExprKind::Vararg => ValueKind::TaggedValue,
         HirExprKind::Str(_) => ValueKind::String,
         HirExprKind::Table(_) => ValueKind::Table,
         // Phase 2.6a-arr (ADR 0054): Number-only arrays mean
@@ -1485,6 +1487,7 @@ fn register_function_signature(
         body: Vec::new(),
         ret_kinds: Vec::new(),
         parent_scope,
+        is_vararg: false,
     });
     function_names.insert(name.to_owned(), id);
     id
@@ -1526,6 +1529,7 @@ fn alloc_method_signature(
         body: Vec::new(),
         ret_kinds: Vec::new(),
         parent_scope,
+        is_vararg: false,
     });
     id
 }
@@ -1536,9 +1540,11 @@ fn alloc_method_signature(
 /// fills in `functions[fid.0]`, and hoists any anonymous functions
 /// registered during inner lowering into the outer table.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn lower_into_function(
     fid: FuncId,
     params: &[String],
+    is_vararg: bool,
     body: &[Stmt],
     function_names: &HashMap<String, FuncId>,
     method_funcs: &HashMap<(Vec<String>, String), FuncId>,
@@ -1559,6 +1565,8 @@ fn lower_into_function(
         outer_visible,
         fid,
     );
+    sub_ctx.in_vararg_function = is_vararg;
+    functions[fid.0].is_vararg = is_vararg;
     let body_hir = sub_ctx.lower_function_body(body)?;
     let ret_kinds = sub_ctx.in_function_ret_kinds.unwrap_or_default();
     functions[fid.0].params = sub_ctx.locals[..params.len()].to_vec();
@@ -2023,7 +2031,11 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
             anon_indexassign_seq += 1;
         }
         if let StmtKind::FunctionDef {
-            name, params, body, ..
+            name,
+            params,
+            is_vararg,
+            body,
+            ..
         } = &s.kind
         {
             let fid = FuncId(funcdef_seq);
@@ -2032,6 +2044,7 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
             lower_into_function(
                 fid,
                 params,
+                *is_vararg,
                 body,
                 &ctx.function_names,
                 &ctx.method_funcs,
@@ -2466,6 +2479,10 @@ struct LowerCtx {
     /// k2, ...])` for multi-return. Subsequent returns must agree on
     /// arity and per-position kind.
     in_function_ret_kinds: Option<Vec<ValueKind>>,
+    /// ADR 0294 — F1-B: `true` inside a function body declared with
+    /// a trailing `...`. `lower_expr` consults this to decide whether
+    /// `ExprKind::Vararg` is legal at all.
+    in_vararg_function: bool,
     /// Phase 2.5c-full Commit 3 (ADR 0083): the FuncId of the
     /// function whose body this ctx is lowering, or `None` at
     /// chunk level. Used by [`Self::current_parent_scope`] to
@@ -2524,6 +2541,7 @@ impl LowerCtx {
             functions,
             in_function: None,
             in_function_ret_kinds: None,
+            in_vararg_function: false,
             containing_fn: None,
             pending_pre_stmts: Vec::new(),
             callee_seq: 0,
@@ -3088,11 +3106,6 @@ impl LowerCtx {
                 is_vararg,
                 body,
             } => {
-                if *is_vararg {
-                    return Err(HirError::VarargUnsupported {
-                        offset: stmt.span.start,
-                    });
-                }
                 let &fid = self.function_names.get(name).expect(
                     "lower_function_body's pass 1 always registers nested \
                      FunctionDef names",
@@ -3104,6 +3117,7 @@ impl LowerCtx {
                 lower_into_function(
                     fid,
                     params,
+                    *is_vararg,
                     body,
                     &self.function_names,
                     &self.method_funcs,
@@ -4605,12 +4619,16 @@ impl LowerCtx {
             },
             ExprKind::Bool(b) => HirExprKind::Bool(*b),
             ExprKind::Nil => HirExprKind::Nil,
-            // ADR 0293 — F1-A: `...` in expression position. HIR
-            // wiring is F1-B; today the compiler refuses to lower.
+            // ADR 0294 — F1-B: lowers to the HIR placeholder inside
+            // a vararg function; outside, HIR raises `VarargUnsupported`
+            // (Lua spec: `...` outside a vararg function is an error).
             ExprKind::Vararg => {
-                return Err(HirError::VarargUnsupported {
-                    offset: expr.span.start,
-                });
+                if !self.in_vararg_function {
+                    return Err(HirError::VarargUnsupported {
+                        offset: expr.span.start,
+                    });
+                }
+                HirExprKind::Vararg
             }
             ExprKind::BinOp { op, lhs, rhs } => {
                 let lhs_hir = self.lower_expr(lhs)?;
@@ -4946,6 +4964,7 @@ impl LowerCtx {
                         body: Vec::new(),
                         ret_kinds: Vec::new(),
                         parent_scope,
+                        is_vararg: false,
                     });
                     id
                 };

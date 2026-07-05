@@ -108,6 +108,11 @@ pub struct HirFunction {
     /// resolve each upvalue's `outer_local_id` to the correct
     /// scope's `locals` table.
     pub parent_scope: ParentScope,
+    /// ADR 0294 — F1-B: `function(..)` trailing `...` was present.
+    /// HIR now carries the flag alongside `params`; codegen (F1-C)
+    /// consumes it to add a hidden variadic-pack parameter to the
+    /// MLIR signature and to expand `...` at call sites.
+    pub is_vararg: bool,
 }
 
 /// Phase 2.5c-full Commit 3 (ADR 0083): identifies the lexical
@@ -264,6 +269,11 @@ pub enum HirExprKind {
     Str(String),
     Bool(bool),
     Nil,
+    /// ADR 0294 — F1-B: `...` in a vararg function body. HIR-level
+    /// placeholder for the variadic pack; codegen (F1-C) expands it
+    /// per call context. `infer_kind` returns `TaggedValue` because
+    /// each variadic element carries a runtime tag.
+    Vararg,
     Local(LocalId),
     BinOp {
         op: BinOp,
