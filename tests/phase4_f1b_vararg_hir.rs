@@ -1,8 +1,9 @@
 //! ADR 0294 — F1-B: HIR representation of `...`.
-//! Codegen still errors — that's F1-C's job. These tests exercise
-//! the HIR lowering only.
+//! ADR 0296 — F1-C-step2 upgraded the lowering: `...` now reads
+//! `_va_pack[1]` and the synthetic Table param is appended to
+//! vararg function signatures. These tests pin the HIR shape.
 
-use lumelir::hir::{HirExprKind, HirStmtKind, lower};
+use lumelir::hir::lower;
 use lumelir::parser::parse;
 
 fn lower_src(src: &str) -> Result<lumelir::hir::HirChunk, lumelir::hir::HirError> {
@@ -25,52 +26,15 @@ fn hir_marks_non_vararg_function() {
     assert!(!chunk.functions[0].is_vararg);
 }
 
-fn body_contains_vararg(stmts: &[lumelir::hir::HirStmt]) -> bool {
-    for s in stmts {
-        match &s.kind {
-            HirStmtKind::LocalInit { value, .. } | HirStmtKind::Assign { value, .. }
-                if matches!(value.kind, HirExprKind::Vararg) =>
-            {
-                return true;
-            }
-            HirStmtKind::If {
-                then_body,
-                elifs,
-                else_body,
-                ..
-            } => {
-                if body_contains_vararg(then_body) {
-                    return true;
-                }
-                for (_, elif_body) in elifs {
-                    if body_contains_vararg(elif_body) {
-                        return true;
-                    }
-                }
-                if let Some(eb) = else_body
-                    && body_contains_vararg(eb)
-                {
-                    return true;
-                }
-            }
-            HirStmtKind::While { body, .. } if body_contains_vararg(body) => return true,
-            HirStmtKind::Block { stmts } if body_contains_vararg(stmts) => return true,
-            _ => {}
-        }
-    }
-    false
-}
-
 #[test]
 fn hir_lowers_vararg_expr_in_body() {
     let chunk = lower_src("local function f(...) local t = ... end").expect("hir ok");
     assert_eq!(chunk.functions.len(), 1);
     let f = &chunk.functions[0];
     assert!(f.is_vararg);
-    assert!(
-        body_contains_vararg(&f.body),
-        "expected HirExprKind::Vararg somewhere in body"
-    );
+    // ADR 0296 step2: `_va_pack` is appended as the last param.
+    let last = f.params.last().expect("has at least the pack");
+    assert_eq!(last.name, "_va_pack");
 }
 
 #[test]

@@ -1567,12 +1567,19 @@ fn lower_into_function(
         &external_kinds,
         outer_visible,
         fid,
+        is_vararg,
     );
-    sub_ctx.in_vararg_function = is_vararg;
     functions[fid.0].is_vararg = is_vararg;
     let body_hir = sub_ctx.lower_function_body(body)?;
     let ret_kinds = sub_ctx.in_function_ret_kinds.unwrap_or_default();
-    functions[fid.0].params = sub_ctx.locals[..params.len()].to_vec();
+    // ADR 0296 — vararg fns include `_va_pack` at position params.len().
+    let declared_arity = params.len();
+    let effective_arity = if is_vararg {
+        declared_arity + 1
+    } else {
+        declared_arity
+    };
+    functions[fid.0].params = sub_ctx.locals[..effective_arity].to_vec();
     functions[fid.0].upvalues = sub_ctx.upvalues;
     functions[fid.0].locals = sub_ctx.locals;
     functions[fid.0].body = body_hir;
@@ -2008,8 +2015,15 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
     // declaration must precede the source-order walk so forward
     // references resolve.
     for stmt in chunk {
-        if let StmtKind::FunctionDef { name, params, .. } = &stmt.kind {
-            let arity = params.len();
+        if let StmtKind::FunctionDef {
+            name,
+            params,
+            is_vararg,
+            ..
+        } = &stmt.kind
+        {
+            // ADR 0296 — vararg fns' effective arity includes `_va_pack`.
+            let arity = params.len() + if *is_vararg { 1 } else { 0 };
             let fid = ctx.function_names[name];
             ctx.declare_local_with_func_id(name.clone(), ValueKind::Function(arity), Some(fid));
         }
@@ -2573,6 +2587,7 @@ impl LowerCtx {
     /// body-pre-scan wins for Function (body-callsite is decisive);
     /// `external_kinds` wins otherwise.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn for_function(
         function_names: &HashMap<String, FuncId>,
         method_funcs: &HashMap<(Vec<String>, String), FuncId>,
@@ -2583,6 +2598,7 @@ impl LowerCtx {
         external_kinds: &[ValueKind],
         outer_visible: HashMap<String, (LocalId, ValueKind)>,
         containing_fn: FuncId,
+        is_vararg: bool,
     ) -> Self {
         let mut ctx = Self::new(
             function_names.clone(),
@@ -2605,6 +2621,14 @@ impl LowerCtx {
                 external_kinds[i]
             };
             ctx.declare_local(p.clone(), kind);
+        }
+        // ADR 0296 — F1-C-step2: append synthetic `_va_pack` Table
+        // param for vararg fns. Codegen sees it like any other Table
+        // param; `HirExprKind::Vararg` in the body lowers to
+        // Index(_va_pack, 1). Call sites pass a fresh Table.
+        if is_vararg {
+            ctx.declare_local("_va_pack".to_owned(), ValueKind::Table);
+            ctx.in_vararg_function = true;
         }
         ctx
     }
@@ -2714,8 +2738,15 @@ impl LowerCtx {
         // `emit_call_user_with_cell` cutover load the closure cell
         // ptr from the local's slot.
         for s in stmts {
-            if let StmtKind::FunctionDef { name, params, .. } = &s.kind {
-                let arity = params.len();
+            if let StmtKind::FunctionDef {
+                name,
+                params,
+                is_vararg,
+                ..
+            } = &s.kind
+            {
+                // ADR 0296 — effective arity includes `_va_pack`.
+                let arity = params.len() + if *is_vararg { 1 } else { 0 };
                 let fid = self.function_names[name];
                 self.declare_local_with_func_id(
                     name.clone(),
@@ -4622,16 +4653,29 @@ impl LowerCtx {
             },
             ExprKind::Bool(b) => HirExprKind::Bool(*b),
             ExprKind::Nil => HirExprKind::Nil,
-            // ADR 0294 — F1-B: lowers to the HIR placeholder inside
-            // a vararg function; outside, HIR raises `VarargUnsupported`
-            // (Lua spec: `...` outside a vararg function is an error).
+            // ADR 0296 — F1-C-step2: `...` in single-value position
+            // lowers to `_va_pack[1]`. The synthetic `_va_pack` Table
+            // param was appended by `for_function` when the enclosing
+            // fn is vararg; here we resolve its LocalId by name.
             ExprKind::Vararg => {
                 if !self.in_vararg_function {
                     return Err(HirError::VarargUnsupported {
                         offset: expr.span.start,
                     });
                 }
-                HirExprKind::Vararg
+                let pack_id = self
+                    .resolve("_va_pack")
+                    .expect("vararg function must have `_va_pack` param declared by for_function");
+                HirExprKind::Index {
+                    target: Box::new(HirExpr {
+                        kind: HirExprKind::Local(pack_id),
+                        span: expr.span,
+                    }),
+                    key: Box::new(HirExpr {
+                        kind: HirExprKind::Integer(1),
+                        span: expr.span,
+                    }),
+                }
             }
             ExprKind::BinOp { op, lhs, rhs } => {
                 let lhs_hir = self.lower_expr(lhs)?;
@@ -4921,11 +4965,7 @@ impl LowerCtx {
                 is_vararg,
                 body,
             } => {
-                if *is_vararg {
-                    return Err(HirError::VarargUnsupported {
-                        offset: expr.span.start,
-                    });
-                }
+                let is_vararg = *is_vararg;
                 // ADR 0141 — if Pass-2 chunk walker armed a
                 // pre-allocated FuncId for this FunctionExpr (top-
                 // level `IndexAssign(chain, Str(key), FunctionExpr)`
@@ -4989,7 +5029,9 @@ impl LowerCtx {
                     &external_kinds,
                     outer_visible,
                     id,
+                    is_vararg,
                 );
+                self.functions[id.0].is_vararg = is_vararg;
                 let body_hir = fn_ctx.lower_function_body(body)?;
                 let ret_kinds = fn_ctx.in_function_ret_kinds.unwrap_or_default();
                 self.functions[id.0].params = fn_ctx.locals[..params.len()].to_vec();
@@ -5437,33 +5479,48 @@ impl LowerCtx {
         // emit `Callee::Indirect`.
         if let Some(local_id) = self.resolve(name) {
             if let ValueKind::Function(arity) = self.locals[local_id.0].kind {
-                // ADR 0295 — F1-C-step1: vararg callees accept extra
-                // args beyond `arity`. The extras are silently dropped
-                // in the stub (real spread lands step2/3).
+                // ADR 0296 — F1-C-step2: `arity` here is the effective
+                // arity stored on `ValueKind::Function` — includes the
+                // synthetic `_va_pack` slot for vararg fns. Declared
+                // (user-visible) arity = arity - 1 when vararg.
                 let target_is_vararg = self.locals[local_id.0]
                     .func_id
                     .is_some_and(|fid| self.functions[fid.0].is_vararg);
+                let declared_arity = if target_is_vararg { arity - 1 } else { arity };
                 let arity_ok = if target_is_vararg {
-                    args.len() >= arity
+                    args.len() >= declared_arity
                 } else {
-                    args.len() == arity
+                    args.len() == declared_arity
                 };
                 if !arity_ok {
                     return Err(HirError::ArityMismatch {
                         builtin: name.clone(),
-                        expected: arity,
+                        expected: declared_arity,
                         actual: args.len(),
                         offset: whole.span.start,
                     });
                 }
-                // Truncate lowered args to declared arity so downstream
-                // codegen paths (kind checks, direct-call ABI) see only
-                // the declared params.
-                let args_slice = &args[..arity.min(args.len())];
-                let lowered_args = args_slice
+                // Lower declared args normally.
+                let declared_slice = &args[..declared_arity.min(args.len())];
+                let mut lowered_args = declared_slice
                     .iter()
                     .map(|a| self.lower_expr(a))
                     .collect::<Result<Vec<_>, _>>()?;
+                // ADR 0296 — pack extras into a Table as the last arg.
+                if target_is_vararg {
+                    let extras = if args.len() > declared_arity {
+                        args[declared_arity..]
+                            .iter()
+                            .map(|a| self.lower_expr(a))
+                            .collect::<Result<Vec<_>, _>>()?
+                    } else {
+                        Vec::new()
+                    };
+                    lowered_args.push(HirExpr {
+                        kind: HirExprKind::Table(extras),
+                        span: whole.span,
+                    });
+                }
                 // Phase 2.5c-full Commit 3b prep fix (ADR 0083):
                 // when the local resolves to a known user fn (e.g.
                 // synthetic FunctionDef local), check per-arg
@@ -6344,6 +6401,7 @@ impl LowerCtx {
             &external_kinds,
             outer_visible,
             id,
+            false,
         );
         let body_hir = fn_ctx.lower_function_body(body)?;
         let ret_kinds = fn_ctx.in_function_ret_kinds.unwrap_or_default();
