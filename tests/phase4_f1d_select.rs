@@ -68,3 +68,32 @@ f(1, 2, 3, 4, 5)",
     );
     assert_eq!(out.trim(), "3");
 }
+
+#[test]
+fn table_pack_sets_n_and_elements() {
+    // ADR 0299 — table.pack(...) → pack alias + hoisted `.n` write.
+    let out = run_ok(
+        "local function f(...)
+    local t = table.pack(...)
+    print(t.n)
+    print(t[2])
+end
+f(10, 20, 30)",
+        "f1d_pack_n",
+    );
+    let lines: Vec<&str> = out.trim().split('\n').collect();
+    assert_eq!(lines, vec!["3", "20"]);
+}
+
+#[test]
+fn table_pack_empty() {
+    let out = run_ok(
+        "local function f(...)
+    local t = table.pack(...)
+    print(t.n)
+end
+f()",
+        "f1d_pack_empty",
+    );
+    assert_eq!(out.trim(), "0");
+}

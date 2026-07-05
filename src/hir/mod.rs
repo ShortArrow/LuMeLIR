@@ -5355,6 +5355,43 @@ impl LowerCtx {
                 key: Box::new(n_hir),
             });
         }
+        // ADR 0299 — F1-D: `table.pack(...)` desugars to the pack
+        // alias + a hoisted `pack.n = #pack` write. Alias (not copy)
+        // — same documented deviation as `{...}` in ADR 0298.
+        if let ExprKind::Index { target, key } = &callee.kind
+            && matches!(&target.kind, ExprKind::Ident(ns) if ns == "table")
+            && matches!(&key.kind, ExprKind::Str(m) if m == "pack")
+            && args.len() == 1
+            && matches!(args[0].kind, ExprKind::Vararg)
+            && self.in_vararg_function
+        {
+            let pack_id = self
+                .resolve("_va_pack")
+                .expect("vararg function must have `_va_pack` declared by for_function");
+            let span = whole.span;
+            let pack = |span| HirExpr {
+                kind: HirExprKind::Local(pack_id),
+                span,
+            };
+            self.pending_pre_stmts.push(HirStmt {
+                kind: HirStmtKind::IndexAssign {
+                    target: pack(span),
+                    key: HirExpr {
+                        kind: HirExprKind::Str("n".to_owned()),
+                        span,
+                    },
+                    value: HirExpr {
+                        kind: HirExprKind::UnaryOp {
+                            op: UnaryOp::Len,
+                            operand: Box::new(pack(span)),
+                        },
+                        span,
+                    },
+                },
+                span,
+            });
+            return Ok(HirExprKind::Local(pack_id));
+        }
         // ADR 0146 — Table-callable. `t(args)` where `t` resolves to
         // a Table-kind Local lowers to `Callee::TableCall` carrying
         // the receiver Local + sig + compile-time candidate set.
