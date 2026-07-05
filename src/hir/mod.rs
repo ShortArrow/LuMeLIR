@@ -199,8 +199,12 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
         HirExprKind::Integer(_) => ValueKind::Number,
         HirExprKind::Bool(_) => ValueKind::Bool,
         HirExprKind::Nil => ValueKind::Nil,
-        // ADR 0294 — F1-B: variadic pack. Elements carry a runtime tag.
-        HirExprKind::Vararg => ValueKind::TaggedValue,
+        // ADR 0294 — F1-B declared `TaggedValue` since each element
+        // carries a tag. ADR 0295 — F1-C-step1 downgrades this to
+        // `Nil` because the current stub evaluates `...` to a
+        // literal nil. Real pack materialisation (step2/3) will
+        // restore `TaggedValue`.
+        HirExprKind::Vararg => ValueKind::Nil,
         HirExprKind::Str(_) => ValueKind::String,
         HirExprKind::Table(_) => ValueKind::Table,
         // Phase 2.6a-arr (ADR 0054): Number-only arrays mean
@@ -5433,7 +5437,18 @@ impl LowerCtx {
         // emit `Callee::Indirect`.
         if let Some(local_id) = self.resolve(name) {
             if let ValueKind::Function(arity) = self.locals[local_id.0].kind {
-                if args.len() != arity {
+                // ADR 0295 — F1-C-step1: vararg callees accept extra
+                // args beyond `arity`. The extras are silently dropped
+                // in the stub (real spread lands step2/3).
+                let target_is_vararg = self.locals[local_id.0]
+                    .func_id
+                    .is_some_and(|fid| self.functions[fid.0].is_vararg);
+                let arity_ok = if target_is_vararg {
+                    args.len() >= arity
+                } else {
+                    args.len() == arity
+                };
+                if !arity_ok {
                     return Err(HirError::ArityMismatch {
                         builtin: name.clone(),
                         expected: arity,
@@ -5441,7 +5456,11 @@ impl LowerCtx {
                         offset: whole.span.start,
                     });
                 }
-                let lowered_args = args
+                // Truncate lowered args to declared arity so downstream
+                // codegen paths (kind checks, direct-call ABI) see only
+                // the declared params.
+                let args_slice = &args[..arity.min(args.len())];
+                let lowered_args = args_slice
                     .iter()
                     .map(|a| self.lower_expr(a))
                     .collect::<Result<Vec<_>, _>>()?;
