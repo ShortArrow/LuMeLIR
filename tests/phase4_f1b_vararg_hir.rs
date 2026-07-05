@@ -53,16 +53,8 @@ fn body_contains_vararg(stmts: &[lumelir::hir::HirStmt]) -> bool {
                     return true;
                 }
             }
-            HirStmtKind::While { body, .. } => {
-                if body_contains_vararg(body) {
-                    return true;
-                }
-            }
-            HirStmtKind::Block { stmts } => {
-                if body_contains_vararg(stmts) {
-                    return true;
-                }
-            }
+            HirStmtKind::While { body, .. } if body_contains_vararg(body) => return true,
+            HirStmtKind::Block { stmts } if body_contains_vararg(stmts) => return true,
             _ => {}
         }
     }
