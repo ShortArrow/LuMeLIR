@@ -1540,7 +1540,6 @@ fn alloc_method_signature(
 /// fills in `functions[fid.0]`, and hoists any anonymous functions
 /// registered during inner lowering into the outer table.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn lower_into_function(
     fid: FuncId,
     params: &[String],
