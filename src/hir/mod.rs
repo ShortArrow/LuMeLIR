@@ -5050,6 +5050,31 @@ impl LowerCtx {
             // upvalues is rejected via the existing
             // `ClosureEscapes` analysis.
             ExprKind::Table(fields) => {
+                // ADR 0298 — F1-C-step3-partial: `{...}` (sole
+                // positional Vararg field) lowers to an ALIAS of the
+                // enclosing fn's `_va_pack`. Documented deviation:
+                // Lua spec creates a fresh copy; the alias shares
+                // mutation with subsequent `...` reads. Enables the
+                // `#{...}` count idiom and pack re-use today; a
+                // copying desugar replaces this in step3-final.
+                if fields.len() == 1
+                    && matches!(
+                        fields[0],
+                        crate::parser::TableField::Positional(Expr {
+                            kind: ExprKind::Vararg,
+                            ..
+                        })
+                    )
+                    && self.in_vararg_function
+                {
+                    let pack_id = self
+                        .resolve("_va_pack")
+                        .expect("vararg function must have `_va_pack` declared by for_function");
+                    return Ok(HirExpr {
+                        kind: HirExprKind::Local(pack_id),
+                        span: expr.span,
+                    });
+                }
                 // ADR 0199 — split fields into positional (initial
                 // table array) and keyed (post-init IndexAssign
                 // pre-statements). Keyed-only or mixed tables are
@@ -5508,18 +5533,36 @@ impl LowerCtx {
                     .collect::<Result<Vec<_>, _>>()?;
                 // ADR 0296 — pack extras into a Table as the last arg.
                 if target_is_vararg {
-                    let extras = if args.len() > declared_arity {
-                        args[declared_arity..]
-                            .iter()
-                            .map(|a| self.lower_expr(a))
-                            .collect::<Result<Vec<_>, _>>()?
+                    // ADR 0298 — F1-C-step3-partial: pack forwarding.
+                    // `inner(...)` with `...` as the sole extra forwards
+                    // the caller's own pack by reference so ALL extras
+                    // pass through (full multi-value semantics for the
+                    // pass-through shape), not just the first.
+                    let sole_extra_is_vararg = args.len() == declared_arity + 1
+                        && matches!(args[declared_arity].kind, ExprKind::Vararg)
+                        && self.in_vararg_function;
+                    if sole_extra_is_vararg {
+                        let pack_id = self.resolve("_va_pack").expect(
+                            "vararg function must have `_va_pack` declared by for_function",
+                        );
+                        lowered_args.push(HirExpr {
+                            kind: HirExprKind::Local(pack_id),
+                            span: whole.span,
+                        });
                     } else {
-                        Vec::new()
-                    };
-                    lowered_args.push(HirExpr {
-                        kind: HirExprKind::Table(extras),
-                        span: whole.span,
-                    });
+                        let extras = if args.len() > declared_arity {
+                            args[declared_arity..]
+                                .iter()
+                                .map(|a| self.lower_expr(a))
+                                .collect::<Result<Vec<_>, _>>()?
+                        } else {
+                            Vec::new()
+                        };
+                        lowered_args.push(HirExpr {
+                            kind: HirExprKind::Table(extras),
+                            span: whole.span,
+                        });
+                    }
                 }
                 // Phase 2.5c-full Commit 3b prep fix (ADR 0083):
                 // when the local resolves to a known user fn (e.g.

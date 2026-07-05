@@ -32,25 +32,57 @@ print(\"ok\")",
 }
 
 #[test]
-fn vararg_no_extras_traps_or_nils() {
-    // step2: with zero extras, `_va_pack` is an empty Table.
-    // Reading `_va_pack[1]` today traps at OOB — documented
-    // deviation until step3 adds an empty-check.
-    let src = "local function f(...) local t = ... print(type(t)) end
-f()";
-    let chunk = lumelir::parser::parse(src).unwrap();
-    let hir = lumelir::hir::lower(&chunk).unwrap();
-    let output = std::env::temp_dir().join("f1c_type_nil");
-    lumelir::codegen::compile(&hir, &output).unwrap();
-    let r = std::process::Command::new(&output)
-        .output()
-        .expect("failed to run");
-    let _ = std::fs::remove_file(&output);
-    // Either exits 0 with "nil" (step3-final) or traps at OOB
-    // (step2 provisional). Both are documented behavior.
-    let out = String::from_utf8_lossy(&r.stdout).into_owned();
-    let ok = (r.status.success() && out.trim() == "nil") || !r.status.success();
-    assert!(ok, "unexpected outcome: {r:?} stdout={out}");
+fn vararg_no_extras_yields_nil() {
+    // With zero extras, `_va_pack` is an empty Table and the
+    // Index nil-on-missing path yields nil — matches Lua.
+    let out = run_ok(
+        "local function f(...) local t = ... print(type(t)) end
+f()",
+        "f1c_type_nil",
+    );
+    assert_eq!(out.trim(), "nil");
+}
+
+#[test]
+fn vararg_table_ctor_counts_extras() {
+    // ADR 0298 — `{...}` aliases the pack; `#` reports extras count.
+    let out = run_ok(
+        "local function count(...) print(#{...}) end
+count(10, 20, 30)",
+        "f1c_pack_count",
+    );
+    assert_eq!(out.trim(), "3");
+}
+
+#[test]
+fn vararg_pack_forwarding_passes_all() {
+    // ADR 0298 — `inner(...)` forwards the whole pack, not just
+    // the first extra.
+    let out = run_ok(
+        "local function fwd(...)
+    local function inner(...) print(#{...}) end
+    inner(...)
+end
+fwd(1, 2, 3, 4)",
+        "f1c_forwarding",
+    );
+    assert_eq!(out.trim(), "4");
+}
+
+#[test]
+fn vararg_pack_elements_readable_by_index() {
+    // Pack elements are ordinary table reads.
+    let out = run_ok(
+        "local function f(...)
+    local t = {...}
+    print(t[1])
+    print(t[3])
+end
+f(7, 8, 9)",
+        "f1c_pack_index",
+    );
+    let lines: Vec<&str> = out.trim().split('\n').collect();
+    assert_eq!(lines, vec!["7", "9"]);
 }
 
 #[test]
