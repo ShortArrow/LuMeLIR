@@ -5324,6 +5324,37 @@ impl LowerCtx {
         args: &[Expr],
         whole: &Expr,
     ) -> Result<HirExprKind, HirError> {
+        // ADR 0299 — F1-D: `select(...)` desugars at HIR when the
+        // second arg is `...` inside a vararg fn.
+        //   select("#", ...) → #_va_pack   (extras count)
+        //   select(n, ...)   → _va_pack[n] (single value; Lua's
+        //                       multi-value tail is truncated — the
+        //                       usual single-position deviation)
+        if let ExprKind::Ident(name) = &callee.kind
+            && name == "select"
+            && args.len() == 2
+            && matches!(args[1].kind, ExprKind::Vararg)
+            && self.in_vararg_function
+        {
+            let pack_id = self
+                .resolve("_va_pack")
+                .expect("vararg function must have `_va_pack` declared by for_function");
+            let pack_expr = HirExpr {
+                kind: HirExprKind::Local(pack_id),
+                span: whole.span,
+            };
+            if matches!(&args[0].kind, ExprKind::Str(s) if s == "#") {
+                return Ok(HirExprKind::UnaryOp {
+                    op: UnaryOp::Len,
+                    operand: Box::new(pack_expr),
+                });
+            }
+            let n_hir = self.lower_expr(&args[0])?;
+            return Ok(HirExprKind::Index {
+                target: Box::new(pack_expr),
+                key: Box::new(n_hir),
+            });
+        }
         // ADR 0146 — Table-callable. `t(args)` where `t` resolves to
         // a Table-kind Local lowers to `Callee::TableCall` carrying
         // the receiver Local + sig + compile-time candidate set.
