@@ -14468,36 +14468,19 @@ fn emit_expr<'a, 'c>(
                 let out_slot =
                     emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
                 let arg_expr = &args[0];
-                // ADR 0232 — M8-A. Local-args propagate via
-                // `LocalInfo::subtype` so `local i = 1;
-                // math.type(i)` returns "integer".
-                let local_subtype = if let HirExprKind::Local(LocalId(idx)) = &arg_expr.kind {
-                    if matches!(locals[*idx].kind, ValueKind::Number) {
-                        Some(locals[*idx].subtype)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                match (&arg_expr.kind, local_subtype) {
-                    (HirExprKind::Integer(_), _) => {
+                // ADR 0301 — F2-R2: one classifier covers literals,
+                // Local subtypes (ADR 0232) AND BinOp results
+                // (`math.type(10 / 4)` → "float" per Lua §3.4.1).
+                match crate::hir::classify_number_subtype(arg_expr, locals) {
+                    crate::hir::NumberSubtype::Integer => {
                         let s = emit_addressof(context, block, "s_subtypename_integer", types, loc);
                         emit_value_slot_store_string(context, block, out_slot, s, types, loc);
                     }
-                    (HirExprKind::Number(_), _) => {
+                    crate::hir::NumberSubtype::Float => {
                         let s = emit_addressof(context, block, "s_subtypename_float", types, loc);
                         emit_value_slot_store_string(context, block, out_slot, s, types, loc);
                     }
-                    (_, Some(crate::hir::NumberSubtype::Integer)) => {
-                        let s = emit_addressof(context, block, "s_subtypename_integer", types, loc);
-                        emit_value_slot_store_string(context, block, out_slot, s, types, loc);
-                    }
-                    (_, Some(crate::hir::NumberSubtype::Float)) => {
-                        let s = emit_addressof(context, block, "s_subtypename_float", types, loc);
-                        emit_value_slot_store_string(context, block, out_slot, s, types, loc);
-                    }
-                    _ => {
+                    crate::hir::NumberSubtype::Unknown => {
                         emit_value_slot_store_nil(context, block, out_slot, types, loc);
                     }
                 }
