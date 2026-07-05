@@ -28,10 +28,10 @@ fn hir_marks_non_vararg_function() {
 fn body_contains_vararg(stmts: &[lumelir::hir::HirStmt]) -> bool {
     for s in stmts {
         match &s.kind {
-            HirStmtKind::LocalInit { value, .. } | HirStmtKind::Assign { value, .. } => {
-                if matches!(value.kind, HirExprKind::Vararg) {
-                    return true;
-                }
+            HirStmtKind::LocalInit { value, .. } | HirStmtKind::Assign { value, .. }
+                if matches!(value.kind, HirExprKind::Vararg) =>
+            {
+                return true;
             }
             HirStmtKind::If {
                 then_body,
