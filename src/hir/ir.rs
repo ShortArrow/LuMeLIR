@@ -1606,9 +1606,11 @@ impl Builtin {
             Builtin::RustFail => &[ValueKind::String],
             // ADR 0201 — string.reverse(s) — String arg.
             Builtin::StringReverse => &[ValueKind::String],
-            // ADR 0210 — math.type accepts any Number-kind arg
-            // (subtype distinction is shape-based at HIR).
-            Builtin::MathType => &[ValueKind::Number],
+            // ADR 0210 — subtype distinction is shape-based at HIR.
+            // ADR 0302 — F2-R3: Lua spec returns nil for ANY
+            // non-number value rather than erroring, so the gate
+            // uses the TaggedValue "any" sentinel (ADR 0111).
+            Builtin::MathType => &[ValueKind::TaggedValue],
             // ADR 0211 — math.tointeger accepts Number.
             Builtin::MathToInteger => &[ValueKind::Number],
             // ADR 0274 — math.ult takes two Numbers (treated as i64).
