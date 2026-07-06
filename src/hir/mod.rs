@@ -2254,11 +2254,27 @@ pub fn classify_number_subtype(value: &HirExpr, locals: &[LocalInfo]) -> NumberS
 ///
 /// ADR 0305 — F2-R1-b widens store RHS from Integer literals to
 /// pure integer trees (see [`is_gate_int_expr`]).
+/// ADR 0306 — F2-R1-c step 2: `true` for a comparison BinOp whose
+/// operands are both pure integer trees. The Bool result is stored
+/// through a dedicated cmpi codegen branch (no f64 round-trip).
+pub fn is_gate_int_comparison(e: &HirExpr, locals: &[LocalInfo]) -> bool {
+    match &e.kind {
+        HirExprKind::BinOp { op, lhs, rhs } => {
+            matches!(
+                op,
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+            ) && is_gate_int_expr(lhs, locals)
+                && is_gate_int_expr(rhs, locals)
+        }
+        _ => false,
+    }
+}
+
 fn mark_integer_slot_eligible(stmts: &[HirStmt], locals: &mut [LocalInfo]) {
     for s in stmts {
         let ok = match &s.kind {
             HirStmtKind::LocalInit { value, .. } | HirStmtKind::Assign { value, .. } => {
-                is_gate_int_expr(value, locals)
+                is_gate_int_expr(value, locals) || is_gate_int_comparison(value, locals)
             }
             HirStmtKind::ExprStmt(e) => match &e.kind {
                 HirExprKind::Call {

@@ -4344,6 +4344,25 @@ fn emit_lumelir_next_function<'c>(
     );
 }
 
+/// ADR 0306 — F2-R1-c step 2: codegen-side integer-tree check keyed
+/// on `int_slot` flags (NOT on subtype — a chunk that bailed the
+/// HIR gate has Integer-subtyped locals still living in f64 slots,
+/// and this check must reject those).
+fn int_tree_on_slots(e: &HirExpr, locals: &[LocalInfo]) -> bool {
+    match &e.kind {
+        HirExprKind::Integer(_) => true,
+        HirExprKind::Local(LocalId(idx)) => locals[*idx].int_slot,
+        HirExprKind::BinOp { op, lhs, rhs } => {
+            matches!(
+                op,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::FloorDiv | BinOp::Mod
+            ) && int_tree_on_slots(lhs, locals)
+                && int_tree_on_slots(rhs, locals)
+        }
+        _ => false,
+    }
+}
+
 /// ADR 0305 — F2-R1-b: emit a pure integer tree as i64 arithmetic.
 /// Shapes are pre-validated by `is_gate_int_expr` (Integer literal,
 /// `int_slot` Local, `+ - *` BinOp). Wraparound is LLVM's natural
@@ -4562,6 +4581,37 @@ fn emit_stmt<'a, 'c>(
             if info.int_slot {
                 let v = emit_int_expr(context, block, value, slots, locals, types, loc);
                 emit_store(block, v, slots[id.0], loc);
+                return Ok(());
+            }
+            // ADR 0306 — F2-R1-c step 2: Bool local ← comparison over
+            // int-slot trees. Emit i64 operands + cmpi so int slots
+            // never round-trip through the generic f64 path.
+            if matches!(info.kind, ValueKind::Bool)
+                && let HirExprKind::BinOp { op, lhs, rhs } = &value.kind
+                && matches!(
+                    op,
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                )
+                && int_tree_on_slots(lhs, locals)
+                && int_tree_on_slots(rhs, locals)
+            {
+                let l = emit_int_expr(context, block, lhs, slots, locals, types, loc);
+                let r = emit_int_expr(context, block, rhs, slots, locals, types, loc);
+                let pred = match op {
+                    BinOp::Eq => arith::CmpiPredicate::Eq,
+                    BinOp::Ne => arith::CmpiPredicate::Ne,
+                    BinOp::Lt => arith::CmpiPredicate::Slt,
+                    BinOp::Le => arith::CmpiPredicate::Sle,
+                    BinOp::Gt => arith::CmpiPredicate::Sgt,
+                    BinOp::Ge => arith::CmpiPredicate::Sge,
+                    _ => unreachable!(),
+                };
+                let b: Value<'c, '_> = block
+                    .append_operation(arith::cmpi(context, pred, l, r, loc))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                emit_store(block, b, slots[id.0], loc);
                 return Ok(());
             }
             match info.kind {

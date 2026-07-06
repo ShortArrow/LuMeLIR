@@ -86,3 +86,29 @@ print(q)";
         "wrong message: {all}"
     );
 }
+
+#[test]
+fn wraparound_equality_end_to_end() {
+    // The full ADR 0300 probe: maxinteger + 1 == mininteger.
+    let out = run_ok(
+        "local m = math.maxinteger
+local w = m + 1
+local mn = math.mininteger
+local eq = w == mn
+print(eq)",
+        "f2r1c_wrap_eq",
+    );
+    assert_eq!(out.trim(), "true");
+}
+
+#[test]
+fn int_comparison_lt() {
+    let out = run_ok(
+        "local a = 9007199254740993
+local b = 9007199254740992
+local lt = b < a
+print(lt)",
+        "f2r1c_lt",
+    );
+    assert_eq!(out.trim(), "true");
+}
