@@ -4335,6 +4335,53 @@ fn emit_lumelir_next_function<'c>(
     );
 }
 
+/// ADR 0305 — F2-R1-b: emit a pure integer tree as i64 arithmetic.
+/// Shapes are pre-validated by `is_gate_int_expr` (Integer literal,
+/// `int_slot` Local, `+ - *` BinOp). Wraparound is LLVM's natural
+/// i64 two's-complement overflow, matching Lua §3.4.1.
+fn emit_int_expr<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    expr: &HirExpr,
+    slots: &[Value<'c, 'a>],
+    locals: &[LocalInfo],
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    match &expr.kind {
+        HirExprKind::Integer(i) => block
+            .append_operation(arith::constant(
+                context,
+                IntegerAttribute::new(types.i64, *i).into(),
+                loc,
+            ))
+            .result(0)
+            .unwrap()
+            .into(),
+        HirExprKind::Local(LocalId(idx)) => {
+            debug_assert!(
+                locals[*idx].int_slot,
+                "emit_int_expr Local without int_slot — gate violated"
+            );
+            emit_load(block, slots[*idx], types.i64, loc)
+        }
+        HirExprKind::BinOp { op, lhs, rhs } => {
+            let l = emit_int_expr(context, block, lhs, slots, locals, types, loc);
+            let r = emit_int_expr(context, block, rhs, slots, locals, types, loc);
+            let op = match op {
+                BinOp::Add => arith::addi(l, r, loc),
+                BinOp::Sub => arith::subi(l, r, loc),
+                BinOp::Mul => arith::muli(l, r, loc),
+                other => {
+                    unreachable!("emit_int_expr BinOp {other:?} — is_gate_int_expr gate violated")
+                }
+            };
+            block.append_operation(op).result(0).unwrap().into()
+        }
+        other => unreachable!("emit_int_expr shape {other:?} — gate violated"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_stmts<'a, 'c>(
     context: &'c Context,
@@ -4390,24 +4437,11 @@ fn emit_stmt<'a, 'c>(
             //     `_ret_value` slot): evaluate the rhs, bridge the
             //     `!func.func` value to `!llvm.ptr`, and store.
             let info = &locals[id.0];
-            // ADR 0304 — F2-R1-a: i64 slot store. The eligibility
-            // gate guarantees the RHS is an Integer literal.
+            // ADR 0304 — F2-R1-a: i64 slot store. ADR 0305 —
+            // F2-R1-b widens the RHS to pure integer trees; the
+            // eligibility gate guarantees the shape.
             if info.int_slot {
-                let HirExprKind::Integer(i) = &value.kind else {
-                    unreachable!(
-                        "int_slot local store with non-Integer RHS — \
-                         mark_integer_slot_eligible gate violated"
-                    );
-                };
-                let v: Value<'c, '_> = block
-                    .append_operation(arith::constant(
-                        context,
-                        IntegerAttribute::new(types.i64, *i).into(),
-                        loc,
-                    ))
-                    .result(0)
-                    .unwrap()
-                    .into();
+                let v = emit_int_expr(context, block, value, slots, locals, types, loc);
                 emit_store(block, v, slots[id.0], loc);
                 return Ok(());
             }

@@ -2251,11 +2251,14 @@ pub fn classify_number_subtype(value: &HirExpr, locals: &[LocalInfo]) -> NumberS
 /// pass entirely (all candidates stay f64). This bail-out keeps
 /// every Local occurrence inside audited codegen sites; ADR 0303's
 /// R1-b/R1-c replace the gate with a real def-use walk.
+///
+/// ADR 0305 — F2-R1-b widens store RHS from Integer literals to
+/// pure integer trees (see [`is_gate_int_expr`]).
 fn mark_integer_slot_eligible(stmts: &[HirStmt], locals: &mut [LocalInfo]) {
     for s in stmts {
         let ok = match &s.kind {
             HirStmtKind::LocalInit { value, .. } | HirStmtKind::Assign { value, .. } => {
-                matches!(value.kind, HirExprKind::Integer(_))
+                is_gate_int_expr(value, locals)
             }
             HirStmtKind::ExprStmt(e) => match &e.kind {
                 HirExprKind::Call {
@@ -2285,6 +2288,28 @@ fn mark_integer_slot_eligible(stmts: &[HirStmt], locals: &mut [LocalInfo]) {
         {
             info.int_slot = true;
         }
+    }
+}
+
+/// ADR 0305 — F2-R1-b: `true` when the expression is a pure
+/// integer tree the i64 emit path can compile: Integer literal,
+/// Number local with Integer subtype, or `+ - *` BinOp over such
+/// trees (wraparound = natural i64 overflow per Lua §3.4.1).
+/// FloorDiv / Mod / bitwise stay excluded until their
+/// floor-semantics fixes land (R1-c).
+pub fn is_gate_int_expr(e: &HirExpr, locals: &[LocalInfo]) -> bool {
+    match &e.kind {
+        HirExprKind::Integer(_) => true,
+        HirExprKind::Local(LocalId(idx)) => {
+            matches!(locals[*idx].kind, ValueKind::Number)
+                && matches!(locals[*idx].subtype, NumberSubtype::Integer)
+        }
+        HirExprKind::BinOp { op, lhs, rhs } => {
+            matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                && is_gate_int_expr(lhs, locals)
+                && is_gate_int_expr(rhs, locals)
+        }
+        _ => false,
     }
 }
 
