@@ -959,6 +959,15 @@ fn emit_fmt_global<'c>(
         "bad argument to 'concat' (number has no integer representation)\0",
         loc,
     );
+    // ADR 0306 — F2-R1-c: integer division / modulo by zero.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_int_div_zero",
+        "attempt to perform 'n//0' or 'n%0' (integer division by zero)\0",
+        loc,
+    );
     emit_string_global(
         context,
         module,
@@ -4368,15 +4377,125 @@ fn emit_int_expr<'a, 'c>(
         HirExprKind::BinOp { op, lhs, rhs } => {
             let l = emit_int_expr(context, block, lhs, slots, locals, types, loc);
             let r = emit_int_expr(context, block, rhs, slots, locals, types, loc);
-            let op = match op {
-                BinOp::Add => arith::addi(l, r, loc),
-                BinOp::Sub => arith::subi(l, r, loc),
-                BinOp::Mul => arith::muli(l, r, loc),
+            match op {
+                BinOp::Add => {
+                    let op = arith::addi(l, r, loc);
+                    block.append_operation(op).result(0).unwrap().into()
+                }
+                BinOp::Sub => {
+                    let op = arith::subi(l, r, loc);
+                    block.append_operation(op).result(0).unwrap().into()
+                }
+                BinOp::Mul => {
+                    let op = arith::muli(l, r, loc);
+                    block.append_operation(op).result(0).unwrap().into()
+                }
+                // ADR 0306 — F2-R1-c: Lua floor semantics (§3.4.1).
+                // Zero divisor traps; quotient/remainder corrected
+                // when the remainder is non-zero and signs differ.
+                BinOp::FloorDiv | BinOp::Mod => {
+                    let zero = block
+                        .append_operation(arith::constant(
+                            context,
+                            IntegerAttribute::new(types.i64, 0).into(),
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let is_zero: Value<'c, '_> = block
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Eq,
+                            r,
+                            zero,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    emit_trap_if(context, block, is_zero, "s_int_div_zero", types, loc);
+                    let rem: Value<'c, '_> = block
+                        .append_operation(arith::remsi(l, r, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    // needs_fix = (rem != 0) && ((rem ^ r) < 0)
+                    let rem_nz: Value<'c, '_> = block
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Ne,
+                            rem,
+                            zero,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let sign_mix: Value<'c, '_> = block
+                        .append_operation(arith::xori(rem, r, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let signs_differ: Value<'c, '_> = block
+                        .append_operation(arith::cmpi(
+                            context,
+                            arith::CmpiPredicate::Slt,
+                            sign_mix,
+                            zero,
+                            loc,
+                        ))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    let needs_fix: Value<'c, '_> = block
+                        .append_operation(arith::andi(rem_nz, signs_differ, loc))
+                        .result(0)
+                        .unwrap()
+                        .into();
+                    if matches!(op, BinOp::FloorDiv) {
+                        let q: Value<'c, '_> = block
+                            .append_operation(arith::divsi(l, r, loc))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let one = block
+                            .append_operation(arith::constant(
+                                context,
+                                IntegerAttribute::new(types.i64, 1).into(),
+                                loc,
+                            ))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        let corr: Value<'c, '_> = block
+                            .append_operation(arith::select(needs_fix, one, zero, loc))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        block
+                            .append_operation(arith::subi(q, corr, loc))
+                            .result(0)
+                            .unwrap()
+                            .into()
+                    } else {
+                        // Mod: rem + (needs_fix ? r : 0)
+                        let corr: Value<'c, '_> = block
+                            .append_operation(arith::select(needs_fix, r, zero, loc))
+                            .result(0)
+                            .unwrap()
+                            .into();
+                        block
+                            .append_operation(arith::addi(rem, corr, loc))
+                            .result(0)
+                            .unwrap()
+                            .into()
+                    }
+                }
                 other => {
                     unreachable!("emit_int_expr BinOp {other:?} — is_gate_int_expr gate violated")
                 }
-            };
-            block.append_operation(op).result(0).unwrap().into()
+            }
         }
         other => unreachable!("emit_int_expr shape {other:?} — gate violated"),
     }

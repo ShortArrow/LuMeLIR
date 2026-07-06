@@ -2305,8 +2305,12 @@ pub fn is_gate_int_expr(e: &HirExpr, locals: &[LocalInfo]) -> bool {
                 && matches!(locals[*idx].subtype, NumberSubtype::Integer)
         }
         HirExprKind::BinOp { op, lhs, rhs } => {
-            matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
-                && is_gate_int_expr(lhs, locals)
+            // ADR 0306 — F2-R1-c adds FloorDiv/Mod (floor-corrected
+            // i64 emission with zero-divisor trap).
+            matches!(
+                op,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::FloorDiv | BinOp::Mod
+            ) && is_gate_int_expr(lhs, locals)
                 && is_gate_int_expr(rhs, locals)
         }
         _ => false,
