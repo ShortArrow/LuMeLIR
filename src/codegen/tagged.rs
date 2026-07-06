@@ -269,6 +269,30 @@ pub(crate) fn policy_for_tagged_arith_operand(tag: i64) -> TaggedArithOperandPla
 /// payload at offset 8); every other kind is a single element of
 /// the natural MLIR type. Phase 2.6c-tag-locals (ADR 0063) added
 /// the TaggedValue branch.
+/// ADR 0304 — F2-R1-a: single-i64 slot for an `int_slot` Number
+/// local (exact 64-bit integer round-trips; f64 slots lose
+/// precision beyond 2^53).
+pub(crate) fn emit_alloca_int_slot<'a, 'c>(
+    context: &'c Context,
+    block: &'a Block<'c>,
+    types: &Types<'c>,
+    loc: Location<'c>,
+) -> Value<'c, 'a> {
+    use melior::ir::{Identifier, attribute::TypeAttribute};
+    let count_op = arith::constant(context, IntegerAttribute::new(types.i32, 1).into(), loc);
+    let count_val: Value<'c, 'a> = block.append_operation(count_op).result(0).unwrap().into();
+    let alloca = OperationBuilder::new("llvm.alloca", loc)
+        .add_operands(&[count_val])
+        .add_attributes(&[(
+            Identifier::new(context, "elem_type"),
+            TypeAttribute::new(types.i64).into(),
+        )])
+        .add_results(&[types.ptr])
+        .build()
+        .expect("llvm.alloca i64 int slot");
+    block.append_operation(alloca).result(0).unwrap().into()
+}
+
 pub(crate) fn emit_alloca_slot_for_kind<'a, 'c>(
     context: &'c Context,
     block: &'a Block<'c>,

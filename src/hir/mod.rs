@@ -1484,6 +1484,7 @@ fn register_function_signature(
                 subtype: NumberSubtype::Unknown,
                 is_const: false,
                 is_close: false,
+                int_slot: false,
             })
             .collect(),
         upvalues: Vec::new(),
@@ -1526,6 +1527,7 @@ fn alloc_method_signature(
                 subtype: NumberSubtype::Unknown,
                 is_const: false,
                 is_close: false,
+                int_slot: false,
             })
             .collect(),
         upvalues: Vec::new(),
@@ -2169,6 +2171,10 @@ pub fn lower(chunk: &Chunk) -> Result<HirChunk, HirError> {
         propagate_number_subtype(&body, &mut hir_fn.locals);
         hir_fn.body = body;
     }
+    // ADR 0304 — F2-R1-a: mark chunk locals eligible for i64 slots
+    // under the conservative gate (see fn doc). Function bodies are
+    // R1-b/R1-c scope.
+    mark_integer_slot_eligible(&stmts, &mut chunk_locals);
     Ok(HirChunk {
         locals: chunk_locals,
         stmts,
@@ -2231,6 +2237,54 @@ pub fn classify_number_subtype(value: &HirExpr, locals: &[LocalInfo]) -> NumberS
             }
         }
         _ => NumberSubtype::Unknown,
+    }
+}
+
+/// ADR 0304 — F2-R1-a: conservative gate for i64 slots. A chunk
+/// Local becomes `int_slot` only when EVERY top-level statement is
+/// one of:
+///   - `LocalInit`/`Assign` whose RHS is an Integer literal, or
+///   - `ExprStmt(print(...))` whose args are each a plain Local or
+///     a literal.
+///
+/// Any other statement shape anywhere in the chunk disables the
+/// pass entirely (all candidates stay f64). This bail-out keeps
+/// every Local occurrence inside audited codegen sites; ADR 0303's
+/// R1-b/R1-c replace the gate with a real def-use walk.
+fn mark_integer_slot_eligible(stmts: &[HirStmt], locals: &mut [LocalInfo]) {
+    for s in stmts {
+        let ok = match &s.kind {
+            HirStmtKind::LocalInit { value, .. } | HirStmtKind::Assign { value, .. } => {
+                matches!(value.kind, HirExprKind::Integer(_))
+            }
+            HirStmtKind::ExprStmt(e) => match &e.kind {
+                HirExprKind::Call {
+                    callee: Callee::Builtin(Builtin::Print),
+                    args,
+                } => args.iter().all(|a| {
+                    matches!(
+                        a.kind,
+                        HirExprKind::Local(_)
+                            | HirExprKind::Integer(_)
+                            | HirExprKind::Number(_)
+                            | HirExprKind::Str(_)
+                            | HirExprKind::Bool(_)
+                            | HirExprKind::Nil
+                    )
+                }),
+                _ => false,
+            },
+            _ => false,
+        };
+        if !ok {
+            return; // bail-out: leave every local on f64.
+        }
+    }
+    for info in locals.iter_mut() {
+        if matches!(info.kind, ValueKind::Number) && matches!(info.subtype, NumberSubtype::Integer)
+        {
+            info.int_slot = true;
+        }
     }
 }
 
@@ -2934,6 +2988,7 @@ impl LowerCtx {
             subtype: NumberSubtype::Unknown,
             is_const: false,
             is_close: false,
+            int_slot: false,
         });
         self.scopes
             .last_mut()
@@ -4170,6 +4225,7 @@ impl LowerCtx {
                     subtype: NumberSubtype::Unknown,
                     is_const: false,
                     is_close: false,
+                    int_slot: false,
                 });
                 self.scopes[0].insert(name.to_owned(), id);
                 Ok((id, true))
@@ -5003,6 +5059,7 @@ impl LowerCtx {
                                 subtype: NumberSubtype::Unknown,
                                 is_const: false,
                                 is_close: false,
+                                int_slot: false,
                             })
                             .collect(),
                         upvalues: Vec::new(),

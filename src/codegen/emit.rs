@@ -3126,7 +3126,14 @@ fn emit_main<'c>(
     let slots: Vec<Value<'c, '_>> = chunk
         .locals
         .iter()
-        .map(|info| emit_alloca_slot_for_kind(context, &main_block, info.kind, types, loc))
+        .map(|info| {
+            // ADR 0304 — F2-R1-a: Integer-eligible locals get i64.
+            if info.int_slot {
+                super::tagged::emit_alloca_int_slot(context, &main_block, types, loc)
+            } else {
+                emit_alloca_slot_for_kind(context, &main_block, info.kind, types, loc)
+            }
+        })
         .collect();
 
     // ADR 0218 — build the chunk root table for the GC mark phase.
@@ -4383,6 +4390,27 @@ fn emit_stmt<'a, 'c>(
             //     `_ret_value` slot): evaluate the rhs, bridge the
             //     `!func.func` value to `!llvm.ptr`, and store.
             let info = &locals[id.0];
+            // ADR 0304 — F2-R1-a: i64 slot store. The eligibility
+            // gate guarantees the RHS is an Integer literal.
+            if info.int_slot {
+                let HirExprKind::Integer(i) = &value.kind else {
+                    unreachable!(
+                        "int_slot local store with non-Integer RHS — \
+                         mark_integer_slot_eligible gate violated"
+                    );
+                };
+                let v: Value<'c, '_> = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, *i).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                emit_store(block, v, slots[id.0], loc);
+                return Ok(());
+            }
             match info.kind {
                 ValueKind::Function(_) => {
                     let is_param = id.0 < params_len;
@@ -10909,6 +10937,17 @@ fn emit_expr<'a, 'c>(
                                 .into();
                             let fmt_ptr = emit_addressof(context, block, "fmt_lld_raw", types, loc);
                             emit_printf(context, block, fmt_ptr, i64_const, types, loc);
+                            continue;
+                        }
+                        // ADR 0304 — F2-R1-a: `int_slot` Local holds
+                        // a raw i64; load and print directly (exact
+                        // for the full 64-bit range).
+                        if let HirExprKind::Local(LocalId(idx)) = &a.kind
+                            && locals[*idx].int_slot
+                        {
+                            let i64_val = emit_load(block, slots[*idx], types.i64, loc);
+                            let fmt_ptr = emit_addressof(context, block, "fmt_lld_raw", types, loc);
+                            emit_printf(context, block, fmt_ptr, i64_val, types, loc);
                             continue;
                         }
                         // ADR 0233 — M8-B: a Number-kind Local with

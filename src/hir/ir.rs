@@ -53,6 +53,12 @@ pub struct LocalInfo {
     /// `<close>` is also `<const>` per Lua 5.4 §3.3.8, so
     /// `is_const` is always also set when `is_close` is.
     pub is_close: bool,
+    /// ADR 0304 — F2-R1-a: when `true`, codegen gives this Number
+    /// local an **i64 slot** (exact 64-bit integer round-trips)
+    /// instead of f64. Set by the `mark_integer_slot_eligible`
+    /// HIR post-pass under a conservative def-use gate; widened
+    /// per ADR 0303's R1-b/R1-c steps.
+    pub int_slot: bool,
 }
 
 /// A name-resolved program — the input to codegen.
