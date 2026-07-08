@@ -4355,7 +4355,14 @@ fn int_tree_on_slots(e: &HirExpr, locals: &[LocalInfo]) -> bool {
         HirExprKind::BinOp { op, lhs, rhs } => {
             matches!(
                 op,
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::FloorDiv | BinOp::Mod
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::FloorDiv
+                    | BinOp::Mod
+                    | BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor
             ) && int_tree_on_slots(lhs, locals)
                 && int_tree_on_slots(rhs, locals)
         }
@@ -4407,6 +4414,20 @@ fn emit_int_expr<'a, 'c>(
                 }
                 BinOp::Mul => {
                     let op = arith::muli(l, r, loc);
+                    block.append_operation(op).result(0).unwrap().into()
+                }
+                // ADR 0307 — direct i64 bitwise (exact beyond 2^53;
+                // the legacy f64 round-trip path loses precision).
+                BinOp::BitAnd => {
+                    let op = arith::andi(l, r, loc);
+                    block.append_operation(op).result(0).unwrap().into()
+                }
+                BinOp::BitOr => {
+                    let op = arith::ori(l, r, loc);
+                    block.append_operation(op).result(0).unwrap().into()
+                }
+                BinOp::BitXor => {
+                    let op = arith::xori(l, r, loc);
                     block.append_operation(op).result(0).unwrap().into()
                 }
                 // ADR 0306 — F2-R1-c: Lua floor semantics (§3.4.1).

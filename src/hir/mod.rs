@@ -2322,10 +2322,20 @@ pub fn is_gate_int_expr(e: &HirExpr, locals: &[LocalInfo]) -> bool {
         }
         HirExprKind::BinOp { op, lhs, rhs } => {
             // ADR 0306 — F2-R1-c adds FloorDiv/Mod (floor-corrected
-            // i64 emission with zero-divisor trap).
+            // i64 emission with zero-divisor trap). ADR 0307 adds
+            // `& | ~` (direct i64, exact beyond 2^53). Shifts stay
+            // excluded — Lua's >=64 / negative-shift semantics are
+            // F2-G scope.
             matches!(
                 op,
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::FloorDiv | BinOp::Mod
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::FloorDiv
+                    | BinOp::Mod
+                    | BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor
             ) && is_gate_int_expr(lhs, locals)
                 && is_gate_int_expr(rhs, locals)
         }
