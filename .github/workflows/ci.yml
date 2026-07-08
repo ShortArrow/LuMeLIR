@@ -38,6 +38,31 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --no-fail-fast
 
+  clippy-and-test-arm64:
+    # ADR 0308 — N9: native arm64 lane on the free public-repo arm
+    # runner. Exercises the full llc→cc pipeline on aarch64 (llc
+    # targets the host triple, so every e2e test compiles + runs a
+    # native arm64 binary). continue-on-error while the image lane
+    # bootstraps — flip to hard-fail once
+    # ghcr.io/shortarrow/lumelir-ci:mlir-22-arm64 is baked and this
+    # job is green (tracked in ADR 0308).
+    name: clippy + test (MLIR 22, arm64)
+    runs-on: ubuntu-24.04-arm
+    continue-on-error: true
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ghcr.io/shortarrow/lumelir-ci:mlir-22-arm64
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --no-fail-fast
+
   audit:
     name: cargo audit (security advisories)
     runs-on: ubuntu-24.04
