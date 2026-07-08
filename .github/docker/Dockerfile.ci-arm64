@@ -31,7 +31,7 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/cargo/bin:/usr/lib/llvm-22/bin:$PATH
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain stable --component clippy rustfmt \
+        | sh -s -- -y --default-toolchain stable --component clippy,rustfmt \
     && cargo --version && rustc --version
 
 # melior 0.27 / mlir-sys 22 / tblgen discovery.
