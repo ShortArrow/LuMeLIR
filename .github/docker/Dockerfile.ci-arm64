@@ -22,6 +22,7 @@ RUN wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
     && apt-get update && apt-get install -y --no-install-recommends \
         llvm-22-dev llvm-22-tools clang-22 \
         libmlir-22-dev mlir-22-tools \
+        libpolly-22-dev \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/llc-22 /usr/local/bin/llc \
     && ln -s /usr/bin/clang-22 /usr/local/bin/cc-clang22
