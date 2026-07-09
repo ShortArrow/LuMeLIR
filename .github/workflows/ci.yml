@@ -42,13 +42,10 @@ jobs:
     # ADR 0308 — N9: native arm64 lane on the free public-repo arm
     # runner. Exercises the full llc→cc pipeline on aarch64 (llc
     # targets the host triple, so every e2e test compiles + runs a
-    # native arm64 binary). continue-on-error while the image lane
-    # bootstraps — flip to hard-fail once
-    # ghcr.io/shortarrow/lumelir-ci:mlir-22-arm64 is baked and this
-    # job is green (tracked in ADR 0308).
+    # native arm64 binary). Hard gate since the ADR 0310 fix + the
+    # RUST_MIN_STACK bump turned the lane green (N9-B closed).
     name: clippy + test (MLIR 22, arm64)
     runs-on: ubuntu-24.04-arm
-    continue-on-error: true
     permissions:
       contents: read
       packages: read
