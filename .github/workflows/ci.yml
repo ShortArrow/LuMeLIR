@@ -57,6 +57,11 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      # AArch64 frames spill more than x86-64 in the recursive
+      # parser/HIR paths; the 2 MiB test-thread default overflows
+      # on phase2_6c_tag_hash_hard (ADR 0308 bake log).
+      RUST_MIN_STACK: "8388608"
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
