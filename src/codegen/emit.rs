@@ -3138,10 +3138,24 @@ fn emit_main<'c>(
         .map(|info| {
             // ADR 0304 — F2-R1-a: Integer-eligible locals get i64.
             if info.int_slot {
-                super::tagged::emit_alloca_int_slot(context, &main_block, types, loc)
-            } else {
-                emit_alloca_slot_for_kind(context, &main_block, info.kind, types, loc)
+                return super::tagged::emit_alloca_int_slot(context, &main_block, types, loc);
             }
+            // ADR 0310 — N9-E: chunk-level mirror of the fn-body
+            // Step 6 (ADR 0083). A captured chunk local's slot must
+            // be a HEAP upvalue box ptr, because the box-store
+            // helper writes a widened 8-byte value and the closure
+            // cell shares the ptr with the inner fn. Before this
+            // fix the slot stayed a plain alloca — for Bool/Nil
+            // (1-byte i1 alloca) the 8-byte box write smashed the
+            // stack, which x86-64 tolerated by layout luck and
+            // aarch64 crashed on (caught by the ADR 0308 arm64 CI
+            // lane).
+            if info.is_captured
+                && !matches!(info.kind, ValueKind::Function(_) | ValueKind::TaggedValue)
+            {
+                return super::closure::emit_allocate_upvalue_box(context, &main_block, types, loc);
+            }
+            emit_alloca_slot_for_kind(context, &main_block, info.kind, types, loc)
         })
         .collect();
 
