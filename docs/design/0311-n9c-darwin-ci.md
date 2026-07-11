@@ -46,9 +46,24 @@ than letting mlir-sys produce a confusing link failure.
 - **`continue-on-error: true` during bake.** When the lane is green,
   the flip commit closes N9-C (same staged pattern as N9-B).
 
+## Bake log (2026-07-11)
+
+1. Homebrew step green on round 1: formula `llvm` is 22.1.8, version
+   guard passed, melior/mlir-sys compile against the bottle. Lane failed
+   on a **toolchain skew**, not darwin: this lane tracks latest stable
+   (Rust 1.97) while the Linux lanes pin via baked images, so the new
+   `useless_borrows_in_formatting` lint fired once (`4d79b37`).
+2. Round 2 reached `cargo test` and died at link: `ld: write() failed,
+   errno=28` (ENOSPC). mlir-sys' auto-detect picks **static** libs, so
+   all ~150 integration-test binaries carried full LLVM+MLIR and
+   exhausted the runner disk. Fix: `MLIR_SYS_LINK_SHARED=1` — the bottle
+   ships `libMLIR.dylib`, and shared mode links `-lMLIR -lMLIR-C`
+   instead. Also `MACOSX_DEPLOYMENT_TARGET=15.0` to stop per-object
+   "built for newer macOS" linker warnings (rustc defaults to 11.0).
+
 ## Follow-up
 
-1. First main push runs the lane; bake log records findings below.
+1. First main push runs the lane; bake log records findings above.
 2. When green: flip `continue-on-error` off — closes **N9-C**.
 3. **N9-D** (release artifacts): tag-triggered multi-target binary job.
    Separate ADR.

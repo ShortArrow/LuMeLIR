@@ -78,6 +78,13 @@ jobs:
       # Same AArch64 frame-spill headroom as the linux arm64 lane
       # (ADR 0308 bake log).
       RUST_MIN_STACK: "8388608"
+      # Static MLIR/LLVM makes every integration-test binary carry the
+      # full toolchain and exhausts the runner disk (ld errno=28,
+      # ADR 0311 bake log round 2) — link the Homebrew dylibs instead.
+      MLIR_SYS_LINK_SHARED: "1"
+      # Match rustc's -mmacosx-version-min to the Homebrew bottle's
+      # build target; silences per-object version-mismatch warnings.
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -92,7 +99,9 @@ jobs:
           "$PREFIX/bin/llvm-config" --version
           "$PREFIX/bin/llvm-config" --version | grep -q '^22\.' \
             || { echo "::error::Homebrew $FORMULA is LLVM $("$PREFIX/bin/llvm-config" --version), need 22.x (ADR 0311)"; exit 1; }
-          ls "$PREFIX/lib" | grep -i mlir | head -20
+          ls "$PREFIX/lib" | grep -iE 'libMLIR(-C)?\.' || true
+          "$PREFIX/bin/llvm-config" --shared-mode || true
+          df -h /
           {
             echo "MLIR_SYS_220_PREFIX=$PREFIX"
             echo "LLVM_SYS_220_PREFIX=$PREFIX"
