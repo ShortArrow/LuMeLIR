@@ -65,6 +65,44 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --no-fail-fast
 
+  clippy-and-test-darwin:
+    # ADR 0311 — N9-C: arm64-darwin lane on Apple Silicon macos-15
+    # runners. No container support on macOS runners, so MLIR comes
+    # from the Homebrew llvm bottle (melior's documented macOS path);
+    # the version guard fails fast if the formula drifts off 22.x.
+    # Soft lane (continue-on-error) until the bake is green.
+    name: clippy + test (MLIR 22, arm64-darwin)
+    runs-on: macos-15
+    continue-on-error: true
+    env:
+      # Same AArch64 frame-spill headroom as the linux arm64 lane
+      # (ADR 0308 bake log).
+      RUST_MIN_STACK: "8388608"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install LLVM/MLIR 22 via Homebrew
+        run: |
+          uname -m
+          if brew info llvm@22 >/dev/null 2>&1; then FORMULA=llvm@22; else FORMULA=llvm; fi
+          brew install "$FORMULA"
+          PREFIX="$(brew --prefix "$FORMULA")"
+          "$PREFIX/bin/llvm-config" --version
+          "$PREFIX/bin/llvm-config" --version | grep -q '^22\.' \
+            || { echo "::error::Homebrew $FORMULA is LLVM $("$PREFIX/bin/llvm-config" --version), need 22.x (ADR 0311)"; exit 1; }
+          ls "$PREFIX/lib" | grep -i mlir | head -20
+          {
+            echo "MLIR_SYS_220_PREFIX=$PREFIX"
+            echo "LLVM_SYS_220_PREFIX=$PREFIX"
+            echo "TABLEGEN_220_PREFIX=$PREFIX"
+          } >> "$GITHUB_ENV"
+          echo "$PREFIX/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --no-fail-fast
+
   audit:
     name: cargo audit (security advisories)
     runs-on: ubuntu-24.04
