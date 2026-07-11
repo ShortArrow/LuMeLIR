@@ -7618,7 +7618,7 @@ local f = function() return b end";
         // stmts[0] = synthetic LocalInit for f
         // stmts[1] = print(f()) ExprStmt
         let HirStmtKind::ExprStmt(call) = &hir.stmts[1].kind else {
-            panic!("expected ExprStmt at idx 1, got {:?}", &hir.stmts[1].kind);
+            panic!("expected ExprStmt at idx 1, got {:?}", hir.stmts[1].kind);
         };
         let HirExprKind::Call { args, .. } = &call.kind else {
             panic!("expected Call");
