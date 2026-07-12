@@ -1,6 +1,6 @@
 # 0313. N9-D release artifacts — tag-triggered multi-target binaries
 
-- **Status:** Accepted (workflow landed; dispatch bake pending)
+- **Status:** Accepted (bake green 2026-07-12 — N9-D closed, N9 arc complete)
 - **Kind:** Architecture Decision
 - **Date:** 2026-07-12
 - **Deciders:** ShortArrow
@@ -36,8 +36,16 @@ publishing `lumelir` binaries per target when a version tag is pushed.
   release body states this. Fully static distribution is out of scope
   for N9-D.
 
+## Bake log (2026-07-12)
+
+Dispatch run `29191133255` green on the first attempt: all three
+builds + publish succeeded; draft `v0.0.0-bake` carried the three
+tarballs + `SHA256SUMS`. Local verification of the amd64 artifact:
+checksum matches, tarball layout and executable bit correct; running
+it requires `libMLIR-C.so.22` exactly as the release notes state
+(shared-linked lane). Sizes: amd64 2.4 MB (shared MLIR), arm64-linux
+43 MB / darwin 54 MB (static MLIR). Draft deleted after verification.
+
 ## Follow-up
 
-1. `workflow_dispatch` bake: draft release created, artifacts
-   verified, draft deleted. Findings go in the bake log below.
-2. First real `v*` tag exercises the publish path end-to-end.
+1. First real `v*` tag exercises the publish path end-to-end.
