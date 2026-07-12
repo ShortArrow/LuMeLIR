@@ -18,7 +18,7 @@ fn run_ok(src: &str, output_name: &str) -> String {
 #[test]
 fn string_format_lowercase_hex() {
     assert_eq!(
-        run_ok(r#"print(string.format("%x", 255))"#, "lumelir_sf_x").trim(),
+        run_ok(r#"print(string.format("%x", 255))"#, "lumelir_sf_hex_lower").trim(),
         "ff"
     );
 }
@@ -26,7 +26,7 @@ fn string_format_lowercase_hex() {
 #[test]
 fn string_format_uppercase_hex() {
     assert_eq!(
-        run_ok(r#"print(string.format("%X", 255))"#, "lumelir_sf_X").trim(),
+        run_ok(r#"print(string.format("%X", 255))"#, "lumelir_sf_hex_upper").trim(),
         "FF"
     );
 }

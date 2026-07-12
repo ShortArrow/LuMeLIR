@@ -90,6 +90,12 @@ than letting mlir-sys produce a confusing link failure.
    `Undefined symbols: "_stdout"` — libSystem names the stdio globals
    `__stdoutp`/`__stdinp` (glibc exports the POSIX names). First
    genuine codegen finding of the lane; fixed in **ADR 0312**.
+7. Rounds 7-8: suite down to **one** failure —
+   `string_format_uppercase_hex` got "ff" for `%X`. Not codegen: the
+   two hex tests wrote temp binaries named `lumelir_sf_x` /
+   `lumelir_sf_X`, which collide on APFS's case-insensitive default;
+   the `%X` test raced and executed the `%x` binary. Renamed to
+   case-distinct names; repo-wide scan found no other collision.
 
 ## Follow-up
 
