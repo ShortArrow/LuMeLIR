@@ -1,6 +1,6 @@
 # 0311. N9-C multi-target CI — arm64-darwin lane
 
-- **Status:** Accepted (soft lane landed; bake + hard-fail flip pending CI)
+- **Status:** Accepted (lane green 2026-07-12; hard gate — N9-C closed)
 - **Kind:** Architecture Decision
 - **Date:** 2026-07-10
 - **Deciders:** ShortArrow
@@ -96,10 +96,10 @@ than letting mlir-sys produce a confusing link failure.
    `lumelir_sf_X`, which collide on APFS's case-insensitive default;
    the `%X` test raced and executed the `%x` binary. Renamed to
    case-distinct names; repo-wide scan found no other collision.
+8. Round 9 (`a7398fe`): lane fully green — full suite passes on
+   arm64-darwin. `continue-on-error` removed. **N9-C closed.**
 
 ## Follow-up
 
-1. First main push runs the lane; bake log records findings above.
-2. When green: flip `continue-on-error` off — closes **N9-C**.
-3. **N9-D** (release artifacts): tag-triggered multi-target binary job.
+1. **N9-D** (release artifacts): tag-triggered multi-target binary job.
    Separate ADR.

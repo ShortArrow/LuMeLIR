@@ -70,10 +70,9 @@ jobs:
     # runners. No container support on macOS runners, so MLIR comes
     # from the Homebrew llvm bottle (melior's documented macOS path);
     # the version guard fails fast if the formula drifts off 22.x.
-    # Soft lane (continue-on-error) until the bake is green.
+    # Hard gate since the ADR 0312 fix turned the lane green.
     name: clippy + test (MLIR 22, arm64-darwin)
     runs-on: macos-15
-    continue-on-error: true
     env:
       # Same AArch64 frame-spill headroom as the linux arm64 lane
       # (ADR 0308 bake log).
