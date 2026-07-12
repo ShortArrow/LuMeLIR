@@ -106,7 +106,12 @@ jobs:
             ls "$PREFIX"/lib/libMLIRCAPI*.a >/dev/null 2>&1 \
               || { echo "::error::no libMLIRCAPI*.a in the bottle — cannot build libMLIR-C.dylib (ADR 0311)"; exit 1; }
             FORCE_LOAD=""
-            for a in "$PREFIX"/lib/libMLIRCAPI*.a; do FORCE_LOAD="$FORCE_LOAD -Wl,-force_load,$a"; done
+            for a in "$PREFIX"/lib/libMLIRCAPI*.a; do
+              case "$a" in
+                *ExecutionEngine*) continue ;;
+              esac
+              FORCE_LOAD="$FORCE_LOAD -Wl,-force_load,$a"
+            done
             # shellcheck disable=SC2086
             clang++ -dynamiclib -o "$PREFIX/lib/libMLIR-C.dylib" \
               -Wl,-install_name,"$PREFIX/lib/libMLIR-C.dylib" \

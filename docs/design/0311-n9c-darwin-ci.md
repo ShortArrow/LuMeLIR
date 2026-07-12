@@ -79,6 +79,12 @@ than letting mlir-sys produce a confusing link failure.
    `libMLIRCAPI*.a` against `-lMLIR` + shared LLVM, i.e. the same
    artifact upstream's `MLIR_BUILD_MLIR_C_DYLIB=ON` produces — then
    verifies `mlirContextCreate` is exported.
+5. Round 5: shim link failed on `libMLIRCAPIExecutionEngine.a` —
+   `mlir::ExecutionEngine::*` is not in `libMLIR.dylib` (upstream also
+   excludes the JIT-side ExecutionEngine from the aggregate dylib).
+   LuMeLIR is AOT (`llc` + `cc`, never `mlirExecutionEngine*`), so the
+   shim simply skips that one archive; unreferenced extern
+   declarations in the mlir-sys bindings cost nothing at link time.
 
 ## Follow-up
 
