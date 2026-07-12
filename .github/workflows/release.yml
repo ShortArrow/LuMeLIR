@@ -1,0 +1,146 @@
+# ADR 0313 — N9-D: tag-triggered multi-target release binaries.
+# Build environments mirror the CI lanes (ci.yml) so a release build
+# can only fail in packaging, never in an unproven configuration.
+# workflow_dispatch runs the same pipeline into a DRAFT release (bake
+# path); a `v*` tag publishes for real.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name for the draft release (bake run)"
+        required: true
+        default: "v0.0.0-bake"
+
+jobs:
+  build-linux-amd64:
+    name: build (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ghcr.io/shortarrow/lumelir-ci:mlir-22
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Package
+        run: |
+          TRIPLE=x86_64-unknown-linux-gnu
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          tar -czf "lumelir-$TAG-$TRIPLE.tar.gz" \
+            -C target/release lumelir \
+            -C ../.. LICENSE-MIT LICENSE-APACHE README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-x86_64-unknown-linux-gnu
+          path: lumelir-*.tar.gz
+          if-no-files-found: error
+
+  build-linux-arm64:
+    name: build (aarch64-unknown-linux-gnu)
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ghcr.io/shortarrow/lumelir-ci:mlir-22-arm64
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Package
+        run: |
+          TRIPLE=aarch64-unknown-linux-gnu
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          tar -czf "lumelir-$TAG-$TRIPLE.tar.gz" \
+            -C target/release lumelir \
+            -C ../.. LICENSE-MIT LICENSE-APACHE README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-aarch64-unknown-linux-gnu
+          path: lumelir-*.tar.gz
+          if-no-files-found: error
+
+  build-darwin-arm64:
+    name: build (aarch64-apple-darwin)
+    runs-on: macos-15
+    # Static MLIR here (no MLIR_SYS_LINK_SHARED): one binary cannot
+    # ENOSPC (ADR 0311 bake), and static avoids shipping a binary
+    # that dlopens /opt/homebrew paths.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install LLVM/MLIR 22 via Homebrew
+        run: |
+          if brew info llvm@22 >/dev/null 2>&1; then FORMULA=llvm@22; else FORMULA=llvm; fi
+          brew install "$FORMULA"
+          PREFIX="$(brew --prefix "$FORMULA")"
+          "$PREFIX/bin/llvm-config" --version | grep -q '^22\.' \
+            || { echo "::error::Homebrew $FORMULA is LLVM $("$PREFIX/bin/llvm-config" --version), need 22.x (ADR 0313)"; exit 1; }
+          {
+            echo "MLIR_SYS_220_PREFIX=$PREFIX"
+            echo "LLVM_SYS_220_PREFIX=$PREFIX"
+            echo "TABLEGEN_220_PREFIX=$PREFIX"
+          } >> "$GITHUB_ENV"
+          echo "$PREFIX/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Package
+        run: |
+          TRIPLE=aarch64-apple-darwin
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          tar -czf "lumelir-$TAG-$TRIPLE.tar.gz" \
+            -C target/release lumelir \
+            -C ../.. LICENSE-MIT LICENSE-APACHE README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-aarch64-apple-darwin
+          path: lumelir-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish GitHub release
+    needs: [build-linux-amd64, build-linux-arm64, build-darwin-arm64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums
+        run: cd dist && sha256sum lumelir-*.tar.gz > SHA256SUMS
+      - name: Create release
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          DRAFT_FLAG=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            DRAFT_FLAG="--draft"
+          fi
+          cat > notes.md <<'EOF'
+          Runtime requirements: `llc` and `cc` (LLVM 22 toolchain) on PATH
+          (ADR 0117 pipeline). Linux builds link the distro LLVM/MLIR 22
+          shared libraries; the darwin build is statically linked against
+          MLIR (ADR 0313).
+          EOF
+          gh release create "$TAG" $DRAFT_FLAG \
+            --target "$GITHUB_SHA" \
+            --title "lumelir $TAG" \
+            --notes-file notes.md \
+            dist/lumelir-*.tar.gz dist/SHA256SUMS
