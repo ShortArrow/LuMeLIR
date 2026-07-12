@@ -1165,7 +1165,8 @@ pub(crate) fn emit_print_string_obj<'a, 'c>(
         .result(0)
         .unwrap()
         .into();
-    let stdout_addr = emit_addressof(context, block, "stdout", types, loc);
+    let stdout_addr =
+        emit_addressof(context, block, super::emit::host_stdio_symbol("stdout"), types, loc);
     let stdout_ptr = emit_load(block, stdout_addr, types.ptr, loc);
     // fwrite(data, 1, len, stdout) — non-variadic, 4 args.
     let call_op = OperationBuilder::new("llvm.call", loc)

@@ -1398,15 +1398,33 @@ fn emit_getline_decl<'c>(
     module.body().append_operation(getline_op.into());
 }
 
+/// Linker-level name of a libc `FILE *` stdio global (ADR 0312).
+///
+/// glibc exports the POSIX names (`stdout`, `stdin`) directly;
+/// Apple's libSystem exports `__stdoutp` / `__stdinp` and the POSIX
+/// names are only macros. Generated code links against the host
+/// libc (`llc` targets the host triple, ADR 0308/0311), so callers
+/// pass `cfg!(target_os = "macos")` via [`host_stdio_symbol`].
+pub(crate) fn stdio_symbol(posix_name: &'static str, macos: bool) -> &'static str {
+    match (posix_name, macos) {
+        ("stdout", true) => "__stdoutp",
+        ("stdin", true) => "__stdinp",
+        (name, _) => name,
+    }
+}
+
+/// [`stdio_symbol`] for the compilation target (= host) libc.
+pub(crate) fn host_stdio_symbol(posix_name: &'static str) -> &'static str {
+    stdio_symbol(posix_name, cfg!(target_os = "macos"))
+}
+
 /// Phase 2.devinfra-stdout-fwrite (ADR 0117): declare the libc
 /// `extern FILE *stdout;` global as an external linkage symbol.
 /// `emit_print_string_obj` reads this address, loads the
 /// `FILE *` pointer, and passes it to `fwrite`.
 ///
-/// On x86_64 Linux / glibc, `stdout` is a real exported symbol
-/// (not a macro), so the ELF resolver binds it at link time.
-/// macOS (`__stdoutp` macro) / Windows (`_iob_func()`) are
-/// out of scope per the ADR 0117 non-goals.
+/// The symbol name is platform-dependent (ADR 0312); Windows
+/// (`_iob_func()`) stays out of scope per the ADR 0117 non-goals.
 fn emit_stdout_extern_decl<'c>(
     context: &'c Context,
     module: &Module<'c>,
@@ -1427,7 +1445,7 @@ fn emit_stdout_extern_decl<'c>(
             ),
             (
                 Identifier::new(context, "sym_name"),
-                StringAttribute::new(context, "stdout").into(),
+                StringAttribute::new(context, host_stdio_symbol("stdout")).into(),
             ),
             (
                 Identifier::new(context, "linkage"),
@@ -1458,7 +1476,7 @@ fn emit_stdin_extern_decl<'c>(
             ),
             (
                 Identifier::new(context, "sym_name"),
-                StringAttribute::new(context, "stdin").into(),
+                StringAttribute::new(context, host_stdio_symbol("stdin")).into(),
             ),
             (
                 Identifier::new(context, "linkage"),
@@ -18018,7 +18036,7 @@ fn emit_io_read_runtime<'a, 'c>(
     emit_store(block, zero_i64, n_slot, loc);
 
     // Load stdin FILE*.
-    let stdin_addr = emit_addressof(context, block, "stdin", types, loc);
+    let stdin_addr = emit_addressof(context, block, host_stdio_symbol("stdin"), types, loc);
     let stdin_ptr = emit_load(block, stdin_addr, types.ptr, loc);
 
     // ssize_t n_read = getline(&lineptr, &n, stdin);
@@ -27068,6 +27086,18 @@ mod tests {
     /// substring. Use this for ABI-shape checks (function
     /// signatures, call_indirect signatures, return tuples) so
     /// the failure message labels the missing shape clearly.
+    #[test]
+    fn stdio_symbol_darwin_uses_libsystem_names() {
+        assert_eq!(stdio_symbol("stdout", true), "__stdoutp");
+        assert_eq!(stdio_symbol("stdin", true), "__stdinp");
+    }
+
+    #[test]
+    fn stdio_symbol_elf_uses_posix_names() {
+        assert_eq!(stdio_symbol("stdout", false), "stdout");
+        assert_eq!(stdio_symbol("stdin", false), "stdin");
+    }
+
     fn assert_mlir_has(mlir: &str, expected: &str) {
         assert!(
             mlir.contains(expected),

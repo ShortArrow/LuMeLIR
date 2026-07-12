@@ -85,6 +85,11 @@ than letting mlir-sys produce a confusing link failure.
    LuMeLIR is AOT (`llc` + `cc`, never `mlirExecutionEngine*`), so the
    shim simply skips that one archive; unreferenced extern
    declarations in the mlir-sys bindings cost nothing at link time.
+6. Round 6: toolchain fully green (brew step, clippy, full suite
+   runs); every e2e test fails at the generated binary's `cc` link:
+   `Undefined symbols: "_stdout"` — libSystem names the stdio globals
+   `__stdoutp`/`__stdinp` (glibc exports the POSIX names). First
+   genuine codegen finding of the lane; fixed in **ADR 0312**.
 
 ## Follow-up
 
