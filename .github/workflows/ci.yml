@@ -102,6 +102,12 @@ jobs:
           ls "$PREFIX/lib" | grep -iE 'libMLIR(-C)?\.' || true
           "$PREFIX/bin/llvm-config" --shared-mode || true
           df -h /
+          if [ ! -e "$PREFIX/lib/libMLIR-C.dylib" ]; then
+            nm -gU "$PREFIX/lib/libMLIR.dylib" | grep -q mlirContextCreate \
+              || { echo "::error::libMLIR.dylib lacks the MLIR C API and no libMLIR-C.dylib exists (ADR 0311)"; exit 1; }
+            ln -s libMLIR.dylib "$PREFIX/lib/libMLIR-C.dylib"
+            echo "shimmed libMLIR-C.dylib -> libMLIR.dylib (C API lives in libMLIR.dylib)"
+          fi
           {
             echo "MLIR_SYS_220_PREFIX=$PREFIX"
             echo "LLVM_SYS_220_PREFIX=$PREFIX"

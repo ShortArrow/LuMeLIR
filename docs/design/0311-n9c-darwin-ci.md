@@ -61,6 +61,17 @@ than letting mlir-sys produce a confusing link failure.
    instead. Also `MACOSX_DEPLOYMENT_TARGET=15.0` to stop per-object
    "built for newer macOS" linker warnings (rustc defaults to 11.0).
 
+3. Round 3: shared mode fails with `ld: library 'MLIR-C' not found` —
+   the bottle ships `libMLIR.dylib` but **no `libMLIR-C.dylib`**, and
+   mlir-sys' shared mode unconditionally links both. Probe data:
+   `llvm-config --shared-mode` = shared, runner disk 43Gi free (so
+   static's ~150 full-toolchain binaries genuinely cannot fit). Fix:
+   the brew step verifies the C API symbols live inside
+   `libMLIR.dylib` (`nm -gU … | grep mlirContextCreate`) and shims
+   `libMLIR-C.dylib -> libMLIR.dylib`; both `-l` flags then resolve to
+   the same install name and ld dedups. Fails fast with an explicit
+   error if the C API ever moves out.
+
 ## Follow-up
 
 1. First main push runs the lane; bake log records findings above.
