@@ -71,6 +71,14 @@ than letting mlir-sys produce a confusing link failure.
    `libMLIR-C.dylib -> libMLIR.dylib`; both `-l` flags then resolve to
    the same install name and ld dedups. Fails fast with an explicit
    error if the C API ever moves out.
+4. Round 4: the symlink guard tripped — `libMLIR.dylib` does **not**
+   export the C API; the bottle ships it only as static
+   `libMLIRCAPI*.a` archives (Homebrew builds without
+   `MLIR_BUILD_MLIR_C_DYLIB`). Fix: the brew step now builds
+   `libMLIR-C.dylib` itself — `clang++ -dynamiclib` force-loading every
+   `libMLIRCAPI*.a` against `-lMLIR` + shared LLVM, i.e. the same
+   artifact upstream's `MLIR_BUILD_MLIR_C_DYLIB=ON` produces — then
+   verifies `mlirContextCreate` is exported.
 
 ## Follow-up
 

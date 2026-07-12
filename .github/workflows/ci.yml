@@ -103,10 +103,18 @@ jobs:
           "$PREFIX/bin/llvm-config" --shared-mode || true
           df -h /
           if [ ! -e "$PREFIX/lib/libMLIR-C.dylib" ]; then
-            nm -gU "$PREFIX/lib/libMLIR.dylib" | grep -q mlirContextCreate \
-              || { echo "::error::libMLIR.dylib lacks the MLIR C API and no libMLIR-C.dylib exists (ADR 0311)"; exit 1; }
-            ln -s libMLIR.dylib "$PREFIX/lib/libMLIR-C.dylib"
-            echo "shimmed libMLIR-C.dylib -> libMLIR.dylib (C API lives in libMLIR.dylib)"
+            ls "$PREFIX"/lib/libMLIRCAPI*.a >/dev/null 2>&1 \
+              || { echo "::error::no libMLIRCAPI*.a in the bottle — cannot build libMLIR-C.dylib (ADR 0311)"; exit 1; }
+            FORCE_LOAD=""
+            for a in "$PREFIX"/lib/libMLIRCAPI*.a; do FORCE_LOAD="$FORCE_LOAD -Wl,-force_load,$a"; done
+            # shellcheck disable=SC2086
+            clang++ -dynamiclib -o "$PREFIX/lib/libMLIR-C.dylib" \
+              -Wl,-install_name,"$PREFIX/lib/libMLIR-C.dylib" \
+              $FORCE_LOAD \
+              -L"$PREFIX/lib" -lMLIR $("$PREFIX/bin/llvm-config" --libs --link-shared)
+            nm -gU "$PREFIX/lib/libMLIR-C.dylib" | grep -q mlirContextCreate \
+              || { echo "::error::built libMLIR-C.dylib but C API symbols missing (ADR 0311)"; exit 1; }
+            echo "built libMLIR-C.dylib from the bottle's libMLIRCAPI*.a archives"
           fi
           {
             echo "MLIR_SYS_220_PREFIX=$PREFIX"
