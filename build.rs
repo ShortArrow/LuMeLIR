@@ -42,4 +42,22 @@ fn main() {
     );
 
     println!("cargo:rustc-env=LUMELIR_BRIDGE_OBJ={}", obj_path.display());
+
+    // ADR 0315 — N5-A: coroutine core over <ucontext.h>, compiled
+    // with the host cc (already a hard runtime dependency of
+    // link.rs) and linked into generated binaries like the bridge.
+    let coro_obj = out_dir.join("runtime_coroutine.o");
+    let coro_src = PathBuf::from("src/runtime/coroutine.c");
+    println!("cargo:rerun-if-changed=src/runtime/coroutine.c");
+    let status = Command::new("cc")
+        .args(["-c", "-O2", "-fPIC", "-o"])
+        .arg(&coro_obj)
+        .arg(&coro_src)
+        .status()
+        .expect("failed to spawn cc for runtime/coroutine.c");
+    assert!(
+        status.success(),
+        "cc runtime/coroutine.c build failed (status: {status:?})"
+    );
+    println!("cargo:rustc-env=LUMELIR_CORO_OBJ={}", coro_obj.display());
 }

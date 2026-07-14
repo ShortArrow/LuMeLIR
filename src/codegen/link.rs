@@ -54,6 +54,10 @@ fn link_object(obj_path: &Path, output: &Path) -> Result<(), CodegenError> {
     if let Some(bridge_obj) = option_env!("LUMELIR_BRIDGE_OBJ") {
         cmd.arg(bridge_obj);
     }
+    // ADR 0315 — N5-A: coroutine core object (ucontext).
+    if let Some(coro_obj) = option_env!("LUMELIR_CORO_OBJ") {
+        cmd.arg(coro_obj);
+    }
     cmd.args(["-lc", "-lm"]);
     let status = cmd
         .status()

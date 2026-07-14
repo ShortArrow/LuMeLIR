@@ -387,6 +387,15 @@ fn emit_fmt_global<'c>(
         "userdata\0",
         loc,
     );
+    // ADR 0315 — N5-A: typename for `type(co)` on coroutines.
+    emit_string_global(
+        context,
+        module,
+        i8_type,
+        "s_typename_thread",
+        "thread\0",
+        loc,
+    );
     // ADR 0210 — math.type subtype names ("integer" / "float").
     // Distinct from s_typename_number to match Lua 5.4 §6.7
     // subtype semantics (type(42) returns "number" but
@@ -2333,6 +2342,20 @@ fn emit_libm_decls<'c>(
         ))
         .build();
     module.body().append_operation(str_find_init_op.into());
+
+    // ADR 0315 — N5-A: coroutine core (src/runtime/coroutine.c).
+    // create(fn_ptr, cell_ptr) -> coroutine object ptr.
+    let coro_create_ty = llvm::r#type::function(types.ptr, &[types.ptr, types.ptr], false);
+    let coro_create_op = LLVMFuncOperationBuilder::new(context, loc)
+        .body(Region::new())
+        .sym_name(StringAttribute::new(context, "lumelir_coro_create"))
+        .function_type(TypeAttribute::new(coro_create_ty))
+        .linkage(llvm::attributes::linkage(
+            context,
+            llvm::attributes::Linkage::External,
+        ))
+        .build();
+    module.body().append_operation(coro_create_op.into());
 
     // ADR 0286 — N4-G: string.gsub(s, pat, repl) string-repl form.
     // (s, pat, repl, out_buf, out_max) -> actual bytes written.
@@ -5091,9 +5114,13 @@ fn emit_stmt<'a, 'c>(
             // For TaggedValue-key + TaggedValue-value writes, leave
             // `value_v` as a placeholder — the TaggedValue-key arm
             // substitutes `slots[idx]` before calling the helper.
-            let value_v = if matches!(key_kind, ValueKind::TaggedValue)
-                && matches!(value_kind_peek, ValueKind::TaggedValue)
-            {
+            // ADR 0315 bake: the placeholder must apply for EVERY
+            // TaggedValue value regardless of key kind — the String-
+            // key arm also substitutes `slots[idx]`, and routing a
+            // tagged local through `emit_expr` here emitted its
+            // Number-payload guard, trapping any non-Number tag
+            // (String / userdata / coroutine) at store time.
+            let value_v = if matches!(value_kind_peek, ValueKind::TaggedValue) {
                 // Placeholder f64 — never consumed (TaggedValue-key arm
                 // overrides this with the source slot ptr before use).
                 block
@@ -14846,6 +14873,76 @@ fn emit_expr<'a, 'c>(
                     loc,
                 );
                 emit_store(block, payload_ptr, payload_slot, loc);
+                Ok(out_slot)
+            }
+            Callee::Builtin(Builtin::CoroutineCreate) => {
+                // ADR 0315 — N5-A: the arg must be a Function value;
+                // its emit_expr result is the closure cell ptr
+                // (ADR 0083) and the fn ptr lives at cell offset 0.
+                let arg_kind = infer_kind(&args[0], locals, functions);
+                if !matches!(arg_kind, ValueKind::Function(_)) {
+                    return Err(CodegenError::UnsupportedExpr(format!(
+                        "coroutine.create arg must be a function, got {}",
+                        arg_kind.name()
+                    )));
+                }
+                let cell_ptr = emit_expr(
+                    context,
+                    block,
+                    &args[0],
+                    slots,
+                    locals,
+                    functions,
+                    types,
+                    params_len,
+                    in_function_cell_ptr,
+                    loc,
+                )?;
+                let fn_ptr =
+                    super::closure::emit_load_closure_fn_ptr(context, block, cell_ptr, types, loc);
+                let call_op = OperationBuilder::new("llvm.call", loc)
+                    .add_operands(&[fn_ptr, cell_ptr])
+                    .add_attributes(&[
+                        (
+                            Identifier::new(context, "callee"),
+                            FlatSymbolRefAttribute::new(context, "lumelir_coro_create").into(),
+                        ),
+                        (
+                            Identifier::new(context, "operandSegmentSizes"),
+                            DenseI32ArrayAttribute::new(context, &[2, 0]).into(),
+                        ),
+                        (
+                            Identifier::new(context, "op_bundle_sizes"),
+                            DenseI32ArrayAttribute::new(context, &[]).into(),
+                        ),
+                    ])
+                    .add_results(&[types.ptr])
+                    .build()
+                    .expect("llvm.call @lumelir_coro_create");
+                let co_ptr: Value<'c, 'a> =
+                    block.append_operation(call_op).result(0).unwrap().into();
+                let out_slot =
+                    emit_alloca_slot_for_kind(context, block, ValueKind::TaggedValue, types, loc);
+                let tag_co = block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i64, crate::codegen::tagged::TAG_COROUTINE)
+                            .into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                emit_store(block, tag_co, out_slot, loc);
+                let payload_slot = emit_byte_offset_ptr(
+                    context,
+                    block,
+                    out_slot,
+                    ARRAY_ELEM_OFF_VALUE,
+                    types,
+                    loc,
+                );
+                emit_store(block, co_ptr, payload_slot, loc);
                 Ok(out_slot)
             }
             Callee::Builtin(Builtin::IoRead) => {

@@ -260,6 +260,8 @@ pub fn infer_kind(expr: &HirExpr, locals: &[LocalInfo], functions: &[HirFunction
             Callee::Builtin(Builtin::Type) => ValueKind::String,
             Callee::Builtin(Builtin::Assert) => ValueKind::Bool,
             Callee::Builtin(Builtin::Newproxy) => ValueKind::TaggedValue,
+            // ADR 0315 — coroutine.create returns a TAG_COROUTINE value.
+            Callee::Builtin(Builtin::CoroutineCreate) => ValueKind::TaggedValue,
             // Phase 2.7h (ADR 0033): error never returns at run-
             // time. The kind is a Number placeholder for static
             // typing only — code after `error(...)` is unreachable.

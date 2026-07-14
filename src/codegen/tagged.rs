@@ -73,6 +73,11 @@ pub(crate) const TAG_DELETED: i64 = 6;
 /// userdata value, `type(ud)` correctly returns `"userdata"` and
 /// metatable machinery (setmetatable / getmetatable) round-trips.
 pub(crate) const TAG_USERDATA: i64 = 7;
+/// ADR 0315 — N5-A: coroutine tag. Payload is the pointer to the
+/// C-runtime `lumelir_coro` object (`src/runtime/coroutine.c`) —
+/// plain `malloc`, not yet GC-tracked (recorded leak until the
+/// N5-E/N8 boundary). `type(co)` reports `"thread"`.
+pub(crate) const TAG_COROUTINE: i64 = 8;
 
 // ADR 0156 / 0157 — Phase 3 GC header layout. Every GC-managed
 // allocation is prefixed with a 16-byte header:
@@ -907,8 +912,57 @@ pub(crate) fn emit_print_tagged_local<'a, 'c>(
                         tbl_then.append_block(tbl_then_blk);
                         let tbl_else = Region::new();
                         let tbl_else_blk = Block::new(&[]);
-                        emit_tagged_unknown_tag_trap(context, &tbl_else_blk, types, loc);
-                        tbl_else_blk.append_operation(scf::r#yield(&[], loc));
+                        {
+                            // ADR 0315 — TAG_COROUTINE prints its
+                            // typename like function/table do.
+                            let tag_co: Value<'c, '_> = tbl_else_blk
+                                .append_operation(arith::constant(
+                                    context,
+                                    IntegerAttribute::new(types.i64, TAG_COROUTINE).into(),
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let is_co: Value<'c, '_> = tbl_else_blk
+                                .append_operation(arith::cmpi(
+                                    context,
+                                    arith::CmpiPredicate::Eq,
+                                    tag,
+                                    tag_co,
+                                    loc,
+                                ))
+                                .result(0)
+                                .unwrap()
+                                .into();
+                            let co_then = Region::new();
+                            let co_then_blk = Block::new(&[]);
+                            {
+                                let co_ptr = emit_addressof(
+                                    context,
+                                    &co_then_blk,
+                                    "s_typename_thread",
+                                    types,
+                                    loc,
+                                );
+                                emit_print_string_obj(context, &co_then_blk, co_ptr, types, loc);
+                                co_then_blk.append_operation(scf::r#yield(&[], loc));
+                            }
+                            co_then.append_block(co_then_blk);
+                            let co_else = Region::new();
+                            let co_else_blk = Block::new(&[]);
+                            emit_tagged_unknown_tag_trap(context, &co_else_blk, types, loc);
+                            co_else_blk.append_operation(scf::r#yield(&[], loc));
+                            co_else.append_block(co_else_blk);
+                            tbl_else_blk.append_operation(scf::r#if(
+                                is_co,
+                                &[],
+                                co_then,
+                                co_else,
+                                loc,
+                            ));
+                            tbl_else_blk.append_operation(scf::r#yield(&[], loc));
+                        }
                         tbl_else.append_block(tbl_else_blk);
                         fn_else_blk.append_operation(scf::r#if(
                             is_table,
@@ -1232,17 +1286,84 @@ pub(crate) fn emit_tagged_eq_local_local<'a, 'c>(
                             tbl_then.append_block(tbl_then_blk);
                             let tbl_else = Region::new();
                             let tbl_else_blk = Block::new(&[]);
-                            emit_tagged_unknown_tag_trap(context, &tbl_else_blk, types, loc);
-                            let placeholder = tbl_else_blk
-                                .append_operation(arith::constant(
-                                    context,
-                                    IntegerAttribute::new(types.i1, 0).into(),
-                                    loc,
-                                ))
-                                .result(0)
-                                .unwrap()
-                                .into();
-                            tbl_else_blk.append_operation(scf::r#yield(&[placeholder], loc));
+                            {
+                                // ADR 0315 — TAG_COROUTINE compares by
+                                // object-pointer identity, same as Table.
+                                let tag_co = make_const_i64(&tbl_else_blk, TAG_COROUTINE);
+                                let is_co: Value<'c, '_> = tbl_else_blk
+                                    .append_operation(arith::cmpi(
+                                        context,
+                                        arith::CmpiPredicate::Eq,
+                                        lhs_tag,
+                                        tag_co,
+                                        loc,
+                                    ))
+                                    .result(0)
+                                    .unwrap()
+                                    .into();
+                                let co_then = Region::new();
+                                let co_then_blk = Block::new(&[]);
+                                {
+                                    let lp = emit_load(&co_then_blk, lhs_payload, types.ptr, loc);
+                                    let rp = emit_load(&co_then_blk, rhs_payload, types.ptr, loc);
+                                    let lp_i = co_then_blk
+                                        .append_operation(
+                                            OperationBuilder::new("llvm.ptrtoint", loc)
+                                                .add_operands(&[lp])
+                                                .add_results(&[types.i64])
+                                                .build()
+                                                .expect("llvm.ptrtoint"),
+                                        )
+                                        .result(0)
+                                        .unwrap()
+                                        .into();
+                                    let rp_i = co_then_blk
+                                        .append_operation(
+                                            OperationBuilder::new("llvm.ptrtoint", loc)
+                                                .add_operands(&[rp])
+                                                .add_results(&[types.i64])
+                                                .build()
+                                                .expect("llvm.ptrtoint"),
+                                        )
+                                        .result(0)
+                                        .unwrap()
+                                        .into();
+                                    let eq: Value<'c, '_> = co_then_blk
+                                        .append_operation(arith::cmpi(
+                                            context,
+                                            arith::CmpiPredicate::Eq,
+                                            lp_i,
+                                            rp_i,
+                                            loc,
+                                        ))
+                                        .result(0)
+                                        .unwrap()
+                                        .into();
+                                    co_then_blk.append_operation(scf::r#yield(&[eq], loc));
+                                }
+                                co_then.append_block(co_then_blk);
+                                let co_else = Region::new();
+                                let co_else_blk = Block::new(&[]);
+                                emit_tagged_unknown_tag_trap(context, &co_else_blk, types, loc);
+                                let placeholder = co_else_blk
+                                    .append_operation(arith::constant(
+                                        context,
+                                        IntegerAttribute::new(types.i1, 0).into(),
+                                        loc,
+                                    ))
+                                    .result(0)
+                                    .unwrap()
+                                    .into();
+                                co_else_blk.append_operation(scf::r#yield(&[placeholder], loc));
+                                co_else.append_block(co_else_blk);
+                                let co_op = scf::r#if(is_co, &[types.i1], co_then, co_else, loc);
+                                let co_result: Value<'c, '_> = tbl_else_blk
+                                    .append_operation(co_op)
+                                    .result(0)
+                                    .unwrap()
+                                    .into();
+                                tbl_else_blk.append_operation(scf::r#yield(&[co_result], loc));
+                            }
                             tbl_else.append_block(tbl_else_blk);
                             let tbl_op = scf::r#if(is_table, &[types.i1], tbl_then, tbl_else, loc);
                             let tbl_result: Value<'c, '_> = fn_else_blk
@@ -1496,15 +1617,52 @@ pub(crate) fn emit_type_tagged_local<'a, 'c>(
                             ud_then.append_block(ud_then_blk);
                             let ud_else = Region::new();
                             let ud_else_blk = Block::new(&[]);
-                            emit_tagged_unknown_tag_trap(context, &ud_else_blk, types, loc);
-                            let placeholder = emit_addressof(
-                                context,
-                                &ud_else_blk,
-                                "s_typename_number",
-                                types,
-                                loc,
-                            );
-                            ud_else_blk.append_operation(scf::r#yield(&[placeholder], loc));
+                            {
+                                // ADR 0315 — N5-A: TAG_COROUTINE → "thread".
+                                let tag_coroutine = make_const_i64(&ud_else_blk, TAG_COROUTINE);
+                                let is_coroutine: Value<'c, '_> = ud_else_blk
+                                    .append_operation(arith::cmpi(
+                                        context,
+                                        arith::CmpiPredicate::Eq,
+                                        tag,
+                                        tag_coroutine,
+                                        loc,
+                                    ))
+                                    .result(0)
+                                    .unwrap()
+                                    .into();
+                                let co_then = Region::new();
+                                let co_then_blk = Block::new(&[]);
+                                let co_str = emit_addressof(
+                                    context,
+                                    &co_then_blk,
+                                    "s_typename_thread",
+                                    types,
+                                    loc,
+                                );
+                                co_then_blk.append_operation(scf::r#yield(&[co_str], loc));
+                                co_then.append_block(co_then_blk);
+                                let co_else = Region::new();
+                                let co_else_blk = Block::new(&[]);
+                                emit_tagged_unknown_tag_trap(context, &co_else_blk, types, loc);
+                                let placeholder = emit_addressof(
+                                    context,
+                                    &co_else_blk,
+                                    "s_typename_number",
+                                    types,
+                                    loc,
+                                );
+                                co_else_blk.append_operation(scf::r#yield(&[placeholder], loc));
+                                co_else.append_block(co_else_blk);
+                                let co_op =
+                                    scf::r#if(is_coroutine, &[types.ptr], co_then, co_else, loc);
+                                let co_res: Value<'c, '_> = ud_else_blk
+                                    .append_operation(co_op)
+                                    .result(0)
+                                    .unwrap()
+                                    .into();
+                                ud_else_blk.append_operation(scf::r#yield(&[co_res], loc));
+                            }
                             ud_else.append_block(ud_else_blk);
                             let ud_op = scf::r#if(is_userdata, &[types.ptr], ud_then, ud_else, loc);
                             let ud_result: Value<'c, '_> = tbl_else_blk

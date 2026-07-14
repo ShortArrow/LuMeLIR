@@ -630,6 +630,11 @@ pub enum Builtin {
     /// thread + an `is_main` Bool. Without a coroutine runtime
     /// the answer from main thread is `(nil, true)`.
     CoroutineRunning,
+    /// ADR 0315 — N5-A: `coroutine.create(f)` allocates a suspended
+    /// coroutine object (C runtime `lumelir_coro_create`) wrapping
+    /// the Function value's `(fn_ptr, cell_ptr)` pair. Returns a
+    /// `TAG_COROUTINE` TaggedValue; `type(co)` is `"thread"`.
+    CoroutineCreate,
     /// `string.len(s)` — Lua's `#s`-equivalent function-call form.
     /// Phase 2.7q-stdlib-string (ADR 0103). Dispatched via the
     /// generic namespace chokepoint when `string` is an UNRESOLVED
@@ -1042,6 +1047,8 @@ impl Builtin {
         match method {
             "isyieldable" => Some(Builtin::CoroutineIsYieldable),
             "running" => Some(Builtin::CoroutineRunning),
+            // ADR 0315 — N5-A.
+            "create" => Some(Builtin::CoroutineCreate),
             _ => None,
         }
     }
@@ -1148,6 +1155,7 @@ impl Builtin {
             // ADR 0245 — arity 0 for both.
             Builtin::CoroutineIsYieldable => (0, 0),
             Builtin::CoroutineRunning => (0, 0),
+            Builtin::CoroutineCreate => (1, 1),
             Builtin::MathPow => (2, 2),
             Builtin::MathFmod => (2, 2),
             Builtin::MathRandom => (0, 2),
@@ -1271,6 +1279,7 @@ impl Builtin {
             Builtin::OsSetlocale => "os.setlocale",
             Builtin::CoroutineIsYieldable => "coroutine.isyieldable",
             Builtin::CoroutineRunning => "coroutine.running",
+            Builtin::CoroutineCreate => "coroutine.create",
             Builtin::StringLen => "string.len",
             Builtin::StringUpper => "string.upper",
             Builtin::StringLower => "string.lower",
@@ -1392,6 +1401,8 @@ impl Builtin {
             Builtin::OsSetlocale => &[ValueKind::String],
             // ADR 0245 — coroutine.isyieldable returns Bool.
             Builtin::CoroutineIsYieldable => &[ValueKind::Bool],
+            // ADR 0315 — TAG_COROUTINE payload in a tagged slot.
+            Builtin::CoroutineCreate => &[ValueKind::TaggedValue],
             // ADR 0245 — coroutine.running returns (thread, Bool).
             // The thread slot is Nil when running on the main
             // thread; widening to TaggedValue covers the nil shape.
@@ -1657,6 +1668,11 @@ impl Builtin {
             Builtin::OsExecute => &[ValueKind::String],
             // ADR 0245 — no args.
             Builtin::CoroutineIsYieldable | Builtin::CoroutineRunning => &[],
+            // ADR 0315 — the Function arg's static kind is
+            // Function(arity) with caller-dependent arity; the
+            // TaggedValue "any" sentinel skips the slice check and
+            // the codegen arm validates the shape.
+            Builtin::CoroutineCreate => &[ValueKind::TaggedValue],
         }
     }
 
