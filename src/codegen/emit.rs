@@ -6351,7 +6351,25 @@ fn emit_multi_assign_from_user_call<'a, 'c>(
 ) -> Result<(), CodegenError> {
     let target = &functions[fid];
     let mut arg_vals: Vec<Value<'c, 'a>> = Vec::with_capacity(args.len());
-    for a in args {
+    for (i, a) in args.iter().enumerate() {
+        // ADR 0314: a Nil-kind param can only ever observe `nil`,
+        // so pass the i1 constant directly — evaluating a
+        // TaggedValue arg (e.g. generic-for's ctl local) through
+        // `emit_expr` would trap in its Number-payload tag guard.
+        if target.params.get(i).map(|p| p.kind) == Some(ValueKind::Nil) {
+            arg_vals.push(
+                block
+                    .append_operation(arith::constant(
+                        context,
+                        IntegerAttribute::new(types.i1, 0).into(),
+                        loc,
+                    ))
+                    .result(0)
+                    .unwrap()
+                    .into(),
+            );
+            continue;
+        }
         arg_vals.push(emit_expr(
             context,
             block,

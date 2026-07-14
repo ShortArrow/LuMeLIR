@@ -5581,6 +5581,19 @@ impl LowerCtx {
         // path; the call falls through to the normal Index-callee
         // Call path. ADR 0103 critical: namespace-agnostic dispatch
         // via `Builtin::from_namespace_method`, NOT hard-coded.
+        // ADR 0314 — N4-F-2b/2c: `string.gmatch(s, pat)` has no
+        // Builtin variant; it desugars entirely at lowering time
+        // into a synthetic `{s, pat, pos}` state table plus a
+        // synthesized iterator closure capturing it, so the result
+        // flows into generic-for like any user closure.
+        if let Some((ns, method)) = extract_namespace_call(callee)
+            && ns == "string"
+            && method == "gmatch"
+            && self.resolve(&ns).is_none()
+            && !self.function_names.contains_key(&ns)
+        {
+            return self.lower_gmatch_iterator(args, whole.span);
+        }
         if let Some((ns, method)) = extract_namespace_call(callee)
             && self.resolve(&ns).is_none()
             && !self.function_names.contains_key(&ns)
@@ -6380,6 +6393,104 @@ impl LowerCtx {
     /// namespaces) as `Callee::Builtin(...)`. Validates arity and
     /// lowers args; the call-site arg-kind check at codegen
     /// verifies operand types match the libc/libm extern signature.
+    /// ADR 0314 — N4-F-2b: synthesize the `string.gmatch` iterator
+    /// closure during lowering.
+    ///
+    /// Emits (via `pending_pre_stmts`) a `{s, pat, 1}` state-table
+    /// local, then builds the iterator as a `FunctionExpr` AST whose
+    /// body is parsed from a Lua snippet referencing that local by
+    /// name — the standard `FunctionExpr` pipeline then performs
+    /// capture analysis, cell allocation, and dispatch registration
+    /// exactly as for a user-written closure. The two protocol
+    /// params `(state, ctl)` are unused by the body and patched to
+    /// `Nil` kind to match the `nil, nil` the generic-for desugar
+    /// passes.
+    fn lower_gmatch_iterator(
+        &mut self,
+        args: &[Expr],
+        call_span: Span,
+    ) -> Result<HirExprKind, HirError> {
+        if args.len() != 2 {
+            return Err(HirError::ArityMismatch {
+                builtin: "string.gmatch".to_owned(),
+                expected: 2,
+                actual: args.len(),
+                offset: call_span.start,
+            });
+        }
+        let s_hir = self.lower_expr(&args[0])?;
+        let pat_hir = self.lower_expr(&args[1])?;
+        for (i, arg_hir) in [&s_hir, &pat_hir].into_iter().enumerate() {
+            let actual = infer_kind(arg_hir, &self.locals, &self.functions);
+            if actual != ValueKind::String {
+                return Err(HirError::BuiltinArgKindMismatch {
+                    builtin: "string.gmatch".to_owned(),
+                    arg_index: i + 1,
+                    expected: ValueKind::String.name().to_owned(),
+                    actual: actual.name().to_owned(),
+                    offset: call_span.start,
+                });
+            }
+        }
+        let seq = self.locals.len();
+        let s_name = format!("__gmatch_s_{seq}");
+        let p_name = format!("__gmatch_p_{seq}");
+        let pos_name = format!("__gmatch_pos_{seq}");
+        let s_id = self.declare_local(s_name.clone(), ValueKind::String);
+        let p_id = self.declare_local(p_name.clone(), ValueKind::String);
+        let pos_id = self.declare_local(pos_name.clone(), ValueKind::Number);
+        for (id, value) in [
+            (s_id, s_hir),
+            (p_id, pat_hir),
+            (
+                pos_id,
+                HirExpr {
+                    kind: HirExprKind::Number(1.0),
+                    span: call_span,
+                },
+            ),
+        ] {
+            self.pending_pre_stmts.push(HirStmt {
+                kind: HirStmtKind::LocalInit { id, value },
+                span: call_span,
+            });
+        }
+        let body_src = format!(
+            "local s0, e0 = string.find({s}, {p}, {pos})\n\
+             if s0 == nil then return nil, nil end\n\
+             if e0 < s0 then {pos} = s0 + 1 else {pos} = e0 + 1 end\n\
+             return string.sub({s}, s0, e0), nil\n",
+            s = s_name,
+            p = p_name,
+            pos = pos_name
+        );
+        let body_chunk = crate::parser::parse(&body_src)
+            .expect("ADR 0314: synthetic gmatch iterator body must parse");
+        let func_ast = Expr::new(
+            ExprKind::FunctionExpr {
+                params: vec!["__gm_state".to_owned(), "__gm_ctl".to_owned()],
+                is_vararg: false,
+                body: body_chunk,
+            },
+            call_span,
+        );
+        let lowered = self.lower_expr(&func_ast)?;
+        let HirExprKind::FunctionRef(fid) = lowered.kind else {
+            unreachable!("FunctionExpr lowering must produce FunctionRef");
+        };
+        // Both protocol params are unused by the body; declaring
+        // them Nil makes the caller pass an `i1 0` directly (the
+        // Nil-param bypass in `emit_multi_assign_from_user_call`),
+        // sidestepping the tagged ctl local's Number-payload guard.
+        for param in self.functions[fid.0].params.iter_mut() {
+            param.kind = ValueKind::Nil;
+        }
+        for local in self.functions[fid.0].locals.iter_mut().take(2) {
+            local.kind = ValueKind::Nil;
+        }
+        Ok(lowered.kind)
+    }
+
     fn lower_namespace_builtin_call(
         &mut self,
         builtin: Builtin,
