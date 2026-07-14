@@ -9,6 +9,13 @@
  * N5-A scope: allocation + status only. Lua's coroutine.create runs
  * nothing — the makecontext trampoline belongs to resume (N5-B).
  */
+#ifdef __APPLE__
+/* Apple gates the deprecated ucontext API behind _XOPEN_SOURCE
+ * (ADR 0315 §2 — the darwin lane must at least compile this file;
+ * runtime behaviour there is still bake-gated). */
+#define _XOPEN_SOURCE 600
+#endif
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <ucontext.h>
